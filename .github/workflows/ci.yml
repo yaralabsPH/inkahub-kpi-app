@@ -1,0 +1,44 @@
+# Automatic quality gate. Runs on every pull request and every push to main.
+# A pull request should not be merged unless this check is green.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc -b
+
+      - name: Tests
+        run: npm run test -- --run
+
+      - name: Build
+        run: npm run build
+
+      - name: Migrations are append-only
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          changed=$(git diff --name-status "origin/${{ github.base_ref }}" HEAD -- supabase/migrations | grep -v '^A' || true)
+          if [ -n "$changed" ]; then
+            echo "Existing migrations were modified, renamed or deleted:"
+            echo "$changed"
+            echo "Migrations are append-only. Add a new numbered file instead."
+            exit 1
+          fi
