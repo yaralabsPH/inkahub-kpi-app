@@ -1,0 +1,40 @@
+# Spec: <feature name>
+
+- Slug: `<slug>`
+- Status: draft | approved by CJ on <date>
+- Author: planner (GPT-6 Astra)
+
+## Problem
+
+What's wrong or missing today, and who feels it (owner, manager, staff, kiosk, cs)?
+
+## Goals
+
+- ...
+
+## Non-goals
+
+What we are deliberately NOT doing in this feature.
+
+- ...
+
+## User stories / flows
+
+- As a <role>, I want <action> so that <outcome>.
+
+## Acceptance criteria
+
+Concrete, checkable statements. CJ tests against these before merging.
+
+- [ ] ...
+
+## Data and backend impact
+
+- Tables / migrations needed:
+- Repository interface changes (both Dexie and Supabase):
+- `api/` endpoints touched:
+- RLS / role access:
+
+## Risks and open questions
+
+- ...

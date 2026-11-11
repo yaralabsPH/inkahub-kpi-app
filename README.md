@@ -39,6 +39,13 @@ npm run test -- --run
 The SQL files are a recovered snapshot. Reconcile them with the target
 database's migration history before applying them.
 
+## AI-assisted development
+
+Work is planned by GPT-6 Astra (Codex) and implemented by Claude Opus (Claude
+Code). Shared agent rules are in `AGENTS.md`; the human playbook with
+copy-paste prompts is `docs/WORKFLOW.md`; spec, plan and review templates are
+in `docs/templates/`.
+
 ## Recovery scope
 
 This repository starts a new Git history from the recovered source. The local

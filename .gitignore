@@ -17,6 +17,9 @@
 !/api/
 !/public/
 !/supabase/
+!/AGENTS.md
+!/CLAUDE.md
+!/docs/
 
 # Local credentials, dependencies, build outputs, and editor backups.
 .env
