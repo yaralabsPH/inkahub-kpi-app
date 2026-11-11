@@ -320,3 +320,215 @@ describe("daily-digest diagnostics behind the guard", () => {
     }
   });
 });
+
+/* ------------------------------------------------------------------
+ * Fixtures shared by the authorized-path tests
+ * ------------------------------------------------------------------ */
+const RESEND_URL = "https://api.resend.com/emails";
+
+/** A UTC instant that falls at roughly midday local time on `ymd`. */
+function middayUtc(location: string, ymd: string): string {
+  const hour = location === "au" ? "01" : location === "uk" ? "12" : "18";
+  return `${ymd}T${hour}:00:00.000Z`;
+}
+
+function seedActivity(location: string, ymd: string, staffId = "staff-0001-aaaa") {
+  const ts = middayUtc(location, ymd);
+  const rows: Row[] = [
+    { id: `${location}-${ymd}-d`, staff_id: staffId, department: "dispatch", order_number: `#${ymd}-1`, line_sku: null, line_quantity: null, event_type: "dispatched", parent_event_id: null, created_at: ts, location },
+    { id: `${location}-${ymd}-v`, staff_id: staffId, department: "dispatch", order_number: `#${ymd}-1`, line_sku: "INKA-AB1234-A3-FN", line_quantity: 2, event_type: "line_verified", parent_event_id: null, created_at: ts, location },
+  ];
+  h.state.tables.production_events = [...(h.state.tables.production_events ?? []), ...rows];
+  h.state.tables.staff_barcodes = [
+    ...(h.state.tables.staff_barcodes ?? []),
+    { user_id: staffId, display_name: "Test Staffer", location },
+  ];
+}
+
+function mockResendOk() {
+  fetchMock.mockImplementation(async (input: unknown) => {
+    if (String(input) === RESEND_URL) return { ok: true, status: 200, text: async () => "{}" };
+    throw new Error(`unexpected network call to ${String(input)}`);
+  });
+}
+
+interface ResendBody { from: string; to: string[]; subject: string; attachments: Array<{ filename: string; content: string }> }
+function resendCalls(): ResendBody[] {
+  return fetchMock.mock.calls
+    .filter((c) => String(c[0]) === RESEND_URL)
+    .map((c) => JSON.parse(String((c[1] as { body: string }).body)) as ResendBody);
+}
+
+/** Asserts that a rejected request touched no database, network or workbook code. */
+function expectRejected(out: Recorded, status: number, error: string) {
+  expect(out.status).toBe(status);
+  expect(out.json).toEqual({ error });
+  expect(out.headers["cache-control"]).toBe("no-store");
+  expect(out.sent).toBeUndefined();
+  expectNoWork();
+}
+
+/* ------------------------------------------------------------------
+ * Task 2: recipient policy
+ * ------------------------------------------------------------------ */
+const DAY = "2026-11-10";
+const ALLOW = "ops-test@example.test, second+tag@example.test";
+
+describe("daily-digest recipient overrides", () => {
+  beforeEach(() => {
+    setEnv({ REPORT_RECIPIENT_ALLOWLIST: ALLOW });
+    seedActivity("au", DAY);
+    mockResendOk();
+  });
+
+  it.each([
+    ["ops-test@example.test", "ops-test@example.test"],
+    ["  OPS-Test@Example.TEST  ", "ops-test@example.test"],
+    ["Second+Tag@example.test", "second+tag@example.test"],
+  ])("sends an allowlisted override %j to the normalized address", async (raw, expected) => {
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: raw } });
+    expect(out.status).toBe(200);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    const sent = resendCalls();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].to).toEqual([expected]);
+  });
+
+  it("works with an allowlisted override even without a default recipient", async () => {
+    setEnv({ REPORT_RECIPIENT: undefined });
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: "ops-test@example.test" } });
+    expect(out.status).toBe(200);
+    expect(resendCalls()[0].to).toEqual(["ops-test@example.test"]);
+  });
+
+  it.each([
+    ["not on the list", "stranger@example.test"],
+    ["plus-address of a listed address", "ops-test+x@example.test"],
+    ["suffix lookalike", "ops-test@example.test.evil.test"],
+    ["prefix lookalike", "xops-test@example.test"],
+    ["same domain", "anyone@example.test"],
+    ["the default address itself", "default-inbox@example.test"],
+  ])("rejects an override (%s) with 403", async (_label, raw) => {
+    expectRejected(await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: raw } }), 403, "Recipient not allowed");
+  });
+
+  const INVALID: Array<[string, string | string[]]> = [
+    ["empty", ""],
+    ["whitespace", "   "],
+    ["no at-sign", "not-an-email"],
+    ["missing domain", "a@"],
+    ["display name", "Ops <ops-test@example.test>"],
+    ["quoted", '"ops-test@example.test"'],
+    ["comma list", "ops-test@example.test,second+tag@example.test"],
+    ["semicolon list", "ops-test@example.test;second+tag@example.test"],
+    ["space list", "ops-test@example.test second+tag@example.test"],
+    ["newline injection", "ops-test@example.test\nBcc: x@example.test"],
+    ["embedded CR", "ops-test@example.test\rBcc: x@example.test"],
+    ["embedded tab", "ops-test\t@example.test"],
+    ["control character", "ops-test\u0000@example.test"],
+    ["repeated parameter", ["ops-test@example.test", "ops-test@example.test"]],
+    ["single-element array", ["ops-test@example.test"]],
+  ];
+  for (const [label, raw] of INVALID) {
+    it(`rejects an invalid override (${label}) with 400`, async () => {
+      expectRejected(await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: raw } }), 400, "Invalid recipient");
+    });
+  }
+
+  it("ignores blank allowlist entries", async () => {
+    setEnv({ REPORT_RECIPIENT_ALLOWLIST: " , ops-test@example.test ,, " });
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: "ops-test@example.test" } });
+    expect(out.status).toBe(200);
+  });
+
+  for (const list of [undefined, "", " , , "]) {
+    it(`denies all overrides when the allowlist is ${JSON.stringify(list)}`, async () => {
+      setEnv({ REPORT_RECIPIENT_ALLOWLIST: list });
+      expectRejected(await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: "ops-test@example.test" } }), 403, "Recipient not allowed");
+    });
+  }
+
+  for (const list of ["ops-test@example.test, not-an-email", "*@example.test", "@example.test", "Ops <ops-test@example.test>", "ops-test@example.test; second+tag@example.test"]) {
+    it(`fails overrides closed with 500 for malformed allowlist ${JSON.stringify(list)}`, async () => {
+      setEnv({ REPORT_RECIPIENT_ALLOWLIST: list });
+      const out = await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: "ops-test@example.test" } });
+      expectRejected(out, 500, "Recipient configuration error");
+    });
+  }
+
+  const OPERATIONS: Array<[string, Req["query"]]> = [
+    ["dry", { location: "au", date: DAY, dry: "1" }],
+    ["envcheck", { envcheck: "1" }],
+    ["rolecheck", { rolecheck: "1" }],
+    ["force", { location: "au", date: DAY, force: "1" }],
+    ["no-activity day", { location: "au", date: "2026-01-01" }],
+    ["invalid location", { location: "zz" }],
+  ];
+  for (const [olabel, query] of OPERATIONS) {
+    it(`validates the override before ${olabel}`, async () => {
+      expectRejected(await call({ headers: AUTH, query: { ...query, recipient: "stranger@example.test" } }), 403, "Recipient not allowed");
+      expectRejected(await call({ headers: AUTH, query: { ...query, recipient: "bad" } }), 400, "Invalid recipient");
+      setEnv({ REPORT_RECIPIENT_ALLOWLIST: "broken" });
+      expectRejected(await call({ headers: AUTH, query: { ...query, recipient: "ops-test@example.test" } }), 500, "Recipient configuration error");
+    });
+  }
+
+  it("keeps auth (401) and method (405) ahead of recipient validation", async () => {
+    setEnv({ REPORT_RECIPIENT_ALLOWLIST: "broken" });
+    expectUnauthorized(await call({ query: { location: "au", recipient: "bad" } }));
+    const out = await call({ method: "POST", headers: AUTH, query: { location: "au", recipient: "bad" } });
+    expect(out.status).toBe(405);
+    expectNoWork();
+  });
+
+  it("error bodies never echo the submitted address or the allowlist", async () => {
+    for (const recipient of ["stranger@example.test", "bad", ""]) {
+      const out = await call({ headers: AUTH, query: { location: "au", date: DAY, recipient } });
+      const text = JSON.stringify(out.json);
+      expect(text).not.toContain("example.test");
+      expect(text).not.toContain("ops-test");
+    }
+  });
+});
+
+describe("daily-digest default recipient", () => {
+  beforeEach(() => {
+    seedActivity("au", DAY);
+    mockResendOk();
+  });
+
+  for (const list of [undefined, "", "broken, also-broken"]) {
+    it(`sends to REPORT_RECIPIENT regardless of allowlist ${JSON.stringify(list)}`, async () => {
+      setEnv({ REPORT_RECIPIENT_ALLOWLIST: list, REPORT_RECIPIENT: "  default-inbox@example.test " });
+      const out = await call({ headers: AUTH, query: { location: "au", date: DAY } });
+      expect(out.status).toBe(200);
+      expect(resendCalls().map((c) => c.to)).toEqual([["default-inbox@example.test"]]);
+    });
+  }
+
+  for (const value of [undefined, "", "   ", "not-an-email", "a@example.test, b@example.test", "Ops <a@example.test>"]) {
+    it(`refuses to email when REPORT_RECIPIENT is ${JSON.stringify(value)}`, async () => {
+      setEnv({ REPORT_RECIPIENT: value });
+      for (const query of [{ location: "au", date: DAY }, { location: "au", date: DAY, force: "1" }]) {
+        const out = await call({ headers: AUTH, query });
+        expect(out.status).toBe(500);
+        expect(out.json).toEqual({ error: "Recipient configuration error" });
+        expect(out.headers["cache-control"]).toBe("no-store");
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it(`still serves downloads, diagnostics and skips when REPORT_RECIPIENT is ${JSON.stringify(value)}`, async () => {
+      setEnv({ REPORT_RECIPIENT: value });
+      const dry = await call({ headers: AUTH, query: { location: "au", date: DAY, dry: "1" } });
+      expect(dry.status).toBe(200);
+      expect(dry.sent).toBeInstanceOf(Buffer);
+      const env = await call({ headers: AUTH, query: { envcheck: "1" } });
+      expect(env.status).toBe(200);
+      const skip = await call({ headers: AUTH, query: { location: "au", date: "2026-01-01" } });
+      expect(skip.status).toBe(200);
+      expect(skip.json).toMatchObject({ skipped: "no activity" });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+});

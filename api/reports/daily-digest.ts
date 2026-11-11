@@ -19,6 +19,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
+import { z } from "zod";
 
 interface VercelRequest {
   method?: string;
@@ -517,6 +518,53 @@ function isAuthorized(headers: VercelRequest["headers"], secret: string | undefi
 }
 
 /* ============================================================
+ * Recipient policy
+ * ============================================================ */
+const emailSchema = z.string().email();
+
+/**
+ * Trimmed, lowercased single email address, or null. Rejects lists
+ * (commas/semicolons), display-name forms (<>, quotes, parens), any
+ * embedded whitespace and control characters, then applies zod's email
+ * check.
+ */
+function normalizeEmail(value: string): string | null {
+  const v = value.trim();
+  if (v === "") return null;
+  if (/[\s\x00-\x1f\x7f,;<>"()]/.test(v)) return null;
+  if (!emailSchema.safeParse(v).success) return null;
+  return v.toLowerCase();
+}
+
+type RecipientError = { status: 400 | 403 | 500; message: string };
+
+/**
+ * Validates an explicit `recipient` override against
+ * REPORT_RECIPIENT_ALLOWLIST (comma-separated individual addresses,
+ * exact case-insensitive match). No override -> {}. Never falls back to
+ * the default recipient on failure.
+ */
+function resolveRecipientOverride(
+  raw: string | string[] | undefined,
+  allowlist: string | undefined,
+): { recipient?: string; error?: RecipientError } {
+  if (raw === undefined) return {};
+  if (typeof raw !== "string") return { error: { status: 400, message: "Invalid recipient" } };
+  const recipient = normalizeEmail(raw);
+  if (!recipient) return { error: { status: 400, message: "Invalid recipient" } };
+
+  const entries = (allowlist ?? "").split(",").map((e) => e.trim()).filter((e) => e !== "");
+  const allowed = new Set<string>();
+  for (const entry of entries) {
+    const n = normalizeEmail(entry);
+    if (!n) return { error: { status: 500, message: "Recipient configuration error" } };
+    allowed.add(n);
+  }
+  if (!allowed.has(recipient)) return { error: { status: 403, message: "Recipient not allowed" } };
+  return { recipient };
+}
+
+/* ============================================================
  * Handler
  * ============================================================ */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -531,6 +579,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (req.method !== "GET") {
       res.setHeader("Allow", "GET");
       res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    // Validate any explicit override before diagnostics or report work.
+    const override = resolveRecipientOverride(req.query.recipient, process.env.REPORT_RECIPIENT_ALLOWLIST);
+    if (override.error) {
+      res.status(override.error.status).json({ error: override.error.message });
       return;
     }
 
@@ -677,9 +731,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
+    // Destination: a validated override, else the configured default.
+    // There is no hardcoded fallback address.
+    let recipient = override.recipient;
+    if (!recipient) {
+      const configured = (process.env.REPORT_RECIPIENT ?? "").trim();
+      if (!normalizeEmail(configured)) {
+        res.status(500).json({ error: "Recipient configuration error" });
+        return;
+      }
+      recipient = configured;
+    }
+
     const bodies = buildBodyText({ ymd, locLabel, today, yesterday, staffNames });
     const subject = `${locLabel}-${formatDDMMYY(ymd)}-Daily KPI Report`;
-    const recipient = (Array.isArray(req.query.recipient) ? req.query.recipient[0] : req.query.recipient) ?? process.env.REPORT_RECIPIENT ?? "max@inkaarthouse.com";
     const from = process.env.FROM_EMAIL || "onboarding@resend.dev";
     const resendKey = process.env.RESEND_API_KEY;
     if (!resendKey) {
