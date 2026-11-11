@@ -4,6 +4,7 @@
  * Supabase, XLSX and global fetch are mocked; no real database, email
  * service or credentials are used. All secrets/addresses are synthetic.
  */
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /* ------------------------------------------------------------------
@@ -326,10 +327,17 @@ describe("daily-digest diagnostics behind the guard", () => {
  * ------------------------------------------------------------------ */
 const RESEND_URL = "https://api.resend.com/emails";
 
-/** A UTC instant that falls at roughly midday local time on `ymd`. */
+/**
+ * A UTC instant on local day `ymd` that also falls inside the window the
+ * handler currently queries. NOTE: the existing localDayRangeUtc returns
+ * the UTC calendar day for AU/UK and the *next* UTC day for US (pre-existing
+ * behaviour, out of scope for digest-auth; see the plan's Open questions),
+ * so these instants are chosen to sit in both windows and not codify it.
+ */
 function middayUtc(location: string, ymd: string): string {
-  const hour = location === "au" ? "01" : location === "uk" ? "12" : "18";
-  return `${ymd}T${hour}:00:00.000Z`;
+  if (location === "au") return `${ymd}T01:00:00.000Z`; // ~12:00 Sydney
+  if (location === "uk") return `${ymd}T12:00:00.000Z`; // ~12:00 London
+  return `${shiftYmd(ymd, 1)}T02:00:00.000Z`;           // ~20:00 Chicago on ymd
 }
 
 function seedActivity(location: string, ymd: string, staffId = "staff-0001-aaaa") {
@@ -531,4 +539,224 @@ describe("daily-digest default recipient", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
   }
+});
+
+/* ------------------------------------------------------------------
+ * Task 3: authorized compatibility
+ * ------------------------------------------------------------------ */
+const LOCS = [
+  // Scheduled UTC fire time (from vercel.json) and the local day it closes,
+  // plus a time after the 04:00 local cutoff and the day it selects.
+  { loc: "au", label: "AU", cronNow: "2026-11-10T13:55:00Z", cronYmd: "2026-11-10", afterNow: "2026-11-10T20:00:00Z", afterYmd: "2026-11-11" },
+  { loc: "uk", label: "UK", cronNow: "2026-11-10T22:55:00Z", cronYmd: "2026-11-10", afterNow: "2026-11-11T02:30:00Z", afterYmd: "2026-11-10" },
+  { loc: "us", label: "US", cronNow: "2026-11-10T04:55:00Z", cronYmd: "2026-11-09", afterNow: "2026-11-10T08:30:00Z", afterYmd: "2026-11-09" },
+] as const;
+
+function ddmmyy(ymd: string) { return `${ymd.slice(8, 10)}/${ymd.slice(5, 7)}/${ymd.slice(2, 4)}`; }
+
+function shiftYmd(ymd: string, days: number) {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function expectLocationFilters(loc: string) {
+  expect(h.state.queries.length).toBeGreaterThan(0);
+  for (const q of h.state.queries) {
+    expect(q.ops).toContainEqual(["eq", ["location", loc]]);
+  }
+}
+
+function sheetNames(): string[] {
+  return h.utils.book_append_sheet.mock.calls.map((c) => String(c[2]));
+}
+
+/** Rows passed to aoa_to_sheet, in the order Summary, Departments, Staff, Notes. */
+function sheetRows(index: number): unknown[][] {
+  return h.utils.aoa_to_sheet.mock.calls[index][0];
+}
+
+describe("daily-digest authorized reports (compatibility)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    mockResendOk();
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  for (const L of LOCS) {
+    it(`${L.label}: scheduled-style request (bearer + location only) closes the right day`, async () => {
+      vi.setSystemTime(new Date(L.cronNow));
+      seedActivity(L.loc, L.cronYmd);
+      seedActivity(L.loc, shiftYmd(L.cronYmd, -1), "staff-0002-bbbb");
+      const out = await call({ headers: AUTH, query: { location: L.loc } });
+      expect(out.status).toBe(200);
+      expect(out.headers["cache-control"]).toBe("no-store");
+      expect(out.json).toMatchObject({
+        ok: true,
+        subject: `${L.label}-${ddmmyy(L.cronYmd)}-Daily KPI Report`,
+        recipient: "default-inbox@example.test",
+        ymd: L.cronYmd,
+        location: L.loc,
+        counts: { orders_today: 1, items_today: 2, staff_today: 1 },
+      });
+      const sent = resendCalls();
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toMatchObject({
+        from: "reports@example.test",
+        to: ["default-inbox@example.test"],
+        subject: `${L.label}-${ddmmyy(L.cronYmd)}-Daily KPI Report`,
+      });
+      expect(sent[0].attachments.map((a) => a.filename)).toEqual([`${L.label}-KPI-${L.cronYmd}.xlsx`]);
+      expect(sent[0].attachments[0].content).toBe(Buffer.from([0x50, 0x4b, 0x03, 0x04]).toString("base64"));
+      expectLocationFilters(L.loc);
+
+      expect(sheetNames()).toEqual(["Summary", "Departments", "Staff", "Notes"]);
+      const summary = sheetRows(0);
+      expect(summary[1].slice(0, 8)).toEqual([L.cronYmd, L.label, 1, 2, 1, 2, 1, 1]);
+      const staff = sheetRows(2);
+      expect(staff.some((r) => r.includes("Test Staffer"))).toBe(true);
+    });
+
+    it(`${L.label}: default date after the 04:00 local cutoff`, async () => {
+      vi.setSystemTime(new Date(L.afterNow));
+      seedActivity(L.loc, L.afterYmd);
+      const out = await call({ headers: AUTH, query: { location: L.loc } });
+      expect(out.status).toBe(200);
+      expect(out.json).toMatchObject({ ymd: L.afterYmd });
+    });
+
+    it(`${L.label}: manual dated rerun`, async () => {
+      vi.setSystemTime(new Date("2026-11-11T09:00:00Z"));
+      seedActivity(L.loc, "2026-10-05");
+      const out = await call({ headers: AUTH, query: { location: L.loc, date: "2026-10-05" } });
+      expect(out.status).toBe(200);
+      expect(out.json).toMatchObject({ ymd: "2026-10-05", location: L.loc, counts: { orders_today: 1, items_today: 2 } });
+      expect(resendCalls()[0].attachments[0].filename).toBe(`${L.label}-KPI-2026-10-05.xlsx`);
+      expectLocationFilters(L.loc);
+    });
+
+    it(`${L.label}: dry=1 downloads the xlsx and never emails`, async () => {
+      seedActivity(L.loc, DAY);
+      const out = await call({ headers: AUTH, query: { location: L.loc, date: DAY, dry: "1" } });
+      expect(out.status).toBe(200);
+      expect(out.headers["content-type"]).toBe("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      expect(out.headers["content-disposition"]).toBe(`attachment; filename="${L.label}-KPI-${DAY}.xlsx"`);
+      expect(out.headers["cache-control"]).toBe("no-store");
+      expect(Buffer.isBuffer(out.sent)).toBe(true);
+      expect([...(out.sent as Buffer)]).toEqual([0x50, 0x4b, 0x03, 0x04]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+
+  it("skips a zero-activity day without building a workbook or emailing", async () => {
+    const out = await call({ headers: AUTH, query: { location: "uk", date: DAY } });
+    expect(out.status).toBe(200);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    expect(out.json).toEqual({
+      ok: true,
+      skipped: "no activity",
+      location: "uk",
+      ymd: DAY,
+      note: "Zero orders and zero items across all departments; email suppressed. Pass ?force=1 to send anyway.",
+    });
+    expect(h.utils.book_new).not.toHaveBeenCalled();
+    expect(h.write).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  for (const force of ["1", "true"]) {
+    it(`force=${force} still sends on a zero-activity day`, async () => {
+      const out = await call({ headers: AUTH, query: { location: "uk", date: DAY, force } });
+      expect(out.status).toBe(200);
+      expect(out.json).toMatchObject({ ok: true, counts: { orders_today: 0, items_today: 0 } });
+      expect(resendCalls()).toHaveLength(1);
+    });
+  }
+
+  it("dry still downloads on a zero-activity day", async () => {
+    const out = await call({ headers: AUTH, query: { location: "uk", date: DAY, dry: "1" } });
+    expect(out.status).toBe(200);
+    expect(Buffer.isBuffer(out.sent)).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps diagnostic precedence (rolecheck before envcheck before report) and never emails", async () => {
+    fetchMock.mockImplementation(async () => ({ status: 200, text: async () => "[]" }));
+    const both = await call({ headers: AUTH, query: { rolecheck: "1", envcheck: "1", location: "au", force: "1" } });
+    expect(both.json).toHaveProperty("raw_fetch_status", 200);
+    const env = await call({ headers: AUTH, query: { envcheck: "1", location: "au", force: "1" } });
+    expect(env.json).toHaveProperty("RESEND_API_KEY");
+    expect(resendCalls()).toHaveLength(0);
+    expect(h.createClient).not.toHaveBeenCalled();
+  });
+});
+
+describe("daily-digest error branches keep no-store and stay generic", () => {
+  beforeEach(() => { mockResendOk(); seedActivity("au", DAY); });
+
+  it("400 for an unknown location", async () => {
+    const out = await call({ headers: AUTH, query: { location: "zz" } });
+    expect(out.status).toBe(400);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    expectNoWork();
+  });
+
+  it("500 when Supabase configuration is missing", async () => {
+    setEnv({ SUPABASE_URL: undefined, VITE_SUPABASE_URL: undefined });
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY } });
+    expect(out.status).toBe(500);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    expectNoWork();
+  });
+
+  it("500 when the database query fails", async () => {
+    h.state.tableErrors.production_events = { message: "boom" };
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY } });
+    expect(out.status).toBe(500);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    expect(JSON.stringify(out.json)).not.toContain(SECRET);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("500 when RESEND_API_KEY is missing", async () => {
+    setEnv({ RESEND_API_KEY: undefined });
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY } });
+    expect(out.status).toBe(500);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("502 when Resend rejects the send", async () => {
+    fetchMock.mockImplementation(async () => ({ ok: false, status: 422, text: async () => "bad request" }));
+    const out = await call({ headers: AUTH, query: { location: "au", date: DAY } });
+    expect(out.status).toBe(502);
+    expect(out.headers["cache-control"]).toBe("no-store");
+    expect(JSON.stringify(out.json)).not.toContain(SECRET);
+  });
+
+  it("logs nothing containing the secret or allowlist during a full send", async () => {
+    setEnv({ REPORT_RECIPIENT_ALLOWLIST: ALLOW });
+    const spies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
+    await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: "ops-test@example.test" } });
+    await call({ headers: AUTH, query: { location: "au", date: DAY, recipient: "stranger@example.test" } });
+    for (const s of spies) {
+      const logged = JSON.stringify(s.mock.calls);
+      expect(logged).not.toContain(SECRET);
+      expect(logged).not.toContain("second+tag");
+      s.mockRestore();
+    }
+  });
+});
+
+describe("vercel.json schedules are unchanged", () => {
+  it("keeps the AU, UK and US cron entries exactly, with no secret in any path", () => {
+    const raw = readFileSync(new URL("../../vercel.json", import.meta.url), "utf-8");
+    const cfg = JSON.parse(raw) as { crons: Array<{ path: string; schedule: string }> };
+    expect(cfg.crons).toEqual([
+      { path: "/api/reports/daily-digest?location=au", schedule: "55 13 * * *" },
+      { path: "/api/reports/daily-digest?location=uk", schedule: "55 22 * * *" },
+      { path: "/api/reports/daily-digest?location=us", schedule: "55 4 * * *" },
+    ]);
+    expect(raw.toLowerCase()).not.toMatch(/secret|bearer|authorization|token/);
+  });
 });
