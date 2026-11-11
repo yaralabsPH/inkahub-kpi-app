@@ -69,6 +69,30 @@ Open a pull request from `feature/<slug>` to `main`. Then follow
 the smoke test, merge at a quiet time, watch, and roll back in Vercel if
 anything goes wrong. The app is live, so never skip this step.
 
+## The automated loop
+
+Once the manual loop feels familiar, Claude Code can drive steps 2 to 5 and
+call Astra itself through the Codex CLI.
+
+One-time setup on your computer:
+
+```sh
+npm install -g @openai/codex
+codex login
+codex exec -m gpt-6-astra "Say hello"
+```
+
+Then for each feature:
+
+1. Write and approve the spec with Astra in the Codex app (step 1 above).
+   The spec must say "approved by CJ".
+2. In Claude Code, type `/loop <slug>`.
+3. Claude asks Astra for the plan, then stops and shows you a summary.
+   Read `docs/plans/<slug>.md` and reply "plan approved" (or ask for changes).
+4. Claude builds, asks Astra for a review, fixes, and repeats (at most 3
+   rounds). Then it pushes the branch and opens a pull request.
+5. You do step 6 (Ship) exactly as before.
+
 ## Rules of thumb
 
 - Only one agent works at a time. Wait for one to finish and commit before
