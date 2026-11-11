@@ -26,6 +26,13 @@ Each task is one commit. Keep them small enough that the diff is easy to review.
 - Do:
 - Done when:
 
+## Release and rollback
+
+- Migration(s) and why each is backward-compatible (expand-then-contract):
+- Does rolling back the app leave the database usable by the old code? yes / no + why:
+- Manual steps CJ must do at release (env vars, SQL, Shopify settings):
+- Follow-up "contract" release needed later? (e.g. drop the old column)
+
 ## Out of scope
 
 - ...

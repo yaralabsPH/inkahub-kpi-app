@@ -75,6 +75,17 @@ Keep it that way.
 6. **Inventory math is money.** Stock deduction, idempotency and ledger code
    (see migrations 0025, 0026, 0031) need tests for any behavior change.
 7. Don't add dependencies without saying why in the plan.
+8. **Production is live.** Real staff use this app all day. Every change must
+   be safe to roll back:
+   - Migrations follow expand-then-contract (see `docs/RELEASING.md`): add
+     tables, nullable columns, indexes; never drop, rename, retype or add
+     NOT NULL in the same release as the code that needs it. Old code must
+     keep working on the new schema. CI rejects edits to existing migrations.
+   - Never point anything at the production database during development or
+     testing. Testing uses Dexie or the staging Supabase project.
+   - Every spec includes a staging test plan; every plan includes release and
+     rollback notes.
+   - Agents never merge to `main`, deploy, or apply SQL. Those are CJ's steps.
 
 ## 6. Team protocol (planner + coder)
 
@@ -104,4 +115,5 @@ Rules:
 - [ ] `npm run test -- --run` passes, with new tests for new logic
 - [ ] `npm run build` passes (run at least once per feature, before review)
 - [ ] One commit per task: `task N: <summary>`
+- [ ] CI green on the pull request (`.github/workflows/ci.yml`)
 - [ ] Plan checkbox ticked and one line added to the plan's Implementation log

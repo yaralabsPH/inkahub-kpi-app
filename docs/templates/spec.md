@@ -35,6 +35,14 @@ Concrete, checkable statements. CJ tests against these before merging.
 - `api/` endpoints touched:
 - RLS / role access:
 
+## Staging test plan
+
+How CJ will prove this works on the Vercel preview (staging database) before
+release. List the steps per role, plus which parts of the smoke test in
+`docs/RELEASING.md` are most at risk.
+
+- ...
+
 ## Risks and open questions
 
 - ...

@@ -64,9 +64,10 @@ Repeat 4 → 5 (r2, r3…) until the verdict is "approved".
 
 **6. Ship — you**
 
-Run the app (`npm run dev`), check every acceptance criterion in the spec,
-then open a pull request from `feature/<slug>` to `main` and merge it. Vercel
-deploys from `main`.
+Open a pull request from `feature/<slug>` to `main`. Then follow
+`docs/RELEASING.md`: CI green, test the Vercel preview against staging, run
+the smoke test, merge at a quiet time, watch, and roll back in Vercel if
+anything goes wrong. The app is live, so never skip this step.
 
 ## Rules of thumb
 
