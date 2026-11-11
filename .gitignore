@@ -1,0 +1,36 @@
+# Recovered root contains historical patch scripts and duplicate source files.
+# Track the application entry points explicitly.
+/*
+!/.gitignore
+!/README.md
+!/.env.example
+!/package.json
+!/package-lock.json
+!/index.html
+!/postcss.config.js
+!/tailwind.config.js
+!/tsconfig.json
+!/tsconfig.node.json
+!/vite.config.ts
+!/vercel.json
+!/src/
+!/api/
+!/public/
+!/supabase/
+
+# Local credentials, dependencies, build outputs, and editor backups.
+.env
+.env.*
+!.env.example
+node_modules/
+dist/
+.vercel/
+*.tsbuildinfo
+*.log
+*.bak
+*.broken-*
+.DS_Store
+Thumbs.db
+
+# Recovered duplicate of the active TypeScript repository implementation.
+/src/lib/repository/supabase/*.txt

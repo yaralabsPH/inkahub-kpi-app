@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/((?!api).*)",
+      "destination": "/index.html"
+    }
+  ],
+  "crons": [
+    { "path": "/api/reports/daily-digest?location=au", "schedule": "55 13 * * *" },
+    { "path": "/api/reports/daily-digest?location=uk", "schedule": "55 22 * * *" },
+    { "path": "/api/reports/daily-digest?location=us", "schedule": "55 4 * * *" }
+  ]
+}
