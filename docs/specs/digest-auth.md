@@ -41,7 +41,7 @@ Request flow: authenticate first → require GET → validate any recipient over
 
 ### Configuration and recipient rules
 
-The following details are planner defaults for this draft, implementing CJ's selected policy:
+The following details implement CJ's approved policy:
 
 | Setting / input | Required behavior |
 | --- | --- |
@@ -96,5 +96,4 @@ If `recipient` is supplied alongside `dry`, diagnostics or a no-activity request
 - **Rollback:** no database rollback is needed. Restoring the current pre-fix deployment also restores the unauthenticated endpoint and arbitrary recipient override. Setting `CRON_SECRET` alone does not protect code that never checks it, and disabling the schedule alone does not block public endpoint access. The plan must state this explicitly: prefer a fix forward that retains authentication, or have CJ block external access to this endpoint before restoring vulnerable code. A rollback to an already protected deployment must reverify its credential/configuration compatibility. Do not remove the guard or add a public bypass to recover delivery.
 - **Shared credential:** anyone who obtains the secret can access all supported locations, downloads and diagnostics and can trigger repeated sends to configured destinations. The allowlist limits overrides; it does not prevent replay. Credential rotation and distribution remain CJ's responsibility; per-user authorization and delivery deduplication are outside this feature.
 - **Existing diagnostic content:** diagnostics still contain sensitive operational information once authenticated. Keep the secret with trusted operators. Payload redesign and other endpoint vulnerabilities remain separate work.
-- **Planner defaults to review:** `REPORT_RECIPIENT_ALLOWLIST` naming/format, exact case-insensitive single-address matching, reject rather than ignore invalid overrides, fail closed without a configured default for email, GET-only behavior, and no-store responses. These are concrete draft decisions, not additional decisions attributed to CJ.
-- No blocking product questions remain. The spec stays **draft** until CJ approves the written document; implementation and the plan are separate steps.
+- **Approved implementation details:** `REPORT_RECIPIENT_ALLOWLIST` naming/format, exact case-insensitive single-address matching, reject rather than ignore invalid overrides, fail closed without a configured default for email, GET-only behavior, and no-store responses. These planner-proposed details are included in CJ's approval of this spec.
