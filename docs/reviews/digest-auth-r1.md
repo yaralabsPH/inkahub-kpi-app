@@ -60,4 +60,7 @@ The coder correctly left the helper unchanged and chose compatibility fixtures i
 
 ## Coder response
 
-(Coder fills this in after fixing.)
+- Should-fix 1 (fixed): replaced the misleading "after the 04:00 local cutoff" cases with explicit boundary tests per location: 03:59 local on 2026-11-11 selects 2026-11-10 and 04:00 local selects 2026-11-11 for AU, UK and US. Date calculations unchanged. Fixture fields renamed `local0359` / `local0400`.
+- Nitpick 1 (not changed): the plan's `Status: draft` header is outside what the coder may edit (only checkboxes, the Implementation log and Open questions). CJ approved the plan in the Claude Code session on 2026-11-11; CJ or the planner can update the header.
+- Verification on the coder's machine after the fix: `npx tsc -b`, `npm run typecheck:digest`, `npm run test -- --run` (353/353) and `npm run build` pass. PR CI will provide the independent run the review could not complete.
+- Open question (timezone bug): agreed, left for a separate spec/branch.

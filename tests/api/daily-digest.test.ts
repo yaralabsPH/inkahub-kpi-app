@@ -546,10 +546,11 @@ describe("daily-digest default recipient", () => {
  * ------------------------------------------------------------------ */
 const LOCS = [
   // Scheduled UTC fire time (from vercel.json) and the local day it closes,
-  // plus a time after the 04:00 local cutoff and the day it selects.
-  { loc: "au", label: "AU", cronNow: "2026-11-10T13:55:00Z", cronYmd: "2026-11-10", afterNow: "2026-11-10T20:00:00Z", afterYmd: "2026-11-11" },
-  { loc: "uk", label: "UK", cronNow: "2026-11-10T22:55:00Z", cronYmd: "2026-11-10", afterNow: "2026-11-11T02:30:00Z", afterYmd: "2026-11-10" },
-  { loc: "us", label: "US", cronNow: "2026-11-10T04:55:00Z", cronYmd: "2026-11-09", afterNow: "2026-11-10T08:30:00Z", afterYmd: "2026-11-09" },
+  // plus the UTC instants of 03:59 and 04:00 local on 2026-11-11 (the
+  // default-date cutoff): 03:59 selects 2026-11-10, 04:00 selects 2026-11-11.
+  { loc: "au", label: "AU", cronNow: "2026-11-10T13:55:00Z", cronYmd: "2026-11-10", local0359: "2026-11-10T16:59:00Z", local0400: "2026-11-10T17:00:00Z" },
+  { loc: "uk", label: "UK", cronNow: "2026-11-10T22:55:00Z", cronYmd: "2026-11-10", local0359: "2026-11-11T03:59:00Z", local0400: "2026-11-11T04:00:00Z" },
+  { loc: "us", label: "US", cronNow: "2026-11-10T04:55:00Z", cronYmd: "2026-11-09", local0359: "2026-11-11T09:59:00Z", local0400: "2026-11-11T10:00:00Z" },
 ] as const;
 
 function ddmmyy(ymd: string) { return `${ymd.slice(8, 10)}/${ymd.slice(5, 7)}/${ymd.slice(2, 4)}`; }
@@ -617,12 +618,18 @@ describe("daily-digest authorized reports (compatibility)", () => {
       expect(staff.some((r) => r.includes("Test Staffer"))).toBe(true);
     });
 
-    it(`${L.label}: default date after the 04:00 local cutoff`, async () => {
-      vi.setSystemTime(new Date(L.afterNow));
-      seedActivity(L.loc, L.afterYmd);
+    it(`${L.label}: default date at 03:59 local (before cutoff) is the previous day`, async () => {
+      vi.setSystemTime(new Date(L.local0359));
       const out = await call({ headers: AUTH, query: { location: L.loc } });
       expect(out.status).toBe(200);
-      expect(out.json).toMatchObject({ ymd: L.afterYmd });
+      expect(out.json).toMatchObject({ skipped: "no activity", ymd: "2026-11-10" });
+    });
+
+    it(`${L.label}: default date at 04:00 local (at cutoff) is the same day`, async () => {
+      vi.setSystemTime(new Date(L.local0400));
+      const out = await call({ headers: AUTH, query: { location: L.loc } });
+      expect(out.status).toBe(200);
+      expect(out.json).toMatchObject({ skipped: "no activity", ymd: "2026-11-11" });
     });
 
     it(`${L.label}: manual dated rerun`, async () => {
