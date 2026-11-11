@@ -19,7 +19,7 @@ Add `tests/api/daily-digest.test.ts` outside the deployable `api/` tree and whit
 Each task is one commit. Keep them small enough that the diff is easy to review.
 Execute in order after CJ approves this plan. For each behavior change, write and run the failing handler tests before implementation, then run them again. At each task completion run `npm run typecheck:digest`, `npx tsc -b` and `npm run test -- --run`; all must pass. Run `npm run build` before final review, require green PR CI, tick the task and add its evidence to the Implementation log in the same task commit. These are coder instructions; this planner handoff does not commit or change git state.
 
-### [ ] Task 1: Guard every digest operation and add server verification
+### [x] Task 1: Guard every digest operation and add server verification
 
 - Files: modify `api/reports/daily-digest.ts`, `package.json`, `.github/workflows/ci.yml`, `.gitignore`; create `tests/api/daily-digest.test.ts`; update this plan's checkbox/log.
 - Do: Set `Cache-Control: no-store` at handler entry so early returns and caught failures inherit it. Add private `isAuthorized(headers: VercelRequest["headers"], secret: string | undefined): boolean`. Reject absent/empty/whitespace-only configuration; use trimming only to detect blank configuration, never to normalize the value being compared. Resolve the authorization field case-insensitively, require a single string value, reject duplicate case-variant keys and arrays, and compare the whole value to `Bearer ${secret}`. Reject combined credentials and malformed values; do not accept prefixes, suffixes or alternate credential sources. Return the same `401` JSON `{ error: "Unauthorized" }` for all auth failures, before method/query handling and before either diagnostic branch. After successful auth, reject every method other than `GET` with `405`, `Allow: GET` and `{ error: "Method not allowed" }`. Do not add secret/header logging or diagnostic fields, including masked secret prefixes or lengths. Correct the handler header comment to describe bearer authentication; a cron-identifying header is not authorization.
@@ -69,4 +69,4 @@ CJ answers inline.
 
 Coder adds one line per task.
 
-- Not started. Planning only; no implementation, checks, staging validation or release performed.
+- Task 1: added bearer CRON_SECRET guard (exact, timing-safe, single header, blank secret = 401), no-store on every response, GET-only 405 after auth; 234 handler tests incl. zero-work spies; `typecheck:digest` script + CI step; `!/tests/` whitelisted. Surprise: the existing handler failed the new focused type-check (`ReturnType<typeof createClient>` vs `createClient(...)` generics); fixed with a one-line type annotation (`SupabaseClient`), no suppression or refactor. Checks: typecheck:digest, tsc -b, 269/269 tests pass.

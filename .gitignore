@@ -15,6 +15,7 @@
 !/vercel.json
 !/src/
 !/api/
+!/tests/
 !/public/
 !/supabase/
 !/AGENTS.md

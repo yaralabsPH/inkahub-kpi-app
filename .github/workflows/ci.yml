@@ -25,6 +25,9 @@ jobs:
       - name: Type-check
         run: npx tsc -b
 
+      - name: Type-check digest endpoint (api/ is outside tsc -b)
+        run: npm run typecheck:digest
+
       - name: Tests
         run: npm run test -- --run
 

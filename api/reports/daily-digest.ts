@@ -7,11 +7,17 @@
  *             &recipient=x@y   (override REPORT_RECIPIENT)
  *
  * Scheduled from vercel.json crons ~23:55 local per location.
- * Vercel adds x-vercel-cron: 1 header on scheduled hits.
+ *
+ * Every request (cron, manual rerun, download, diagnostics) must send
+ * `Authorization: Bearer <CRON_SECRET>`. Vercel adds that header to
+ * scheduled hits when CRON_SECRET is set; manual callers supply it
+ * themselves. Anything else gets 401 before any other work. A cron-
+ * identifying header or an app login is NOT authorization. GET only.
  *
  * Sends via Resend using RESEND_API_KEY from env.
  */
-import { createClient } from "@supabase/supabase-js";
+import { timingSafeEqual } from "node:crypto";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
 
 interface VercelRequest {
@@ -198,7 +204,7 @@ function ensureStaff(dept: DeptTotals, staff_id: string): StaffTotals {
 }
 
 async function aggregateDay(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   location: string,
   ymd: string,
   tz: string,
@@ -487,10 +493,47 @@ function buildBodyText(payload: {
 }
 
 /* ============================================================
+ * Request authorization
+ * ============================================================ */
+
+/**
+ * True only when the server has a nonblank CRON_SECRET and the request
+ * carries exactly one Authorization header whose whole value is
+ * `Bearer <CRON_SECRET>`. The configured secret is never trimmed or
+ * otherwise normalized for the comparison; trimming is only used to
+ * detect a blank (unconfigured) secret.
+ */
+function isAuthorized(headers: VercelRequest["headers"], secret: string | undefined): boolean {
+  if (typeof secret !== "string" || secret.trim() === "") return false;
+  if (!headers || typeof headers !== "object") return false;
+  const keys = Object.keys(headers).filter((k) => k.toLowerCase() === "authorization");
+  if (keys.length !== 1) return false;
+  const value = headers[keys[0]];
+  if (typeof value !== "string") return false;
+  const got = Buffer.from(value, "utf-8");
+  const want = Buffer.from(`Bearer ${secret}`, "utf-8");
+  if (got.length !== want.length) return false;
+  return timingSafeEqual(got, want);
+}
+
+/* ============================================================
  * Handler
  * ============================================================ */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Applies to every response below, including early returns and errors.
+  res.setHeader("Cache-Control", "no-store");
   try {
+    // Authenticate before looking at the method, query or anything else.
+    if (!isAuthorized(req.headers, process.env.CRON_SECRET)) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    if (req.method !== "GET") {
+      res.setHeader("Allow", "GET");
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+
     // Diagnostic: report which env vars are visible to the function
     // without exposing values. Trigger with ?envcheck=1.
     if (req.query.rolecheck) {
