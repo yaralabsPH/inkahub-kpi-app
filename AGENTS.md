@@ -106,6 +106,10 @@ Rules:
   directly.
 - **Files, not chat.** Decisions go into the spec or plan. Chat context is lost;
   the docs are what the other agent reads.
+- **Automated loop.** When the coder runs `/loop <slug>`, it calls the
+  planner through `codex exec`. In that mode the planner writes only the file
+  it was asked for and does not commit; the coder commits it. CJ still
+  approves the spec and the plan, and still does every release step.
 - File names: `docs/specs/<slug>.md`, `docs/plans/<slug>.md`,
   `docs/reviews/<slug>-r<N>.md`. Templates live in `docs/templates/`.
 

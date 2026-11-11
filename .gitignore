@@ -21,6 +21,7 @@
 !/CLAUDE.md
 !/docs/
 !/.github/
+!/.claude/
 
 # Local credentials, dependencies, build outputs, and editor backups.
 .env
@@ -34,6 +35,7 @@ dist/
 *.bak
 *.broken-*
 .DS_Store
+.claude/settings.local.json
 Thumbs.db
 
 # Recovered duplicate of the active TypeScript repository implementation.
