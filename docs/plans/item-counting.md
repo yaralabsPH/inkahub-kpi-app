@@ -64,15 +64,15 @@ npm run test -- --run
 npm run build
 ```
 
-### [ ] Task 1: Add strict piece counting and lock down routing regressions
+### [x] Task 1: Add strict piece counting and lock down routing regressions
 
 - Files: create `src/lib/domain/productionItems.ts`, `src/lib/domain/__tests__/productionItems.test.ts`, `src/lib/domain/__tests__/skuRouting-regression.test.ts`.
 - Consumes: `parseSku`, existing package catalogue constants and routing helpers from `src/lib/domain/skuRouting.ts`.
 - Produces: the classifier/item-count interfaces above. Reuse the parser without changing its capture/routing grammar. Recognize the digest's current `INKA-AUX[A-Z]{2,4}` free-print form in this counting module, plus parsed legacy AUX-FP; classify only known packaging codes/IDs from the existing catalogue as excluded. Unknown packaging-like strings remain unclassified. A malformed S0/S1/S10 or unsupported format never becomes a single. No changes to `isLineMyDept`, `shouldDeductAtDept`, catalogue decomposition or package selection.
 - Do:
-  - [ ] Add table-driven failing tests for FB/FW/FN/UN singles and S2–S9 sets, GW sets, PF PB/PW/PN, both free-print forms, gift cards, hooks, packaging, SC, unknown/missing SKU, case/whitespace normalization and unsupported variants/sizes.
-  - [ ] Implement finite nonnegative safe-integer quantity validation and safe multiplication without defaulting null to one. Preserve product classification when quantity is invalid; return unclassified item coverage for that invalid quantity, including on an excluded product. Zero is valid. No coercion of strings, fractions or booleans.
-  - [ ] Characterize existing routing/deduction results before consumer edits: the approved UN S2 quantity 2 yields four KPI items but keeps the original catalogue quantity calculation; framed/PF/GW/free-print routes and package choices are unchanged. These are reporting-versus-stock regression tests, not a new inventory algorithm.
+  - [x] Add table-driven failing tests for FB/FW/FN/UN singles and S2–S9 sets, GW sets, PF PB/PW/PN, both free-print forms, gift cards, hooks, packaging, SC, unknown/missing SKU, case/whitespace normalization and unsupported variants/sizes.
+  - [x] Implement finite nonnegative safe-integer quantity validation and safe multiplication without defaulting null to one. Preserve product classification when quantity is invalid; return unclassified item coverage for that invalid quantity, including on an excluded product. Zero is valid. No coercion of strings, fractions or booleans.
+  - [x] Characterize existing routing/deduction results before consumer edits: the approved UN S2 quantity 2 yields four KPI items but keeps the original catalogue quantity calculation; framed/PF/GW/free-print routes and package choices are unchanged. These are reporting-versus-stock regression tests, not a new inventory algorithm.
 - Done when: named cases `unframed_two_sets_are_four`, `frame_is_one_item`, `s0_s1_s10_are_unclassified`, `invalid_quantity_is_not_defaulted` and `kpi_multiplier_does_not_rededuct_components` pass; test null/undefined, negative, fractional, NaN/infinities, unsafe quantity and multiplication overflow. Run `npm run test -- --run src/lib/domain/__tests__/productionItems.test.ts src/lib/domain/__tests__/skuRouting-regression.test.ts`, then the common gate.
 - Commit: `task 1: add shared production item classification`.
 
@@ -248,4 +248,5 @@ Coder writes here when it hits something this plan did not foresee; stop the aff
 
 Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. All tasks are unstarted; no build, test, staging or deployment result is claimed by this plan.
 
-- Pending implementation after CJ approves this draft.
+- 2026-11-12: CJ approved this plan in chat ("Plan approved"); header Status left as written by the planner.
+- Task 1: added `productionItems.ts` (classifier + strict quantity/overflow checks, current `INKA-AUX…` and legacy `AUX-FP` free prints, catalogue packaging codes + mail-tube IDs excluded) and 52 tests (37 classification, 15 routing/deduction/packaging characterization). Tests failed with the module absent, then passed. Decisions inside the plan's scope: a non-set `GW` single or `GW` picture frame is `unsupported_size` (GW is a set composite per `routeShopifyLineToCatalogueLines`); `S10…` reports `invalid_set_count`. Gate: `tsc -b` OK, `typecheck:digest` OK, 405/405 tests, build OK (only the existing Vite chunk-size warning; new module not yet imported). CI pending: the feature PR is not open yet.
