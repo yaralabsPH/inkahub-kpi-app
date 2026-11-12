@@ -669,7 +669,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const now = new Date();
       const localYmd = ymdInTz(now, tz);
       const localHourStr = new Intl.DateTimeFormat("en-US", {
-        timeZone: tz, hour: "numeric", hour12: false,
+        timeZone: tz, hour: "numeric", hourCycle: "h23",
       }).format(now);
       const localHour = Number(localHourStr);
       ymd = localHour < 4 ? ymdShift(localYmd, -1) : localYmd;
