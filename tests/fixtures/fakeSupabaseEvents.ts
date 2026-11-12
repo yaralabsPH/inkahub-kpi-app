@@ -1,201 +1,166 @@
 /**
- * In-memory stand-in for supabase-js `from("production_events").select(...)`
- * that ENFORCES the filters the evidence reader sends: site, time bounds,
- * event types, quoted in-lists, the (created_at, id) keyset cursor, ordering
- * and a server-side row cap. Removing a filter or the pagination from the
- * reader changes results, so tests fail.
+ * In-memory stand-in for supabase-js `rpc("load_production_evidence", args)`.
+ *
+ * It ENFORCES the contract of migration 0034: exact function name and four
+ * named arguments, a copy of the visible rows taken at "statement start",
+ * fake RLS applied to every family before joins, and the four evidence
+ * families derived here, independently of the loader's code. Table reads,
+ * other RPCs, paging calls and second evidence calls fail.
+ *
+ * Tests can also replace the raw response (malformed envelopes), return an
+ * RPC error, throw a transport error, hold the response pending (abort and
+ * deadline tests) or change rows after the snapshot was taken.
  */
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
 
-type Pred = (r: ProductionEvidenceEvent) => boolean;
+export const EVIDENCE_RPC_NAME = "load_production_evidence";
+const ARG_KEYS = ["p_as_of_utc", "p_end_utc_exclusive", "p_site", "p_start_utc"];
+const COUNT_TYPES = ["line_verified", "completed", "dispatched", "cancelled"];
+
+export interface FakeRpcArgs {
+  p_site: string;
+  p_start_utc: string;
+  p_end_utc_exclusive: string;
+  p_as_of_utc: string;
+}
 
 export interface FakeOptions {
-  /** Max rows the "server" returns per request, regardless of limit. */
-  serverCap?: number;
-  /** Called before each response; may throw, mutate rows or return an error. */
-  beforeResponse?: (info: { call: number; filters: string[] }) => { error?: unknown } | void;
-  /** When false, ignore .order() and return rows in reverse. */
-  honorOrder?: boolean;
+  /** Fake RLS: rows this caller may see (default: all). Applied to every family before joins. */
+  visible?: (r: ProductionEvidenceEvent) => boolean;
+  /** Replace or edit the envelope the "server" returns (malformed-payload tests). */
+  rawResponse?: (envelope: Record<string, unknown> | null, args: FakeRpcArgs) => unknown;
+  /** Return { error } instead of data, or throw (transport failure). */
+  beforeResponse?: (info: { call: number; args: FakeRpcArgs }) => { error?: unknown } | void;
+  /** Called after the statement snapshot is taken, before the response is delivered. */
+  afterSnapshot?: (db: FakeEventsDb) => void;
+  /** Keep the response pending until this resolves. */
+  hold?: Promise<void>;
+  /** Echo request timestamps in this representation (default: as sent). */
+  echo?: (iso: string) => string;
+  /** Allow more than one evidence call (default: a second call fails). */
+  allowRepeatCalls?: boolean;
 }
 
 export interface FakeEventsDb {
-  client: { from(table: string): { select(columns: string): unknown } };
+  client: {
+    rpc(name: string, args: Record<string, unknown>): unknown;
+    from(table: string): never;
+  };
   rows: ProductionEvidenceEvent[];
-  calls: Array<{ filters: string[]; columns: string; returned: number }>;
-  /** Change rows (insert/edit/delete) and re-sort the fake's index. */
+  calls: Array<{ name: string; args: FakeRpcArgs; returned: number; aborted: boolean }>;
+  /** Change rows (insert/edit/delete). */
   mutate(fn: (rows: ProductionEvidenceEvent[]) => void): void;
 }
 
-function byKeyset(a: ProductionEvidenceEvent, b: ProductionEvidenceEvent): number {
-  return Date.parse(a.created_at) - Date.parse(b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+/** Independent exact-instant parse for the fake: [ms, micro-remainder]. */
+function at(iso: string): [number, number] {
+  const m = /^(.*?)(?:\.(\d{1,6}))?(Z|[+-]\d{2}:?\d{2})$/.exec(iso);
+  if (!m) throw new Error(`fake: unreadable timestamp ${iso}`);
+  const frac = (m[2] ?? "").padEnd(6, "0");
+  const ms = Date.parse(`${m[1]}.${frac.slice(0, 3)}${m[3]}`);
+  if (!Number.isFinite(ms)) throw new Error(`fake: unreadable timestamp ${iso}`);
+  return [ms, Number(frac.slice(3))];
+}
+function cmp(a: string, b: string): number {
+  const [am, au] = at(a);
+  const [bm, bu] = at(b);
+  return am - bm || au - bu;
 }
 
-const TIME_COLS = new Set(["created_at"]);
-
-function parseQuotedList(raw: string): string[] {
-  if (!raw.startsWith("(") || !raw.endsWith(")")) throw new Error(`fake: bad in-list ${raw}`);
-  const body = raw.slice(1, -1);
-  const out: string[] = [];
-  let i = 0;
-  while (i < body.length) {
-    if (body[i] !== '"') throw new Error(`fake: unquoted in-list value in ${raw}`);
-    let v = "";
-    i++;
-    while (i < body.length && body[i] !== '"') {
-      if (body[i] === "\\") i++;
-      v += body[i];
-      i++;
-    }
-    out.push(v);
-    i++; // closing quote
-    if (body[i] === ",") i++;
-  }
-  return out;
+function tuple(r: ProductionEvidenceEvent): unknown[] {
+  return [r.id, r.location, r.staff_id, r.department, r.order_number, r.line_sku, r.line_quantity ?? null,
+    r.event_type, r.created_at, r.parent_event_id, r.cs_case_id];
 }
 
-function unquote(s: string): string {
-  if (!s.startsWith('"') || !s.endsWith('"')) throw new Error(`fake: expected quoted value, got ${s}`);
-  return s.slice(1, -1).replace(/\\(.)/g, "$1");
+/** The four families of 0034, computed from a row snapshot. */
+export function fakeEvidence(rows: readonly ProductionEvidenceEvent[], args: FakeRpcArgs, visible: (r: ProductionEvidenceEvent) => boolean) {
+  const seen = rows.filter((r) => r.location === args.p_site && visible(r) && cmp(r.created_at, args.p_as_of_utc) <= 0);
+  const win = seen.filter((r) => COUNT_TYPES.includes(r.event_type)
+    && cmp(r.created_at, args.p_start_utc) >= 0 && cmp(r.created_at, args.p_end_utc_exclusive) < 0);
+  const orders = new Set(win.filter((r) => (r.event_type === "completed" || r.event_type === "dispatched")
+    && r.order_number !== null && r.order_number.trim() !== "").map((r) => r.order_number));
+  const parentIds = new Set(win.filter((r) => r.event_type === "cancelled" && r.parent_event_id).map((r) => r.parent_event_id));
+  const evidenceIds = new Set(win.filter((r) => r.event_type !== "cancelled").map((r) => r.id));
+  const before = seen.filter((r) => cmp(r.created_at, args.p_start_utc) < 0);
+  const qualification = before.filter((r) => r.event_type === "line_verified" && orders.has(r.order_number));
+  const parents = before.filter((r) => parentIds.has(r.id));
+  const later = seen.filter((r) => r.event_type === "cancelled" && r.parent_event_id !== null
+    && cmp(r.created_at, args.p_end_utc_exclusive) >= 0 && evidenceIds.has(r.parent_event_id));
+  const all = new Map<string, ProductionEvidenceEvent>();
+  for (const r of [...win, ...qualification, ...parents, ...later]) all.set(`${r.location}\u0000${r.id}`, r);
+  return [...all.values()].sort((a, b) => cmp(a.created_at, b.created_at) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-function cmp(col: string, a: unknown, b: string): number {
-  if (TIME_COLS.has(col)) return Date.parse(String(a)) - Date.parse(b);
-  const x = String(a);
-  return x < b ? -1 : x > b ? 1 : 0;
-}
-
-function field(r: ProductionEvidenceEvent, col: string): unknown {
-  return (r as unknown as Record<string, unknown>)[col];
+function checkArgs(name: string, args: Record<string, unknown>): FakeRpcArgs {
+  if (name !== EVIDENCE_RPC_NAME) throw new Error(`fake: unexpected RPC ${name}`);
+  const keys = Object.keys(args).sort();
+  if (keys.join(",") !== ARG_KEYS.join(",")) throw new Error(`fake: unexpected RPC arguments ${keys.join(",")}`);
+  for (const k of ARG_KEYS) if (typeof args[k] !== "string") throw new Error(`fake: argument ${k} is not text`);
+  return args as unknown as FakeRpcArgs;
 }
 
 export function createFakeEventsDb(initial: ProductionEvidenceEvent[], opts: FakeOptions = {}): FakeEventsDb {
   const db: FakeEventsDb = {
-    rows: [...initial].sort(byKeyset),
+    rows: [...initial],
     calls: [],
     client: undefined as never,
     mutate(fn) {
       fn(db.rows);
-      db.rows.sort(byKeyset);
     },
   };
-  const cap = opts.serverCap ?? 1000;
+  const visible = opts.visible ?? (() => true);
+  const echo = opts.echo ?? ((s: string) => s);
 
   db.client = {
-    from(table: string) {
-      if (table !== "production_events") throw new Error(`fake: unexpected table ${table}`);
-      return {
-        select(columns: string) {
-          const preds: Pred[] = [];
-          let cursor: { ms: number; id: string } | null = null;
-          const filters: string[] = [];
-          let limit = Number.POSITIVE_INFINITY;
-          const orders: string[] = [];
-          const builder = {
-            eq(col: string, v: string) {
-              filters.push(`${col}=eq.${v}`);
-              preds.push((r) => field(r, col) === v);
-              return builder;
-            },
-            in(col: string, vals: readonly string[]) {
-              filters.push(`${col}=in.${vals.join(",")}`);
-              const set = new Set(vals);
-              preds.push((r) => set.has(String(field(r, col))));
-              return builder;
-            },
-            gte(col: string, v: string) {
-              filters.push(`${col}=gte.${v}`);
-              preds.push((r) => cmp(col, field(r, col), v) >= 0);
-              return builder;
-            },
-            lt(col: string, v: string) {
-              filters.push(`${col}=lt.${v}`);
-              preds.push((r) => cmp(col, field(r, col), v) < 0);
-              return builder;
-            },
-            lte(col: string, v: string) {
-              filters.push(`${col}=lte.${v}`);
-              preds.push((r) => cmp(col, field(r, col), v) <= 0);
-              return builder;
-            },
-            filter(col: string, op: string, v: string) {
-              filters.push(`${col}=${op}.${v}`);
-              if (op === "in") {
-                const set = new Set(parseQuotedList(v));
-                preds.push((r) => set.has(String(field(r, col))));
-              } else if (op === "not.is" && v === "null") {
-                preds.push((r) => field(r, col) != null);
-              } else {
-                throw new Error(`fake: unsupported filter ${op}`);
-              }
-              return builder;
-            },
-            or(expr: string) {
-              filters.push(`or=${expr}`);
-              const m = /^created_at\.gt\.("(?:[^"\\]|\\.)*"),and\(created_at\.eq\.("(?:[^"\\]|\\.)*"),id\.gt\.("(?:[^"\\]|\\.)*")\)$/.exec(expr);
-              if (!m) throw new Error(`fake: unsupported or() ${expr}`);
-              const t = unquote(m[1]);
-              const t2 = unquote(m[2]);
-              const id = unquote(m[3]);
-              if (t !== t2) throw new Error("fake: keyset timestamps differ");
-              cursor = { ms: Date.parse(t), id };
-              return builder;
-            },
-            order(col: string) {
-              orders.push(col);
-              return builder;
-            },
-            limit(n: number) {
-              limit = n;
-              return builder;
-            },
-            abortSignal() {
-              return builder;
-            },
-            then<R1, R2>(onOk: (v: { data: unknown[] | null; error: unknown }) => R1, onErr?: (e: unknown) => R2) {
-              return Promise.resolve()
-                .then(() => {
-                  const call = db.calls.length;
-                  const hook = opts.beforeResponse?.({ call, filters });
-                  if (hook && hook.error) {
-                    db.calls.push({ filters, columns, returned: 0 });
-                    return { data: null, error: hook.error };
-                  }
-                  const max = Math.min(limit, cap);
-                  const rows = db.rows; // kept sorted by (created_at, id)
-                  const ordered = opts.honorOrder !== false && orders[0] === "created_at" && orders[1] === "id";
-                  let start = 0;
-                  if (cursor) {
-                    // first row strictly after the cursor
-                    let lo = 0;
-                    let hi = rows.length;
-                    while (lo < hi) {
-                      const mid = (lo + hi) >> 1;
-                      const r = rows[mid];
-                      const d = Date.parse(r.created_at) - cursor.ms;
-                      if (d < 0 || (d === 0 && r.id <= cursor.id)) lo = mid + 1;
-                      else hi = mid;
-                    }
-                    start = lo;
-                  }
-                  const page: ProductionEvidenceEvent[] = [];
-                  if (ordered) {
-                    for (let i = start; i < rows.length && page.length < max; i++) {
-                      if (preds.every((p) => p(rows[i]))) page.push({ ...rows[i] });
-                    }
-                  } else {
-                    for (let i = rows.length - 1; i >= start && page.length < max; i--) {
-                      if (preds.every((p) => p(rows[i]))) page.push({ ...rows[i] });
-                    }
-                  }
-                  db.calls.push({ filters, columns, returned: page.length });
-                  return { data: page, error: null };
-                })
-                .then(onOk, onErr);
-            },
-          };
-          return builder;
+    from(table: string): never {
+      throw new Error(`fake: unexpected table read ${table}`);
+    },
+    rpc(name: string, rawArgs: Record<string, unknown>) {
+      const args = checkArgs(name, rawArgs);
+      if (db.calls.length > 0 && !opts.allowRepeatCalls) throw new Error("fake: second evidence RPC in one load");
+      const entry = { name, args, returned: 0, aborted: false };
+      db.calls.push(entry);
+      let signal: AbortSignal | undefined;
+      const fail = (what: string) => () => {
+        throw new Error(`fake: unexpected ${what} on an evidence RPC`);
+      };
+      const call = {
+        abortSignal(s: AbortSignal) {
+          signal = s;
+          s.addEventListener("abort", () => (entry.aborted = true), { once: true });
+          return call;
+        },
+        range: fail(".range()"),
+        limit: fail(".limit()"),
+        order: fail(".order()"),
+        then<R1, R2>(onOk: (v: { data: unknown; error: unknown }) => R1, onErr?: (e: unknown) => R2) {
+          // Statement start: copy the visible rows now.
+          const snapshot = db.rows.map((r) => ({ ...r }));
+          return Promise.resolve()
+            .then(async () => {
+              opts.afterSnapshot?.(db);
+              if (opts.hold) await opts.hold;
+              if (signal?.aborted) throw new DOMException("The operation was aborted.", "AbortError");
+              const hook = opts.beforeResponse?.({ call: db.calls.length - 1, args });
+              if (hook && hook.error) return { data: null, error: hook.error };
+              const evidence = fakeEvidence(snapshot, args, visible);
+              entry.returned = evidence.length;
+              const envelope: Record<string, unknown> = {
+                version: 1,
+                site: args.p_site,
+                startUtc: echo(args.p_start_utc),
+                endUtcExclusive: echo(args.p_end_utc_exclusive),
+                asOfUtc: echo(args.p_as_of_utc),
+                complete: true,
+                rowCount: evidence.length,
+                rows: evidence.map(tuple),
+              };
+              return { data: opts.rawResponse ? opts.rawResponse(envelope, args) : envelope, error: null };
+            })
+            .then(onOk, onErr);
         },
       };
+      return call;
     },
   };
   return db;

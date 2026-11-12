@@ -16,7 +16,7 @@ jobs:
 
       - name: No staging settings or results committed
         run: |
-          leaked=$(git ls-files | grep -E '(^|/)(\.env\.staging\.local|staging-results-[^/]*\.md)$' || true)
+          leaked=$(git ls-files | grep -E '(^|/)(\.env\.staging\.local|staging-results-[^/]*\.(md|json))$' || true)
           if [ -n "$leaked" ]; then
             echo "These files must never be committed:"
             echo "$leaked"

@@ -38,9 +38,20 @@ describe("splitSqlStatements", () => {
     const labels = (f: string) => splitSqlStatements(readFileSync(dir + f, "utf8")).map((s) => s.label.split(/\s+/)[0].toLowerCase());
     expect(labels("01-sites.sql")).toEqual(["begin", "do", "insert", "insert", "insert", "insert", "insert", "insert", "select", "commit"]);
     expect(labels("02-volume.sql")).toEqual(["begin", "do", "insert", "insert", "select", "commit"]);
-    expect(labels("03-query-evidence.sql")).toEqual([
-      "begin", "select", "select", "analyze", "select", "set",
-      "explain", "explain", "explain", "explain", "explain", "explain", "rollback",
-    ]);
+    const q = splitSqlStatements(readFileSync(dir + "03-query-evidence.sql", "utf8"));
+    const first = q.map((s) => s.label.split(/\s+/)[0].toLowerCase());
+    expect(first[0]).toBe("begin");
+    expect(first.at(-1)).toBe("rollback");
+    expect(first).not.toContain("commit");
+    // 2 roles x 6 scopes x (3 call runs + 1 body) labelled plans.
+    const gates = q.filter((s) => /^explain \(analyze, buffers\) select 'gate:(call|body):\w+:[\w-]+:\d+' as gate,/.test(s.label));
+    expect(gates).toHaveLength(48);
+    expect(new Set(gates.map((s) => s.label.split("gate:")[1])).size).toBe(48);
+  });
+
+  it("03-query-evidence.sql is current with migration 0034 and the measured cases", async () => {
+    const { buildQueryEvidenceSql } = await import("./generate-query-evidence");
+    const onDisk = readFileSync("supabase/staging/item-counting/03-query-evidence.sql", "utf8").replace(/\r\n/g, "\n");
+    expect(onDisk, "regenerate with: npx vite-node tests/staging/generate-query-evidence.ts --write").toBe(buildQueryEvidenceSql());
   });
 });

@@ -1,30 +1,34 @@
 /**
- * Complete, authorized production evidence reader (F1 / item-counting plan, Task 4).
+ * Complete, authorized production evidence reader (F1 / item-counting plan,
+ * Task 4, one-call amendment).
  *
- * Reads one site's production events for an enclosing display window plus the
- * context the shared counter needs (before-window verifications that qualify a
- * completion, referenced parents, and corrections saved after the window), all
- * under one fixed `asOfUtc` cutoff.
+ * One call to the read-only RPC `public.load_production_evidence`
+ * (migration 0034) returns one site's evidence as a single scalar envelope:
+ * the display window's count events plus the context the shared counter needs
+ * (before-window verifications that qualify a completion, referenced
+ * parents, and cancellations saved after the window), all under one fixed
+ * `asOfUtc` cutoff and one database snapshot.
  *
  * Rules:
- *  - Every request filters by site and `created_at <= asOfUtc`.
- *  - Keyset pages ordered by (created_at, id); continue until an EMPTY page, so a
- *    server row cap can never silently truncate. No 1,000-row or 100-page ceiling.
- *  - Any failed page, non-advancing cursor, abort or deadline rejects. A partial
- *    read is never returned as a success-shaped snapshot.
- *  - A second pass re-reads the same bounded queries; a difference retries once,
- *    then rejects as "changed".
- *  - The caller's client (and its RLS) is used as-is. This module never builds a
- *    client, reads env vars or touches browser state, so api/ can import it.
+ *  - Exactly one RPC per load. No paging, no batches, no automatic re-read,
+ *    no fallback to table reads.
+ *  - The envelope (encoding v1) is validated strictly before any snapshot is
+ *    built: version, completeness flag, echoed scope, row count, every tuple's
+ *    shape, site, cutoff and family membership. Anything malformed or
+ *    partial rejects; nothing success-shaped is returned from a bad read.
+ *  - Identical repeated rows are deduplicated; two different payloads for
+ *    the same event reject as "changed".
+ *  - The caller's client (and its RLS) is used as-is. This module never
+ *    builds a client, reads env vars or touches browser state, so api/ can
+ *    import it.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import {
-  PRODUCTION_EVIDENCE_COLUMNS,
-  type ProductionEvidenceEvent,
-  type ProductionSnapshot,
-  type ProductionVisibility,
-  type UtcWindow,
+import type {
+  ProductionEvidenceEvent,
+  ProductionSnapshot,
+  ProductionVisibility,
+  UtcWindow,
 } from "../../domain/productionCounts";
 
 export type ProductionReadErrorKind = "failed" | "incomplete" | "changed" | "aborted";
@@ -49,9 +53,9 @@ export interface ProductionReadRequest {
   /** Caller-established visibility for this role/site (see productionVisibilityFor). */
   visibility: ProductionVisibility;
   signal?: AbortSignal;
-  /** Rows requested per page (default 500). The server may return fewer. */
+  /** @deprecated Paged reader setting; validated for compatibility, no longer used. */
   pageSize?: number;
-  /** Order numbers / ids per context request (default 100). */
+  /** @deprecated Paged reader setting; validated for compatibility, no longer used. */
   batchSize?: number;
   /** Absolute deadline (epoch ms); exceeded = incomplete. */
   deadlineMs?: number;
@@ -59,27 +63,16 @@ export interface ProductionReadRequest {
   now?: () => number;
 }
 
-/** Minimal structural view of the supabase-js builder used here. */
-interface EvidenceQuery extends PromiseLike<{ data: unknown[] | null; error: unknown }> {
-  eq(column: string, value: string): EvidenceQuery;
-  in(column: string, values: readonly string[]): EvidenceQuery;
-  gte(column: string, value: string): EvidenceQuery;
-  lt(column: string, value: string): EvidenceQuery;
-  lte(column: string, value: string): EvidenceQuery;
-  filter(column: string, operator: string, value: string): EvidenceQuery;
-  or(filters: string): EvidenceQuery;
-  order(column: string, options: { ascending: boolean }): EvidenceQuery;
-  limit(count: number): EvidenceQuery;
-  abortSignal?(signal: AbortSignal): EvidenceQuery;
+export const EVIDENCE_RPC = "load_production_evidence";
+
+/** Minimal structural view of supabase-js `rpc(...)` used here. */
+interface EvidenceRpcCall extends PromiseLike<{ data: unknown; error: unknown }> {
+  abortSignal?(signal: AbortSignal): EvidenceRpcCall;
 }
 
-interface EvidenceClient {
-  from(table: string): { select(columns: string): unknown };
+export interface EvidenceRpcClient {
+  rpc(fn: string, args: Record<string, unknown>): unknown;
 }
-
-const COUNT_EVENT_TYPES = ["line_verified", "cancelled", "completed", "dispatched"] as const;
-const DEFAULT_PAGE_SIZE = 500;
-const DEFAULT_BATCH_SIZE = 100;
 
 /** Roles whose SELECT policy returns every production event at an accessible site. */
 const SITE_WIDE_ROLES = new Set(["owner", "manager", "cs", "kiosk"]);
@@ -100,14 +93,49 @@ export function quotePostgrestValue(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function inList(values: readonly string[]): string {
-  return `(${values.map(quotePostgrestValue).join(",")})`;
+// ---------------------------------------------------------------------------
+// Exact instants (PostgreSQL keeps microseconds; Date.parse would drop them).
+
+const INSTANT_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}(?::?\d{2})?)$/;
+
+/** Microseconds since the epoch, or null if the text is not an exact ISO-8601 instant. */
+export function instantMicros(text: unknown): bigint | null {
+  if (typeof text !== "string") return null;
+  const m = INSTANT_RE.exec(text);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, frac, zone] = m;
+  const ms = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+  const check = new Date(ms);
+  if (
+    !Number.isFinite(ms) || +h > 23 || +mi > 59 || +s > 59 ||
+    check.getUTCFullYear() !== +y || check.getUTCMonth() !== +mo - 1 || check.getUTCDate() !== +d
+  ) return null;
+  let offsetMin = 0;
+  if (zone !== "Z") {
+    const sign = zone[0] === "-" ? -1 : 1;
+    const digits = zone.slice(1).replace(":", "");
+    const oh = +digits.slice(0, 2);
+    const om = digits.length > 2 ? +digits.slice(2, 4) : 0;
+    if (oh > 23 || om > 59) return null;
+    offsetMin = sign * (oh * 60 + om);
+  }
+  const micros = BigInt((frac ?? "").padEnd(6, "0"));
+  return (BigInt(ms) - BigInt(offsetMin) * 60_000n) * 1000n + micros;
 }
 
-function chunks<T>(items: readonly T[], size: number): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-  return out;
+// ---------------------------------------------------------------------------
+// Envelope v1
+
+const ENVELOPE_KEYS = ["version", "site", "startUtc", "endUtcExclusive", "asOfUtc", "complete", "rowCount", "rows"] as const;
+const TUPLE_LENGTH = 11;
+const COUNT_TYPES = new Set(["line_verified", "completed", "dispatched", "cancelled"]);
+const EVIDENCE_TYPES = new Set(["line_verified", "completed", "dispatched"]);
+const TERMINAL_TYPES = new Set(["completed", "dispatched"]);
+/** Check abort/deadline every this many rows while validating. */
+const CHECK_EVERY = 10_000;
+
+function isNullableString(v: unknown): v is string | null {
+  return v === null || typeof v === "string";
 }
 
 function errorMessage(error: unknown): string {
@@ -115,162 +143,142 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-function isRow(v: unknown): v is ProductionEvidenceEvent {
-  if (typeof v !== "object" || v === null) return false;
-  const r = v as Record<string, unknown>;
-  return typeof r.id === "string" && typeof r.location === "string" && typeof r.created_at === "string" && typeof r.event_type === "string";
+interface Bounds {
+  start: bigint;
+  end: bigint;
+  cutoff: bigint;
 }
 
-function rowKey(r: ProductionEvidenceEvent): string {
-  return `${r.location}\u0000${r.id}`;
-}
-
-function fingerprint(rows: Map<string, ProductionEvidenceEvent>): string {
-  return [...rows.keys()]
-    .sort()
-    .map((k) => {
-      const r = rows.get(k)!;
-      return JSON.stringify([
-        r.location, r.id, r.staff_id, r.department, r.order_number, r.line_sku,
-        r.line_quantity ?? null, r.event_type, r.created_at, r.parent_event_id, r.cs_case_id,
-      ]);
-    })
-    .join("\n");
-}
-
-type Narrow = (q: EvidenceQuery) => EvidenceQuery;
-
-class Reader {
-  private readonly pageSize: number;
-  private readonly batchSize: number;
-  private readonly now: () => number;
-
-  constructor(
-    private readonly client: EvidenceClient,
-    private readonly req: ProductionReadRequest,
-  ) {
-    this.pageSize = req.pageSize ?? DEFAULT_PAGE_SIZE;
-    this.batchSize = req.batchSize ?? DEFAULT_BATCH_SIZE;
-    this.now = req.now ?? Date.now;
-  }
-
-  private checkLive(): void {
-    if (this.req.signal?.aborted) throw new ProductionReadError("aborted", "Production read was cancelled.");
-    if (this.req.deadlineMs !== undefined && this.now() > this.req.deadlineMs) {
-      throw new ProductionReadError("incomplete", "Production read exceeded its time limit.");
-    }
-  }
-
-  private base(): EvidenceQuery {
-    let q = this.client.from("production_events").select(PRODUCTION_EVIDENCE_COLUMNS) as EvidenceQuery;
-    q = q.eq("location", this.req.site).lte("created_at", this.req.asOfUtc);
-    if (this.req.signal && typeof q.abortSignal === "function") q = q.abortSignal(this.req.signal);
-    return q;
-  }
-
-  /** Keyset-page one bounded query to exhaustion. */
-  private async pageAll(narrow: Narrow, into: Map<string, ProductionEvidenceEvent>): Promise<void> {
-    let cursor: { createdAt: string; ms: number; id: string } | null = null;
-    for (;;) {
-      this.checkLive();
-      let q = narrow(this.base());
-      if (cursor) {
-        const t = quotePostgrestValue(cursor.createdAt);
-        q = q.or(`created_at.gt.${t},and(created_at.eq.${t},id.gt.${quotePostgrestValue(cursor.id)})`);
-      }
-      q = q.order("created_at", { ascending: true }).order("id", { ascending: true }).limit(this.pageSize);
-      let res: { data: unknown[] | null; error: unknown };
-      try {
-        res = await q;
-      } catch (e) {
-        if (this.req.signal?.aborted) throw new ProductionReadError("aborted", "Production read was cancelled.");
-        throw new ProductionReadError("failed", `Production read failed: ${errorMessage(e)}`);
-      }
-      this.checkLive();
-      if (res.error) throw new ProductionReadError("failed", `Production read failed: ${errorMessage(res.error)}`);
-      const page = res.data ?? [];
-      if (page.length === 0) return;
-      for (const raw of page) {
-        if (!isRow(raw)) throw new ProductionReadError("incomplete", "Production read returned a malformed row.");
-        if (raw.location !== this.req.site) throw new ProductionReadError("incomplete", "Production read returned another site's row.");
-        const ms = Date.parse(raw.created_at);
-        if (!Number.isFinite(ms)) throw new ProductionReadError("incomplete", `Production row ${raw.id} has an unreadable time.`);
-        // Rows must strictly advance past the cursor in (created_at, id) order.
-        if (cursor && (ms < cursor.ms || (ms === cursor.ms && raw.id <= cursor.id))) {
-          throw new ProductionReadError("incomplete", "Production read cursor did not advance.");
-        }
-        const k = rowKey(raw);
-        const prior = into.get(k);
-        if (prior && fingerprint(new Map([[k, prior]])) !== fingerprint(new Map([[k, raw]]))) {
-          throw new ProductionReadError("incomplete", `Production event ${raw.id} was read with two different payloads.`);
-        }
-        into.set(k, raw);
-        cursor = { createdAt: raw.created_at, ms, id: raw.id };
-      }
-    }
-  }
-
-  /**
-   * One full bounded read:
-   *  1. every count event inside the window;
-   *  2. original verifications BEFORE the window for orders completed inside it
-   *     (qualification context, all workers; exact match happens in the reducer);
-   *  3. parents of in-window cancellations that fall before the window;
-   *  4. corrections saved AFTER the window (up to the cutoff) that point at
-   *     in-window evidence. One time-bounded paged read, not one request per id.
-   */
-  async readOnce(): Promise<Map<string, ProductionEvidenceEvent>> {
-    const { range, site } = this.req;
-    const rows = new Map<string, ProductionEvidenceEvent>();
-
-    await this.pageAll(
-      (q) => q.in("event_type", COUNT_EVENT_TYPES).gte("created_at", range.startUtc).lt("created_at", range.endUtcExclusive),
-      rows,
-    );
-
-    const orders = new Set<string>();
-    const evidenceIds = new Set<string>();
-    const parents = new Set<string>();
-    for (const r of rows.values()) {
-      const terminal = r.event_type === "completed" || r.event_type === "dispatched";
-      if (terminal && typeof r.order_number === "string" && r.order_number.trim()) orders.add(r.order_number);
-      if (terminal || r.event_type === "line_verified") evidenceIds.add(r.id);
-    }
-    for (const r of rows.values()) {
-      if (r.event_type !== "cancelled" || typeof r.parent_event_id !== "string" || !r.parent_event_id) continue;
-      if (!rows.has(`${site}\u0000${r.parent_event_id}`)) parents.add(r.parent_event_id);
-    }
-
-    for (const batch of chunks([...orders].sort(), this.batchSize)) {
-      await this.pageAll(
-        (q) => q.eq("event_type", "line_verified").filter("order_number", "in", inList(batch)).lt("created_at", range.startUtc),
-        rows,
-      );
-    }
-    for (const batch of chunks([...parents].sort(), this.batchSize)) {
-      await this.pageAll((q) => q.filter("id", "in", inList(batch)).lt("created_at", range.startUtc), rows);
-    }
-    const later = new Map<string, ProductionEvidenceEvent>();
-    await this.pageAll(
-      (q) => q.eq("event_type", "cancelled").filter("parent_event_id", "not.is", "null").gte("created_at", range.endUtcExclusive),
-      later,
-    );
-    for (const [k, r] of later) {
-      if (typeof r.parent_event_id === "string" && evidenceIds.has(r.parent_event_id)) rows.set(k, r);
-    }
-    return rows;
-  }
-}
-
-function validateRequest(req: ProductionReadRequest): void {
-  const start = Date.parse(req.range.startUtc);
-  const end = Date.parse(req.range.endUtcExclusive);
-  const asOf = Date.parse(req.asOfUtc);
+function validateRequest(req: ProductionReadRequest): Bounds {
   if (typeof req.site !== "string" || !req.site.trim()) throw new ProductionReadError("failed", "Production read needs a site.");
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) throw new ProductionReadError("failed", "Production read has an invalid window.");
-  if (!Number.isFinite(asOf)) throw new ProductionReadError("failed", "Production read has an invalid cutoff.");
+  const start = instantMicros(req.range?.startUtc);
+  const end = instantMicros(req.range?.endUtcExclusive);
+  const cutoff = instantMicros(req.asOfUtc);
+  if (start === null || end === null || start >= end) throw new ProductionReadError("failed", "Production read has an invalid window.");
+  if (cutoff === null) throw new ProductionReadError("failed", "Production read has an invalid cutoff.");
   if (req.pageSize !== undefined && (!Number.isSafeInteger(req.pageSize) || req.pageSize < 1)) throw new ProductionReadError("failed", "Invalid page size.");
   if (req.batchSize !== undefined && (!Number.isSafeInteger(req.batchSize) || req.batchSize < 1)) throw new ProductionReadError("failed", "Invalid batch size.");
+  return { start, end, cutoff };
+}
+
+function bad(message: string): ProductionReadError {
+  return new ProductionReadError("incomplete", `Production evidence was incomplete or malformed: ${message}`);
+}
+
+interface DecodedRow {
+  event: ProductionEvidenceEvent;
+  at: bigint;
+  key: string;
+  tuple: string;
+}
+
+function decodeTuple(raw: unknown, index: number): DecodedRow {
+  if (!Array.isArray(raw) || raw.length !== TUPLE_LENGTH) throw bad(`row ${index} is not an ${TUPLE_LENGTH}-field tuple`);
+  const [id, location, staffId, department, orderNumber, lineSku, lineQuantity, eventType, createdAt, parentEventId, csCaseId] = raw;
+  if (typeof id !== "string" || !id) throw bad(`row ${index} has no id`);
+  if (typeof location !== "string" || !location) throw bad(`row ${index} has no site`);
+  if (typeof eventType !== "string") throw bad(`row ${index} has no event type`);
+  for (const [name, v] of [
+    ["staff_id", staffId], ["department", department], ["order_number", orderNumber],
+    ["line_sku", lineSku], ["parent_event_id", parentEventId], ["cs_case_id", csCaseId],
+  ] as const) {
+    if (!isNullableString(v)) throw bad(`row ${index} has a non-text ${name}`);
+  }
+  if (lineQuantity !== null && (typeof lineQuantity !== "number" || !Number.isFinite(lineQuantity))) {
+    throw bad(`row ${index} has a non-numeric quantity`);
+  }
+  const at = instantMicros(createdAt);
+  if (at === null) throw bad(`row ${index} has an unreadable time`);
+  const event: ProductionEvidenceEvent = {
+    id,
+    location,
+    staff_id: staffId as string | null,
+    department: department as string | null,
+    order_number: orderNumber as string | null,
+    line_sku: lineSku as string | null,
+    line_quantity: lineQuantity,
+    event_type: eventType,
+    created_at: createdAt as string,
+    parent_event_id: parentEventId as string | null,
+    cs_case_id: csCaseId as string | null,
+  };
+  return { event, at, key: `${location}\u0000${id}`, tuple: JSON.stringify(raw) };
+}
+
+/** Validate an envelope against its request and return the events in (created_at, id) order. */
+export function decodeEvidenceEnvelope(
+  data: unknown,
+  req: ProductionReadRequest,
+  bounds: Bounds,
+  checkLive: () => void = () => {},
+): ProductionEvidenceEvent[] {
+  if (data === null || data === undefined) throw bad("the server returned no evidence");
+  if (typeof data !== "object" || Array.isArray(data)) throw bad("the response is not an evidence envelope");
+  const env = data as Record<string, unknown>;
+  const keys = Object.keys(env);
+  for (const k of ENVELOPE_KEYS) if (!(k in env)) throw bad(`missing ${k}`);
+  if (keys.length !== ENVELOPE_KEYS.length) throw bad("unexpected envelope fields");
+  if (env.version !== 1) throw bad(`unsupported encoding version ${String(env.version)}`);
+  if (env.complete !== true) throw bad("the server did not mark the evidence complete");
+  if (env.site !== req.site) throw bad("the evidence is for another site");
+  if (instantMicros(env.startUtc) !== bounds.start || instantMicros(env.endUtcExclusive) !== bounds.end) {
+    throw bad("the evidence is for another window");
+  }
+  if (instantMicros(env.asOfUtc) !== bounds.cutoff) throw bad("the evidence has another cutoff");
+  const rows = env.rows;
+  if (!Array.isArray(rows)) throw bad("rows is not a list");
+  const rowCount = env.rowCount;
+  if (typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) || rowCount < 0) throw bad("rowCount is not a count");
+  if (rowCount !== rows.length) throw bad(`the server counted ${rowCount} rows but sent ${rows.length}`);
+
+  // Pass 1: decode, check site/cutoff, deduplicate.
+  const unique = new Map<string, DecodedRow>();
+  for (let i = 0; i < rows.length; i++) {
+    if (i % CHECK_EVERY === 0) checkLive();
+    const row = decodeTuple(rows[i], i);
+    if (row.event.location !== req.site) throw bad(`row ${i} belongs to another site`);
+    if (row.at > bounds.cutoff) throw bad(`row ${i} is after the cutoff`);
+    const prior = unique.get(row.key);
+    if (prior) {
+      if (prior.tuple !== row.tuple) {
+        throw new ProductionReadError("changed", `Production event ${row.event.id} was returned with two different payloads.`);
+      }
+      continue;
+    }
+    unique.set(row.key, row);
+  }
+  checkLive();
+
+  // Pass 2: index the window rows.
+  const inWindow = (r: DecodedRow) => r.at >= bounds.start && r.at < bounds.end;
+  const terminalOrders = new Set<string>();
+  const cancelParents = new Set<string>();
+  const evidenceIds = new Set<string>();
+  for (const r of unique.values()) {
+    if (!inWindow(r)) continue;
+    const e = r.event;
+    if (!COUNT_TYPES.has(e.event_type)) throw bad(`window row ${e.id} has event type ${e.event_type}`);
+    if (TERMINAL_TYPES.has(e.event_type) && e.order_number !== null && e.order_number.trim()) terminalOrders.add(e.order_number);
+    if (EVIDENCE_TYPES.has(e.event_type)) evidenceIds.add(e.id);
+    if (e.event_type === "cancelled" && e.parent_event_id) cancelParents.add(e.parent_event_id);
+  }
+
+  // Pass 3: every context row must belong to one of the three context families.
+  for (const r of unique.values()) {
+    if (inWindow(r)) continue;
+    const e = r.event;
+    if (r.at < bounds.start) {
+      const qualifies = e.event_type === "line_verified" && e.order_number !== null && terminalOrders.has(e.order_number);
+      if (!qualifies && !cancelParents.has(e.id)) throw bad(`context row ${e.id} before the window is unrelated to it`);
+    } else if (!(e.event_type === "cancelled" && e.parent_event_id !== null && evidenceIds.has(e.parent_event_id))) {
+      throw bad(`context row ${e.id} after the window is not a correction of window evidence`);
+    }
+  }
+  checkLive();
+
+  return [...unique.values()]
+    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.event.id < b.event.id ? -1 : a.event.id > b.event.id ? 1 : 0))
+    .map((r) => r.event);
 }
 
 /**
@@ -278,27 +286,69 @@ function validateRequest(req: ProductionReadRequest): void {
  * Accepts the caller's Supabase client (browser: signed-in client; digest: its server client).
  */
 export async function loadProductionEvidence(
-  client: Pick<SupabaseClient, "from"> | EvidenceClient,
+  client: Pick<SupabaseClient, "rpc"> | EvidenceRpcClient,
   request: ProductionReadRequest,
 ): Promise<ProductionSnapshot> {
-  validateRequest(request);
-  const reader = new Reader(client as EvidenceClient, request);
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const first = await reader.readOnce();
-    const second = await reader.readOnce();
-    if (fingerprint(first) === fingerprint(second)) {
-      const events = [...first.values()].sort((a, b) => {
-        const d = Date.parse(a.created_at) - Date.parse(b.created_at);
-        return d || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-      });
-      return {
-        events,
-        range: { startUtc: request.range.startUtc, endUtcExclusive: request.range.endUtcExclusive },
-        asOfUtc: request.asOfUtc,
-        loadedAtUtc: new Date((request.now ?? Date.now)()).toISOString(),
-        visibility: request.visibility,
-      };
-    }
+  const bounds = validateRequest(request);
+  const now = request.now ?? Date.now;
+  const deadlinePassed = () => request.deadlineMs !== undefined && now() > request.deadlineMs;
+  const checkLive = () => {
+    if (request.signal?.aborted) throw new ProductionReadError("aborted", "Production read was cancelled.");
+    if (deadlinePassed()) throw new ProductionReadError("incomplete", "Production read exceeded its time limit.");
+  };
+  checkLive();
+
+  // One controller aborts the request for either a caller cancel or the deadline.
+  const controller = new AbortController();
+  let stop: ((e: ProductionReadError) => void) | null = null;
+  const stopped = new Promise<never>((_, reject) => {
+    stop = reject;
+  });
+  stopped.catch(() => {});
+  const onCallerAbort = () => {
+    controller.abort();
+    stop?.(new ProductionReadError("aborted", "Production read was cancelled."));
+  };
+  request.signal?.addEventListener("abort", onCallerAbort, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (request.deadlineMs !== undefined) {
+    timer = setTimeout(() => {
+      controller.abort();
+      stop?.(new ProductionReadError("incomplete", "Production read exceeded its time limit."));
+    }, Math.max(0, request.deadlineMs - now()));
   }
-  throw new ProductionReadError("changed", "Production data changed while loading; retry.");
+
+  try {
+    let call = (client as EvidenceRpcClient).rpc(EVIDENCE_RPC, {
+      p_site: request.site,
+      p_start_utc: request.range.startUtc,
+      p_end_utc_exclusive: request.range.endUtcExclusive,
+      p_as_of_utc: request.asOfUtc,
+    }) as EvidenceRpcCall;
+    if (typeof call.abortSignal === "function") call = call.abortSignal(controller.signal);
+
+    let res: { data: unknown; error: unknown };
+    try {
+      res = await Promise.race([Promise.resolve(call), stopped]);
+    } catch (e) {
+      if (e instanceof ProductionReadError) throw e;
+      checkLive();
+      throw new ProductionReadError("failed", `Production read failed: ${errorMessage(e)}`);
+    }
+    checkLive();
+    if (res.error) throw new ProductionReadError("failed", `Production read failed: ${errorMessage(res.error)}`);
+
+    const events = decodeEvidenceEnvelope(res.data, request, bounds, checkLive);
+    checkLive();
+    return {
+      events: Object.freeze(events),
+      range: { startUtc: request.range.startUtc, endUtcExclusive: request.range.endUtcExclusive },
+      asOfUtc: request.asOfUtc,
+      loadedAtUtc: new Date(now()).toISOString(),
+      visibility: request.visibility,
+    };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    request.signal?.removeEventListener("abort", onCallerAbort);
+  }
 }

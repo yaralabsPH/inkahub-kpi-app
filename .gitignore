@@ -46,3 +46,4 @@ Thumbs.db
 # CI also fails if one is ever force-added (.github/workflows/ci.yml).
 .env.staging.local
 staging-results-*.md
+staging-results-*.json
