@@ -2,9 +2,95 @@
 
 Reviewed by the planner for CJ on 2026-11-12. Source baseline: `556b5f9ad9c9d6988b5a2b87e1da7103f02cfafe` (`main` after PR #4).
 
-This reviews every item in [ROADMAP.md](ROADMAP.md) against the checked-in implementation, [ARCHITECTURE.md](ARCHITECTURE.md), [HARDENING.md](HARDENING.md), [AGENTS.md](../AGENTS.md), and [WORKFLOW.md](WORKFLOW.md). Approved product decisions remain the brief. Recommendations and unanswered questions below are not new approvals or implementation instructions.
+This reviews every item in [ROADMAP.md](ROADMAP.md) against the checked-in implementation, [ARCHITECTURE.md](ARCHITECTURE.md), [HARDENING.md](HARDENING.md), [AGENTS.md](../AGENTS.md), and [WORKFLOW.md](WORKFLOW.md). The **CJ decisions and follow-up evidence** section records CJ's subsequent answers on 2026-11-12. Those answers supersede the corresponding initial questions, including the original wall-display requirement. Other recommendations remain proposals, not implementation approval.
 
-Only this review is changed. No production Supabase account, database, customer records, Make scenario or Slack workspace was accessed. The staging connection was verified earlier in this chat; that does not establish schema parity, seeded test data or working Vercel Preview settings. The roadmap describes Make Parts 1–6, but this repository contains no scenario exports, preview index examples or Slack app manifest. Those integrations are discovery dependencies, not verified implementation facts.
+Only this review is changed. No production Supabase account/database or live Make/Slack service was accessed. The staging connection was verified earlier in this chat; that does not establish schema parity, seeded test data or working Vercel Preview settings. After the initial review, CJ supplied six local Make exports and a local Dropbox preview folder. The follow-up below records read-only inspection of those files; exported configuration is not proof of current live behavior. Raw exports, identifiers, credentials and image assets are not copied into this repository.
+
+## CJ decisions and follow-up evidence — 2026-11-12
+
+Superpowers skills were already installed in the local Codex skills directory. The planner read `using-superpowers` and its Codex reference, and used the review/brainstorming guidance to verify supplied evidence and distinguish approved choices from missing facts. This is documentation follow-up, not a feature design approval or permission to implement, merge, deploy, or change an external service. ROADMAP.md remains unchanged under the existing single-file scope; future specs must carry these CJ-approved amendments into their brief.
+
+### Decision register
+
+Question numbers refer to the initial questions preserved later in this document.
+
+| Item / questions | CJ-approved decision or supplied fact | Still needed / limits |
+| --- | --- | --- |
+| F1 / 1–2 | Use the recommended count: once per site/work type/report period after qualifying completion, with the overall order total deduplicated; report rework separately. Count supported print/frame pieces and flag incomplete historical detail. | Canvas eligibility was not supplied by “use recommendation”; do not add it silently. The decided gift/free/accessory exclusions remain. |
+| F3 / 3 | Inspect `C:\Users\cjgom\Dropbox\Packing Slip Previews`; local evidence is available, findings below. | Reuse and a composite for sets remain the planner's recommendation; providing the folder did not explicitly approve the composite choice. Current revision selection and canonical keys still require design. |
+| F3 / 4 | Immediate background processing, a placeholder while pending, visible failure status, and a two-minute target under normal service conditions. | This is a normal-service target, not a promise during provider outages. |
+| F4 / 5–6 | Test Max's examples before activation. Deduct packaging once at the final packing point, including replacement packaging; unresolved rules flag the order without blocking completion. | Max's actual box/rule table is still missing. Approval of the process is not a supplied rule set. |
+| F5 / 7–8 | Preserve unknown historical departments rather than applying today's assignment retroactively; retain the recommended distinction between managed departments and fixed work types. | Initial department names, person assignments, framing-line scope and whether every badge user has an Auth identity remain unprovided. |
+| F6 / 9 | Three shared Bluetooth scanners connect to one Android tablet. **No wall display and no monitors.** No scanner model has been selected; CJ described any wireless scanner. | “Any” is a preference, not verified compatibility. Require configurable per-scanner prefixes/suffixes, Android pairing and collision tests, reconnection/reboot behavior, range and battery verification. Browser/model details remain a rollout gate. |
+| F6 / 10 | Badge required at every handover, after 15 minutes of framing-scanner inactivity, and after receiver restart. This does not clock the person out of attendance. | Per-scanner capture and UI still need design; a software timeout cannot detect every unannounced handover. |
+| F6 / 11 | Persist offline captures locally, keep them visibly pending until validated, and use supervised recovery after device failure. | Never credit guessed identities/quantities; local browser storage does not guarantee survival of device loss or storage erasure. |
+| F6 / 12 | Alert coverage is 08:00–18:00 in each site's own timezone. CJ separately confirmed the existing zones: AU `Australia/Sydney`, UK `Europe/London`, US `America/Chicago`. | Workdays/holiday exceptions and alert recipient/channel remain unprovided. Five minutes without a heartbeat remains the recommendation; the hours-only answer did not explicitly approve the threshold. |
+| F7 / 13 | Authorized dispatchers may manually assign a framer with an audit record. Unknown attribution remains a visible warning and does not block dispatch. | Apply the separate shift-length dispatch session; no fabricated scan time or duplicate credit when real evidence arrives. |
+| F8 / 14–15 | Owners see all sites; managers assigned sites; staff their own performance; kiosks operational confirmations; CS only explicitly granted access. Use 04:00 site-local production days and Monday-start weeks, with the confirmed timezones above. | Role/site enforcement, summary export parity and DST tests remain implementation acceptance criteria. |
+| F9 / 16 | Proportionally scale fallback time for verified partial shifts and display measured and estimated results separately. | Max's actual size weights remain missing. Approval did not validate the existing weight values or authorize assuming a full shift when attendance is unknown. |
+| F10 / 17–18 | Main order-to-ship metric uses complete shipment, with partial shipments visible separately. Max supplies lateness deadlines, cutoffs, holidays and exclusions. | Shop-to-site mapping and actual lateness values are still missing. Do not treat the app's single-shop configuration as proof of all three sites' arrangement. |
+| F11 / 19–20 | Use explicit versioned batch mappings and replay from durable records; missing evidence remains missing. CJ supplied exports for all six parts. | The exports answer when the initial batch ID exists and identify recovery candidates; they do not prove a complete retained event log for every stage. Details below. |
+| F12 / 21–23 | Infer printing only for the evidenced order and show partial batch evidence. Use a verified interaction endpoint and explicitly authorized users, tested in staging. Preserve earlier inference separately from a late confirmation's actor/time. No reminders initially. | Slack app ownership, workspace and exact authorized users are still unprovided. Part 5's existing text-only post is not an interactive app configuration. |
+
+### F3 evidence: preview reuse is feasible, with mapping limits
+
+The supplied folder contains **605 JPEG files** and `packing-preview-index-v1.json`. The v1 index contains **583 artwork/component keys**, referencing **565 distinct hashes**; every referenced `<hash>.jpg` exists locally. The index includes **181 set-component keys** and **21 entries with more than one candidate hash**. Presence is not proof of complete current catalogue coverage, freshness or image validity for every file.
+
+The index's declared `data_sha256` matches the serialized entries. The planner visually inspected one single-artwork preview (`INKA-ABS0007`) and both components of `INKA-S2-BAU0055`; these samples contain artwork, not customer/address/packing-slip information. They are individual component images, not a prebuilt set composite. Do not extend the sample inspection into a claim that every file was visually checked.
+
+Part 6 modules provide the reuse contract:
+
+- Module 3150 loads `/Packing Slip Previews/packing-preview-index-v1.json`; module 15 checks the version/entry hash and resolves preview candidates. For excluded-from-print products it requires exactly one candidate per component, rejecting missing or ambiguous previews.
+- Module 3100 reads `/Packing Slip Previews/<hash>.jpg`. Module 17 validates the JPEG structure, dimensions up to 400 pixels per side, and size bounds.
+- On a cache miss, modules 3102/3104 fetch source artwork and validate its Dropbox content hash. Modules 3106/3108 resize to a maximum 256-pixel side and convert to JPEG. Modules 3110/3113 validate and upload the preview under the source hash.
+- A set component key such as `INKA-S2-BAU0055-01` differs from the app's canonical set key `S2BAU0055`. Group and order all expected components explicitly; never select the first hash or component as if it represented the complete set. Multi-hash entries need authoritative revision evidence.
+
+Recommended F3 refinement: reuse verified component JPEGs as the initial artwork source, create the proposed set composite where appropriate, and store the selected version in Supabase Storage as already decided. Preserve all four auto-generation triggers and source-replacement handling. The cache and index do not establish an automatic, unambiguous mapping for every new/replaced artwork. The two-minute target is now approved; the composite presentation remains a narrow open choice.
+
+### F11 evidence: batch identity exists before Part 3
+
+The six supplied exports were parsed locally. Relevant modules establish the following:
+
+| Part | Export evidence | Consequence for the spec |
+| --- | --- | --- |
+| 1 | Module 4 creates `batch_id` from the supplied stamp plus a random UUID fragment, builds the accepted order list, and excludes already-logged orders. Module 6 persists order name, queued status/time and batch ID. History lookup checks AU/UK/US by displayed order number. | **The initial batch ID and accepted membership already exist in Part 1.** Close the initial uncertainty about having to wait for Part 3. Send accepted orders, not skipped/malformed inputs. Re-executing the generator can create a new ID, so recovery must use the stored identity rather than regenerate it. Cross-shop order-number uniqueness is still unverified. |
+| 2 | Module 24 records order/SKU/file path/quantity and batch ID; module 29 records the Shopify legacy order ID and processing status/time. There are separate failure and excluded-from-print paths. | There are candidate order/file mapping records. A generic `done` flag is not proof that every requested file was found; distinguish partial, excluded and failed outcomes. |
+| 3 | Module 3 carries the input batch ID into the folder/roll plan. Module 7 records planned placements and timestamp; module 12 writes roll records with batch ID/root. | Preserve the initial batch identity through planning, and attach membership/plan revisions for retries or later changes. |
+| 4 | Module 9 updates roll status to cut and writes `now` to the same numbered column populated during planning. | Mutable sheet state cannot reconstruct the original planning event time reliably. CJ's instruction not to change this behavior remains in force. |
+| 5 | Module 1302 verifies completed-folder contents and roll counts before producing an images-ready message, with a deterministic message key. Module 34 sends the resulting text to Slack. | Reuse verified completion evidence, not merely entry into Part 5. A message key is useful evidence but not proof of a durable milestone log or exact retained transition time. |
+| 6 | Stable production job keys, attempt counts, included/excluded/pending orders, report/manifest records, READY JSON files and Packing Slip Activity event keys are present. Module 44 publishes the report JSON; module 33 updates the durable job record. Retry logic limits which excluded orders may be retried. | These are concrete reconciliation sources for packing-slip readiness and partial results. Use their attempt/order detail, preserve missing event times, and do not claim they recover earlier Parts 1–5 transitions automatically. |
+
+The supplied Part 6 export explicitly contains AU-specific paths/validation. Do not assume it demonstrates equivalent UK/US deployments. Before F11's plan, define retained source, event time, replay key and partial-success semantics for each of the five reporting steps. No supplied export was executed, imported, modified or uploaded.
+
+### F12 evidence: the Slack post currently has no button
+
+Part 5 module 34 is `slack:CreateMessage`, receiving `{{1302.result.text}}`. Its mapper has no Block Kit `blocks` or interactive button. It references a Make connection; that reference does not reveal an installed app's signing-secret ownership, Interactivity Request URL or authorized users. F12 therefore still needs app-ownership/configuration evidence before specifying exact delivery wiring. Inspection did not contact Slack or reveal connection credentials.
+
+### Remaining inputs after CJ's answers
+
+These are narrower than the original 23 questions; approved decisions above should not be asked again.
+
+- **F1:** explicit canvas eligibility if canvas is in scope.
+- **F3:** accept or replace the recommended set-composite presentation; current-source selection for ambiguous index entries is a technical design task.
+- **F4/F5/F9:** Max's box rules/examples, initial departments/assignments and framing-line scope, and approved size weights. Badge-user identity compatibility needs staging-only verification before schema design.
+- **F6:** actual scanner/tablet/browser details and a successful hardware trial; alert recipient/channel, workdays/holiday exclusions, and confirmation of the proposed five-minute heartbeat threshold. The hours, timezones, Android/Bluetooth choice, no-monitor constraint, idle timeout and offline policy are settled.
+- **F10:** shop/site mapping and Max's late-order thresholds/calendars.
+- **F11:** per-stage retained evidence and replay/time contract. Initial batch identity is now established from Part 1; live retention and non-AU deployment parity are not.
+- **F12:** the posting Slack app/workspace owner and exact confirmation permissions. Order-level inference, separate late confirmations and no reminders are settled.
+
+### Local evidence provenance
+
+Exports were read from CJ's Downloads directory; only filenames and fingerprints are recorded for reproducibility. No raw export, customer data, credential, webhook address or provider connection identifier is included here.
+
+| Supplied file | SHA-256 |
+| --- | --- |
+| `Part 1 - Get Orders v5.blueprint (5).json` | `4878c05de16234c78631891cfa2d814f31d2561a1d6f9a8cf7448d1d58a6d9b8` |
+| `Part 2 - Process Products v5.blueprint (3).json` | `fa6487d7b9233dda0d90f54c48def9321a1a86bf6a3ea7491f428084aa34fa5b` |
+| `Part 3 - Plan Rolls & Copy v7.blueprint (4).json` | `40317cf1c7a1cc94b2f978b048df296a6815d9db0d6731d85d3ab28812399c5d` |
+| `Part 4 - Cut Sequence v5.blueprint (3).json` | `8f66ce50393f629a37941eeb2bec2969935e78df7a19988948fd1e90b5eb04e4` |
+| `Part 5 - Floor Placement v6.blueprint (3).json` | `4732228ac7e9d23c776f9c6ae8fbecfcfafda45df89515d748a5c68b78e453e5` |
+| `Part 6 - Folder First (LIVE AU).blueprint (1).json` | `45a6e33ee1e771a01c64865be875604ad6608a4ef114d6c975f13dfdea1dd26a` |
+| `packing-preview-index-v1.json` | `840db6dd77808db80e979999009bd83065c2c5db25a0828906d2fec3377b6420` |
 
 ## Overall assessment
 
@@ -36,6 +122,8 @@ These are the main code paths inspected; line references are at the baseline abo
 
 ## Item-by-item review
 
+This retains the original baseline analysis. Apply the decision register above when a recommendation/question below has since been answered; targeted evidence updates are noted where relevant.
+
 ### S1 — digest-auth
 
 **Understood:** protect every digest path with `CRON_SECRET`; retain the configured default recipient and restrict overrides to an allowlist. Downloads and diagnostics require the same credential.
@@ -60,9 +148,9 @@ These are the main code paths inspected; line references are at the baseline abo
 
 **Understood:** large title, framed/unframed label, bold size and unmistakable black/white/natural colour blocks at one metre; reserve thumbnail space before F3, then frame the image in that colour.
 
-**Current code/conflicts:** the live line list already has `ProductImage`, SKU-derived labels and `variantChipClass`, but uses small text/chips; it is separate from the older `LineCard`. Change the rendered path, not just the legacy component. Unknown SKUs use Shopify text fallbacks. A colour block must not turn an unknown or unframed line into an apparent frame colour. F6's wall confirmation is a different view from a detailed order card.
+**Current code/conflicts:** the live line list already has `ProductImage`, SKU-derived labels and `variantChipClass`, but uses small text/chips; it is separate from the older `LineCard`. Change the rendered path, not just the legacy component. Unknown SKUs use Shopify text fallbacks. A colour block must not turn an unknown or unframed line into an apparent frame colour. F6's scan confirmation is a different view from a detailed order card; CJ subsequently removed the separate wall display.
 
-**Risks/missing decisions:** validate physical legibility on the actual tablet and wall display from F6, in both themes. Retain written colour labels and neutral placeholders; colour alone is insufficient. Long titles, mixed orders, orientation, gallery walls and missing images must not hide quantities or warnings.
+**Risks/missing decisions:** validate physical legibility on the actual Android tablet from F6, in both themes. Retain written colour labels and neutral placeholders; colour alone is insufficient. Long titles, mixed orders, orientation, gallery walls and missing images must not hide quantities or warnings. Confirmations/errors must work on the tablet itself; there will be no monitor.
 
 **Suggested specs:** one `order-display` spec, independently releasable with the reserved image area; F3 supplies the image source later. No additional product question; device details are covered by question **9**.
 
@@ -108,9 +196,9 @@ Dropbox notifications identify accounts with changes, not individual changed fil
 
 Strict framing rejects malformed input, but delimiter-only keyboard multiplexing cannot guarantee correct attribution under every collision. Bench-test simultaneous scans with the chosen models/receiver; if valid-looking corruption remains possible, require hardware serialization or a transport retaining scanner identity before rollout. The requirement is unchanged; this is a feasibility gate. Software cannot detect a new person holding a still-active scanner without a badge scan. Timeout, visible names and the badge-on-handover operating rule reduce that risk but cannot prove it absent.
 
-Kiosk persistence in `client.ts` is an opt-in browser-storage mode, not OS auto-start or a guarantee that sessions never expire. Screen wake, sound activation, focus loss, reboot and receiver reconnect require device-specific testing. A scanner read beep is not proof of database acceptance. Health checks must distinguish a live idle receiver from a failed one; define work hours and alert ownership.
+Kiosk persistence in `client.ts` is an opt-in browser-storage mode, not OS auto-start or a guarantee that sessions never expire. Screen wake, sound activation, focus loss, reboot and receiver reconnect require device-specific testing. A scanner read beep is not proof of database acceptance. With CJ's no-monitor decision, confirm that workers can see the tablet or hear application error feedback from their benches; the tablet is the only specified display. Health checks must distinguish a live idle receiver from a failed one. Hours/timezones are now confirmed above; alert ownership and working days remain open.
 
-**Suggested specs:** `scanner-hardware-protocol` (bench proof and purchase requirements); `scanner-sessions` (per-scanner identity/expiry/work-type binding); `scan-outbox-and-ingestion` (durable queue, server idempotency, validation and recovery); `scan-only-framing` (atomic multi-line capture and compatibility); `kiosk-health` (startup, wall feedback and monitoring). Requires F1, F5 snapshots, production write safety and F4's nonblocking packaging contract. Questions **9–12**.
+**Suggested specs:** `scanner-hardware-protocol` (bench proof and purchase requirements); `scanner-sessions` (per-scanner identity/expiry/work-type binding); `scan-outbox-and-ingestion` (durable queue, server idempotency, validation and recovery); `scan-only-framing` (atomic multi-line capture and compatibility); `kiosk-health` (startup, tablet feedback and monitoring). Requires F1, F5 snapshots, production write safety and F4's nonblocking packaging contract. Questions **9–12**.
 
 ### F7 — dispatch-flow
 
@@ -158,7 +246,7 @@ Shopify delivery verification requires the raw request body and HMAC; delivery i
 
 **Understood:** add one authenticated reporting HTTP step plus Ignore handler to Parts 1, 2, 3, 5 and 6; map batch events to orders and display missing data. Keep printing independent of app availability.
 
-**Current code/conflicts:** there is no Make receiver or batch mapping in the repository. The roadmap requires Part 1 to send a batch ID/order list even though batching is described around Part 3; inspect actual scenario data before assuming Part 1 knows final membership. Parts may split, retry or rebuild batches. A receiver cannot recover an event it never received, so idempotency alone does not solve an Ignore-handled failed request.
+**Current code/conflicts:** there is no Make receiver or batch mapping in the repository. Follow-up inspection now confirms that Part 1 creates the initial batch ID and accepted order list before Part 3. Parts can still exclude orders or retry partial results, so initial membership must not be confused with successful membership at every later stage. A receiver cannot recover an event it never received, so idempotency alone does not solve an Ignore-handled failed request.
 
 **Risks/missing decisions:** use stable source occurrence/run keys, explicit site/shop, batch membership version, source timestamp and schema version. Validate bounded payloads, caller scope and order mapping before crediting milestones. Accept out-of-order batch events durably and resolve only after mapping exists. Retry/reconcile from a retained Make log, manifest or other agreed recovery source; until recovered show missing. If no such source exists, report that limitation rather than promise eventual completeness. Rotate the hard-coded cancellation-registry token through CJ's separate manual task; do not reuse it for ingestion. Never publish secrets in payloads or Slack.
 
@@ -215,9 +303,9 @@ No simultaneous writers are proposed. “Can begin earlier” means dependency f
 
 Important new dependency edges: S1 → F1 digest integration; F1/F5/F10 identity contract + write safety → F6; F4 → F6/F7 nonblocking completion; F7 source semantics → F9/F12; history correction + periods → F8/F10 reporting; F11 mapping → F12. These remove the apparent cycle in which scanner capture would ship before its order/line identity was designed.
 
-## Open questions for CJ
+## Initial questions for CJ — answers recorded above
 
-Reply with the question number and a short answer; “use recommendation” is sufficient except where an artifact, hardware detail or Max's rules are needed. These questions fill gaps or explicitly flag conflicts; they do not reopen approved choices such as shared scanners, one home department, permanent thumbnails or secret-only digest access.
+The original numbering is retained so CJ's answers can be traced. The decision register and remaining-input list above are current; this historical list is not a request to answer settled questions again. “Use recommendation” approves the stated policy but cannot supply an artifact, hardware detail or Max's actual rule values.
 
 ### F1 — counting
 
@@ -281,5 +369,5 @@ Reply with the question number and a short answer; “use recommendation” is s
 - `npx tsc -b`: passed on this baseline. As AGENTS.md states, this does not type-check `api/`.
 - `npm run test -- --run` with `VITE_BACKEND=dexie`: passed, 35 tests. The existing suite is payment-terms coverage, not evidence that scanners, RLS, stock races or integrations are safe.
 - `npm run build` with `VITE_BACKEND=dexie`: passed. Warnings concern stale Browserslist data, an XLSX mixed import and large chunks; no app changes were made to address them in this docs-only task.
-- No migrations, provider writes, live endpoint calls or production-database access were performed. Staging schema parity, hardware collision behavior, Make mappings, Slack ownership and actual Shopify/carrier capabilities remain unverified and are explicit spec gates above.
+- No migrations, provider writes, live endpoint calls or production-database access were performed. The follow-up inspected all six supplied local exports, checked preview-index references/integrity and visually inspected three artwork previews. Initial Make batch identity and Part 6 recovery candidates are now documented. Staging schema parity, hardware collision behavior, live Make retention/non-AU parity, Slack ownership and actual Shopify/carrier capabilities remain unverified and are explicit spec gates above.
 - PR CI must pass for this document branch. CJ alone approves the resulting specs/plans and performs later merges/releases; the one-time merge authorization for PR #4 does not apply to this review PR or any feature.
