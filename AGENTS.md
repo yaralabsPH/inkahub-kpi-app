@@ -53,7 +53,9 @@ Keep it that way.
 - `api/` — Vercel serverless endpoints (NOT covered by `tsc -b`; `tsconfig.json` includes only `src`)
 - `supabase/migrations/` — numbered SQL migrations (recovered snapshot)
 
-`docs/ARCHITECTURE.md` holds the deeper map once the planner writes it.
+`docs/ARCHITECTURE.md` holds the deeper map of the code.
+`docs/ROADMAP.md` lists the approved features and the decisions already made.
+`docs/HARDENING.md` is the checklist every spec, plan and review must pass.
 
 ## 5. Guardrails (read before changing anything)
 
@@ -97,6 +99,12 @@ Keep it that way.
 
 Rules:
 
+- **The roadmap is the brief.** Before writing a spec, the planner reads the
+  feature's section in `docs/ROADMAP.md`. Decisions marked Decided are
+  followed, not reopened; concerns go in the spec's "Risks and open
+  questions" so CJ can decide.
+- **Hardening is required.** Every spec and plan answers `docs/HARDENING.md`,
+  and every review checks the code against it.
 - **The plan is the contract.** If the coder hits something the plan didn't
   foresee, it stops and writes it under "Open questions" in the plan. It does
   not improvise a different design.

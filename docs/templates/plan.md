@@ -26,6 +26,11 @@ Each task is one commit. Keep them small enough that the diff is easy to review.
 - Do:
 - Done when:
 
+## Hardening in the plan
+
+For each relevant `docs/HARDENING.md` item, name the task that handles it
+(for example "idempotent retry → Task 3, test in Task 4").
+
 ## Release and rollback
 
 - Migration(s) and why each is backward-compatible (expand-then-contract):

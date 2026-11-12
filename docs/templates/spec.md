@@ -1,6 +1,6 @@
 # Spec: <feature name>
 
-- Slug: `<slug>`
+- Slug: `<slug>` · Roadmap ID: `<F#>` (see `docs/ROADMAP.md`)
 - Status: draft | approved by CJ on <date>
 - Author: planner (GPT-6 Astra)
 
@@ -42,6 +42,17 @@ release. List the steps per role, plus which parts of the smoke test in
 `docs/RELEASING.md` are most at risk.
 
 - ...
+
+## Hardening
+
+Answer every section of `docs/HARDENING.md` for this feature (failure modes,
+data correctness, security, release and rollback, performance, operations,
+tests). Write "n/a" with a reason where a section doesn't apply.
+
+## Roadmap decisions honoured
+
+List each Decided point from this feature's section of `docs/ROADMAP.md` and
+how the spec meets it.
 
 ## Risks and open questions
 

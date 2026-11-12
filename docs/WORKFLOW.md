@@ -21,6 +21,19 @@ this page is the human side, with prompts to copy and paste.
 
    Read it yourself, merge it. Every future plan gets better because of it.
 
+## Roadmap review (once, before the first roadmap feature)
+
+In Codex:
+
+> Read AGENTS.md, docs/ARCHITECTURE.md, docs/ROADMAP.md and
+> docs/HARDENING.md. Review the whole roadmap against the actual code. For
+> each item: confirm you understand it, list conflicts with existing code or
+> with other items, risks, missing decisions, and a suggested split into
+> specs. Check the build order and dependencies. Write
+> docs/ROADMAP-REVIEW.md. Don't change any other file.
+
+Read it, answer its questions, and update ROADMAP.md with your decisions.
+
 ## The loop for each feature
 
 Pick a short slug, e.g. `barcode-attribution`.

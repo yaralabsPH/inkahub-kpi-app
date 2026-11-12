@@ -45,7 +45,7 @@ codex exec -m gpt-6-astra -c model_reasoning_effort="high" --sandbox workspace-w
 ```
 
 Every prompt to Astra starts with: "You are the PLANNER in this repo. Read
-AGENTS.md and docs/ARCHITECTURE.md. Only write the file named below. Do not
+AGENTS.md, docs/ARCHITECTURE.md, docs/ROADMAP.md and docs/HARDENING.md. Only write the file named below. Do not
 edit app code. Do not commit, push, or run git commands that change state."
 After Astra finishes, check `git status`: if it changed anything other than
 the file you asked for, revert those changes and tell CJ. Then you commit
@@ -70,7 +70,7 @@ error. Do not do the planner's work yourself.
    to update the plan and show it again.
 5. **Build.** Implement the plan as in "When asked to implement a plan" above.
 6. **Review.** Ask Astra to review branch `feature/<slug>` against `main`, the
-   spec, the plan and the AGENTS.md guardrails, run the type-check, tests and
+   spec, the plan, the AGENTS.md guardrails and every item in `docs/HARDENING.md`, run the type-check, tests and
    build, and write `docs/reviews/<slug>-r<N>.md` from
    `docs/templates/review.md`. Commit it as `review rN: Astra review`.
 7. **Fix.** If the verdict is "changes required", address the review as in
