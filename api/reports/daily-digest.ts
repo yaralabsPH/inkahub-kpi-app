@@ -7,12 +7,19 @@
  *             &recipient=x@y   (override REPORT_RECIPIENT)
  *
  * Scheduled from vercel.json crons ~23:55 local per location.
- * Vercel adds x-vercel-cron: 1 header on scheduled hits.
+ *
+ * Every request (cron, manual rerun, download, diagnostics) must send
+ * `Authorization: Bearer <CRON_SECRET>`. Vercel adds that header to
+ * scheduled hits when CRON_SECRET is set; manual callers supply it
+ * themselves. Anything else gets 401 before any other work. A cron-
+ * identifying header or an app login is NOT authorization. GET only.
  *
  * Sends via Resend using RESEND_API_KEY from env.
  */
-import { createClient } from "@supabase/supabase-js";
+import { timingSafeEqual } from "node:crypto";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
+import { z } from "zod";
 
 interface VercelRequest {
   method?: string;
@@ -198,7 +205,7 @@ function ensureStaff(dept: DeptTotals, staff_id: string): StaffTotals {
 }
 
 async function aggregateDay(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   location: string,
   ymd: string,
   tz: string,
@@ -487,10 +494,100 @@ function buildBodyText(payload: {
 }
 
 /* ============================================================
+ * Request authorization
+ * ============================================================ */
+
+/**
+ * True only when the server has a nonblank CRON_SECRET and the request
+ * carries exactly one Authorization header whose whole value is
+ * `Bearer <CRON_SECRET>`. The configured secret is never trimmed or
+ * otherwise normalized for the comparison; trimming is only used to
+ * detect a blank (unconfigured) secret.
+ */
+function isAuthorized(headers: VercelRequest["headers"], secret: string | undefined): boolean {
+  if (typeof secret !== "string" || secret.trim() === "") return false;
+  if (!headers || typeof headers !== "object") return false;
+  const keys = Object.keys(headers).filter((k) => k.toLowerCase() === "authorization");
+  if (keys.length !== 1) return false;
+  const value = headers[keys[0]];
+  if (typeof value !== "string") return false;
+  const got = Buffer.from(value, "utf-8");
+  const want = Buffer.from(`Bearer ${secret}`, "utf-8");
+  if (got.length !== want.length) return false;
+  return timingSafeEqual(got, want);
+}
+
+/* ============================================================
+ * Recipient policy
+ * ============================================================ */
+const emailSchema = z.string().email();
+
+/**
+ * Trimmed, lowercased single email address, or null. Rejects lists
+ * (commas/semicolons), display-name forms (<>, quotes, parens), any
+ * embedded whitespace and control characters, then applies zod's email
+ * check.
+ */
+function normalizeEmail(value: string): string | null {
+  const v = value.trim();
+  if (v === "") return null;
+  if (/[\s\x00-\x1f\x7f,;<>"()]/.test(v)) return null;
+  if (!emailSchema.safeParse(v).success) return null;
+  return v.toLowerCase();
+}
+
+type RecipientError = { status: 400 | 403 | 500; message: string };
+
+/**
+ * Validates an explicit `recipient` override against
+ * REPORT_RECIPIENT_ALLOWLIST (comma-separated individual addresses,
+ * exact case-insensitive match). No override -> {}. Never falls back to
+ * the default recipient on failure.
+ */
+function resolveRecipientOverride(
+  raw: string | string[] | undefined,
+  allowlist: string | undefined,
+): { recipient?: string; error?: RecipientError } {
+  if (raw === undefined) return {};
+  if (typeof raw !== "string") return { error: { status: 400, message: "Invalid recipient" } };
+  const recipient = normalizeEmail(raw);
+  if (!recipient) return { error: { status: 400, message: "Invalid recipient" } };
+
+  const entries = (allowlist ?? "").split(",").map((e) => e.trim()).filter((e) => e !== "");
+  const allowed = new Set<string>();
+  for (const entry of entries) {
+    const n = normalizeEmail(entry);
+    if (!n) return { error: { status: 500, message: "Recipient configuration error" } };
+    allowed.add(n);
+  }
+  if (!allowed.has(recipient)) return { error: { status: 403, message: "Recipient not allowed" } };
+  return { recipient };
+}
+
+/* ============================================================
  * Handler
  * ============================================================ */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Applies to every response below, including early returns and errors.
+  res.setHeader("Cache-Control", "no-store");
   try {
+    // Authenticate before looking at the method, query or anything else.
+    if (!isAuthorized(req.headers, process.env.CRON_SECRET)) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+    if (req.method !== "GET") {
+      res.setHeader("Allow", "GET");
+      res.status(405).json({ error: "Method not allowed" });
+      return;
+    }
+    // Validate any explicit override before diagnostics or report work.
+    const override = resolveRecipientOverride(req.query.recipient, process.env.REPORT_RECIPIENT_ALLOWLIST);
+    if (override.error) {
+      res.status(override.error.status).json({ error: override.error.message });
+      return;
+    }
+
     // Diagnostic: report which env vars are visible to the function
     // without exposing values. Trigger with ?envcheck=1.
     if (req.query.rolecheck) {
@@ -572,7 +669,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const now = new Date();
       const localYmd = ymdInTz(now, tz);
       const localHourStr = new Intl.DateTimeFormat("en-US", {
-        timeZone: tz, hour: "numeric", hour12: false,
+        timeZone: tz, hour: "numeric", hourCycle: "h23",
       }).format(now);
       const localHour = Number(localHourStr);
       ymd = localHour < 4 ? ymdShift(localYmd, -1) : localYmd;
@@ -634,9 +731,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
+    // Destination: a validated override, else the configured default.
+    // There is no hardcoded fallback address.
+    let recipient = override.recipient;
+    if (!recipient) {
+      const configured = (process.env.REPORT_RECIPIENT ?? "").trim();
+      if (!normalizeEmail(configured)) {
+        res.status(500).json({ error: "Recipient configuration error" });
+        return;
+      }
+      recipient = configured;
+    }
+
     const bodies = buildBodyText({ ymd, locLabel, today, yesterday, staffNames });
     const subject = `${locLabel}-${formatDDMMYY(ymd)}-Daily KPI Report`;
-    const recipient = (Array.isArray(req.query.recipient) ? req.query.recipient[0] : req.query.recipient) ?? process.env.REPORT_RECIPIENT ?? "max@inkaarthouse.com";
     const from = process.env.FROM_EMAIL || "onboarding@resend.dev";
     const resendKey = process.env.RESEND_API_KEY;
     if (!resendKey) {
