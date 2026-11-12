@@ -9,6 +9,8 @@
 - [ ] Spec acceptance criteria
 - [ ] Plan tasks (all done, nothing extra slipped in)
 - [ ] AGENTS.md guardrails (both backends, migrations, RLS, secrets, whitelist)
+- [ ] `docs/HARDENING.md`, every section
+- [ ] Roadmap decisions for this feature (`docs/ROADMAP.md`)
 - [ ] Tests cover the new logic; type-check, tests and build pass
 
 ## Must-fix
