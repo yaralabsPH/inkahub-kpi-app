@@ -14,6 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: No staging settings or results committed
+        run: |
+          leaked=$(git ls-files | grep -E '(^|/)(\.env\.staging\.local|staging-results-[^/]*\.md)$' || true)
+          if [ -n "$leaked" ]; then
+            echo "These files must never be committed:"
+            echo "$leaked"
+            exit 1
+          fi
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20

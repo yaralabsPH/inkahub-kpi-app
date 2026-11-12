@@ -41,3 +41,8 @@ Thumbs.db
 
 # Recovered duplicate of the active TypeScript repository implementation.
 /src/lib/repository/supabase/*.txt
+
+# Staging settings and staging run results: never committed, at any depth.
+# CI also fails if one is ever force-added (.github/workflows/ci.yml).
+.env.staging.local
+staging-results-*.md

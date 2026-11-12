@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest",
-    "typecheck:digest": "tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node api/reports/daily-digest.ts tests/api/daily-digest.test.ts"
+    "typecheck:digest": "tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node api/reports/daily-digest.ts tests/api/daily-digest.test.ts",
+    "staging:item-counting": "vite-node tests/staging/run-item-counting.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
@@ -28,10 +29,12 @@
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "@types/pg": "^8.23.1",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.19",
+    "pg": "^8.23.1",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.4",
     "typescript": "^5.4.5",
