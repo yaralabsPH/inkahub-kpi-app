@@ -68,12 +68,42 @@ export interface MeasureResult {
   rows: MeasureRow[];
 }
 
+/** Live progress while one user's cases run (for the console and the report). */
+export interface MeasureProgress {
+  phase: "case-start" | "heartbeat" | "run-done" | "case-done";
+  label: string;
+  caseIndex: number;
+  caseCount: number;
+  /** 1-based run of the current case; 0 before the first run starts. */
+  run: number;
+  runs: number;
+  /** Authorized in-window rows the server counts for this case (one full pass reads these). */
+  serverCount: number | null;
+  /** Requests and production_events rows read so far in the current run. */
+  requests: number;
+  rowsRead: number;
+  /** Elapsed ms of the current run (or of the finished run for run-done). */
+  elapsedMs: number;
+}
+
 export interface MeasureOptions {
   supabaseUrl: string;
   anonKey: string;
   email: string;
   password: string;
   runs?: number;
+  /** Called on case start/end, after each run and every `heartbeatMs` while a run is loading. */
+  onProgress?: (p: MeasureProgress) => void;
+  /** Called after sign-in and after every finished case with the results so far. */
+  onUpdate?: (partial: MeasureResult) => void;
+  /** Heartbeat interval (default 10 s). */
+  heartbeatMs?: number;
+}
+
+/** Rows in a PostgREST response, from its Content-Range header ("0-499/*"); 0 if absent. */
+export function rowsFromContentRange(header: string | null): number {
+  const m = header ? /^(\d+)-(\d+)\//.exec(header.trim()) : null;
+  return m ? Number(m[2]) - Number(m[1]) + 1 : 0;
 }
 
 function median(xs: number[]): number {
@@ -98,13 +128,16 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
   const runs = Math.max(1, opts.runs ?? 3);
 
   // Count every request and response byte the loader causes.
+  // Rows are taken from the Content-Range header so progress adds no parsing to the timed load.
   let requests = 0;
   let bytes = 0;
+  let rowsRead = 0;
   const countingFetch: typeof fetch = async (input, init) => {
     const res = await fetch(input, init);
     const body = await res.arrayBuffer();
     requests++;
     bytes += body.byteLength;
+    rowsRead += rowsFromContentRange(res.headers.get("content-range"));
     return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
   };
 
@@ -131,7 +164,10 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
 
     const asOfUtc = new Date().toISOString();
     const rows: MeasureRow[] = [];
-    for (const c of MEASURE_CASES) {
+    const snapshot = (): MeasureResult => ({ email: opts.email, role, sites, asOfUtc, runs, rows: [...rows] });
+    opts.onUpdate?.(snapshot());
+    const heartbeatMs = Math.max(1_000, opts.heartbeatMs ?? 10_000);
+    for (const [caseIndex, c] of MEASURE_CASES.entries()) {
       const range = productionRange(c.site, c.first, c.last);
       const window = { startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive };
       const visibility = productionVisibilityFor(role, siteSet.has(c.site));
@@ -153,28 +189,42 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
       let reqs = 0;
       let payload = 0;
       let error: string | null = countError ? `server count failed: ${countError.message}` : null;
+      const progress = (phase: MeasureProgress["phase"], run: number, elapsedMs: number) =>
+        opts.onProgress?.({
+          phase, label: c.label, caseIndex: caseIndex + 1, caseCount: MEASURE_CASES.length, run, runs,
+          serverCount: serverCount ?? null, requests, rowsRead, elapsedMs: Math.round(elapsedMs),
+        });
+      requests = 0;
+      rowsRead = 0;
+      progress("case-start", 0, 0);
       for (let i = 0; i < runs && !error; i++) {
         requests = 0;
         bytes = 0;
+        rowsRead = 0;
         const t0 = performance.now();
+        const beat = setInterval(() => progress("heartbeat", i + 1, performance.now() - t0), heartbeatMs);
         try {
-          const snapshot = await loadProductionEvidence(client, { site: c.site, range: window, asOfUtc, visibility });
+          const evidence = await loadProductionEvidence(client, { site: c.site, range: window, asOfUtc, visibility });
+          clearInterval(beat);
           const t1 = performance.now();
-          summarizeProduction(prepareProductionEvidence(snapshot), { range: window });
+          summarizeProduction(prepareProductionEvidence(evidence), { range: window });
           const t2 = performance.now();
           loadTimes.push(t1 - t0);
           countTimes.push(t2 - t1);
-          loaded = snapshot.events.length;
+          loaded = evidence.events.length;
           const s = Date.parse(window.startUtc);
           const e = Date.parse(window.endUtcExclusive);
-          inWindow = snapshot.events.filter((ev) => {
+          inWindow = evidence.events.filter((ev) => {
             const ms = Date.parse(ev.created_at);
             return ms >= s && ms < e;
           }).length;
           reqs = requests;
           payload = bytes;
+          progress("run-done", i + 1, t1 - t0);
         } catch (e) {
           error = e instanceof ProductionReadError ? `${e.kind}: ${e.message}` : String(e);
+        } finally {
+          clearInterval(beat);
         }
       }
 
@@ -199,8 +249,10 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
         complete,
         withinTarget: complete && loadMs !== null && countMs !== null && loadMs + countMs <= c.targetMs,
       });
+      progress("case-done", runs, loadMs ?? 0);
+      opts.onUpdate?.(snapshot());
     }
-    return { email: opts.email, role, sites, asOfUtc, runs, rows };
+    return snapshot();
   } finally {
     await client.auth.signOut();
   }

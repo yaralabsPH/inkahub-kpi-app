@@ -31,6 +31,17 @@ The command (`tests/staging/run-item-counting.ts`):
 `.env.staging.local` and `staging-results-*.md` are git-ignored, and CI fails
 if one is ever committed.
 
+**Progress and stopping.** The console prints each step and, during each
+load, a heartbeat every 10 s: case, run, elapsed time, requests and rows read.
+The report file is rewritten after every statement, finished case and
+heartbeat. If you stop the command with Ctrl+C, or it is killed, the report
+keeps everything that finished. It ends with `STATUS: FAILED – … stopped
+during <step>`, so a stopped run never reads as complete.
+
+**Expected duration.** With the current indexes, the AU three-month case takes
+about 12 minutes per run (see the plan's Open questions); 3 runs take about
+35 minutes. The other cases are much shorter.
+
 ## Files
 
 | File | What it does |

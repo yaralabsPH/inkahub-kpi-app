@@ -13,27 +13,30 @@
  *   4. Writes the report, ending with "STATUS: COMPLETE" or
  *      "STATUS: FAILED – <reason>", and exits non-zero on failure.
  *
+ * Progress: the console shows each step and a heartbeat every 10 s while a
+ * load runs. The report is rewritten after every SQL statement, measured
+ * case and heartbeat, so stopping the command (Ctrl+C) or killing it keeps
+ * every finished result; an unfinished report always ends with FAILED.
+ *
  * Credentials are never printed or written to the report.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import pg from "pg";
 import { splitSqlStatements } from "./sqlStatements";
-import { measureItemCounting, measureTable, STAGING_REF, assertStagingSupabaseUrl } from "./measure-item-counting";
 import {
-  checkItemCountingEvidence,
-  overTarget,
-  statusLine,
-  SQL_FILES,
-  type FileRun,
-  type MeasureOutcome,
-  type StatementResult,
-} from "./itemCountingEvidence";
+  measureItemCounting,
+  STAGING_REF,
+  assertStagingSupabaseUrl,
+  type MeasureProgress,
+} from "./measure-item-counting";
+import { SQL_FILES, type FileRun } from "./itemCountingEvidence";
+import { buildReport, type GateState } from "./itemCountingReport";
 
 const ENV_FILE = ".env.staging.local";
 const REPORT_FILE = "staging-results-item-counting.md";
+const REPORT_TMP = "staging-results-item-counting.tmp.md";
 const SQL_DIR = "supabase/staging/item-counting/";
-const MAX_ROWS_SHOWN = 500;
 
 const REQUIRED = [
   "STAGING_DB_URL",
@@ -86,40 +89,72 @@ function stagingDbConfig(raw: string): pg.ClientConfig {
   };
 }
 
-function cell(v: unknown): string {
-  if (v === null || v === undefined) return "∅";
-  const s = v instanceof Date ? v.toISOString() : typeof v === "object" ? JSON.stringify(v) : String(v);
-  return s.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+function gitRevision(): string {
+  try {
+    return execSync("git rev-parse --short HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return "unknown";
+  }
 }
 
-function resultMarkdown(r: StatementResult): string {
-  const head = `#### Statement ${r.index} · line ${r.line} · \`${r.label.replace(/`/g, "'")}\`\n\n` +
-    `command: ${r.command ?? "–"} · rows: ${r.rowCount ?? r.rows.length} · ${r.ms} ms` +
-    (r.error ? `\n\n**ERROR:** ${r.error}` : "") +
-    (r.notices.length ? `\n\nnotices: ${r.notices.join("; ")}` : "");
-  if (r.command === "EXPLAIN") {
-    return `${head}\n\n\`\`\`\n${r.rows.map((row) => String(Object.values(row)[0])).join("\n")}\n\`\`\``;
+const state: GateState = {
+  startedAt: new Date().toISOString(),
+  revision: gitRevision(),
+  runs: [],
+  measures: { owner: undefined, manager: undefined },
+  current: "reading settings",
+  lastProgress: null,
+  stopped: null,
+  fatal: null,
+  finishedAt: null,
+};
+
+/** Rewrite the report from the current state (write-then-rename, so a kill never leaves half a file). */
+function saveReport(): ReturnType<typeof buildReport> {
+  const report = buildReport(state);
+  try {
+    writeFileSync(REPORT_TMP, report.markdown, "utf8");
+    renameSync(REPORT_TMP, REPORT_FILE);
+  } catch (e) {
+    console.error(`Could not write ${REPORT_FILE}: ${e instanceof Error ? e.message : String(e)}`);
   }
-  if (!r.rows.length || !r.fields.length) return head;
-  const shown = r.rows.slice(0, MAX_ROWS_SHOWN);
-  const table = [
-    `| ${r.fields.join(" | ")} |`,
-    `| ${r.fields.map(() => "---").join(" | ")} |`,
-    ...shown.map((row) => `| ${r.fields.map((f) => cell(row[f])).join(" | ")} |`),
-  ].join("\n");
-  const more = r.rows.length > shown.length ? `\n\n(${r.rows.length - shown.length} more rows not shown)` : "";
-  return `${head}\n\n${table}${more}`;
+  return report;
+}
+
+function mmss(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
+function progressLine(who: string, p: MeasureProgress): string {
+  const where = `${who} · case ${p.caseIndex}/${p.caseCount} ${p.label}`;
+  const target = p.serverCount === null ? "?" : p.serverCount.toLocaleString("en");
+  switch (p.phase) {
+    case "case-start":
+      return `${where} · server counts ${target} in-window rows · ${p.runs} run(s)`;
+    case "heartbeat":
+      return `${where} · run ${p.run}/${p.runs} · ${mmss(p.elapsedMs)} · ${p.requests} requests · ${p.rowsRead.toLocaleString("en")} rows read (one pass ≈ ${target} + context; the loader reads twice)`;
+    case "run-done":
+      return `${where} · run ${p.run}/${p.runs} done in ${mmss(p.elapsedMs)} (${p.elapsedMs} ms) · ${p.requests} requests`;
+    case "case-done":
+      return `${where} · finished (median load ${p.elapsedMs} ms)`;
+  }
 }
 
 async function runSqlFile(client: pg.Client, file: string, notices: string[]): Promise<FileRun> {
   const statements = splitSqlStatements(readFileSync(SQL_DIR + file, "utf8"));
   const run: FileRun = { file, statements: statements.length, results: [] };
+  state.runs.push(run);
   console.log(`\n${file}: ${statements.length} statements`);
   for (const s of statements) {
+    state.current = `${file} · statement ${s.index}/${statements.length} (line ${s.line})`;
+    state.lastProgress = s.label.slice(0, 80);
+    saveReport();
     notices.length = 0;
     const t0 = performance.now();
     try {
       const res = await client.query(s.text);
+      const ms = Math.round(performance.now() - t0);
       run.results.push({
         index: s.index,
         line: s.line,
@@ -129,10 +164,10 @@ async function runSqlFile(client: pg.Client, file: string, notices: string[]): P
         fields: (res.fields ?? []).map((f) => f.name),
         rows: res.rows ?? [],
         notices: [...notices],
-        ms: Math.round(performance.now() - t0),
+        ms,
         error: null,
       });
-      console.log(`  ${s.index}. ${res.command ?? "?"} ${res.rowCount ?? ""} (${Math.round(performance.now() - t0)} ms) ${s.label.slice(0, 60)}`);
+      console.log(`  ${s.index}. ${res.command ?? "?"} ${res.rowCount ?? ""} (${ms} ms) ${s.label.slice(0, 60)}`);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       run.results.push({
@@ -148,29 +183,19 @@ async function runSqlFile(client: pg.Client, file: string, notices: string[]): P
       break; // later statements depend on this one
     }
   }
+  saveReport();
   return run;
 }
 
-function gitRevision(): string {
-  try {
-    return execSync("git rev-parse --short HEAD", { encoding: "utf8" }).trim();
-  } catch {
-    return "unknown";
-  }
-}
-
 async function main(): Promise<number> {
-  const startedAt = new Date().toISOString();
-  const runs: FileRun[] = [];
-  const measures: { owner: MeasureOutcome; manager: MeasureOutcome } = { owner: undefined, manager: undefined };
-  let fatal: string | null = null;
-
   try {
     const settings = readSettings();
     const dbConfig = stagingDbConfig(settings.STAGING_DB_URL);
     assertStagingSupabaseUrl(settings.STAGING_SUPABASE_URL);
     const repeat = Math.max(1, Number(settings.STAGING_RUNS ?? 3) || 3);
 
+    state.current = "connecting to the staging database";
+    saveReport();
     const client = new pg.Client(dbConfig);
     const notices: string[] = [];
     client.on("notice", (n) => notices.push(n.message ?? String(n)));
@@ -178,75 +203,74 @@ async function main(): Promise<number> {
     try {
       for (const file of SQL_FILES) {
         const run = await runSqlFile(client, file, notices);
-        runs.push(run);
         if (run.results.some((r) => r.error) || run.results.length !== run.statements) break;
       }
     } finally {
       await client.end();
     }
 
-    const sqlOk = runs.length === SQL_FILES.length && runs.every((r) => !r.results.some((x) => x.error));
+    const sqlOk = state.runs.length === SQL_FILES.length && state.runs.every((r) => !r.results.some((x) => x.error));
     if (sqlOk) {
       for (const who of ["owner", "manager"] as const) {
-        console.log(`\nMeasuring as ${who}…`);
+        console.log(`\nMeasuring as ${who} (${repeat} run(s) per case)…`);
+        state.current = `measuring as ${who} · signing in`;
+        state.lastProgress = null;
+        saveReport();
         try {
-          measures[who] = await measureItemCounting({
+          state.measures[who] = await measureItemCounting({
             supabaseUrl: settings.STAGING_SUPABASE_URL,
             anonKey: settings.STAGING_SUPABASE_ANON_KEY,
             email: who === "owner" ? settings.STAGING_OWNER_EMAIL : settings.STAGING_MANAGER_EMAIL,
             password: who === "owner" ? settings.STAGING_OWNER_PASSWORD : settings.STAGING_MANAGER_PASSWORD,
             runs: repeat,
+            onUpdate: (partial) => {
+              state.measures[who] = partial;
+              saveReport();
+            },
+            onProgress: (p) => {
+              const line = progressLine(who, p);
+              console.log(`  ${line}`);
+              state.current = `measuring as ${who} · case ${p.caseIndex}/${p.caseCount} ${p.label}${p.run ? ` · run ${p.run}/${p.runs}` : ""}`;
+              state.lastProgress = `${new Date().toISOString()} · ${line}`;
+              saveReport();
+            },
           });
         } catch (e) {
-          measures[who] = { error: e instanceof Error ? e.message : String(e) };
+          // Keep any finished cases; record the failure for the rest.
+          const message = e instanceof Error ? e.message : String(e);
+          const partial = state.measures[who];
+          if (partial && !("error" in partial) && partial.rows.length) state.fatal = `measurement as ${who} stopped: ${message}`;
+          else state.measures[who] = { error: message };
         }
       }
     }
   } catch (e) {
-    fatal = e instanceof Error ? e.message : String(e);
+    state.fatal = e instanceof Error ? e.message : String(e);
   }
 
-  const problems = fatal ? [fatal, ...checkItemCountingEvidence(runs, measures)] : checkItemCountingEvidence(runs, measures);
-  const slow = overTarget(measures);
-  const status = statusLine(problems);
-
-  const parts: string[] = [
-    "# item-counting · staging gate results",
-    "",
-    `- project: ${STAGING_REF} (staging)`,
-    `- code revision: ${gitRevision()}`,
-    `- started: ${startedAt} · finished: ${new Date().toISOString()}`,
-    "- generated by `npm run staging:item-counting`; credentials are not recorded",
-  ];
-  for (const run of runs) {
-    parts.push("", `## ${run.file} (${run.results.length} of ${run.statements} statements)`, "");
-    for (const r of run.results) parts.push(resultMarkdown(r), "");
-  }
-  for (const who of ["owner", "manager"] as const) {
-    const m = measures[who];
-    parts.push("", `## Loader measurements as ${who}`, "");
-    if (!m) parts.push("Not run.");
-    else if ("error" in m) parts.push(`**FAILED:** ${m.error}`);
-    else parts.push(measureTable(m));
-  }
-  parts.push("", "## Checks", "");
-  parts.push(problems.length ? problems.map((p) => `- MISSING/WRONG: ${p}`).join("\n") : "- Every expected result is present and non-empty.");
-  parts.push("", "## Latency targets (one day ≤ 2,000 ms, three months ≤ 10,000 ms)", "");
-  parts.push(
-    problems.length
-      ? "- Not assessed: evidence is incomplete."
-      : slow.length
-        ? `${slow.map((s) => `- OVER TARGET: ${s}`).join("\n")}\n\nEvidence is complete but targets were missed: the coder records this as an Open question in the plan and does not start Task 5.`
-        : "- All cases within target.",
-  );
-  parts.push("", status, "");
-  writeFileSync(REPORT_FILE, parts.join("\n"), "utf8");
-
+  state.current = null;
+  state.finishedAt = new Date().toISOString();
+  const report = saveReport();
   console.log(`\nWrote ${REPORT_FILE}`);
-  if (slow.length && !problems.length) console.log(`${slow.length} case(s) over latency target.`);
-  console.log(status);
-  return problems.length ? 1 : 0;
+  if (report.slow.length) console.log(`${report.slow.length} case(s) over latency target.`);
+  console.log(report.status);
+  return report.problems.length ? 1 : 0;
 }
+
+let stopping = false;
+function stop(signal: string): void {
+  if (stopping) process.exit(130);
+  stopping = true;
+  state.stopped = `${signal} received`;
+  state.finishedAt = new Date().toISOString();
+  const report = saveReport();
+  console.log(`\nStopped (${signal}). Finished evidence is saved in ${REPORT_FILE}.`);
+  console.log(report.status);
+  process.exit(130);
+}
+process.on("SIGINT", () => stop("SIGINT"));
+process.on("SIGTERM", () => stop("SIGTERM"));
+process.on("SIGBREAK", () => stop("SIGBREAK"));
 
 main().then(
   (code) => {
