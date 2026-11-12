@@ -1,7 +1,7 @@
 # Spec: Count production items separately from orders
 
 - Slug: `item-counting` · Roadmap ID: `F1` (see [ROADMAP.md](../ROADMAP.md))
-- Status: draft
+- Status: approved by CJ
 - Author: planner (GPT-6 Astra)
 - Source baseline: `57b89d2bec371c2aca66c2098fa2e57c7e3d73a7` (main after digest-auth PR #6)
 - Decision sources: [ROADMAP-REVIEW.md](../ROADMAP-REVIEW.md), especially the CJ decision register, F1 analysis and shared report-period recommendation. Draft details below become implementation requirements only after CJ approves this spec.
