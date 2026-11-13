@@ -9,19 +9,11 @@
  */
 import type pg from "pg";
 import { checkPolicySet, type ParityArtifact } from "./itemCountingPolicyParity";
-import { APPLY_TIMEOUT, catalog } from "./policyParityRun";
+import { APPLY_TIMEOUT, catalog, PRE_0036_RESTORE } from "./policyParityRun";
 import { deductSummary, STEPS, type Actor, type PolicySet, type SetOutcome, type StepOutcome } from "./writeCompat";
 
-/** The plan's policy rollback body (Release and rollback), without BEGIN/COMMIT. */
-export const PRE_0036_RESTORE = [
-  "set local search_path = public",
-  "drop policy production_events_read on public.production_events",
-  "drop policy production_events_select on public.production_events",
-  `create policy production_events_read on production_events for select
-  using (can_access_location(location) and (staff_id = auth.uid() or is_manager_or_higher()))`,
-  `create policy production_events_select on production_events for select
-  using (can_access_location(location) and (staff_id = auth.uid() or current_user_role() in ('owner', 'manager', 'cs', 'kiosk')))`,
-];
+/** The plan's policy rollback body (shared with the four-case parity collector). */
+export { PRE_0036_RESTORE };
 
 async function become(client: pg.Client, actor: Actor, claimsText: Record<string, string>): Promise<void> {
   await client.query("reset role");

@@ -51,6 +51,68 @@ Results go to `staging-results-item-counting.policy-parity.json` and
 `staging-results-item-counting-policy-parity.md` (git-ignored, ending with a
 STATUS line).
 
+Steps 1–5 are now **history**: they cannot certify parity on their own
+(review r1, M6). Acceptance is the four-case run below.
+
+## Four-case parity after 0036 (acceptance, M6 amendment)
+
+Staging already has 0036, so the four required cases are collected in one
+command, on its own (any other flag is refused):
+
+```sh
+npm run staging:item-counting -- --policy-parity=cases
+```
+
+**Required state before running:** standard memberships exactly —
+owner and kiosk on `au, staging, uk, us`; manager, staff and cs on
+`au, staging`. No fixture or membership administration may run at the same
+time. The original `--policy-parity=before` standard snapshot must still be in
+`staging-results-item-counting.policy-parity.json`: its pre-0036 policy hash
+is the authority the restore must reproduce.
+
+What it does, all on ONE connection in ONE `REPEATABLE READ` transaction that
+always ends in `ROLLBACK` (also on errors, timeouts and Ctrl+C):
+
+1. Checks the installed policies are the approved post-0036 set (and match the
+   retained post-0036 hash), records the fixture fingerprint, month bounds and
+   all five users' memberships, and refuses to continue unless they are
+   standard.
+2. Runs each case under its own savepoint, changing only that user's
+   memberships inside the transaction:
+
+   | Case | Change (transaction-local) | Identities read |
+   |---|---|---|
+   | `baseline` | none | owner, manager, staff, kiosk, cs, no-subject |
+   | `manager-all-sites` | add manager `uk`, `us` | manager |
+   | `owner-denied-uk` | remove owner `uk` | owner |
+   | `kiosk-denied-uk` | remove kiosk `uk` | kiosk |
+
+3. Reads each identity's complete per-site rows and the 11 direct-reader
+   replays under installed 0036, then, under a nested savepoint, restores the
+   exact pre-0036 SELECT policy text (the plan's Policy rollback body, no
+   BEGIN/COMMIT) and reads again. Every read is `authenticated`, RLS on,
+   bypass-RLS off, real session claims and the catalog 8 s limit. The nested
+   savepoint and then the case savepoint are rolled back, and memberships are
+   re-checked before the next case.
+4. After `ROLLBACK`, a fresh statement re-reads the five users' memberships,
+   the installed policy hash and the fixture fingerprint (the restoration
+   check).
+
+Nothing is committed: no membership, policy, migration-history or data change
+is kept. "Before" here is a restored-policy rehearsal, not a historical
+capture. The new collection is stored as `cases` in the parity artifact and
+replaces any earlier one, even when it failed. Each case must show identical
+row ids and reader results under both policy sets, positive coverage (every
+role sees rows at each populated member site; staff sees only its own rows;
+the no-subject session sees nothing; manager sees UK and US with membership;
+owner and kiosk see no UK rows and some AU rows without UK), and the
+restoration check must pass. The report is
+`staging-results-item-counting-policy-parity.md`, ending in one STATUS line.
+
+After a COMPLETE four-case run, rerun all three manager phases below with the
+same artifact (harness `item-counting-gate-v2.3`); older phase records do not
+count.
+
 ## Write paths, digest and anon (after 0036)
 
 `npm run staging:item-counting -- --write-compat` replays the app's own write

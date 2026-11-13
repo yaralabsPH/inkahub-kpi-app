@@ -25,7 +25,12 @@
  * `--policy-parity=before|after [--arrangement=standard|owner-kiosk-without-uk]`
  * instead captures/compares what every role can see around migration 0036
  * (staging-results-item-counting.policy-parity.json + its own report); it
- * times nothing and records no manager phase.
+ * times nothing and records no manager phase. These are history now.
+ *
+ * `--policy-parity=cases` (Task 4 M6 amendment) collects the four acceptance
+ * cases in one rolled-back transaction with the pre-0036 SELECT policies
+ * restored inside a nested savepoint, then checks restoration with a fresh
+ * statement. It must be run on its own (no other flags).
  *
  * Progress: the console shows each step and a heartbeat every 10 s while a
  * load runs. The report is rewritten after every SQL statement, measured
@@ -57,11 +62,13 @@ import { runGate, type GateIO } from "./itemCountingGate";
 import { buildReport, type GateState } from "./itemCountingReport";
 import { claimsSetting } from "./generate-query-evidence";
 import { signInClaims, SESSION_ROLES, type SessionRole } from "./stagingSessions";
-import { collectParitySnapshot } from "./policyParityRun";
+import { collectCaseParity, collectParitySnapshot } from "./policyParityRun";
+import { casesModeArgProblems, caseParityMarkdown, caseParityProblems } from "./itemCountingParityCases";
 import { collectWriteCompat } from "./writeCompatRun";
 import { checkSet, compareSets, STEPS } from "./writeCompat";
 import {
   ARRANGEMENTS,
+  baselinePolicyHash,
   checkSnapshot,
   compareSnapshots,
   redactSecrets,
@@ -89,11 +96,20 @@ if (PHASE_ARG !== undefined && !MANAGER_PHASES.includes(PHASE_ARG)) {
   console.error(`--manager-phase must be one of ${MANAGER_PHASES.join(", ")}`);
   process.exit(2);
 }
-const PARITY_ARG = ARGS.find((a) => a.startsWith("--policy-parity="))?.split("=")[1] as "before" | "after" | undefined;
-if (PARITY_ARG !== undefined && PARITY_ARG !== "before" && PARITY_ARG !== "after") {
-  console.error("--policy-parity must be before or after");
+const PARITY_ARG = ARGS.find((a) => a.startsWith("--policy-parity="))?.split("=")[1] as "before" | "after" | "cases" | undefined;
+if (PARITY_ARG !== undefined && PARITY_ARG !== "before" && PARITY_ARG !== "after" && PARITY_ARG !== "cases") {
+  console.error("--policy-parity must be cases (or the historical before/after)");
   process.exit(2);
 }
+if (PARITY_ARG === "cases") {
+  const refused = casesModeArgProblems(ARGS);
+  if (refused.length) {
+    for (const r of refused) console.error(r);
+    process.exit(2);
+  }
+}
+/** Cancels a running four-case collection; it still rolls back and records FAILED. */
+const CASES_ABORT = new AbortController();
 /** Parity and write-compat runs never touch the performance report. */
 const ALTERNATE_MODE = !!(PARITY_ARG || WRITE_COMPAT);
 const ARRANGEMENT = (ARGS.find((a) => a.startsWith("--arrangement="))?.split("=")[1] ?? "standard") as Arrangement;
@@ -310,6 +326,7 @@ async function main(): Promise<number> {
     state.claimsSources = sessions.sources;
     for (const [role, c] of Object.entries(sessions.sources)) console.log(`  ${role}: real session claims ${c.bytes} bytes${c.problems.length ? ` · ${c.problems[0]}` : ""}`);
 
+    if (PARITY_ARG === "cases") return await runCaseParity(dbConfig);
     if (PARITY_ARG) return await runParity(dbConfig, PARITY_ARG);
     if (WRITE_COMPAT) return await runWriteCompat(dbConfig);
 
@@ -441,6 +458,51 @@ async function runParity(dbConfig: pg.ClientConfig, mode: "before" | "after"): P
   return problems.length ? 1 : 0;
 }
 
+/** Write the parity artifact atomically (temp file, then rename). */
+function writeParity(art: ParityArtifact): void {
+  const tmp = `${PARITY_FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify(art), "utf8");
+  renameSync(tmp, PARITY_FILE);
+}
+
+/**
+ * `--policy-parity=cases`: the four M6 cases in one rolled-back transaction.
+ * The new collection replaces any earlier one in the artifact, even when it
+ * failed, so a failed run can never fall back to an older success.
+ */
+async function runCaseParity(dbConfig: pg.ClientConfig): Promise<number> {
+  const art: ParityArtifact = readParity() ?? { snapshots: [], comparisons: [] };
+  const lines: string[] = [];
+  const log = (l: string) => {
+    console.log(`  ${l}`);
+    lines.push(l);
+  };
+  console.log("\nPolicy parity · four cases (one transaction, rolled back; pre-0036 restored in a nested savepoint)");
+  const retained = art.comparisons.find((c) => c.arrangement === "standard" && c.problems.length === 0)?.afterHash ?? null;
+  const extra: string[] = [];
+  const client = new pg.Client(dbConfig);
+  client.on("error", (e) => console.error(`  database connection error: ${redactSecrets(e.message)}`));
+  let coll: Awaited<ReturnType<typeof collectCaseParity>> | null = null;
+  try {
+    await client.connect();
+    coll = await collectCaseParity(client, {
+      revision: state.revision, claimsText, baselinePolicyHash: baselinePolicyHash(art), expectedInstalledHash: retained, log, signal: CASES_ABORT.signal,
+    });
+    art.cases = coll;
+    writeParity(art);
+  } catch (e) {
+    extra.push(redactSecrets(e instanceof Error ? e.message : String(e)));
+  } finally {
+    await client.end().catch(() => {});
+  }
+  const problems = [...extra, ...caseParityProblems(baselinePolicyHash(art), coll, state.claimsSources)].map(redactSecrets);
+  const { markdown, status } = caseParityMarkdown({ coll, problems, lines, claimsSources: state.claimsSources, revision: state.revision, project: STAGING_REF, finishedAt: new Date().toISOString() });
+  writeFileSync(PARITY_REPORT, markdown, "utf8");
+  console.log(`\nWrote ${PARITY_REPORT}`);
+  console.log(status);
+  return problems.length ? 1 : 0;
+}
+
 /** `--write-compat`: app write paths, digest and anon checks with 0036 and restored pre-0036 policies, all rolled back. */
 async function runWriteCompat(dbConfig: pg.ClientConfig): Promise<number> {
   const lines: string[] = [];
@@ -493,6 +555,13 @@ let stopping = false;
 function stop(signal: string): void {
   if (stopping) process.exit(130);
   stopping = true;
+  if (PARITY_ARG === "cases") {
+    // Let the collector reach ROLLBACK and the fresh restoration check; it records FAILED (cancelled).
+    // A second signal quits at once; the server then rolls the open transaction back.
+    console.log(`\nStopping (${signal}): rolling back and checking restoration. Press again to quit immediately.`);
+    CASES_ABORT.abort();
+    return;
+  }
   if (ALTERNATE_MODE) {
     console.log(`
 Stopped (${signal}). STATUS: FAILED – stopped before completion`);

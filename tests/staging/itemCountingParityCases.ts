@@ -13,6 +13,7 @@ import {
   checkPolicySet,
   PARITY_SITES,
   READER_PROBES,
+  type ClaimsSource,
   type ParityRole,
   type PolicyRow,
   type RoleSnapshot,
@@ -265,4 +266,93 @@ export function caseCollectionHash(coll: CaseCollection): string {
     comparisons: coll.comparisons, restoration: coll.restoration,
   };
   return createHash("sha256").update(JSON.stringify(body), "utf8").digest("hex");
+}
+
+/**
+ * `--policy-parity=cases` collects all four cases in one invocation; it must
+ * not be combined with setup/seed/cleanup, performance/manager-phase flags or
+ * a single-case/legacy arrangement selector. Returns the reasons to refuse.
+ */
+export function casesModeArgProblems(args: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const a of args) {
+    if (a === "--policy-parity=cases") continue;
+    const flag = a.split("=")[0];
+    if (flag === "--policy-parity") out.push(`${a} cannot be combined with --policy-parity=cases`);
+    else if (flag === "--arrangement" || flag === "--parity-case") out.push(`${flag} selects a single/legacy arrangement; --policy-parity=cases collects all four cases`);
+    else if (flag === "--measure-only" || flag === "--manager-phase") out.push(`${flag} is a performance flag; parity collection times nothing and records no phase`);
+    else if (flag === "--write-compat") out.push("--write-compat is a separate rehearsal; run it on its own");
+    else out.push(`${a} is not allowed with --policy-parity=cases (no setup, seeding or cleanup)`);
+  }
+  return out;
+}
+
+/**
+ * Everything that keeps a `--policy-parity=cases` run from passing: session
+ * claims problems, SQL claims sizes that differ from the signed-in session,
+ * and the full artifact check against the installed hash and original baseline.
+ */
+export function caseParityProblems(
+  baselineHash: string | null,
+  coll: CaseCollection | null,
+  claimsSources: Record<string, ClaimsSource>,
+): string[] {
+  const out: string[] = [];
+  for (const c of Object.values(claimsSources)) out.push(...c.problems);
+  if (!coll) return [...out, "the four-case collection did not run"];
+  for (const ev of coll.cases) {
+    for (const side of [ev.after, ev.before]) {
+      for (const [role, r] of Object.entries(side.roles)) {
+        if (role === "no-subject" || !r) continue;
+        if (r.claimsBytes !== claimsSources[role]?.bytes) out.push(`${ev.case}: ${role} SQL claims size differs from the session's`);
+      }
+    }
+  }
+  out.push(...checkCaseCollection(coll, coll.installedPolicyHash || null, baselineHash));
+  return [...new Set(out)];
+}
+
+const cell = (s: string) => s.replace(/\|/g, "/").replace(/\n/g, " ");
+
+/** The `--policy-parity=cases` report; ends with exactly one STATUS line. */
+export function caseParityMarkdown(input: {
+  coll: CaseCollection | null;
+  problems: string[];
+  lines: string[];
+  claimsSources: Record<string, ClaimsSource>;
+  revision: string;
+  project: string;
+  finishedAt: string;
+}): { markdown: string; status: string } {
+  const { coll, problems } = input;
+  const status = problems.length ? `STATUS: FAILED – ${cell(problems[0])}${problems.length > 1 ? ` (+${problems.length - 1} more)` : ""}` : "STATUS: COMPLETE";
+  const table = coll
+    ? [
+        "| Case | Identities | Policies restored pre-0036 → installed 0036 | Rows seen (0036) | Result |",
+        "|---|---|---|---|---|",
+        ...PARITY_CASES.map((k) => {
+          const cmp = coll.comparisons.find((x) => x.case === k);
+          if (!cmp) return `| ${k} | ${CASE_SPECS[k].roles.join(", ")} | – | – | not collected |`;
+          const rows = Object.entries(cmp.counts).filter(([, n]) => n > 0).map(([key, n]) => `${key} ${n.toLocaleString("en")}`).join("; ") || "none";
+          return `| ${k} | ${CASE_SPECS[k].roles.join(", ")} | ${cmp.beforeHash.slice(0, 12)} → ${cmp.afterHash.slice(0, 12)} | ${rows} | ${cmp.problems.length ? `FAILED: ${cell(cmp.problems[0])}` : "identical"} |`;
+        }),
+        "",
+        `- collection ${coll.collectionId} · fixture ${coll.fixtureHash || "not read"} · pre-0036 baseline ${coll.baselinePolicyHash || "missing"} · installed ${coll.installedPolicyHash || "not read"}`,
+        `- restoration: ${coll.restoration ? `${coll.restoration.passed ? "passed" : `FAILED (${cell(coll.restoration.problems[0] ?? "unknown")})`} at ${coll.restoration.checkedAt}` : "not checked"}`,
+      ]
+    : ["- No collection."];
+  const markdown = [
+    "# item-counting · four-case policy parity (0036, M6)",
+    "",
+    `- project: ${input.project} (staging) · code revision: ${input.revision} · finished: ${input.finishedAt}`,
+    `- method: ${CASE_METHOD} — one REPEATABLE READ transaction that always ends in ROLLBACK; "before" is the exact pre-0036 SELECT policy text restored in a nested savepoint, not a historical capture`,
+    "- every read is `authenticated` with RLS on, real-session claims and the catalog statement_timeout; claim values are never recorded",
+    "", "## Cases", "", ...table,
+    "", "## Log", "", ...input.lines.map((l) => `- ${l}`),
+    "", "## Real-session claims (sizes only)", "", ...Object.entries(input.claimsSources).map(([r, c]) => `- ${r}: ${c.bytes} bytes`),
+    "", "## Checks", "",
+    ...(problems.length ? problems.map((p) => `- MISSING/WRONG: ${p}`) : ["- All four cases identical under restored pre-0036 and installed 0036, with positive coverage, real denials and a passed fresh restoration check."]),
+    "", status, "",
+  ].join("\n");
+  return { markdown, status };
 }

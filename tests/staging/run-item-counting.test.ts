@@ -176,6 +176,37 @@ describe("runGate: claims and policy parity come before any API timing", () => {
     expect(buildReport({ ...state, current: null, finishedAt: "f" }).status).toMatch(/policy parity has not been run/);
   });
 
+  it("a failed or legacy-only parity artifact starts no API measurement and records no phase (review r1 M6)", async () => {
+    const variants: Array<(s: GateState) => void> = [
+      (s) => void (s.parity!.cases = null),
+      (s) => void (s.parity!.cases!.restoration = { checkedAt: "t", passed: false, problems: ["cs memberships"] }),
+      (s) => void (s.parity!.cases!.problems = ["cancelled before completion"]),
+      (s) => void (s.parity!.cases!.cases = s.parity!.cases!.cases.filter((c) => c.case !== "owner-denied-uk")),
+    ];
+    for (const change of variants) {
+      const { state, io, written } = setup(query03);
+      change(state);
+      await runGate(state, io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
+      expect(io.measure).not.toHaveBeenCalled();
+      expect(written).toHaveLength(0);
+      expect(buildReport({ ...state, current: null, finishedAt: "f" }).status).toMatch(/^STATUS: FAILED – /);
+    }
+  });
+
+  it("a v2.2 phase record does not count towards the v2.3 phase order", async () => {
+    expect(HARNESS_VERSION).toBe("item-counting-gate-v2.3");
+    const first = setup(query03);
+    await runGate(first.state, first.io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
+    const clean = first.written[0][0];
+    // Same identity in every respect except the harness version, already through all-sites.
+    const old: PhaseRecord[] = [{ ...clean, harnessVersion: "item-counting-gate-v2.2" }, { ...clean, phase: "all-sites", harnessVersion: "item-counting-gate-v2.2" }];
+    const { state, io } = setup(query03, undefined, old);
+    await runGate(state, io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
+    expect(state.managerPhase).toBe("denied-before");
+    const report = buildReport({ ...state, current: null, finishedAt: "f" });
+    expect(report.status).toMatch(/awaiting manager phases all-sites, denied-after/);
+  });
+
   it("minimal claims start no API measurement", async () => {
     const { state, io } = setup(() => {
       const q = query03();

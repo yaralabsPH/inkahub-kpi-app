@@ -140,9 +140,22 @@ export function buildReport(state: GateState): GateReport {
   for (const [role, c] of Object.entries(state.claimsSources)) parts.push(`| ${role} | ${c.bytes} | ${c.problems.length ? cell(c.problems.join("; ")) : "none"} |`);
   if (!Object.keys(state.claimsSources).length) parts.push("| – | – | no sessions signed in |");
   parts.push("", "## Policy parity (0036)", "");
-  if (!state.parity || !state.parity.comparisons.length) parts.push("- No completed before/after comparison.");
+  const cases = state.parity?.cases;
+  if (!state.parity) parts.push("- No parity artifact.");
+  else parts.push(`- parity artifact hash: ${parityArtifactHash(state.parity)}`);
+  parts.push("", "### Four-case acceptance (in-transaction policy restore)", "");
+  if (!cases) parts.push("- Not collected: run `--policy-parity=cases`.");
   else {
-    parts.push(`- parity artifact hash: ${parityArtifactHash(state.parity)}`, "", "| Arrangement | Compared | Policies before → after | Result |", "|---|---|---|---|");
+    parts.push(
+      `- collection ${cases.collectionId} at ${cases.capturedAt} · restoration ${cases.restoration ? (cases.restoration.passed ? "passed" : "FAILED") : "not checked"}${cases.problems.length ? ` · FAILED: ${cell(cases.problems[0])}` : ""}`,
+      "", "| Case | Policies restored pre-0036 → 0036 | Result |", "|---|---|---|",
+    );
+    for (const c of cases.comparisons) parts.push(`| ${c.case} | ${c.beforeHash.slice(0, 12)} → ${c.afterHash.slice(0, 12)} | ${c.problems.length ? `FAILED: ${cell(c.problems[0])}` : "identical visibility"} |`);
+  }
+  parts.push("", "### History (cannot certify on its own)", "");
+  if (!state.parity?.comparisons.length) parts.push("- No before/after comparison.");
+  else {
+    parts.push("| Arrangement | Compared | Policies before → after | Result |", "|---|---|---|---|");
     for (const c of state.parity.comparisons) {
       parts.push(`| ${c.arrangement} | ${c.comparedAt} | ${c.beforeHash.slice(0, 12)} → ${c.afterHash.slice(0, 12)} | ${c.problems.length ? `FAILED: ${cell(c.problems[0])}` : "identical visibility"} |`);
     }
