@@ -16,7 +16,7 @@ import {
   PACKAGE_TYPES,
   parseSku,
   type ParsedSku,
-} from "./skuRouting";
+} from "./skuRouting.js";
 
 export type EligibleReason = "single_print" | "set_print" | "picture_frame";
 

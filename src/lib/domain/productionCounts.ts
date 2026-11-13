@@ -13,7 +13,7 @@
  * Browser/server safe: no env, browser state or Supabase imports.
  */
 
-import { countProductionItems, type ItemCount } from "./productionItems";
+import { countProductionItems, type ItemCount } from "./productionItems.js";
 
 export const WORK_TYPES = ["a0_framed", "framed", "unframed", "dispatch"] as const;
 export type WorkType = (typeof WORK_TYPES)[number];

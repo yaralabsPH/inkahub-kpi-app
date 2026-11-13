@@ -2,7 +2,8 @@
  * Daily KPI digest for one location.
  *
  * GET /api/reports/daily-digest?location=au|us|uk
- *   Optional: &date=YYYY-MM-DD (target day, local TZ)
+ *   Optional: &date=YYYY-MM-DD (production date at the site; default: the
+ *                               site's current production date)
  *             &dry=1           (return xlsx to caller instead of emailing)
  *             &recipient=x@y   (override REPORT_RECIPIENT)
  *
@@ -14,12 +15,36 @@
  * themselves. Anything else gets 401 before any other work. A cron-
  * identifying header or an app login is NOT authorization. GET only.
  *
+ * Counts (F1) use the same code as the app: one production-evidence read
+ * for the report day and the day before under one cutoff, the shared
+ * reducer for Items/Orders/rework/coverage, and site production days that
+ * start at 04:00 local. A full-site report needs the server credential
+ * (SUPABASE_SERVICE_ROLE_KEY); without it the digest refuses rather than
+ * reporting an RLS-limited view as complete.
+ *
  * Sends via Resend using RESEND_API_KEY from env.
  */
 import { timingSafeEqual } from "node:crypto";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
 import { z } from "zod";
+import {
+  prepareProductionEvidence,
+  summarizeProduction,
+  type CoverageIssueKind,
+  type PreparedProductionEvidence,
+  type ProductionSummary,
+  type WorkType,
+} from "../../src/lib/domain/productionCounts.js";
+import {
+  isProductionDate,
+  productionDateAt,
+  productionRange,
+  shiftProductionDate,
+  type ProductionRange,
+  type ReportSite,
+} from "../../src/lib/domain/productionPeriods.js";
+import { loadProductionEvidence } from "../../src/lib/repository/supabase/productionEvidence.js";
 
 interface VercelRequest {
   method?: string;
@@ -47,120 +72,25 @@ const DEPT_LABELS: Record<Department, string> = {
   unframed:  "Unframed",
   dispatch:  "Dispatch",
 };
+const ISSUE_LABELS: Record<CoverageIssueKind, string> = {
+  invalid_event: "invalid saved events",
+  unclassified_sku: "unrecognised SKUs",
+  invalid_quantity: "missing or invalid quantities",
+  unresolved_parent: "corrections that could not be matched",
+  missing_completion_detail: "completions without line detail",
+  ambiguous_repeat: "possible repeated scans",
+};
 
-interface EventRow {
-  id: string;
-  staff_id: string;
-  department: string;
-  order_number: string;
-  line_sku: string | null;
-  line_quantity: number | null;
-  event_type: string;
-  parent_event_id: string | null;
-  created_at: string;
-}
 interface StaffRow { user_id: string; display_name: string; }
+interface ClockRow { id: string; staff_id: string | null; department: string | null; event_type: string; created_at: string; }
+
+/** Evidence read limit: well inside the function's own time budget. */
+const EVIDENCE_DEADLINE_MS = 25_000;
+const PAGE_SIZE = 1000;
 
 /* ============================================================
- * SKU helpers - trimmed copy of the client kpi rules so we can
- * run them on the server without importing browser code.
+ * Small helpers
  * ============================================================ */
-const RE_SET = /^INKA-S(\d)([A-Z]{2,3})(\d{4})-([A-Z0-9]+)-([A-Z]{2})$/;
-const RE_SINGLE = /^INKA-([A-Z]{2,3})(\d{4})-([A-Z0-9]+)-([A-Z]{2})$/;
-const RE_PF = /^INKA-PF(\d{4})-([A-Z0-9]+)-([A-Z]{2})$/;
-const RE_AUX_FP_NEW = /^INKA-AUX([A-Z]{2,4})$/;
-const RE_AUX_FP_LEGACY = /^INKA-AUX-FP-([A-Z]{2,3})-([A-Z0-9]+)$/;
-const RE_AUX_OTHER = /^INKA-AUX-([A-Z0-9]+)$/;
-const RE_GC = /^INKA-GC(\d{4})-(\d+)$/;
-
-interface ParsedSku {
-  type: "single_print" | "set_print" | "picture_frame" | "gift_card" | "aux_free_print" | "aux_other";
-  variant?: string;
-  setCount?: number;
-}
-
-function parseSku(rawSku: string | null | undefined): ParsedSku | null {
-  if (!rawSku) return null;
-  const sku = rawSku.trim().toUpperCase();
-  if (!sku.startsWith("INKA-")) return null;
-  let m: RegExpExecArray | null;
-  m = RE_AUX_FP_NEW.exec(sku);   if (m) return { type: "aux_free_print" };
-  m = RE_AUX_FP_LEGACY.exec(sku); if (m) return { type: "aux_free_print" };
-  if (sku.startsWith("INKA-AUX-")) {
-    m = RE_AUX_OTHER.exec(sku);
-    if (m) return { type: "aux_other" };
-  }
-  m = RE_GC.exec(sku);     if (m) return { type: "gift_card" };
-  m = RE_PF.exec(sku);     if (m) return { type: "picture_frame", variant: m[3] };
-  m = RE_SET.exec(sku);    if (m) return { type: "set_print", variant: m[5], setCount: Number(m[1]) };
-  m = RE_SINGLE.exec(sku); if (m) return { type: "single_print", variant: m[4] };
-  return null;
-}
-
-function isKpiEligibleSku(sku: string | null | undefined): boolean {
-  if (!sku) return false;
-  const p = parseSku(sku);
-  if (!p) return false;
-  if (p.type === "gift_card" || p.type === "aux_other" || p.type === "aux_free_print") return false;
-  if (p.type === "picture_frame") return true;
-  return p.variant === "FN" || p.variant === "FB" || p.variant === "FW";
-}
-
-function kpiUnitMultiplier(sku: string | null | undefined): number {
-  if (!sku) return 1;
-  const p = parseSku(sku);
-  if (p && p.type === "set_print" && typeof p.setCount === "number" && p.setCount > 0) return p.setCount;
-  return 1;
-}
-
-/* ============================================================
- * Date + timezone helpers
- * ============================================================ */
-
-/**
- * Given a Date and a timezone, return the local YYYY-MM-DD.
- */
-function ymdInTz(d: Date, tz: string): string {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return fmt.format(d); // en-CA gives YYYY-MM-DD
-}
-
-/**
- * Given YYYY-MM-DD (local) and tz, return the UTC ISO range
- * [startUtc, endUtc) for that local day.
- */
-function localDayRangeUtc(ymd: string, tz: string): { start: string; end: string } {
-  // Build a Date at 00:00 local by parsing "YYYY-MM-DDT00:00:00" as tz.
-  // Trick: use Intl to compute offset and construct via UTC.
-  const [y, m, d] = ymd.split("-").map(Number);
-  // We need midnight local in UTC. Approach: assume UTC, then shift.
-  // Use a reference Date at UTC midnight of ymd, then determine tz offset.
-  const utcMidnight = new Date(Date.UTC(y, m - 1, d, 0, 0, 0));
-  const localWall = ymdInTz(utcMidnight, tz);
-  // If localWall != ymd, offset is non-zero. Compute delta and shift.
-  const localWallDate = new Date(Date.UTC(
-    Number(localWall.slice(0, 4)),
-    Number(localWall.slice(5, 7)) - 1,
-    Number(localWall.slice(8, 10)),
-    0, 0, 0,
-  ));
-  const deltaMs = utcMidnight.getTime() - localWallDate.getTime();
-  const startUtc = new Date(utcMidnight.getTime() + deltaMs);
-  const endUtc = new Date(startUtc.getTime() + 24 * 3600 * 1000);
-  return { start: startUtc.toISOString(), end: endUtc.toISOString() };
-}
-
-function ymdShift(ymd: string, days: number): string {
-  const [y, m, d] = ymd.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + days);
-  return dt.toISOString().slice(0, 10);
-}
 
 function formatDDMMYY(ymd: string): string {
   const [y, m, d] = ymd.split("-");
@@ -172,107 +102,120 @@ function pct(now: number, prev: number): string {
   return ((now - prev) / prev * 100).toFixed(0) + "%";
 }
 
-/* ============================================================
- * Aggregation
- * ============================================================ */
-interface DeptTotals {
-  orders: Set<string>;
-  items: number;
-  boxes: number;
-  staff: Map<string, StaffTotals>;
+/** Items can be null when an exact total would overflow: never print a rounded guess. */
+function n(items: number | null): number | string {
+  return items === null ? "too large" : items;
 }
-interface StaffTotals {
+
+function localTime(ms: number | null, tz: string): string {
+  return ms == null ? "" : new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: tz });
+}
+
+function localStamp(iso: string, tz: string): string {
+  return new Date(iso).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short", timeZone: tz });
+}
+
+type PageQuery = { range(from: number, to: number): PromiseLike<{ data: unknown; error: { message: string } | null }> };
+
+/** Read every page of a query with a stable order; any page error fails the report. */
+async function readAll<T>(build: () => PageQuery, label: string): Promise<T[]> {
+  const out: T[] = [];
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await build().range(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`${label}: ${error.message}`);
+    const rows = (data ?? []) as T[];
+    out.push(...rows);
+    if (rows.length < PAGE_SIZE) return out;
+  }
+}
+
+/* ============================================================
+ * Day projection (shared counting; no local count rules here)
+ * ============================================================ */
+
+interface PersonDay {
   staff_id: string;
-  orders: Set<string>;
-  items: number;
+  normal: { items: number | null; orders: number };
+  rework: { items: number | null; orders: number };
   first_ts: number | null;
   last_ts: number | null;
   clock_in_ts: number | null;
   clock_out_ts: number | null;
 }
 
-function newDeptTotals(): DeptTotals {
-  return { orders: new Set(), items: 0, boxes: 0, staff: new Map() };
+interface DeptDay {
+  summary: ProductionSummary;
+  boxes: number;
+  people: Map<string, PersonDay>;
 }
 
-function ensureStaff(dept: DeptTotals, staff_id: string): StaffTotals {
-  let s = dept.staff.get(staff_id);
-  if (!s) {
-    s = { staff_id, orders: new Set(), items: 0, first_ts: null, last_ts: null, clock_in_ts: null, clock_out_ts: null };
-    dept.staff.set(staff_id, s);
-  }
-  return s;
+interface DayReport {
+  date: string;
+  range: ProductionRange;
+  summary: ProductionSummary;
+  depts: Record<Department, DeptDay>;
+  distinctStaff: Set<string>;
 }
 
-async function aggregateDay(
-  supabase: SupabaseClient,
-  location: string,
-  ymd: string,
-  tz: string,
-): Promise<{ depts: Record<Department, DeptTotals>; distinctStaff: Set<string> }> {
-  const { start, end } = localDayRangeUtc(ymd, tz);
-  const depts: Record<Department, DeptTotals> = {
-    a0_framed: newDeptTotals(),
-    framed:    newDeptTotals(),
-    unframed:  newDeptTotals(),
-    dispatch:  newDeptTotals(),
-  };
-  const distinctStaff = new Set<string>();
-
-  // production_events for the window.
-  const { data: eventRows, error: evErr } = await supabase
-    .from("production_events")
-    .select("id, staff_id, department, order_number, line_sku, line_quantity, event_type, parent_event_id, created_at")
-    .eq("location", location)
-    .gte("created_at", start)
-    .lt("created_at", end);
-  if (evErr) throw new Error(`production_events: ${evErr.message}`);
-
-  const events = (eventRows ?? []) as EventRow[];
-
-  // Cancelled parents to skip.
-  const cancelledIds = new Set<string>();
-  for (const ev of events) {
-    if (ev.event_type === "cancelled" && ev.parent_event_id) cancelledIds.add(ev.parent_event_id);
+function projectDay(
+  evidence: PreparedProductionEvidence,
+  site: ReportSite,
+  date: string,
+  clocks: readonly ClockRow[],
+): DayReport {
+  const range = productionRange(site, date, date);
+  const window = { startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive };
+  const startMs = Date.parse(range.startUtc);
+  const endMs = Date.parse(range.endUtcExclusive);
+  const summary = summarizeProduction(evidence, { range: window });
+  const distinctStaff = new Set<string>(Object.keys(summary.byPerson));
+  const depts = {} as Record<Department, DeptDay>;
+  for (const d of DEPARTMENTS) {
+    const s = summarizeProduction(evidence, { range: window, workTypes: [d as WorkType] });
+    const people = new Map<string, PersonDay>();
+    const person = (id: string) => {
+      let p = people.get(id);
+      if (!p) {
+        const g = s.byPerson[id];
+        p = {
+          staff_id: id,
+          normal: g ? { items: g.normal.items, orders: g.normal.orders } : { items: 0, orders: 0 },
+          rework: g ? { items: g.rework.items, orders: g.rework.orders } : { items: 0, orders: 0 },
+          first_ts: null, last_ts: null, clock_in_ts: null, clock_out_ts: null,
+        };
+        people.set(id, p);
+      }
+      return p;
+    };
+    for (const id of Object.keys(s.byPerson)) person(id);
+    // Shift span from this person's own completions here (fallback when no clock rows).
+    for (const t of evidence.terminals) {
+      if (t.reversed || t.workType !== d || t.ev.ms < startMs || t.ev.ms >= endMs || !t.ev.staff_id) continue;
+      const p = person(t.ev.staff_id);
+      if (p.first_ts == null || t.ev.ms < p.first_ts) p.first_ts = t.ev.ms;
+      if (p.last_ts == null || t.ev.ms > p.last_ts) p.last_ts = t.ev.ms;
+    }
+    depts[d] = { summary: s, boxes: 0, people };
   }
-
-  for (const ev of events) {
-    if (!(DEPARTMENTS as readonly string[]).includes(ev.department)) continue;
-    const dept = depts[ev.department as Department];
-    const ts = new Date(ev.created_at).getTime();
-
-    if (ev.event_type === "clock_in" || ev.event_type === "clock_out") {
-      distinctStaff.add(ev.staff_id);
-      const s = ensureStaff(dept, ev.staff_id);
-      if (ev.event_type === "clock_in") s.clock_in_ts = s.clock_in_ts == null ? ts : Math.min(s.clock_in_ts, ts);
-      else                              s.clock_out_ts = s.clock_out_ts == null ? ts : Math.max(s.clock_out_ts, ts);
-      continue;
+  for (const c of clocks) {
+    const ms = Date.parse(c.created_at);
+    if (!c.staff_id || !Number.isFinite(ms) || ms < startMs || ms >= endMs) continue;
+    if (!(DEPARTMENTS as readonly string[]).includes(c.department ?? "")) continue;
+    distinctStaff.add(c.staff_id);
+    const dept = depts[c.department as Department];
+    let p = dept.people.get(c.staff_id);
+    if (!p) {
+      p = { staff_id: c.staff_id, normal: { items: 0, orders: 0 }, rework: { items: 0, orders: 0 }, first_ts: null, last_ts: null, clock_in_ts: null, clock_out_ts: null };
+      dept.people.set(c.staff_id, p);
     }
-
-    // Orders (completions per dept)
-    if (ev.event_type === "completed" || ev.event_type === "dispatched") {
-      dept.orders.add(ev.order_number);
-      const s = ensureStaff(dept, ev.staff_id);
-      s.orders.add(ev.order_number);
-      distinctStaff.add(ev.staff_id);
-      if (s.first_ts == null || ts < s.first_ts) s.first_ts = ts;
-      if (s.last_ts == null || ts > s.last_ts) s.last_ts = ts;
-    }
-
-    // Items (line_verified with KPI eligibility)
-    if (ev.event_type === "line_verified" && !cancelledIds.has(ev.id)) {
-      if (!isKpiEligibleSku(ev.line_sku)) continue;
-      const mult = kpiUnitMultiplier(ev.line_sku);
-      const qty = (ev.line_quantity ?? 1) * mult;
-      dept.items += qty;
-      const s = ensureStaff(dept, ev.staff_id);
-      s.items += qty;
-      distinctStaff.add(ev.staff_id);
-    }
+    if (c.event_type === "clock_in") p.clock_in_ts = p.clock_in_ts == null ? ms : Math.min(p.clock_in_ts, ms);
+    else if (c.event_type === "clock_out") p.clock_out_ts = p.clock_out_ts == null ? ms : Math.max(p.clock_out_ts, ms);
   }
+  return { date, range, summary, depts, distinctStaff };
+}
 
-  // Boxes used from ledger, routed to the correct dept slot based on
-  // known package product codes / mail tube IDs.
+/** Boxes used from ledger, routed to the department slot by package code / mail tube id (unchanged rules). */
+async function addBoxes(supabase: SupabaseClient, location: string, days: DayReport[], asOfUtc: string): Promise<void> {
   //   A0-Double, A0-Single           -> a0_framed
   //   A1-Single, A1-Double-Wide,
   //   NZ, A2-Double, A3-A4           -> dispatch
@@ -280,129 +223,160 @@ async function aggregateDay(
   const A0_CODES = new Set<string>(["A0-Double", "A0-Single"]);
   const DISPATCH_CODES = new Set<string>(["A1-Single", "A1-Double-Wide", "NZ", "A2-Double", "A3-A4"]);
   const TUBE_IDS = new Set<string>(["sku-xniriygn", "sku-2jiumpm4"]);
-  const packageProductIdsAndCodes = await supabase
+  const products = await supabase
     .from("products")
     .select("id, code")
     .eq("location", location)
     .in("code", Array.from(new Set([...A0_CODES, ...DISPATCH_CODES])));
+  if (products.error) throw new Error(`products: ${products.error.message}`);
   const codeById = new Map<string, string>();
-  for (const p of (packageProductIdsAndCodes.data ?? []) as Array<{ id: string; code: string }>) {
-    codeById.set(p.id, p.code);
-  }
-  const allPackageIds = new Set<string>([...codeById.keys(), ...TUBE_IDS]);
+  for (const p of (products.data ?? []) as Array<{ id: string; code: string }>) codeById.set(p.id, p.code);
+  const allPackageIds = Array.from(new Set<string>([...codeById.keys(), ...TUBE_IDS]));
 
-  const { data: ledgerRows } = await supabase
-    .from("ledger")
-    .select("product_id, delta")
-    .eq("location", location)
-    .in("product_id", Array.from(allPackageIds))
-    .lt("delta", 0)
-    .gte("ts", start)
-    .lt("ts", end);
-
-  for (const r of (ledgerRows ?? []) as Array<{ product_id: string; delta: number }>) {
+  const first = days.reduce((a, d) => (d.range.startUtc < a ? d.range.startUtc : a), days[0].range.startUtc);
+  const last = days.reduce((a, d) => (d.range.endUtcExclusive > a ? d.range.endUtcExclusive : a), days[0].range.endUtcExclusive);
+  const ledger = await readAll<{ id: string; product_id: string; delta: number; ts: string }>(
+    () =>
+      supabase
+        .from("ledger")
+        .select("id, product_id, delta, ts")
+        .eq("location", location)
+        .in("product_id", allPackageIds)
+        .lt("delta", 0)
+        .gte("ts", first)
+        .lt("ts", last)
+        .lte("ts", asOfUtc)
+        .order("ts", { ascending: true })
+        .order("id", { ascending: true }) as unknown as PageQuery,
+    "ledger",
+  );
+  for (const r of ledger) {
+    const ms = Date.parse(r.ts);
+    const day = days.find((d) => ms >= Date.parse(d.range.startUtc) && ms < Date.parse(d.range.endUtcExclusive));
+    if (!day) continue;
     const qty = Math.abs(r.delta);
     if (TUBE_IDS.has(r.product_id)) {
-      depts.unframed.boxes += qty;
+      day.depts.unframed.boxes += qty;
     } else {
       const code = codeById.get(r.product_id);
       if (!code) continue; // unrelated ledger movement, skip
-      if (A0_CODES.has(code)) depts.a0_framed.boxes += qty;
-      else if (DISPATCH_CODES.has(code)) depts.dispatch.boxes += qty;
-      // Any other code is not a package - drop it (shouldn't happen given the .in() filter).
+      if (A0_CODES.has(code)) day.depts.a0_framed.boxes += qty;
+      else if (DISPATCH_CODES.has(code)) day.depts.dispatch.boxes += qty;
     }
   }
+}
 
-  return { depts, distinctStaff };
+/* ============================================================
+ * Report labels and notes
+ * ============================================================ */
+
+interface ReportMeta {
+  ymd: string;
+  locLabel: string;
+  tz: string;
+  range: ProductionRange;
+  asOfUtc: string;
+  loadedAtUtc: string;
+  generatedAtUtc: string;
+  /** False while the production day is still open at the cutoff. */
+  closed: boolean;
+}
+
+function windowLabel(m: ReportMeta): string {
+  return `${m.ymd} 04:00 to ${shiftProductionDate(m.ymd, 1)} 04:00 ${m.tz} (UTC ${m.range.startUtc} to ${m.range.endUtcExclusive})`;
+}
+
+function statusLabel(m: ReportMeta): string {
+  return m.closed ? "final (day closed before the cutoff)" : `as of ${localStamp(m.asOfUtc, m.tz)} (day not yet closed)`;
+}
+
+interface Note { severity: string; department: string; staff: string; note: string }
+
+function reportNotes(today: DayReport, m: ReportMeta): Note[] {
+  const notes: Note[] = [];
+  if (!m.closed) notes.push({ severity: "info", department: "-", staff: "-", note: `Counts as of ${localStamp(m.asOfUtc, m.tz)}; the production day was still open.` });
+  for (const [kind, count] of Object.entries(today.summary.coverage.issueCounts) as Array<[CoverageIssueKind, number]>) {
+    if (count > 0) notes.push({ severity: "warning", department: "-", staff: "-", note: `${count} ${ISSUE_LABELS[kind]}: totals may be incomplete.` });
+  }
+  for (const d of DEPARTMENTS) {
+    const s = today.depts[d].summary;
+    const active = (s.normal.items ?? 0) > 0 || s.normal.orders > 0 || (s.rework.items ?? 0) > 0 || s.rework.orders > 0;
+    if (!active) notes.push({ severity: "info", department: DEPT_LABELS[d], staff: "-", note: "Zero activity — rostering gap?" });
+  }
+  return notes;
 }
 
 /* ============================================================
  * xlsx build
  * ============================================================ */
-function buildXlsx(payload: {
-  ymd: string;
-  location: string;
-  locLabel: string;
-  today: { depts: Record<Department, DeptTotals>; distinctStaff: Set<string> };
-  yesterday: { depts: Record<Department, DeptTotals>; distinctStaff: Set<string> };
-  staffNames: Map<string, string>;
-}): Uint8Array {
-  const { ymd, locLabel, today, yesterday, staffNames } = payload;
-  const yYmd = ymdShift(ymd, -1);
-
-  // Totals across depts
-  const totOrders = (t: typeof today) =>
-    DEPARTMENTS.reduce((s, d) => s + t.depts[d].orders.size, 0);
-  const totItems = (t: typeof today) =>
-    DEPARTMENTS.reduce((s, d) => s + t.depts[d].items, 0);
-  const ordersToday = totOrders(today);
-  const ordersYesterday = totOrders(yesterday);
-  const itemsToday = totItems(today);
-  const itemsYesterday = totItems(yesterday);
+function buildXlsx(payload: { meta: ReportMeta; today: DayReport; yesterday: DayReport; staffNames: Map<string, string> }): Uint8Array {
+  const { meta, today, yesterday, staffNames } = payload;
+  const { ymd, locLabel, tz } = meta;
+  const T = today.summary, Y = yesterday.summary;
   const staffToday = today.distinctStaff.size;
   const staffYesterday = yesterday.distinctStaff.size;
-  const perStaffToday = staffToday > 0 ? itemsToday / staffToday : 0;
-  const perStaffYesterday = staffYesterday > 0 ? itemsYesterday / staffYesterday : 0;
+  const perStaffToday = staffToday > 0 && T.normal.items !== null ? T.normal.items / staffToday : 0;
+  const perStaffYesterday = staffYesterday > 0 && Y.normal.items !== null ? Y.normal.items / staffYesterday : 0;
+  const notes = reportNotes(today, meta);
 
-  const notes: Array<{ severity: string; department: string; staff: string; note: string }> = [];
-  for (const d of DEPARTMENTS) {
-    if (today.depts[d].orders.size === 0 && today.depts[d].items === 0) {
-      notes.push({ severity: "info", department: DEPT_LABELS[d], staff: "-", note: "Zero activity â€” rostering gap?" });
-    }
-  }
-
-  // Sheet 1 - Summary
+  // Sheet 1 - Summary. orders_total is distinct completed orders across work types
+  // (not a sum of departments); items_total is work processed across work types.
   const summarySheet = XLSX.utils.aoa_to_sheet([
-    ["date", "location", "orders_total", "items_total", "orders_yesterday", "items_yesterday", "staff_on_shift", "staff_yesterday", "items_per_staff", "items_per_staff_yesterday", "notes"],
+    ["date", "location", "orders_total", "items_total", "orders_yesterday", "items_yesterday", "staff_on_shift", "staff_yesterday", "items_per_staff", "items_per_staff_yesterday", "notes",
+      "rework_orders", "rework_items", "rework_orders_yesterday", "rework_items_yesterday", "coverage_issues", "status", "timezone", "production_window", "window_start_utc", "window_end_utc", "as_of_utc", "loaded_at_utc", "generated_at_utc"],
     [
       ymd, locLabel,
-      ordersToday, itemsToday,
-      ordersYesterday, itemsYesterday,
+      T.normal.orders, n(T.normal.items),
+      Y.normal.orders, n(Y.normal.items),
       staffToday, staffYesterday,
       Number(perStaffToday.toFixed(1)), Number(perStaffYesterday.toFixed(1)),
-      notes.map((n) => n.note).join(" | "),
+      notes.map((x) => x.note).join(" | "),
+      T.rework.orders, n(T.rework.items), Y.rework.orders, n(Y.rework.items),
+      T.coverage.issues.length, statusLabel(meta), tz, windowLabel(meta),
+      meta.range.startUtc, meta.range.endUtcExclusive, meta.asOfUtc, meta.loadedAtUtc, meta.generatedAtUtc,
     ],
   ]);
 
-  // Sheet 2 - Departments
+  // Sheet 2 - Departments (per work type; Orders here overlap across departments).
   const deptRows: Array<Array<string | number>> = [
-    ["date", "location", "department", "orders", "items", "orders_yesterday", "items_yesterday", "delta_pct_orders", "delta_pct_items", "staff_on_shift", "boxes_used"],
+    ["date", "location", "department", "orders", "items", "orders_yesterday", "items_yesterday", "delta_pct_orders", "delta_pct_items", "staff_on_shift", "boxes_used", "rework_orders", "rework_items"],
   ];
   for (const d of DEPARTMENTS) {
-    const t = today.depts[d];
-    const y = yesterday.depts[d];
+    const t = today.depts[d], y = yesterday.depts[d];
     deptRows.push([
       ymd, locLabel, DEPT_LABELS[d],
-      t.orders.size, t.items,
-      y.orders.size, y.items,
-      pct(t.orders.size, y.orders.size),
-      pct(t.items, y.items),
-      t.staff.size, t.boxes,
+      t.summary.normal.orders, n(t.summary.normal.items),
+      y.summary.normal.orders, n(y.summary.normal.items),
+      pct(t.summary.normal.orders, y.summary.normal.orders),
+      t.summary.normal.items !== null && y.summary.normal.items !== null ? pct(t.summary.normal.items, y.summary.normal.items) : "n/a",
+      t.people.size, t.boxes,
+      t.summary.rework.orders, n(t.summary.rework.items),
     ]);
   }
   const deptSheet = XLSX.utils.aoa_to_sheet(deptRows);
 
-  // Sheet 3 - Staff
+  // Sheet 3 - Staff (hours from clock rows, else first/last completion, within the production day).
   const staffRows: Array<Array<string | number>> = [
-    ["date", "location", "department", "staff_name", "orders", "items", "hours_worked", "items_per_hour", "shift_start", "shift_end"],
+    ["date", "location", "department", "staff_name", "orders", "items", "hours_worked", "items_per_hour", "shift_start", "shift_end", "rework_orders", "rework_items"],
   ];
   for (const d of DEPARTMENTS) {
-    const t = today.depts[d];
-    const sortedStaff = Array.from(t.staff.values()).sort((a, b) => b.orders.size - a.orders.size);
-    for (const s of sortedStaff) {
+    const sorted = Array.from(today.depts[d].people.values()).sort(
+      (a, b) => b.normal.orders - a.normal.orders || (b.normal.items ?? 0) - (a.normal.items ?? 0) || (a.staff_id < b.staff_id ? -1 : 1),
+    );
+    for (const s of sorted) {
       const name = staffNames.get(s.staff_id) ?? `User ${s.staff_id.slice(0, 8)}`;
       const startTs = s.clock_in_ts ?? s.first_ts;
-      const endTs   = s.clock_out_ts ?? s.last_ts;
+      const endTs = s.clock_out_ts ?? s.last_ts;
       const hours = startTs != null && endTs != null ? Math.max(0, (endTs - startTs) / 3600000) : 0;
-      const itemsPerHour = hours > 0 ? s.items / hours : 0;
-      const fmt = (ts: number | null) => ts == null ? "" : new Date(ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+      const itemsPerHour = hours > 0 && s.normal.items !== null ? s.normal.items / hours : 0;
       staffRows.push([
         ymd, locLabel, DEPT_LABELS[d], name,
-        s.orders.size, s.items,
+        s.normal.orders, n(s.normal.items),
         Number(hours.toFixed(2)),
         Number(itemsPerHour.toFixed(2)),
-        fmt(startTs),
-        fmt(endTs),
+        localTime(startTs, tz),
+        localTime(endTs, tz),
+        s.rework.orders, n(s.rework.items),
       ]);
     }
   }
@@ -410,7 +384,7 @@ function buildXlsx(payload: {
 
   // Sheet 4 - Notes
   const noteRows: Array<Array<string>> = [["date", "location", "severity", "department", "staff", "note"]];
-  for (const n of notes) noteRows.push([ymd, locLabel, n.severity, n.department, n.staff, n.note]);
+  for (const x of notes) noteRows.push([ymd, locLabel, x.severity, x.department, x.staff, x.note]);
   const notesSheet = XLSX.utils.aoa_to_sheet(noteRows);
 
   const wb = XLSX.utils.book_new();
@@ -426,52 +400,54 @@ function buildXlsx(payload: {
 /* ============================================================
  * Email body (plaintext + simple HTML)
  * ============================================================ */
-function buildBodyText(payload: {
-  ymd: string;
-  locLabel: string;
-  today: { depts: Record<Department, DeptTotals>; distinctStaff: Set<string> };
-  yesterday: { depts: Record<Department, DeptTotals>; distinctStaff: Set<string> };
-  staffNames: Map<string, string>;
-}): { text: string; html: string } {
-  const { ymd, locLabel, today, yesterday, staffNames } = payload;
-  const displayDate = new Date(ymd + "T00:00:00Z").toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
-  const totOrders = (t: typeof today) => DEPARTMENTS.reduce((s, d) => s + t.depts[d].orders.size, 0);
-  const totItems = (t: typeof today) => DEPARTMENTS.reduce((s, d) => s + t.depts[d].items, 0);
-  const ot = totOrders(today), oy = totOrders(yesterday);
-  const it = totItems(today), iy = totItems(yesterday);
+function buildBodyText(payload: { meta: ReportMeta; today: DayReport; yesterday: DayReport; staffNames: Map<string, string> }): { text: string; html: string } {
+  const { meta, today, yesterday, staffNames } = payload;
+  const { ymd, locLabel } = meta;
+  const displayDate = new Date(ymd + "T00:00:00Z").toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
+  const T = today.summary, Y = yesterday.summary;
+  const ot = T.normal.orders, oy = Y.normal.orders;
+  const it = T.normal.items, iy = Y.normal.items;
   const st = today.distinctStaff.size, sy = yesterday.distinctStaff.size;
-  const perT = st > 0 ? it / st : 0;
-  const perY = sy > 0 ? iy / sy : 0;
+  const perT = st > 0 && it !== null ? it / st : 0;
+  const perY = sy > 0 && iy !== null ? iy / sy : 0;
+  const itemsPct = it !== null && iy !== null ? pct(it, iy) : "n/a";
 
   const lines: string[] = [];
-  lines.push(`Inka Arthouse â€” Daily KPI Report â€” ${locLabel} â€” ${displayDate}`);
+  lines.push(`Inka Arthouse — Daily KPI Report — ${locLabel} — ${displayDate}`);
+  lines.push(`Production day: ${windowLabel(meta)}`);
+  lines.push(`Status: ${statusLabel(meta)}`);
   lines.push("");
-  lines.push(`Orders dispatched   ${String(ot).padStart(6)}   (${pct(ot, oy)} vs ${oy} yesterday)`);
-  lines.push(`Items verified      ${String(it).padStart(6)}   (${pct(it, iy)} vs ${iy} yesterday)`);
+  lines.push(`Orders completed    ${String(ot).padStart(6)}   (${pct(ot, oy)} vs ${oy} yesterday; each order once across departments)`);
+  lines.push(`Items processed     ${String(n(it)).padStart(6)}   (${itemsPct} vs ${n(iy)} yesterday; work across all departments)`);
+  lines.push(`CS / rework         ${String(T.rework.orders).padStart(6)}   orders, ${n(T.rework.items)} items (counted separately)`);
   lines.push(`Staff on shift      ${String(st).padStart(6)}   (${st - sy >= 0 ? "+" : ""}${st - sy} vs yesterday)`);
   lines.push(`Items / staff-day   ${perT.toFixed(1).padStart(6)}   (${pct(Math.round(perT * 10), Math.round(perY * 10))} normalised)`);
+  const issues = (Object.entries(T.coverage.issueCounts) as Array<[CoverageIssueKind, number]>).filter(([, c]) => c > 0);
+  if (issues.length) lines.push(`Data warnings: ${issues.map(([k, c]) => `${c} ${ISSUE_LABELS[k]}`).join(", ")}; totals may be incomplete.`);
   lines.push("");
-  lines.push("Per department");
+  lines.push("Per department (Orders overlap across departments)");
   for (const d of DEPARTMENTS) {
-    const t = today.depts[d], y = yesterday.depts[d];
-    if (t.orders.size === 0 && t.items === 0) {
+    const t = today.depts[d].summary, y = yesterday.depts[d].summary;
+    const active = (t.normal.items ?? 0) > 0 || t.normal.orders > 0 || (t.rework.items ?? 0) > 0 || t.rework.orders > 0;
+    if (!active) {
       lines.push(`  ${DEPT_LABELS[d]}: no activity`);
     } else {
-      lines.push(`  ${DEPT_LABELS[d]}: ${t.orders.size} orders / ${t.items} items   (^ from ${y.orders.size}/${y.items})`);
+      const rework = t.rework.orders > 0 || (t.rework.items ?? 0) > 0 ? `; rework ${t.rework.orders}/${n(t.rework.items)}` : "";
+      lines.push(`  ${DEPT_LABELS[d]}: ${t.normal.orders} orders / ${n(t.normal.items)} items   (^ from ${y.normal.orders}/${n(y.normal.items)})${rework}`);
     }
   }
   lines.push("");
   lines.push("Top performers per department (top 3)");
   for (const d of DEPARTMENTS) {
     lines.push(`  ${DEPT_LABELS[d]}:`);
-    const staffArr = Array.from(today.depts[d].staff.values())
+    const staffArr = Array.from(today.depts[d].people.values())
       .map((s) => ({
         name: staffNames.get(s.staff_id) ?? `User ${s.staff_id.slice(0, 8)}`,
-        orders: s.orders.size,
-        items: s.items,
+        orders: s.normal.orders,
+        items: s.normal.items,
       }))
-      .filter((s) => s.orders > 0 || s.items > 0)
-      .sort((a, b) => (b.orders - a.orders) || (b.items - a.items));
+      .filter((s) => s.orders > 0 || (s.items ?? 0) > 0)
+      .sort((a, b) => (b.orders - a.orders) || ((b.items ?? 0) - (a.items ?? 0)) || a.name.localeCompare(b.name));
     if (staffArr.length === 0) {
       lines.push(`    -- no activity --`);
       continue;
@@ -479,11 +455,12 @@ function buildBodyText(payload: {
     const top = staffArr.slice(0, 3);
     for (let i = 0; i < top.length; i++) {
       const p = top[i];
-      lines.push(`    ${i + 1}. ${p.name.padEnd(12)}   ${p.orders} orders / ${p.items} items`);
+      lines.push(`    ${i + 1}. ${p.name.padEnd(12)}   ${p.orders} orders / ${n(p.items)} items`);
     }
   }
   lines.push("");
   lines.push(`See attached ${locLabel}-KPI-${ymd}.xlsx for full staff-level detail.`);
+  lines.push(`Loaded ${localStamp(meta.loadedAtUtc, meta.tz)}; generated ${localStamp(meta.generatedAtUtc, meta.tz)}.`);
   lines.push("");
   lines.push("Sent from Inka Arthouse Hub | https://inka-arthouse-hub.vercel.app/reports");
 
@@ -653,61 +630,112 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.status(400).json({ error: `Unknown location "${location}"` });
       return;
     }
+    const site = location as ReportSite;
     const tz = LOCATION_TZ[location];
     const locLabel = LOCATION_LABELS[location];
 
-    // Target day: the local day we are closing out. Vercel cron can
-    // jitter by up to an hour, so a scheduled 22:55 local run may
-    // actually fire at 00:30 local the following day. Rule: if the
-    // local hour is < 4, treat as previous day. Any fire between 20:00
-    // and 03:59 local reports the correct closed day.
+    // Target day: a validated production date, or the site's current
+    // production date. Production days start at 04:00 local, so a
+    // scheduled ~23:55 run that Vercel delays past midnight (up to 03:59)
+    // still closes the right day. Invalid or repeated dates are rejected
+    // before any report read.
     const dateOverride = req.query.date;
     let ymd: string;
-    if (typeof dateOverride === "string" && /^\d{4}-\d{2}-\d{2}$/.test(dateOverride)) {
+    if (dateOverride === undefined) {
+      ymd = productionDateAt(new Date(), site);
+    } else if (typeof dateOverride === "string" && isProductionDate(dateOverride)) {
       ymd = dateOverride;
     } else {
-      const now = new Date();
-      const localYmd = ymdInTz(now, tz);
-      const localHourStr = new Intl.DateTimeFormat("en-US", {
-        timeZone: tz, hour: "numeric", hourCycle: "h23",
-      }).format(now);
-      const localHour = Number(localHourStr);
-      ymd = localHour < 4 ? ymdShift(localYmd, -1) : localYmd;
+      res.status(400).json({ error: "Invalid date" });
+      return;
     }
-    const yYmd = ymdShift(ymd, -1);
+    const yYmd = shiftProductionDate(ymd, -1);
 
-    // Supabase client using service-role or anon+RLS. For read-only cron
-    // access, VITE_SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY is cleanest.
+    // Full-site counts need the server credential. The anon key would return
+    // only what RLS lets an anonymous caller see (nothing), which must never
+    // be reported as a complete site.
     const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
-    if (!supabaseUrl || !supabaseKey) {
+    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl) {
       res.status(500).json({ error: "Supabase env vars missing" });
+      return;
+    }
+    if (!supabaseKey) {
+      res.status(500).json({ error: "Full-site report needs SUPABASE_SERVICE_ROLE_KEY" });
       return;
     }
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const [today, yesterday] = await Promise.all([
-      aggregateDay(supabase, location, ymd, tz),
-      aggregateDay(supabase, location, yYmd, tz),
-    ]);
+    // One cutoff for every read in this report.
+    const asOfUtc = new Date().toISOString();
+    const todayRange = productionRange(site, ymd, ymd);
+    const bothDays = productionRange(site, yYmd, ymd);
+    const snapshot = await loadProductionEvidence(supabase, {
+      site,
+      range: { startUtc: bothDays.startUtc, endUtcExclusive: bothDays.endUtcExclusive },
+      asOfUtc,
+      visibility: { kind: "site" },
+      deadlineMs: Date.now() + EVIDENCE_DEADLINE_MS,
+    });
+    const evidence = prepareProductionEvidence(snapshot);
 
-    // Resolve staff names for anyone who appeared.
-    const allStaffIds = new Set<string>([...today.distinctStaff, ...yesterday.distinctStaff]);
+    // Clock rows drive hours only (not counts); same window and cutoff, paged.
+    const clocks = await readAll<ClockRow>(
+      () =>
+        supabase
+          .from("production_events")
+          .select("id, staff_id, department, event_type, created_at")
+          .eq("location", location)
+          .in("event_type", ["clock_in", "clock_out"])
+          .gte("created_at", bothDays.startUtc)
+          .lt("created_at", bothDays.endUtcExclusive)
+          .lte("created_at", asOfUtc)
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true }) as unknown as PageQuery,
+      "production_events (clock)",
+    );
+
+    const today = projectDay(evidence, site, ymd, clocks);
+    const yesterday = projectDay(evidence, site, yYmd, clocks);
+    await addBoxes(supabase, location, [today, yesterday], asOfUtc);
+
+    // Staff names for anyone who appeared. A failed lookup fails the report;
+    // a person with no name row falls back to their saved id.
+    const allStaffIds = Array.from(new Set<string>([...today.distinctStaff, ...yesterday.distinctStaff])).sort();
     const staffNames = new Map<string, string>();
-    if (allStaffIds.size > 0) {
-      const { data: staffRows } = await supabase
-        .from("staff_barcodes")
-        .select("user_id, display_name")
-        .eq("location", location)
-        .in("user_id", Array.from(allStaffIds));
-      for (const r of (staffRows ?? []) as StaffRow[]) staffNames.set(r.user_id, r.display_name);
+    if (allStaffIds.length > 0) {
+      const staffRows = await readAll<StaffRow>(
+        () =>
+          supabase
+            .from("staff_barcodes")
+            .select("user_id, display_name")
+            .eq("location", location)
+            .in("user_id", allStaffIds)
+            .order("user_id", { ascending: true }) as unknown as PageQuery,
+        "staff_barcodes",
+      );
+      for (const r of staffRows) if (!staffNames.has(r.user_id)) staffNames.set(r.user_id, r.display_name);
     }
 
-    // Skip sending if the location had zero activity across every
-    // department. Cron/preview/manual runs pass ?force=1 to override.
-    const totalOrdersToday = DEPARTMENTS.reduce((s, d) => s + today.depts[d].orders.size, 0);
-    const totalItemsToday = DEPARTMENTS.reduce((s, d) => s + today.depts[d].items, 0);
-    const noActivity = totalOrdersToday === 0 && totalItemsToday === 0;
+    const meta: ReportMeta = {
+      ymd,
+      locLabel,
+      tz,
+      range: todayRange,
+      asOfUtc,
+      loadedAtUtc: snapshot.loadedAtUtc,
+      generatedAtUtc: new Date().toISOString(),
+      closed: Date.parse(asOfUtc) >= Date.parse(todayRange.endUtcExclusive),
+    };
+
+    // Skip sending only when there is truly nothing to report: no normal
+    // or rework Items/Orders and no data warnings. Cron/preview/manual runs
+    // pass ?force=1 to override.
+    const T = today.summary;
+    const noActivity =
+      T.normal.orders === 0 && (T.normal.items ?? 0) === 0 &&
+      T.rework.orders === 0 && (T.rework.items ?? 0) === 0 &&
+      T.coverage.issues.length === 0;
     const forceSend = req.query.force === "1" || req.query.force === "true";
     if (noActivity && !forceSend && !req.query.dry) {
       res.status(200).json({
@@ -720,7 +748,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const xlsxBytes = buildXlsx({ ymd, location, locLabel, today, yesterday, staffNames });
+    const xlsxBytes = buildXlsx({ meta, today, yesterday, staffNames });
     const filename = `${locLabel}-KPI-${ymd}.xlsx`;
 
     const dry = req.query.dry;
@@ -743,7 +771,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       recipient = configured;
     }
 
-    const bodies = buildBodyText({ ymd, locLabel, today, yesterday, staffNames });
+    const bodies = buildBodyText({ meta, today, yesterday, staffNames });
     const subject = `${locLabel}-${formatDDMMYY(ymd)}-Daily KPI Report`;
     const from = process.env.FROM_EMAIL || "onboarding@resend.dev";
     const resendKey = process.env.RESEND_API_KEY;
@@ -780,10 +808,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       recipient,
       ymd,
       location,
+      as_of_utc: asOfUtc,
       counts: {
-        orders_today: DEPARTMENTS.reduce((s, d) => s + today.depts[d].orders.size, 0),
-        items_today: DEPARTMENTS.reduce((s, d) => s + today.depts[d].items, 0),
+        orders_today: T.normal.orders,
+        items_today: T.normal.items,
         staff_today: today.distinctStaff.size,
+        rework_orders_today: T.rework.orders,
+        rework_items_today: T.rework.items,
       },
     });
   } catch (e) {
