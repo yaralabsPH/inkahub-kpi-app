@@ -268,9 +268,9 @@ For repeatable handoff, parity modes also require `--parity-case=baseline|manage
 
 - Files: create `tests/production/item-counting-parity.test.ts`, `docs/releases/item-counting.md`; extend the existing fixture/tests as needed; remove the obsolete KPI helper section from `src/lib/domain/skuRouting.ts` after migrating all callers; update this plan's log/evidence.
 - Do:
-  - [ ] Run the same explicit fixture through Reports, Welcome, Production selectors and the authenticated digest harness for equal site/person/work-type/window/as-of scope. Compare normal/rework Items/Orders and coverage, not just a direct invocation of the common reducer four times. Include summary versus drill-down, current versus reload, a longer period versus summed days, repeated requests, and frozen snapshot versus a later corrected refresh.
-  - [ ] Search all consumers for stale parser copies, raw completion-row counts, `line_quantity ?? 1`, default multipliers, browser-midnight boundaries and frame denominators using expanded Items. Remove residual count paths and the now-unused `isKpiEligibleSku`, `isKpiOrderSku`, `kpiUnitMultiplier` exports from `skuRouting.ts`; all current callers are in the three pages migrated above. Task 5 owns any deliberately preserved frame-only predicate/weighting. This keeps imports one-way from counting/timing to the parser and avoids a compatibility-wrapper cycle. If a new caller appeared since planning, migrate its reporting use or record a scope question; do not alter routing/parser or stock helpers.
-  - [ ] Add release notes explaining UN inclusion, historical recomputation, terminal/deduplicated Orders, separate CS/rework, 04:00 site periods, overlapping subtotals/processed work, as-of reports and unknown history that cannot be reconstructed. State that framing-time and inventory rules have not been redesigned. Include current coverage/performance limitations proven during testing.
+  - [x] Run the same explicit fixture through Reports, Welcome, Production selectors and the authenticated digest harness for equal site/person/work-type/window/as-of scope. Compare normal/rework Items/Orders and coverage, not just a direct invocation of the common reducer four times. Include summary versus drill-down, current versus reload, a longer period versus summed days, repeated requests, and frozen snapshot versus a later corrected refresh.
+  - [x] Search all consumers for stale parser copies, raw completion-row counts, `line_quantity ?? 1`, default multipliers, browser-midnight boundaries and frame denominators using expanded Items. Remove residual count paths and the now-unused `isKpiEligibleSku`, `isKpiOrderSku`, `kpiUnitMultiplier` exports from `skuRouting.ts`; all current callers are in the three pages migrated above. Task 5 owns any deliberately preserved frame-only predicate/weighting. This keeps imports one-way from counting/timing to the parser and avoids a compatibility-wrapper cycle. If a new caller appeared since planning, migrate its reporting use or record a scope question; do not alter routing/parser or stock helpers.
+  - [x] Add release notes explaining UN inclusion, historical recomputation, terminal/deduplicated Orders, separate CS/rework, 04:00 site periods, overlapping subtotals/processed work, as-of reports and unknown history that cannot be reconstructed. State that framing-time and inventory rules have not been redesigned. Include current coverage/performance limitations proven during testing.
   - [ ] Complete the staging checklist below with CJ, recording Preview URL, code revision, fixture IDs/counts, sites, role memberships, period/as-of scope, expected/actual values, timings and pass/fail. Link evidence in the log; never store tokens, credentials, real customer data or secret-bearing URLs. Re-run after any fixes that affect the result.
 - Done when: `npm run test -- --run tests/production/item-counting-parity.test.ts` and the common gate pass; the staging checklist has real evidence, feature PR CI is green, and the planner review checks `docs/HARDENING.md`. Pending external checks stay marked pending and block release. No task completion or review grants merge/deploy authority.
 - Commit: `task 9: verify item counting parity and release guidance`.
@@ -439,6 +439,14 @@ Coder writes here when it hits something this plan did not foresee; stop the aff
     - Rejected without approval: raising timeouts, splitting the read, reducing the workload or targets.
   - The saved report is `staging-results-item-counting-v2-denied-before.md` (git-ignored). The earlier v1 copy was renamed `staging-results-item-counting-v1-copy-not-v2.md`.
 
+- **Task 9 (coder, for CJ): three side cards still count from raw rows.** They are not among the plan's four consumers (Reports, Welcome, Production, digest), so I left them unchanged and listed them in the release notes:
+  - `LabourHoursTodayCard`: orders per worker = completion rows, used for cost per order;
+  - `RecentActivityCard`: sums raw `line_quantity`;
+  - `PackageHistoryCard`: package-per-order denominators from its own distinct order sets. The plan freezes package behaviour.
+
+  Decide whether a follow-up should move them to the shared evidence. No change is made under F1.
+- **Task 8/9 (coder, for CJ): `docs/RELEASING.md` digest status table is now incomplete.** The digest adds 400 `Invalid date` and 500 `Full-site report needs SUPABASE_SERVICE_ROLE_KEY`, and no longer falls back to the anon key. The plan does not list RELEASING.md, so I documented these in `docs/releases/item-counting.md` only. Release prerequisite: `SUPABASE_SERVICE_ROLE_KEY` must be set in Production and Preview before deploy.
+
 ## Implementation log
 
 Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. All tasks are unstarted; no build, test, staging or deployment result is claimed by this plan.
@@ -551,3 +559,16 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - Surprise: the repo is `"type": "module"` and Vercel's Node ESM functions need explicit extensions on relative imports. The digest imports `../../src/lib/...*.js`, and `productionCounts` → `productionItems` → `skuRouting` now use `.js` specifiers; tsc, Vite and vitest resolve these to the `.ts` files. This must be confirmed on a CJ-created Preview (local Vite does not serve `api/`).
   - Staging proxy for digest read time: as service_role, the two-day AU read (2026-09-14/15, 2,610 rows, 0.34 MB) took 47 ms server-side. End-to-end Preview timing stays in the Task 9 checklist.
   - Gate: tsc, typecheck:digest, 625/625 tests, build OK.
+- task 9: new `tests/production/item-counting-parity.test.ts` (4 tests). One explicit UK fixture goes through `buildProductionReportView`, `buildProductionWelcomeView`, `buildProductionCounterView` and the real digest handler (mocked Supabase/XLSX, dry download). It checks:
+  - site/day (7 Items / 2 Orders, rework 1/1), unframed (6/2) and A at unframed (5/2) agree across all four consumers, as do rework and coverage counts;
+  - summary equals the drill-down; reload, shuffle and duplicate retrieval give identical results;
+  - the two-day union is 2 Orders where the days sum to 3;
+  - a frozen snapshot keeps its values while a corrected refresh drops the cancelled Items (the Order stays).
+  
+  Stale-path search: no parser copies, `?? 1` defaults or KPI helper callers remain. `isKpiEligibleSku`, `isKpiOrderSku` and `kpiUnitMultiplier` were removed from `skuRouting.ts`; the frame predicates live in `productionFrameTiming.ts`. The remaining `setHours` uses are the clock-state lookup and package windows, both unchanged by design. Three side cards with their own counts are recorded under Open questions, not changed.
+  
+  Release notes are in `docs/releases/item-counting.md`, including the new SUPABASE_SERVICE_ROLE_KEY prerequisite.
+  
+  Pending (blocks release, CJ): the staging browser checklist on a Preview. It covers role logins, kiosk capture/stock/ledger smoke, `dry=1` digests for AU/UK/US (also proving the server-side `.js` imports load), hook loading/error/identity behaviour and the protected rollback rehearsal. Agents cannot sign in through the browser to staging, so Task 9 stays unticked until that evidence exists.
+  
+  Gate: tsc, typecheck:digest, 629/629 tests, build OK.
