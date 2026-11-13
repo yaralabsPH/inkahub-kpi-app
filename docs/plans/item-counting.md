@@ -517,3 +517,19 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Tests were written alongside the parity module, not strictly first.
   - **Needs CJ:** `.env.staging.local` has no staff/kiosk/cs logins yet.
   - **Gate:** `tsc -b` OK, `typecheck:digest` OK, 557/557 tests, build OK.
+- 2026-11-13 0036 staging run (code 86dd1c3 + harness fixes; Claude ran it on CJ's instruction, staging only, through the guarded helpers):
+  - **Setup:** reset the staff/kiosk/cs test passwords; they are stored only in `.env.staging.local`. Real session claims are 501–516 bytes.
+  - **Parity before 0036, standard:** COMPLETE. Visible rows: owner/kiosk 240,112; manager/cs 155,432; staff 30,018; no-subject 0.
+  - **Parity before 0036, owner/kiosk without uk:** COMPLETE. Owner/kiosk 197,772 (−42,340 UK); uk restored.
+  - **Applied 0036.** Policy hash 2ce3f0db… → b7884efe…
+  - **Parity after 0036, both arrangements:** COMPLETE. Identical row ids for every role and site and identical replays for all 11 direct readers; only the two SELECT policies changed.
+  - **Harness fixes found while running, test-only:**
+    - two order-lookup reader replays picked sample orders with a site-wide sorted subquery and timed out before 0036; they now use the fixed orders VOL-<SITE>-20260915-1..3 (8 ms via the order index);
+    - the package-history replay window starts 2026-10-01;
+    - one standard after-run lost its connection (ECONNRESET) and crashed; the runner now handles connection errors, and the rerun completed.
+  - **Phase denied-before: passed and recorded.** Median totals: owner AU day 1,216 ms, AU three months 3,895 ms; manager 1,230 / 5,207 ms.
+  - **Phase all-sites: passed and recorded.** Owner AU 1,265 / 3,793 ms, UK 269 / 531, US 267 / 470; manager AU 1,233 / 5,100, UK 276 / 385, US 267 / 416.
+  - **Phase denied-after: FAILED in the SQL gate; no API timing ran.**
+    - The manager AU three-month rowCount statement (03 statement 94) was cancelled at the 8 s timeout after 12.8 s wall time; the same statement took 1.5 s in both earlier runs.
+    - All manager AU three-month SQL in this run was 2–4× slower than earlier (call EXPLAINs 5.3 / 3.6 / 2.2 s, versus about 1.4 s), which points to transient staging-instance load after back-to-back runs, not a code or policy change.
+  - **State left:** standard memberships, 0036 applied, manager AU-only. Task 4 stays unticked until denied-after passes.

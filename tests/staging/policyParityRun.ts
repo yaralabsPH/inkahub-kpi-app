@@ -38,17 +38,24 @@ end $$`;
  * (the readers' unchanged limits apply on top of the same set).
  */
 const C = `'${STAGING_CUTOFF}'::timestamptz`;
+/**
+ * Fixed sample orders for the order-lookup readers (Production, Reports search):
+ * the synthetic orders VOL-<SITE>-20260915-1..3. Picking orders with a subquery
+ * would sort every row of the site under RLS, which is not what those readers do.
+ */
+const SAMPLE_ORDERS = "order_number = any($2::text[])";
+const sampleOrders = (site: string) => [1, 2, 3].map((g) => `VOL-${site.toUpperCase()}-20260915-${g}`);
 const READER_SQL: Record<(typeof READER_PROBES)[number], string> = {
   "currently-clocked-in": `event_type in ('clock_in', 'clock_out') and created_at >= ${C} - interval '16 hours'`,
   "daily-timesheet": `event_type in ('clock_in', 'clock_out', 'started', 'completed', 'dispatched') and created_at >= '2026-09-14T14:00:00Z' and created_at < '2026-09-15T14:00:00Z'`,
   "labour-hours-today": `event_type in ('clock_in', 'clock_out', 'started', 'completed', 'dispatched') and created_at >= ${C} - interval '1 day' and created_at < ${C}`,
   "live-order-completions": `event_type in ('completed', 'dispatched') and created_at >= ${C} - interval '7 days'`,
-  "package-history": `event_type in ('dispatched', 'completed') and created_at >= '2026-08-01T00:00:00Z'`,
+  "package-history": `event_type in ('dispatched', 'completed') and created_at >= '2026-10-01T00:00:00Z'`,
   "recent-activity": `created_at >= ${C} - interval '7 days'`,
-  "production-verified-lines": `order_number in (select order_number from public.production_events where location = $1 and event_type = 'line_verified' order by created_at, id limit 5) and event_type in ('line_verified', 'cancelled')`,
+  "production-verified-lines": `${SAMPLE_ORDERS} and event_type in ('line_verified', 'cancelled')`,
   "production-counters": `staff_id = (select auth.uid()) and event_type in ('completed', 'dispatched') and created_at >= '2026-09-14T14:00:00Z'`,
   "reports-event-stream": `event_type in ('line_verified', 'cancelled', 'completed', 'dispatched') and created_at >= '2026-09-01T00:00:00Z' and created_at <= '2026-10-01T00:00:00Z'`,
-  "reports-order-search": `order_number in (select order_number from public.production_events where location = $1 order by created_at desc, id limit 3)`,
+  "reports-order-search": SAMPLE_ORDERS,
   "welcome-team": `event_type in ('completed', 'dispatched', 'line_verified') and created_at >= ${C} - interval '8 days'`,
 };
 
@@ -175,7 +182,8 @@ export async function collectParitySnapshot(
           if (snap.errors.length) break;
           await client.query("savepoint parity_read");
           try {
-            const r = await client.query(`select id from public.production_events where location = $1 and (${READER_SQL[probe]})`, [site]);
+            const sql = READER_SQL[probe];
+            const r = await client.query(`select id from public.production_events where location = $1 and (${sql})`, sql.includes("$2") ? [site, sampleOrders(site)] : [site]);
             snap.readers[`${probe}:${site}`] = r.rows.map((x) => String(x.id)).sort();
             await client.query("release savepoint parity_read");
           } catch (e) {

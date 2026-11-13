@@ -309,6 +309,7 @@ async function main(): Promise<number> {
         state.current = "connecting to the staging database";
         saveReport();
         const client = new pg.Client(dbConfig);
+        client.on("error", (e) => console.error(`  database connection error: ${redactSecrets(e.message)}`));
         const notices: string[] = [];
         client.on("notice", (n) => notices.push(n.message ?? String(n)));
         await client.connect();
@@ -379,6 +380,8 @@ async function runParity(dbConfig: pg.ClientConfig, mode: "before" | "after"): P
   };
   console.log(`\nPolicy parity ${mode} · arrangement ${ARRANGEMENT}`);
   const client = new pg.Client(dbConfig);
+  // A dropped connection becomes the failing query's error (reported), not an unhandled crash.
+  client.on("error", (e) => console.error(`  database connection error: ${redactSecrets(e.message)}`));
   await client.connect();
   let problems: string[] = [];
   try {
