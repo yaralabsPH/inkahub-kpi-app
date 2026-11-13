@@ -8,6 +8,7 @@ import { buildReport, type GateState } from "./itemCountingReport";
 import { runGate, type GateIO } from "./itemCountingGate";
 import { FN_ARGS, HARNESS_VERSION, V1_FUNCTION, V2_FUNCTION, type FileRun, type PhaseRecord, type StatementResult } from "./itemCountingEvidence";
 import { MEASURE_CASES, type MeasureResult, type MeasureRow, type RunMetrics } from "./measure-item-counting";
+import { claimsRow, claimsSources, parityArtifact, policyCatalogRows, POST_POLICY_HASH } from "./gateTestFixtures";
 
 const SCOPES = MEASURE_CASES.map((c) => c.scope);
 const DAYS = MEASURE_CASES.filter((c) => c.first === c.last).map((c) => c.scope);
@@ -26,8 +27,9 @@ function query03(): FileRun {
     out.push(res("SELECT", [{ fn_name: name, fn_args: FN_ARGS, fn_result: "json", fn_language: "sql", fn_volatility: "s", fn_security_definer: false, fn_config: 'search_path=""', fn_definition_md5: name === V2_FUNCTION ? "v2md5" : "v1md5" }]));
     out.push(res("SELECT", ["PUBLIC", "anon", "authenticated", "service_role"].map((g) => ({ fn_privileges_for: name, fn_grantee: g, can_execute: g === "authenticated" || g === "service_role" }))));
   }
+  out.push(res("SELECT", policyCatalogRows()));
   out.push(res("SELECT", [{ total_size: "90 MB", rows: 240112 }]));
-  const become = (who: string) => out.push(res("RESET"), res("SELECT", [{ b: 1 }]), res("SET"), res("DO"), res("SELECT", [{
+  const become = (who: string) => out.push(res("RESET"), res("SELECT", [{ claims_set: true }]), res("SELECT", [claimsRow(who)]), res("SET"), res("DO"), res("SELECT", [{
     timeout_for: who, current_user_name: "authenticated", effective_timeout_ms: 8000, catalog_timeout: "8s", row_security: "on",
   }]));
   for (const role of ["owner", "manager"]) {
@@ -71,7 +73,7 @@ const managerAuOnly = (): MeasureResult => ({
 function setup(sql: () => FileRun, measures: { owner: MeasureResult; manager: MeasureResult } = { owner: owner(), manager: managerAuOnly() }, records: PhaseRecord[] = []) {
   const state: GateState = {
     startedAt: "s", revision: "r", mode: "measure-only", runs: [], measures: { owner: undefined, manager: undefined },
-    managerPhase: null, phaseRecords: records, current: null, lastProgress: null, stopped: null, fatal: null, finishedAt: null,
+    managerPhase: null, phaseRecords: records, claimsSources: claimsSources(), parity: parityArtifact(), current: null, lastProgress: null, stopped: null, fatal: null, finishedAt: null,
   };
   const written: PhaseRecord[][] = [];
   const io: GateIO = {
@@ -95,7 +97,8 @@ describe("runGate", () => {
     expect(io.measure).toHaveBeenCalledTimes(2);
     expect(state.managerPhase).toBe("denied-before");
     expect(written).toHaveLength(1);
-    expect(written[0][0]).toMatchObject({ phase: "denied-before", fnName: V2_FUNCTION, fnDefinitionMd5: "v2md5", encodingVersion: 2, harnessVersion: HARNESS_VERSION, problems: [] });
+    expect(written[0][0]).toMatchObject({ phase: "denied-before", fnName: V2_FUNCTION, fnDefinitionMd5: "v2md5", encodingVersion: 2, harnessVersion: HARNESS_VERSION, policyHash: POST_POLICY_HASH, problems: [] });
+    expect(written[0][0].parityHash).toMatch(/^[0-9a-f]{64}$/);
     const report = buildReport({ ...state, current: null, finishedAt: "f" });
     expect(report.status).toBe("STATUS: FAILED – awaiting manager phases all-sites, denied-after (expected; no query or performance failure)");
   });
@@ -160,5 +163,36 @@ describe("runGate", () => {
     const { state, io } = setup(query03, undefined, [old]);
     await runGate(state, io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
     expect(state.managerPhase).toBe("denied-before");
+  });
+});
+
+describe("runGate: claims and policy parity come before any API timing", () => {
+  it("missing parity starts no API measurement and records nothing", async () => {
+    const { state, io, written } = setup(query03);
+    state.parity = null;
+    await runGate(state, io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
+    expect(io.measure).not.toHaveBeenCalled();
+    expect(written).toHaveLength(0);
+    expect(buildReport({ ...state, current: null, finishedAt: "f" }).status).toMatch(/policy parity has not been run/);
+  });
+
+  it("minimal claims start no API measurement", async () => {
+    const { state, io } = setup(() => {
+      const q = query03();
+      const c = q.results.find((r) => r.fields.includes("claims_for"))!;
+      c.rows = [{ ...c.rows[0], claims_bytes: 74 }];
+      return q;
+    });
+    await runGate(state, io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
+    expect(io.measure).not.toHaveBeenCalled();
+  });
+
+  it("the report shows claims sizes and parity but never a claim value", async () => {
+    const { state, io } = setup(query03);
+    await runGate(state, io, { mode: "measure-only", files: ["03-query-evidence.sql"] });
+    const md = buildReport({ ...state, current: null, finishedAt: "f" }).markdown;
+    expect(md).toContain("## Real-session claims");
+    expect(md).toContain("identical visibility");
+    expect(md).not.toMatch(/inka-staging\.test|"sub"|session_id":|eyJ/);
   });
 });

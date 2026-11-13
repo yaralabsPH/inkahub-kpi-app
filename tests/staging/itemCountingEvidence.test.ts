@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { prePolicies } from "./gateTestFixtures";
 import {
   checkItemCountingEvidence,
   checkManager,
@@ -18,6 +19,7 @@ import {
   type StatementResult,
 } from "./itemCountingEvidence";
 import { MEASURE_CASES, type MeasureResult, type MeasureRow, type RunMetrics } from "./measure-item-counting";
+import { claimsRow, claimsSources, gateIdentity, parityArtifact, policyCatalogRows } from "./gateTestFixtures";
 
 let idx = 0;
 function res(command: string, rows: Array<Record<string, unknown>> = [], label = `stmt`): StatementResult {
@@ -36,6 +38,8 @@ const TOTAL: Record<string, number> = { "au-busy-day": 1313, "au-3-months": 1182
 const DAYS = MEASURE_CASES.filter((c) => c.first === c.last).map((c) => c.scope);
 
 interface QueryOver {
+  policies?: Parameters<typeof policyCatalogRows>[0];
+  claims?: Record<string, unknown>;
   fn?: Record<string, unknown>;
   grants?: Record<string, boolean>;
   timeout?: Record<string, unknown>;
@@ -65,8 +69,10 @@ function queryRun(managerAllSites = false, over: QueryOver = {}): FileRun {
     const grants = { PUBLIC: false, anon: false, authenticated: true, service_role: true, ...(name === V2_FUNCTION ? over.grants : {}) };
     results.push(res("SELECT", Object.entries(grants).map(([fn_grantee, can_execute]) => ({ fn_privileges_for: name, fn_grantee, can_execute }))));
   }
+  results.push(res("SELECT", policyCatalogRows(over.policies)));
   results.push(res("SELECT", [{ total_size: "90 MB", rows: 240112 }]));
-  const become = (who: string) => results.push(res("RESET"), res("SELECT", [{ become: "{}" }]), res("SET"), res("DO"),
+  const become = (who: string) => results.push(res("RESET"), res("SELECT", [{ claims_set: true, legacy_cleared: true }]),
+    res("SELECT", [claimsRow(who, who === "manager" ? over.claims : {})]), res("SET"), res("DO"),
     res("SELECT", [timeoutRow(who, who === "manager" ? over.timeout : {})]));
   for (const role of ["owner", "manager"]) {
     become(role);
@@ -142,10 +148,11 @@ function managerAllSites(): MeasureResult {
   return { ...managerAuOnly(), sites: ["au", "staging", "uk", "us"], rows: SCOPES.map((s) => row(s)) };
 }
 
-const ID = { fnName: V2_FUNCTION, fnDefinitionMd5: "abc", encodingVersion: 2, harnessVersion: HARNESS_VERSION };
+const ID = gateIdentity("abc");
 const rec = (phase: PhaseRecord["phase"], finishedAt: string, over: Partial<PhaseRecord> = {}): PhaseRecord => ({
   phase, finishedAt, revision: "r", fnName: ID.fnName, fnDefinitionMd5: ID.fnDefinitionMd5,
-  encodingVersion: ID.encodingVersion, harnessVersion: ID.harnessVersion, problems: [], ...over,
+  encodingVersion: ID.encodingVersion, harnessVersion: ID.harnessVersion, policyHash: ID.policyHash, parityHash: ID.parityHash,
+  problems: [], ...over,
 });
 const phases = (over: Partial<PhaseRecord> = {}): PhaseRecord[] => [
   rec("denied-before", "2026-11-13T01:00:00Z", over),
@@ -156,7 +163,7 @@ const phases = (over: Partial<PhaseRecord> = {}): PhaseRecord[] => [
 function input(over: Partial<GateInput> = {}): GateInput {
   return {
     mode: "full", runs: fullRuns(), measures: { owner: owner(), manager: managerAuOnly() },
-    managerPhase: "denied-after", phaseRecords: phases(), ...over,
+    managerPhase: "denied-after", phaseRecords: phases(), extras: { claimsSources: claimsSources(), parity: parityArtifact() }, ...over,
   };
 }
 
@@ -284,6 +291,7 @@ describe("manager phases", () => {
     ]);
     const stale: Array<Partial<PhaseRecord>> = [
       { fnDefinitionMd5: "other" }, { fnName: V1_FUNCTION }, { encodingVersion: 1 }, { harnessVersion: "old" }, { fnName: undefined },
+      { policyHash: "pre-0036" }, { parityHash: undefined },
     ];
     for (const old of stale) {
       expect(checkManagerPhases(phases(old), ID).length, JSON.stringify(old)).toBe(3);
@@ -364,5 +372,38 @@ describe("SQL evidence rules", () => {
     o.rows[0].runs[1] = run(2, TOTAL["au-busy-day"], { otherEvidenceCalls: 1 });
     expect(checkItemCountingEvidence(input({ measures: { owner: o, manager: managerAuOnly() } })))
       .toContain("measurement as owner: AU busy day run 2 called another evidence RPC (v1 fallback?) 1 time(s)");
+  });
+});
+
+describe("policy and real-session claims evidence", () => {
+  it("fails on minimal claims, a size/shape mismatch or a wrong subject", () => {
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ claims_bytes: 74 }, /manager: SQL claims are 74 bytes but the session's are \d+/],
+      [{ claims_shape: "role:string,sub:string" }, /manager: SQL claims shape differs/],
+      [{ claims_subject_ok: false }, /manager: claims subject ok is not true/],
+      [{ legacy_overrides_empty: false }, /manager: legacy overrides empty is not true/],
+      [{ profile_role: "staff" }, /manager: the session's profile role is staff/],
+    ];
+    for (const [claims, re] of cases) {
+      const runs = fullRuns();
+      runs[2] = queryRun(false, { claims });
+      expect(checkItemCountingEvidence(input({ runs })).some((p) => re.test(p)), String(re)).toBe(true);
+    }
+    const missing = checkItemCountingEvidence(input({ extras: { claimsSources: {}, parity: parityArtifact() } }));
+    expect(missing).toContain("03-query-evidence: owner: no real session claims were supplied");
+  });
+
+  it("fails when the policies are still the pre-0036 ones, or parity is missing or for other policies", () => {
+    const runs = fullRuns();
+    runs[2] = queryRun(false, { policies: prePolicies() });
+    const p = checkItemCountingEvidence(input({ runs }));
+    expect(p).toContain("03-query-evidence: policy production_events_read still calls can_access_location per row");
+    expect(p.some((x) => x.includes("captured under different policies"))).toBe(true);
+    expect(checkItemCountingEvidence(input({ extras: { claimsSources: claimsSources(), parity: null } })).some((x) => x.includes("policy parity has not been run"))).toBe(true);
+  });
+
+  it("phases recorded under the old policies (no policy hash) don't count", () => {
+    const old = phases({ policyHash: undefined, parityHash: undefined });
+    expect(checkManagerPhases(old, ID)).toHaveLength(3);
   });
 });

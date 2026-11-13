@@ -19,6 +19,49 @@ checks that v1 and v2 are STABLE, SECURITY INVOKER with `search_path=""`, that
 only `authenticated` and `service_role` can execute them, and records a hash
 of v2's definition. Manager phases are recorded against that hash.
 
+## Policy amendment 0036: staging sequence
+
+`0036_production_events_select_initplans.sql` rewrites only the two SELECT
+policies on `production_events` so their checks run once per statement.
+Visibility must not change, so the gate proves it on staging, in this order
+(the runner never applies SQL; each SQL step is CJ's, or Astra's on CJ's
+instruction):
+
+1. `npm run staging:item-counting -- --policy-parity=before` (standard
+   memberships).
+2. Remove `uk` from the owner and kiosk test users; run
+   `npm run staging:item-counting -- --policy-parity=before --arrangement=owner-kiosk-without-uk`;
+   restore `uk`.
+3. Apply `0036` on staging.
+4. `npm run staging:item-counting -- --policy-parity=after`.
+5. Remove `uk` from owner and kiosk again; run
+   `--policy-parity=after --arrangement=owner-kiosk-without-uk`; restore `uk`.
+6. The three manager phases below (`--measure-only --manager-phase=…`).
+
+Parity reads what every role (owner, manager, staff, kiosk, cs, and a session
+with no subject) can see at each site, month by month, as `authenticated`
+with RLS on, real session claims and the 8 s limit. It also replays each
+direct app reader's filters (clock cards, timesheet, completions, package
+history, recent activity, Production, Reports, Welcome). Before and after
+must match exactly, by row id, not just by count. Only the two SELECT
+policies may change: write policies, helpers, grants, RLS flags, role
+settings and both evidence functions are fingerprinted and must not. A
+privileged fingerprint of all saved events detects data changes in between.
+Results go to `staging-results-item-counting.policy-parity.json` and
+`staging-results-item-counting-policy-parity.md` (git-ignored, ending with a
+STATUS line).
+
+## Real session claims
+
+The runner signs in all five test users and passes each session's real JWT
+claims to the SQL as bound parameters (never written anywhere; reports show
+only sizes). Through the API, RLS parses those claims on every
+`auth.uid()` call, so tiny `{sub, role}` claims under-measure it by about
+2 s. 03 fails if it is run without the runner's claims. Add the staff, kiosk
+and cs logins to `.env.staging.local` (`STAGING_STAFF_EMAIL`,
+`STAGING_STAFF_PASSWORD`, `STAGING_KIOSK_EMAIL`, `STAGING_KIOSK_PASSWORD`,
+`STAGING_CS_EMAIL`, `STAGING_CS_PASSWORD`).
+
 ## The API's time limit is part of the test
 
 Through the API, every request runs as `authenticated`, whose
@@ -69,7 +112,10 @@ site memberships and records each finished phase in
 
 A phase is recorded only when its own SQL gate and every owner and manager
 API run passed. It is tagged with the v2 function name, definition hash,
-encoding version and harness version, so v1-era records never count. The gate
+encoding version, harness version, the policy hash and the parity artifact
+hash, so records from before 0036 (or from v1) never count. The SQL gate
+also requires completed parity for the current policies before any API
+timing. The gate
 is COMPLETE only when all three phases passed, in order, for that same
 identity. A `--manager-phase` that doesn't match the manager's real
 memberships is refused. Until the later phases are run, the report ends with

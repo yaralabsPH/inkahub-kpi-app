@@ -35,7 +35,7 @@ function state(over: Partial<GateState> = {}): GateState {
   const sites: FileRun = { file: "01-sites.sql", statements: 2, results: [res(1, "BEGIN"), res(2, "SELECT", [{ what: "locations", detail: "au" }])] };
   return {
     startedAt: "2026-11-13T00:00:00Z", revision: "abc1234", mode: "full", runs: [sites],
-    measures: { owner: undefined, manager: undefined }, managerPhase: null, phaseRecords: [],
+    measures: { owner: undefined, manager: undefined }, managerPhase: null, phaseRecords: [], claimsSources: {}, parity: null,
     current: null, lastProgress: null, stopped: null, fatal: null, finishedAt: null, ...over,
   };
 }

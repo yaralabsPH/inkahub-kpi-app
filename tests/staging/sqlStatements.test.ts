@@ -72,6 +72,17 @@ describe("splitSqlStatements", () => {
     for (const s of text) expect(s.text).toMatch(/json_to_record\(pgrst_payload\.json_data\)/);
   });
 
+  it("03 switches identity only with the runner's real-session claims (no minimal-claims fallback)", () => {
+    const sql = readFileSync("supabase/staging/item-counting/03-query-evidence.sql", "utf8").replace(/\r\n/g, "\n");
+    expect(sql).not.toMatch(/json_build_object\(\s*'sub'/);
+    const setters = [...sql.matchAll(/set_config\('request\.jwt\.claims', current_setting\('inka_staging\.jwt_(\w+)'\), true\)/g)].map((m) => m[1]);
+    expect(setters).toEqual(["owner", "manager", "staff", "owner"]);
+    // current_setting without missing_ok: standalone SQL without the runner's claims fails instead of reading nothing.
+    expect(sql).not.toMatch(/current_setting\('inka_staging\.jwt_\w+', true\)/);
+    expect((sql.match(/as claims_for,/g) ?? []).length).toBe(4);
+    expect((sql.match(/as policy_catalog,/g) ?? []).length).toBe(1);
+  });
+
   it("03-query-evidence.sql is current with migrations 0035 and the measured cases", async () => {
     const { buildQueryEvidenceSql } = await import("./generate-query-evidence");
     const onDisk = readFileSync("supabase/staging/item-counting/03-query-evidence.sql", "utf8").replace(/\r\n/g, "\n");

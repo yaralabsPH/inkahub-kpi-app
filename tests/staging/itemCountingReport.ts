@@ -20,6 +20,7 @@ import {
   type PhaseRecord,
   type StatementResult,
 } from "./itemCountingEvidence";
+import { parityArtifactHash, type ClaimsSource, type ParityArtifact } from "./itemCountingPolicyParity";
 
 const MAX_ROWS_SHOWN = 500;
 
@@ -33,6 +34,10 @@ export interface GateState {
   managerPhase: ManagerPhase | null;
   /** Manager phases recorded by earlier runs and, once finished, this one. */
   phaseRecords: PhaseRecord[];
+  /** Real-session claims (sizes/shapes only, never values) per role, from this run's sign-ins. */
+  claimsSources: Record<string, ClaimsSource>;
+  /** The policy parity artifact (before/after 0036), if any. */
+  parity: ParityArtifact | null;
   /** Step now running, e.g. "measuring as owner · AU 3 months (busy) · run 1/3". Null when finished. */
   current: string | null;
   /** Latest progress line for the current step (heartbeat). */
@@ -90,6 +95,7 @@ export function gateProblems(state: GateState): string[] {
       measures: state.measures,
       managerPhase: state.managerPhase,
       phaseRecords: state.phaseRecords,
+      extras: { claimsSources: state.claimsSources, parity: state.parity },
     }),
   ];
 }
@@ -129,6 +135,17 @@ export function buildReport(state: GateState): GateReport {
     if (!m) parts.push("Not run.");
     else if ("error" in m) parts.push(`**FAILED:** ${m.error}`);
     else parts.push(measureTable(m), ...(m.rows.length < 6 ? ["", `(${m.rows.length} of 6 cases finished)`] : []));
+  }
+  parts.push("", "## Real-session claims (sizes only; values are never recorded)", "", "| Role | Bytes | Problems |", "|---|---:|---|");
+  for (const [role, c] of Object.entries(state.claimsSources)) parts.push(`| ${role} | ${c.bytes} | ${c.problems.length ? cell(c.problems.join("; ")) : "none"} |`);
+  if (!Object.keys(state.claimsSources).length) parts.push("| – | – | no sessions signed in |");
+  parts.push("", "## Policy parity (0036)", "");
+  if (!state.parity || !state.parity.comparisons.length) parts.push("- No completed before/after comparison.");
+  else {
+    parts.push(`- parity artifact hash: ${parityArtifactHash(state.parity)}`, "", "| Arrangement | Compared | Policies before → after | Result |", "|---|---|---|---|");
+    for (const c of state.parity.comparisons) {
+      parts.push(`| ${c.arrangement} | ${c.comparedAt} | ${c.beforeHash.slice(0, 12)} → ${c.afterHash.slice(0, 12)} | ${c.problems.length ? `FAILED: ${cell(c.problems[0])}` : "identical visibility"} |`);
+    }
   }
   parts.push("", "## Manager membership phases", "", "| Phase | Recorded | Code | Result |", "|---|---|---|---|");
   for (const phase of MANAGER_PHASES) {

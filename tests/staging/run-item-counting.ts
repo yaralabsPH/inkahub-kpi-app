@@ -18,6 +18,15 @@
  *   4. Writes the report, ending with "STATUS: COMPLETE" or
  *      "STATUS: FAILED – <reason>", and exits non-zero on failure.
  *
+ * Before any SQL it signs in the five test users (owner, manager, staff,
+ * kiosk, cs) and passes each REAL session's claims to 03 as bound parameters
+ * (never written anywhere), so RLS costs what it costs through the API.
+ *
+ * `--policy-parity=before|after [--arrangement=standard|owner-kiosk-without-uk]`
+ * instead captures/compares what every role can see around migration 0036
+ * (staging-results-item-counting.policy-parity.json + its own report); it
+ * times nothing and records no manager phase.
+ *
  * Progress: the console shows each step and a heartbeat every 10 s while a
  * load runs. The report is rewritten after every SQL statement, measured
  * case and heartbeat, so stopping the command (Ctrl+C) or killing it keeps
@@ -46,6 +55,17 @@ import {
 } from "./itemCountingEvidence";
 import { runGate, type GateIO } from "./itemCountingGate";
 import { buildReport, type GateState } from "./itemCountingReport";
+import { claimsSetting } from "./generate-query-evidence";
+import { signInClaims, SESSION_ROLES, type SessionRole } from "./stagingSessions";
+import { collectParitySnapshot } from "./policyParityRun";
+import {
+  ARRANGEMENTS,
+  checkSnapshot,
+  compareSnapshots,
+  redactSecrets,
+  type Arrangement,
+  type ParityArtifact,
+} from "./itemCountingPolicyParity";
 
 const ENV_FILE = ".env.staging.local";
 const REPORT_FILE = "staging-results-item-counting.md";
@@ -53,6 +73,9 @@ const REPORT_TMP = "staging-results-item-counting.tmp.md";
 const SQL_DIR = "supabase/staging/item-counting/";
 /** Manager membership phases recorded across runs (git-ignored, no secrets). */
 const PHASES_FILE = "staging-results-item-counting.phases.json";
+/** Policy parity snapshots/comparisons (git-ignored; synthetic row ids and catalog text only). */
+const PARITY_FILE = "staging-results-item-counting.policy-parity.json";
+const PARITY_REPORT = "staging-results-item-counting-policy-parity.md";
 
 const ARGS = process.argv.slice(2);
 const MODE: GateMode = ARGS.includes("--measure-only") ? "measure-only" : "full";
@@ -60,6 +83,25 @@ const PHASE_ARG = ARGS.find((a) => a.startsWith("--manager-phase="))?.split("=")
 if (PHASE_ARG !== undefined && !MANAGER_PHASES.includes(PHASE_ARG)) {
   console.error(`--manager-phase must be one of ${MANAGER_PHASES.join(", ")}`);
   process.exit(2);
+}
+const PARITY_ARG = ARGS.find((a) => a.startsWith("--policy-parity="))?.split("=")[1] as "before" | "after" | undefined;
+if (PARITY_ARG !== undefined && PARITY_ARG !== "before" && PARITY_ARG !== "after") {
+  console.error("--policy-parity must be before or after");
+  process.exit(2);
+}
+const ARRANGEMENT = (ARGS.find((a) => a.startsWith("--arrangement="))?.split("=")[1] ?? "standard") as Arrangement;
+if (!ARRANGEMENTS.includes(ARRANGEMENT)) {
+  console.error(`--arrangement must be one of ${ARRANGEMENTS.join(", ")}`);
+  process.exit(2);
+}
+
+function readParity(): ParityArtifact | null {
+  try {
+    const raw = JSON.parse(readFileSync(PARITY_FILE, "utf8")) as ParityArtifact;
+    return Array.isArray(raw.snapshots) && Array.isArray(raw.comparisons) ? raw : null;
+  } catch {
+    return null;
+  }
 }
 
 function readPhases(): PhaseRecord[] {
@@ -79,6 +121,12 @@ const REQUIRED = [
   "STAGING_OWNER_PASSWORD",
   "STAGING_MANAGER_EMAIL",
   "STAGING_MANAGER_PASSWORD",
+  "STAGING_STAFF_EMAIL",
+  "STAGING_STAFF_PASSWORD",
+  "STAGING_KIOSK_EMAIL",
+  "STAGING_KIOSK_PASSWORD",
+  "STAGING_CS_EMAIL",
+  "STAGING_CS_PASSWORD",
 ] as const;
 type Settings = Record<(typeof REQUIRED)[number], string> & { STAGING_RUNS?: string };
 
@@ -137,6 +185,8 @@ const state: GateState = {
   runs: [],
   managerPhase: null,
   phaseRecords: readPhases(),
+  claimsSources: {},
+  parity: readParity(),
   measures: { owner: undefined, manager: undefined },
   current: "reading settings",
   lastProgress: null,
@@ -177,6 +227,9 @@ function progressLine(who: string, p: MeasureProgress): string {
   }
 }
 
+/** Real-session claims text per role (memory only), filled by main() before any SQL. */
+let claimsText: Record<string, string> = {};
+
 async function runSqlFile(client: pg.Client, file: string, notices: string[]): Promise<FileRun> {
   const statements = splitSqlStatements(readFileSync(SQL_DIR + file, "utf8"));
   const run: FileRun = { file, statements: statements.length, results: [] };
@@ -204,8 +257,14 @@ async function runSqlFile(client: pg.Client, file: string, notices: string[]): P
         error: null,
       });
       console.log(`  ${s.index}. ${res.command ?? "?"} ${res.rowCount ?? ""} (${ms} ms) ${s.label.slice(0, 60)}`);
+      if (file === "03-query-evidence.sql" && res.command === "BEGIN") {
+        for (const [role, text] of Object.entries(claimsText)) {
+          await client.query("select set_config($1, $2, true) is not null as ok", [claimsSetting(role), text]);
+        }
+        console.log(`     real-session claims supplied for ${Object.keys(claimsText).join(", ")} (values not shown)`);
+      }
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
+      const message = redactSecrets(e instanceof Error ? e.message : String(e));
       run.results.push({
         index: s.index, line: s.line, label: s.label, command: null, rowCount: null,
         fields: [], rows: [], notices: [...notices], ms: Math.round(performance.now() - t0), error: message,
@@ -231,6 +290,19 @@ async function main(): Promise<number> {
     assertStagingSupabaseUrl(settings.STAGING_SUPABASE_URL);
     const s = settings;
     const repeat = Math.max(1, Number(s.STAGING_RUNS ?? 3) || 3);
+
+    state.current = "signing in the five test users for real-session claims";
+    saveReport();
+    const logins = Object.fromEntries(SESSION_ROLES.map((r) => {
+      const up = r.toUpperCase() as Uppercase<SessionRole>;
+      return [r, { email: s[`STAGING_${up}_EMAIL`], password: s[`STAGING_${up}_PASSWORD`] }];
+    })) as Record<SessionRole, { email: string; password: string }>;
+    const sessions = await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins);
+    claimsText = sessions.text;
+    state.claimsSources = sessions.sources;
+    for (const [role, c] of Object.entries(sessions.sources)) console.log(`  ${role}: real session claims ${c.bytes} bytes${c.problems.length ? ` · ${c.problems[0]}` : ""}`);
+
+    if (PARITY_ARG) return await runParity(dbConfig, PARITY_ARG);
 
     const io: GateIO = {
       async runSql(files) {
@@ -295,6 +367,61 @@ async function main(): Promise<number> {
   if (report.slow.length) console.log(`${report.slow.length} case(s) over latency target.`);
   console.log(report.status);
   return report.problems.length ? 1 : 0;
+}
+
+/** `--policy-parity=before|after`: capture a snapshot; after compares with the latest before for the arrangement. */
+async function runParity(dbConfig: pg.ClientConfig, mode: "before" | "after"): Promise<number> {
+  const art: ParityArtifact = readParity() ?? { snapshots: [], comparisons: [] };
+  const lines: string[] = [];
+  const log = (l: string) => {
+    console.log(`  ${l}`);
+    lines.push(l);
+  };
+  console.log(`\nPolicy parity ${mode} · arrangement ${ARRANGEMENT}`);
+  const client = new pg.Client(dbConfig);
+  await client.connect();
+  let problems: string[] = [];
+  try {
+    const snap = await collectParitySnapshot(client, { mode, arrangement: ARRANGEMENT, revision: state.revision, claimsText, log });
+    for (const [role, c] of Object.entries(state.claimsSources)) {
+      problems.push(...c.problems);
+      if (snap.roles[role as SessionRole]?.claimsBytes !== c.bytes) problems.push(`${role}: SQL claims size differs from the session's`);
+    }
+    if (mode === "before") {
+      problems.push(...checkSnapshot(snap));
+      // Keep only the latest before-snapshot per arrangement (the baseline).
+      art.snapshots = [...art.snapshots.filter((x) => !(x.mode === "before" && x.arrangement === ARRANGEMENT)), snap];
+    } else {
+      const before = [...art.snapshots].reverse().find((x) => x.mode === "before" && x.arrangement === ARRANGEMENT);
+      if (!before) problems.push(`no before-snapshot for arrangement ${ARRANGEMENT}; run --policy-parity=before first (before applying 0036)`);
+      else {
+        const cmp = compareSnapshots(before, snap, new Date().toISOString());
+        problems.push(...cmp.problems);
+        // Claims problems count too: a comparison only passes when everything in this run passed.
+        art.comparisons = [...art.comparisons.filter((c) => c.arrangement !== ARRANGEMENT), { ...cmp, problems: [...problems] }];
+      }
+    }
+    writeFileSync(PARITY_FILE, JSON.stringify(art), "utf8");
+  } catch (e) {
+    problems.push(redactSecrets(e instanceof Error ? e.message : String(e)));
+  } finally {
+    await client.end().catch(() => {});
+  }
+  const status = problems.length ? `STATUS: FAILED – ${problems[0]}${problems.length > 1 ? ` (+${problems.length - 1} more)` : ""}` : "STATUS: COMPLETE";
+  const md = [
+    "# item-counting · policy parity (0036)", "",
+    `- project: ${STAGING_REF} (staging) · code revision: ${state.revision}`,
+    `- mode: ${mode} · arrangement: ${ARRANGEMENT} · finished: ${new Date().toISOString()}`,
+    "- what each role can see, read as `authenticated` with RLS on, real-session claims and the catalog statement_timeout; values of claims are never recorded",
+    "", "## Log", "", ...lines.map((l) => `- ${l}`),
+    "", "## Real-session claims (sizes only)", "", ...Object.entries(state.claimsSources).map(([r, c]) => `- ${r}: ${c.bytes} bytes`),
+    "", "## Checks", "", ...(problems.length ? problems.map((p) => `- MISSING/WRONG: ${p}`) : [mode === "before" ? "- Baseline complete (this alone does not satisfy Task 4)." : "- Identical visibility for every role and site; only the two SELECT policies changed."]),
+    "", status, "",
+  ].join("\n");
+  writeFileSync(PARITY_REPORT, md, "utf8");
+  console.log(`\nWrote ${PARITY_REPORT}`);
+  console.log(status);
+  return problems.length ? 1 : 0;
 }
 
 let stopping = false;

@@ -21,8 +21,13 @@ import { HARNESS_VERSION, V1_FUNCTION, V2_FUNCTION } from "./itemCountingEvidenc
 const SIG = "(text, timestamptz, timestamptz, timestamptz)";
 
 const readLf = (p: string) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
-const v2Migration = readLf("supabase/migrations/0035_load_production_evidence_v2.sql");
-const v2Body = /AS \$fn\$\n([\s\S]*?)\n\$fn\$;/.exec(v2Migration)![1].replace(/^\s*--.*$/gm, "").replace(/\n{2,}/g, "\n");
+/** The v2 function body from migration 0035, read when the SQL is built (not at import time). */
+let v2BodyCache: string | null = null;
+function v2Body(): string {
+  v2BodyCache ??= /AS \$fn\$\n([\s\S]*?)\n\$fn\$;/.exec(readLf("supabase/migrations/0035_load_production_evidence_v2.sql"))![1]
+    .replace(/^\s*--.*$/gm, "").replace(/\n{2,}/g, "\n");
+  return v2BodyCache;
+}
 
 const scopes = MEASURE_CASES.map((c) => {
   const r = productionRange(c.site, c.first, c.last);
@@ -34,16 +39,38 @@ const C = STAGING_CUTOFF;
 const call = (fn: string, site: string, s: string, e: string) =>
   `public.${fn}(${lit(site)}, ${ts(s)}, ${ts(e)}, ${ts(C)})`;
 const bodyWith = (site: string, s: string, e: string) =>
-  v2Body.replace(/p_site/g, `${lit(site)}::text`).replace(/p_start_utc/g, ts(s))
+  v2Body().replace(/p_site/g, `${lit(site)}::text`).replace(/p_start_utc/g, ts(s))
     .replace(/p_end_utc_exclusive/g, ts(e)).replace(/p_as_of_utc/g, ts(C));
 
-/** Switch identity, then apply authenticated's catalog statement_timeout and record the settings. */
-function become(role: string): string[] {
+/** The transaction-local setting the runner fills with a role's real session claims (never a literal here). */
+export const claimsSetting = (role: string) => `inka_staging.jwt_${role.replace(/-/g, "_")}`;
+export const STAGING_ISSUER = "https://ybrzhrgfrnvtcwymjdrq.supabase.co/auth/v1";
+
+/**
+ * Switch identity using that role's REAL session claims, supplied by the
+ * runner as a bound parameter into a transaction-local setting. Standalone
+ * SQL without them fails (current_setting without missing_ok); there is no
+ * fallback to minimal {sub, role} claims. Then record claims evidence (sizes,
+ * shape, booleans — never values), switch to authenticated, apply
+ * authenticated's catalog statement_timeout and record the settings.
+ */
+export function become(role: string, email = `${role}@inka-staging.test`): string[] {
   return [
     "reset role;",
-    `select set_config('request.jwt.claims',
-  json_build_object('sub', (select id from auth.users where email = '${role}@inka-staging.test'),
-                    'role', 'authenticated')::text, true) as become_${role};`,
+    `select set_config('request.jwt.claims', current_setting('${claimsSetting(role)}'), true) is not null as claims_set,
+       set_config('request.jwt.claim.sub', '', true) = '' and set_config('request.jwt.claim.role', '', true) = '' as legacy_cleared;`,
+    `select '${role}' as claims_for,
+       octet_length(current_setting('request.jwt.claims')) as claims_bytes,
+       (select string_agg(k || ':' || json_typeof(c.j -> k), ',' order by k collate "C") from json_object_keys(c.j) k) as claims_shape,
+       (c.j ->> 'role') = 'authenticated' as claims_db_role_ok,
+       (c.j ->> 'aud') = 'authenticated' as claims_aud_ok,
+       (c.j ->> 'iss') = '${STAGING_ISSUER}' as claims_iss_ok,
+       (c.j ->> 'exp')::bigint > extract(epoch from now()) as claims_unexpired,
+       coalesce((select u.email from auth.users u where u.id::text = c.j ->> 'sub') = '${email}', false) as claims_subject_ok,
+       coalesce(current_setting('request.jwt.claim.sub', true), '') = '' and coalesce(current_setting('request.jwt.claim.role', true), '') = '' as legacy_overrides_empty,
+       (select p.role from public.profiles p where p.user_id::text = c.j ->> 'sub') as profile_role,
+       (select string_agg(ul.location, ',' order by ul.location) from public.user_locations ul where ul.user_id::text = c.j ->> 'sub') as memberships
+from (select current_setting('request.jwt.claims')::json as j) c;`,
     "set local role authenticated;",
     `-- apply the API role's own statement_timeout (read from the catalog, never hardcoded)
 do $$
@@ -72,10 +99,15 @@ $$;`,
        (select coalesce(array_to_string(rolconfig, ', '), '') from pg_catalog.pg_roles where rolname = 'anon') as anon_config,
        current_setting('row_security') as row_security,
        current_setting('work_mem') as work_mem,
-       current_setting('request.jwt.claims', true)::json ->> 'sub' as jwt_sub,
        version() as server_version;`,
   ];
 }
+
+/** All policies on public.production_events, as pg prints them (hashed and checked by the gate). */
+export const POLICY_CATALOG_SQL = `-- production_events policies (all of them; hashed by the gate)
+select 'production_events' as policy_catalog, schemaname, tablename, policyname, permissive, roles::text[] as roles, cmd, qual, with_check
+from pg_catalog.pg_policies where schemaname = 'public' and tablename = 'production_events'
+order by policyname;`;
 
 /** The four families, written independently (EXISTS, not the function's IN), as full rows. */
 function familiesSql(site: string, s: string, e: string): string {
@@ -197,12 +229,19 @@ export function buildQueryEvidenceSql(): string {
 --
 -- GENERATED by tests/staging/generate-query-evidence.ts (${HARNESS_VERSION}) from
 -- supabase/migrations/0035_load_production_evidence_v2.sql and MEASURE_CASES /
--- STAGING_CUTOFF. STAGING ONLY. Needs 0034 and 0035 applied on staging.
+-- STAGING_CUTOFF. STAGING ONLY. Needs 0034, 0035 and 0036 applied on staging.
 -- Read-only: everything runs in one transaction that is rolled back; no
 -- ANALYZE, no ALTER of any role or setting.
 --
--- 1. v2 and v1 function catalog definitions and grants.
--- 2. After every switch to the authenticated role: apply authenticated's own
+-- Identity switches use each role's REAL session claims, which the runner
+-- puts into transaction-local inka_staging.jwt_<role> settings as bound
+-- parameters right after BEGIN. Run standalone, without them, the first
+-- switch fails: there is no fallback to minimal claims.
+--
+-- 1. v2 and v1 function catalog definitions and grants; all production_events
+--    policies (hashed by the gate and checked against the reviewed 0036 text).
+-- 2. After every switch to the authenticated role: record claims evidence
+--    (size, shape, subject, issuer — never values), apply authenticated's own
 --    statement_timeout from pg_roles with SET LOCAL (as PostgREST does) and
 --    record the effective settings. Over-limit statements cancel and fail.
 -- 3. Owner and manager (RLS on), each of the six scopes:
@@ -218,7 +257,7 @@ export function buildQueryEvidenceSql(): string {
 -- Labels: EXPLAINs select 'gate:<call|body>:<role>:<scope>:<run>'; text runs
 -- return 'gate:text:<role>:<scope>:<run>' in their gate column.`);
   parts.push("begin;");
-  parts.push(catalog(V2_FUNCTION), privileges(V2_FUNCTION), catalog(V1_FUNCTION), privileges(V1_FUNCTION));
+  parts.push(catalog(V2_FUNCTION), privileges(V2_FUNCTION), catalog(V1_FUNCTION), privileges(V1_FUNCTION), POLICY_CATALOG_SQL);
   parts.push(`select pg_size_pretty(pg_total_relation_size('public.production_events')) as total_size,
        (select count(*) from public.production_events) as rows;`);
 

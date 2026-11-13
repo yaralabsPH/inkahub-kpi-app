@@ -22,6 +22,17 @@
  *    definition, encoding and harness version.
  */
 import { MEASURE_CASES, type MeasureResult, type MeasureRow } from "./measure-item-counting";
+import {
+  checkClaimsEvidence,
+  checkParityArtifact,
+  checkPolicySet,
+  parityArtifactHash,
+  policyHash,
+  rolesOf,
+  type ClaimsSource,
+  type ParityArtifact,
+  type PolicyRow,
+} from "./itemCountingPolicyParity";
 
 export interface StatementResult {
   index: number;
@@ -53,7 +64,7 @@ export const V2_FUNCTION = "load_production_evidence_v2";
 export const V1_FUNCTION = "load_production_evidence";
 export const ENCODING_VERSION = 2;
 /** Bump when the evidence/gate rules change, so older manager phase records can't count. */
-export const HARNESS_VERSION = "item-counting-gate-v2.1";
+export const HARNESS_VERSION = "item-counting-gate-v2.2";
 
 /** What a phase record must have been measured against. */
 export interface GateIdentity {
@@ -61,6 +72,10 @@ export interface GateIdentity {
   fnDefinitionMd5: string;
   encodingVersion: number;
   harnessVersion: string;
+  /** SHA-256 of ALL production_events policies (canonical JSON). */
+  policyHash: string;
+  /** SHA-256 of the completed parity comparisons this run relied on. */
+  parityHash: string;
 }
 
 /** A manager phase recorded by an earlier (or this) run. Only clean runs are recorded. */
@@ -72,6 +87,8 @@ export interface PhaseRecord {
   fnDefinitionMd5: string | null;
   encodingVersion?: number;
   harnessVersion?: string;
+  policyHash?: string;
+  parityHash?: string;
   problems: string[];
 }
 
@@ -162,7 +179,15 @@ export interface QueryFacts {
   expected: Map<string, number>;
   /** v2 definition hash (what manager phases are recorded against). */
   fnDefinitionMd5: string | null;
+  /** Hash of the current production_events policies (from 03). */
+  policyHash: string | null;
   identity: GateIdentity | null;
+}
+
+/** What the runner supplies besides the SQL results: real-session claims and the parity artifact. */
+export interface GateExtras {
+  claimsSources?: Record<string, ClaimsSource>;
+  parity?: ParityArtifact | null;
 }
 
 function findWith(run: FileRun, field: string): StatementResult[] {
@@ -190,15 +215,43 @@ function checkFunction(run: FileRun, fnName: string, p: (s: string) => void, mig
   return fn;
 }
 
-function checkQueryEvidence(run: FileRun, problems: string[]): QueryFacts {
-  const facts: QueryFacts = { expected: new Map(), fnDefinitionMd5: null, identity: null };
+function checkQueryEvidence(run: FileRun, problems: string[], extras: GateExtras = {}): QueryFacts {
+  const facts: QueryFacts = { expected: new Map(), fnDefinitionMd5: null, policyHash: null, identity: null };
   const p = (s: string) => problems.push(`03-query-evidence: ${s}`);
+
+  // Real-session claims after every switch (sizes/shapes/booleans only).
+  const claims = findWith(run, "claims_for").map((r) => r.rows[0]).filter(Boolean);
+  if (claims.map((c) => String(c.claims_for)).join(",") !== TIMEOUT_SWITCHES.join(",")) {
+    p(`claims evidence after role switches is ${claims.map((c) => String(c.claims_for)).join(",") || "missing"}, expected ${TIMEOUT_SWITCHES.join(",")}`);
+  }
+  for (const c of claims) {
+    const who = String(c.claims_for);
+    for (const x of checkClaimsEvidence(c, extras.claimsSources?.[who])) p(x);
+    if (c.profile_role !== who) p(`${who}: the session's profile role is ${String(c.profile_role ?? "none")}`);
+  }
+
+  // All production_events policies: the reviewed post-0036 set, hashed.
+  const policyRows: PolicyRow[] = findWith(run, "policy_catalog").flatMap((r) => r.rows).map((r) => ({
+    schemaname: String(r.schemaname), tablename: String(r.tablename), policyname: String(r.policyname), permissive: String(r.permissive),
+    roles: rolesOf(r.roles), cmd: String(r.cmd), qual: r.qual == null ? null : String(r.qual), with_check: r.with_check == null ? null : String(r.with_check),
+  }));
+  if (!policyRows.length) p("production_events policy catalog is missing");
+  else {
+    for (const x of checkPolicySet(policyRows, "post")) p(x);
+    facts.policyHash = policyHash(policyRows).hash;
+  }
+  for (const x of checkParityArtifact(extras.parity ?? null, facts.policyHash)) p(x);
 
   const v2 = checkFunction(run, V2_FUNCTION, p, "0035");
   checkFunction(run, V1_FUNCTION, p, "0034");
   if (v2 && typeof v2.fn_definition_md5 === "string") {
     facts.fnDefinitionMd5 = v2.fn_definition_md5;
-    facts.identity = { fnName: V2_FUNCTION, fnDefinitionMd5: v2.fn_definition_md5, encodingVersion: ENCODING_VERSION, harnessVersion: HARNESS_VERSION };
+    if (facts.policyHash && extras.parity) {
+      facts.identity = {
+        fnName: V2_FUNCTION, fnDefinitionMd5: v2.fn_definition_md5, encodingVersion: ENCODING_VERSION, harnessVersion: HARNESS_VERSION,
+        policyHash: facts.policyHash, parityHash: parityArtifactHash(extras.parity),
+      };
+    }
   }
   const size = findWith(run, "total_size")[0];
   if (!size || size.rows.length === 0) p("table size/row count is missing");
@@ -359,7 +412,8 @@ export function checkOwner(m: MeasureOutcome, facts: QueryFacts | null): string[
 /** Does a record belong to this exact v2 function, encoding and harness? */
 export function sameIdentity(r: PhaseRecord, id: GateIdentity | null): boolean {
   return !!id && r.fnName === id.fnName && r.fnDefinitionMd5 === id.fnDefinitionMd5
-    && r.encodingVersion === id.encodingVersion && r.harnessVersion === id.harnessVersion;
+    && r.encodingVersion === id.encodingVersion && r.harnessVersion === id.harnessVersion
+    && r.policyHash === id.policyHash && r.parityHash === id.parityHash;
 }
 
 /** Which phase the manager's memberships put this run in (only this identity's records count). */
@@ -438,10 +492,12 @@ export interface GateInput {
   managerPhase: ManagerPhase | null;
   /** Earlier recorded phases plus this run's, if it finished. */
   phaseRecords: readonly PhaseRecord[];
+  /** Real-session claims and the policy parity artifact. */
+  extras?: GateExtras;
 }
 
 /** SQL-file problems and 03's facts. */
-export function checkSqlRuns(mode: GateMode, runs: FileRun[]): { problems: string[]; facts: QueryFacts | null } {
+export function checkSqlRuns(mode: GateMode, runs: FileRun[], extras: GateExtras = {}): { problems: string[]; facts: QueryFacts | null } {
   const problems: string[] = [];
   let facts: QueryFacts | null = null;
   const files = mode === "full" ? SQL_FILES : (["03-query-evidence.sql"] as const);
@@ -464,14 +520,14 @@ export function checkSqlRuns(mode: GateMode, runs: FileRun[]): { problems: strin
     if (failed || run.results.length !== run.statements) continue;
     if (file === "01-sites.sql") checkSites(run, problems);
     if (file === "02-volume.sql") checkVolume(run, problems);
-    if (file === "03-query-evidence.sql") facts = checkQueryEvidence(run, problems);
+    if (file === "03-query-evidence.sql") facts = checkQueryEvidence(run, problems, extras);
   }
   return { problems, facts };
 }
 
 /** Every missing, wrong or over-target item; empty means the gate passed. */
 export function checkItemCountingEvidence(input: GateInput): string[] {
-  const { problems, facts } = checkSqlRuns(input.mode, input.runs);
+  const { problems, facts } = checkSqlRuns(input.mode, input.runs, input.extras);
   problems.push(...checkOwner(input.measures.owner, facts));
   problems.push(...checkManager(input.measures.manager, input.managerPhase, facts));
   problems.push(...checkManagerPhases(input.phaseRecords, facts?.identity ?? null));

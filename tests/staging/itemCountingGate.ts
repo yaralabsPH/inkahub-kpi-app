@@ -3,9 +3,10 @@
  * can be tested:
  *
  *   1. run the SQL files (evidence, under the API role's real time limit);
- *   2. API timing starts ONLY when the SQL evidence has zero problems and a
- *      known v2 identity: a cancelled, errored or semantically wrong SQL
- *      result means no API measurement at all;
+ *   2. API timing starts ONLY when the SQL evidence has zero problems
+ *      (including real-session claims and completed 0036 policy parity for
+ *      the current policies) and a known v2/policy identity: a cancelled,
+ *      errored or semantically wrong SQL result means no API measurement;
  *   3. measure as owner, then manager; an explicit --manager-phase must
  *      match the manager's real memberships;
  *   4. record the manager phase only when the SQL gate, the owner and the
@@ -50,7 +51,7 @@ export async function runGate(state: GateState, io: GateIO, opts: GateOptions): 
     return;
   }
 
-  const sql = checkSqlRuns(opts.mode, state.runs);
+  const sql = checkSqlRuns(opts.mode, state.runs, { claimsSources: state.claimsSources, parity: state.parity });
   if (sql.problems.length || !sql.facts?.identity) {
     io.log(`\nSQL gate failed (${sql.problems[0] ?? "v2 function identity unknown"}); API measurements were not started.`);
     return;
@@ -98,6 +99,8 @@ export async function runGate(state: GateState, io: GateIO, opts: GateOptions): 
     fnDefinitionMd5: facts.identity.fnDefinitionMd5,
     encodingVersion: facts.identity.encodingVersion,
     harnessVersion: facts.identity.harnessVersion,
+    policyHash: facts.identity.policyHash,
+    parityHash: facts.identity.parityHash,
     problems: [],
   };
   state.phaseRecords = [...state.phaseRecords, record];
