@@ -18,6 +18,18 @@ import {
 } from "./itemCountingPolicyParity";
 import { STAGING_ISSUER } from "./generate-query-evidence";
 import { ENCODING_VERSION, HARNESS_VERSION, V2_FUNCTION, type GateIdentity } from "./itemCountingEvidence";
+import {
+  CASE_METHOD,
+  CASE_SPECS,
+  caseMemberships,
+  compareCase,
+  fixtureHash,
+  PARITY_CASES,
+  STANDARD_MEMBERSHIPS,
+  type CaseCollection,
+  type CaseSide,
+  type ParityCase,
+} from "./itemCountingParityCases";
 
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -82,12 +94,49 @@ function snap(mode: "before" | "after", arrangement: "standard" | "owner-kiosk-w
   return { mode, arrangement, capturedAt: "t", revision: "r", catalog: { policies, policyHash: policyHash(policies).hash, other: { helpers: "h" } }, fixture: { au: "1:x" }, roles };
 }
 
-/** A passing parity artifact under the post-0036 policies (both arrangements). */
-export function parityArtifact(): ParityArtifact {
+/** The pre-M6 history only (two arrangements): must NOT certify parity any more. */
+export function legacyParityArtifact(): ParityArtifact {
   return {
-    snapshots: [],
+    snapshots: [snap("before", "standard")],
     comparisons: (["standard", "owner-kiosk-without-uk"] as const).map((a) => compareSnapshots(snap("before", a), snap("after", a), "t")),
   };
+}
+
+/** One case side whose row sets satisfy every coverage rule for that case. */
+export function caseSide(kase: ParityCase, which: "before" | "after"): CaseSide {
+  const policies = which === "before" ? prePolicies() : postPolicies();
+  const want = caseMemberships(kase);
+  const roles: CaseSide["roles"] = {};
+  for (const role of CASE_SPECS[kase].roles) {
+    const member = role === "no-subject" ? [] : want[role as keyof typeof want];
+    const visible: Record<string, string[]> = {};
+    for (const st of ["au", "uk", "us", "staging"]) visible[st] = member.includes(st) && st !== "staging" ? [`${st}|${role}-1`] : [];
+    const readers = Object.fromEntries(READER_PROBES.flatMap((pr) => ["au", "uk", "us", "staging"].map((st) => [`${pr}:${st}`, visible[st]])));
+    roles[role] = { profileRole: role === "no-subject" ? null : role, memberships: member.join(","), claimsBytes: 630, visible, readers, errors: [] };
+  }
+  return { policies, policyHash: policyHash(policies).hash, other: { helpers: "h" }, roles, staffForeignRows: CASE_SPECS[kase].roles.includes("staff") ? 0 : null };
+}
+
+/** A passing four-case collection under the post-0036 policies. */
+export function caseCollection(): CaseCollection {
+  const fixture = { au: "5:a", uk: "5:b", us: "5:c" };
+  const coll: CaseCollection = {
+    collectionId: "c1", capturedAt: "t", revision: "r", method: CASE_METHOD, cutoff: "2026-11-12T00:00:00.000Z", bounds: ["-infinity", "infinity"],
+    fixture, fixtureHash: fixtureHash(fixture), baselinePolicyHash: policyHash(prePolicies()).hash, installedPolicyHash: policyHash(postPolicies()).hash,
+    startMemberships: Object.fromEntries(Object.entries(STANDARD_MEMBERSHIPS).map(([k, v]) => [k, [...v]])),
+    staffOtherWorkerRows: { au: 3 },
+    cases: PARITY_CASES.map((k) => ({ case: k, memberships: caseMemberships(k), before: caseSide(k, "before"), after: caseSide(k, "after") })),
+    comparisons: [],
+    restoration: { checkedAt: "t", passed: true, problems: [] },
+    problems: [],
+  };
+  coll.comparisons = coll.cases.map((e) => compareCase(coll, e));
+  return coll;
+}
+
+/** A passing parity artifact under the post-0036 policies (four cases + baseline history). */
+export function parityArtifact(): ParityArtifact {
+  return { ...legacyParityArtifact(), cases: caseCollection() };
 }
 
 export const POST_POLICY_HASH = policyHash(postPolicies()).hash;

@@ -8,6 +8,7 @@
  * shapes, booleans and synthetic row identities.
  */
 import { createHash } from "node:crypto";
+import { caseCollectionHash, checkCaseCollection, type CaseCollection } from "./itemCountingParityCases";
 
 /** One pg_policies row for public.production_events. */
 export interface PolicyRow {
@@ -231,8 +232,11 @@ export interface ParityComparison {
 }
 
 export interface ParityArtifact {
+  /** History: the original before/after runs (the `standard` before snapshot is the pre-0036 baseline authority). */
   snapshots: ParitySnapshot[];
   comparisons: ParityComparison[];
+  /** Acceptance evidence (M6 amendment): the four-case in-transaction collection. */
+  cases?: CaseCollection | null;
 }
 
 /** Expected memberships per arrangement (the app's site list, excluding the "staging" site). */
@@ -322,21 +326,24 @@ export function compareSnapshots(before: ParitySnapshot, after: ParitySnapshot, 
   return { arrangement: after.arrangement, comparedAt, beforeHash: before.catalog.policyHash, afterHash: after.catalog.policyHash, problems, counts };
 }
 
-/** Is parity complete for the current policies? Both arrangements compared cleanly, latest after-hash = current hash. */
-export function checkParityArtifact(art: ParityArtifact | null, currentPolicyHash: string | null): string[] {
-  if (!art) return ["policy parity has not been run (run --policy-parity=before, apply 0036, then --policy-parity=after)"];
-  const out: string[] = [];
-  for (const arrangement of ARRANGEMENTS) {
-    const c = [...art.comparisons].reverse().find((x) => x.arrangement === arrangement);
-    if (!c) out.push(`policy parity for arrangement ${arrangement} is not complete`);
-    else if (c.problems.length) out.push(`policy parity for ${arrangement} failed: ${c.problems[0]}`);
-    else if (!currentPolicyHash || c.afterHash !== currentPolicyHash) out.push(`policy parity for ${arrangement} was captured under different policies; run it again`);
-  }
-  return out;
+/** The original pre-0036 baseline policy hash (latest standard before snapshot), or null. */
+export function baselinePolicyHash(art: ParityArtifact | null): string | null {
+  return [...(art?.snapshots ?? [])].reverse().find((x) => x.mode === "before" && x.arrangement === "standard")?.catalog.policyHash ?? null;
 }
 
-/** Stable hash of the artifact's comparisons, recorded with each manager phase. */
+/**
+ * Is parity complete for the installed policies? Since the M6 amendment only
+ * the four-case collection certifies it; the older standard/owner-kiosk
+ * arrangements are history and cannot certify completion on their own.
+ */
+export function checkParityArtifact(art: ParityArtifact | null, currentPolicyHash: string | null): string[] {
+  if (!art) return ["policy parity has not been run (run --policy-parity=cases)"];
+  return checkCaseCollection(art.cases ?? null, currentPolicyHash, baselinePolicyHash(art));
+}
+
+/** Stable hash of the accepted parity evidence, recorded with each manager phase. */
 export function parityArtifactHash(art: ParityArtifact): string {
+  if (art.cases) return caseCollectionHash(art.cases);
   return createHash("sha256").update(JSON.stringify(art.comparisons), "utf8").digest("hex");
 }
 

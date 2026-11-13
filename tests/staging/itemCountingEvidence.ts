@@ -64,7 +64,7 @@ export const V2_FUNCTION = "load_production_evidence_v2";
 export const V1_FUNCTION = "load_production_evidence";
 export const ENCODING_VERSION = 2;
 /** Bump when the evidence/gate rules change, so older manager phase records can't count. */
-export const HARNESS_VERSION = "item-counting-gate-v2.2";
+export const HARNESS_VERSION = "item-counting-gate-v2.3";
 
 /** What a phase record must have been measured against. */
 export interface GateIdentity {

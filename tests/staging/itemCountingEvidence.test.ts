@@ -19,7 +19,7 @@ import {
   type StatementResult,
 } from "./itemCountingEvidence";
 import { MEASURE_CASES, type MeasureResult, type MeasureRow, type RunMetrics } from "./measure-item-counting";
-import { claimsRow, claimsSources, gateIdentity, parityArtifact, policyCatalogRows } from "./gateTestFixtures";
+import { claimsRow, claimsSources, gateIdentity, legacyParityArtifact, parityArtifact, policyCatalogRows } from "./gateTestFixtures";
 
 let idx = 0;
 function res(command: string, rows: Array<Record<string, unknown>> = [], label = `stmt`): StatementResult {
@@ -398,8 +398,13 @@ describe("policy and real-session claims evidence", () => {
     runs[2] = queryRun(false, { policies: prePolicies() });
     const p = checkItemCountingEvidence(input({ runs }));
     expect(p).toContain("03-query-evidence: policy production_events_read still calls can_access_location per row");
-    expect(p.some((x) => x.includes("captured under different policies"))).toBe(true);
+    expect(p.some((x) => x.includes("collected under different installed policies"))).toBe(true);
     expect(checkItemCountingEvidence(input({ extras: { claimsSources: claimsSources(), parity: null } })).some((x) => x.includes("policy parity has not been run"))).toBe(true);
+  });
+
+  it("the pre-M6 two-arrangement artifact no longer certifies parity (review r1 M6)", () => {
+    const p = checkItemCountingEvidence(input({ extras: { claimsSources: claimsSources(), parity: legacyParityArtifact() } }));
+    expect(p.some((x) => x.includes("four-case policy parity has not been run (run --policy-parity=cases)"))).toBe(true);
   });
 
   it("phases recorded under the old policies (no policy hash) don't count", () => {

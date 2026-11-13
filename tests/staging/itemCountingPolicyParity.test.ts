@@ -6,6 +6,7 @@ import {
   claimsSource,
   compareSnapshots,
   jwtPayloadText,
+  parityArtifactHash,
   policyHash,
   PRE_0036_SELECT_QUAL,
   READER_PROBES,
@@ -15,6 +16,8 @@ import {
   type ParitySnapshot,
   type PolicyRow,
 } from "./itemCountingPolicyParity";
+import { PARITY_CASES } from "./itemCountingParityCases";
+import { parityArtifact, POST_POLICY_HASH } from "./gateTestFixtures";
 
 const ISS = "https://ybrzhrgfrnvtcwymjdrq.supabase.co/auth/v1";
 const NOW = 1_794_000_000;
@@ -199,15 +202,99 @@ describe("before/after parity", () => {
     expect(compareSnapshots(wrong, snap("after", "owner-kiosk-without-uk"), "now").problems.some((x) => x.includes("owner is a member of au,uk,us, expected au,us"))).toBe(true);
   });
 
-  it("parity counts only when both arrangements passed under the current policies", () => {
+  it("the old two-arrangement history alone no longer certifies parity (review r1 M6)", () => {
     const post = snap("after").catalog.policyHash;
-    const ok: ParityArtifact = {
-      snapshots: [],
+    const legacy: ParityArtifact = {
+      snapshots: [snap("before")],
       comparisons: [compareSnapshots(snap("before"), snap("after"), "t1"), compareSnapshots(snap("before", "owner-kiosk-without-uk"), snap("after", "owner-kiosk-without-uk"), "t2")],
     };
-    expect(checkParityArtifact(ok, post)).toEqual([]);
-    expect(checkParityArtifact(ok, "otherhash")[0]).toMatch(/captured under different policies/);
-    expect(checkParityArtifact({ snapshots: [], comparisons: ok.comparisons.slice(0, 1) }, post)).toEqual(["policy parity for arrangement owner-kiosk-without-uk is not complete"]);
+    expect(legacy.comparisons.every((c) => c.problems.length === 0)).toBe(true);
+    expect(checkParityArtifact(legacy, post)).toEqual(["four-case policy parity has not been run (run --policy-parity=cases)"]);
     expect(checkParityArtifact(null, post)[0]).toMatch(/has not been run/);
+  });
+});
+
+describe("four-case in-transaction parity (review r1 M6)", () => {
+  const post = POST_POLICY_HASH;
+
+  it("passes all four cases with restoration, against the original pre-0036 baseline", () => {
+    expect(checkParityArtifact(parityArtifact(), post)).toEqual([]);
+    expect(PARITY_CASES).toEqual(["baseline", "manager-all-sites", "owner-denied-uk", "kiosk-denied-uk"]);
+  });
+
+  it("rejects a missing or duplicated case", () => {
+    const art = parityArtifact();
+    art.cases!.cases = art.cases!.cases.filter((c) => c.case !== "kiosk-denied-uk");
+    expect(checkParityArtifact(art, post)).toContain("parity case kiosk-denied-uk is missing");
+    const dup = parityArtifact();
+    dup.cases!.cases.push(dup.cases!.cases[1]);
+    expect(checkParityArtifact(dup, post)).toContain("parity case manager-all-sites is duplicated");
+  });
+
+  it("rejects the same count with different ids, and reader-result mismatches", () => {
+    const art = parityArtifact();
+    art.cases!.cases[0].after.roles.manager!.visible.au = ["au|other-1"];
+    const r = parityArtifact();
+    r.cases!.cases[0].after.roles.kiosk!.readers!["welcome-team:uk"] = ["uk|zz"];
+    expect(checkParityArtifact(art, post).some((x) => x.includes("manager at au: 1 rows only under pre-0036"))).toBe(true);
+    expect(checkParityArtifact(r, post).some((x) => x.includes("kiosk reader welcome-team:uk"))).toBe(true);
+  });
+
+  it("requires exact memberships including staging", () => {
+    const art = parityArtifact();
+    art.cases!.cases[0].memberships.manager = ["au"];
+    expect(checkParityArtifact(art, post)).toContain("parity case baseline: baseline: manager memberships are au, expected au,staging");
+    const start = parityArtifact();
+    start.cases!.startMemberships.cs = ["au", "staging", "uk"];
+    expect(checkParityArtifact(start, post).some((x) => x.startsWith("parity did not start from standard memberships (cs"))).toBe(true);
+  });
+
+  it("requires positive coverage and real denials", () => {
+    const noUk = parityArtifact();
+    noUk.cases!.cases[1].after.roles.manager!.visible.uk = [];
+    noUk.cases!.cases[1].before.roles.manager!.visible.uk = [];
+    expect(checkParityArtifact(noUk, post).some((x) => x.includes("manager saw no uk rows with uk membership"))).toBe(true);
+    const leak = parityArtifact();
+    leak.cases!.cases[2].after.roles.owner!.visible.uk = ["uk|x"];
+    leak.cases!.cases[2].before.roles.owner!.visible.uk = ["uk|x"];
+    expect(checkParityArtifact(leak, post).some((x) => x.includes("owner saw 1 uk rows without uk membership"))).toBe(true);
+    const staff = parityArtifact();
+    staff.cases!.cases[0].after.staffForeignRows = 2;
+    expect(checkParityArtifact(staff, post).some((x) => x.includes("staff saw 2 rows saved by other workers"))).toBe(true);
+    const proof = parityArtifact();
+    proof.cases!.staffOtherWorkerRows = {};
+    expect(checkParityArtifact(proof, post).some((x) => x.includes("exclusion is not proven"))).toBe(true);
+  });
+
+  it("rejects a mixed fixture/baseline, the wrong restored hash and different installed policies", () => {
+    const fx = parityArtifact();
+    fx.cases!.comparisons[2].fixtureHash = "other";
+    expect(checkParityArtifact(fx, post)).toContain("parity case owner-denied-uk belongs to a different collection, fixture or baseline");
+    const restored = parityArtifact();
+    restored.cases!.baselinePolicyHash = "x".repeat(64);
+    expect(checkParityArtifact(restored, post)).toContain("the restored pre-0036 hash is not the original pre-0036 baseline hash");
+    expect(checkParityArtifact(parityArtifact(), "otherhash")).toContain("four-case parity was collected under different installed policies; run it again");
+    const noBaseline = parityArtifact();
+    noBaseline.snapshots = [];
+    expect(checkParityArtifact(noBaseline, post)[0]).toMatch(/original pre-0036 baseline snapshot is missing/);
+  });
+
+  it("rejects a missing or failed restoration and a stored summary that disagrees with its evidence", () => {
+    const none = parityArtifact();
+    none.cases!.restoration = null;
+    expect(checkParityArtifact(none, post)).toContain("the post-rollback restoration check is missing");
+    const failed = parityArtifact();
+    failed.cases!.restoration = { checkedAt: "t", passed: false, problems: ["owner lacks uk"] };
+    expect(checkParityArtifact(failed, post)).toContain("the post-rollback restoration check failed: owner lacks uk");
+    const lying = parityArtifact();
+    lying.cases!.comparisons[0].counts["owner:au"] = 999;
+    expect(checkParityArtifact(lying, post)).toContain("parity case baseline: the stored comparison does not match its evidence");
+  });
+
+  it("the phase identity hash covers the restoration result", () => {
+    const a = parityArtifact();
+    const b = parityArtifact();
+    b.cases!.restoration = { checkedAt: "t2", passed: true, problems: [] };
+    expect(parityArtifactHash(a)).not.toBe(parityArtifactHash(b));
   });
 });
