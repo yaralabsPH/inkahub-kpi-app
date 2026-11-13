@@ -1,11 +1,13 @@
 /**
- * In-memory stand-in for supabase-js `rpc("load_production_evidence", args)`.
+ * In-memory stand-in for supabase-js `rpc("load_production_evidence_v2", args)`.
  *
- * It ENFORCES the contract of migration 0034: exact function name and four
- * named arguments, a copy of the visible rows taken at "statement start",
+ * It ENFORCES the contract of migration 0035 (encoding v2): exact function
+ * name and four named arguments, a copy of the visible rows taken at "statement start",
  * fake RLS applied to every family before joins, and the four evidence
- * families derived here, independently of the loader's code. Table reads,
- * other RPCs, paging calls and second evidence calls fail.
+ * families derived here, independently of the loader's code. Rows and
+ * dictionaries come back deliberately unsorted (reversed), as the SQL makes
+ * no ordering promise. Table reads, other RPCs (including v1), paging calls
+ * and second evidence calls fail.
  *
  * Tests can also replace the raw response (malformed envelopes), return an
  * RPC error, throw a transport error, hold the response pending (abort and
@@ -13,7 +15,7 @@
  */
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
 
-export const EVIDENCE_RPC_NAME = "load_production_evidence";
+export const EVIDENCE_RPC_NAME = "load_production_evidence_v2";
 const ARG_KEYS = ["p_as_of_utc", "p_end_utc_exclusive", "p_site", "p_start_utc"];
 const COUNT_TYPES = ["line_verified", "completed", "dispatched", "cancelled"];
 
@@ -39,6 +41,8 @@ export interface FakeOptions {
   echo?: (iso: string) => string;
   /** Allow more than one evidence call (default: a second call fails). */
   allowRepeatCalls?: boolean;
+  /** Row/dictionary order on the wire (default "reverse": deliberately unsorted). */
+  order?: "reverse" | "asis";
 }
 
 export interface FakeEventsDb {
@@ -67,9 +71,32 @@ function cmp(a: string, b: string): number {
   return am - bm || au - bu;
 }
 
-function tuple(r: ProductionEvidenceEvent): unknown[] {
-  return [r.id, r.location, r.staff_id, r.department, r.order_number, r.line_sku, r.line_quantity ?? null,
-    r.event_type, r.created_at, r.parent_event_id, r.cs_case_id];
+/**
+ * Encoding v2 (independent of the loader): dictionaries of distinct non-null
+ * staff ids / SKUs used by the evidence, rows of ten slots holding indexes.
+ * `order: "reverse"` (default) reverses rows and dictionaries.
+ */
+export function encodeV2(evidence: readonly ProductionEvidenceEvent[], order: "reverse" | "asis" = "reverse") {
+  const distinct = (xs: Array<string | null>) => [...new Set(xs.filter((x): x is string => x !== null))];
+  let staffIds = distinct(evidence.map((r) => r.staff_id));
+  let skus = distinct(evidence.map((r) => r.line_sku));
+  let rows = [...evidence];
+  if (order === "reverse") {
+    staffIds = staffIds.reverse();
+    skus = skus.reverse();
+    rows = rows.reverse();
+  }
+  const staffAt = new Map(staffIds.map((s, i) => [s, i]));
+  const skuAt = new Map(skus.map((s, i) => [s, i]));
+  return {
+    staffIds,
+    skus,
+    rows: rows.map((r) => [
+      r.id, r.staff_id === null ? null : staffAt.get(r.staff_id)!, r.department, r.order_number,
+      r.line_sku === null ? null : skuAt.get(r.line_sku)!, r.line_quantity ?? null, r.event_type, r.created_at,
+      r.parent_event_id, r.cs_case_id,
+    ]),
+  };
 }
 
 /** The four families of 0034, computed from a row snapshot. */
@@ -145,15 +172,18 @@ export function createFakeEventsDb(initial: ProductionEvidenceEvent[], opts: Fak
               if (hook && hook.error) return { data: null, error: hook.error };
               const evidence = fakeEvidence(snapshot, args, visible);
               entry.returned = evidence.length;
+              const encoded = encodeV2(evidence, opts.order);
               const envelope: Record<string, unknown> = {
-                version: 1,
+                version: 2,
                 site: args.p_site,
                 startUtc: echo(args.p_start_utc),
                 endUtcExclusive: echo(args.p_end_utc_exclusive),
                 asOfUtc: echo(args.p_as_of_utc),
                 complete: true,
-                rowCount: evidence.length,
-                rows: evidence.map(tuple),
+                rowCount: encoded.rows.length,
+                staffIds: encoded.staffIds,
+                skus: encoded.skus,
+                rows: encoded.rows,
               };
               return { data: opts.rawResponse ? opts.rawResponse(envelope, args) : envelope, error: null };
             })

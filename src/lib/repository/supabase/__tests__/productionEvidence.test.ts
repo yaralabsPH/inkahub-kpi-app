@@ -40,6 +40,7 @@ describe("one RPC call", () => {
     await loadProductionEvidence(db.client, req());
     expect(db.calls).toHaveLength(1);
     expect(db.calls[0].name).toBe(EVIDENCE_RPC);
+    expect(EVIDENCE_RPC).toBe("load_production_evidence_v2");
     expect(db.calls[0].args).toEqual({
       p_site: "uk", p_start_utc: UK_DAY_1.startUtc, p_end_utc_exclusive: UK_DAY_1.endUtcExclusive, p_as_of_utc: AS_OF,
     });
@@ -199,8 +200,15 @@ describe("context families", () => {
   });
 });
 
-describe("envelope validation", () => {
-  const rows = () => [v1({ id: "a" }), complete({ id: "b", created_at: t("09:05") })];
+describe("envelope v2 validation", () => {
+  const rows = () => [
+    v1({ id: "a", staff_id: WORKER_A }),
+    complete({ id: "b", staff_id: WORKER_B, created_at: t("09:05") }),
+  ];
+  type Env = Record<string, unknown> & { rows: unknown[][]; staffIds: unknown[]; skus: unknown[] };
+  const editEnv = (edit: (e: Env) => unknown) => (e: Record<string, unknown>) => edit(e as Env);
+  const editRow0 = (fn: (r: unknown[]) => unknown) => editEnv((e) => ({ ...e, rows: e.rows.map((r, j) => (j === 0 ? fn(r) : r)) }));
+  const slot = (i: number, v: unknown) => editRow0((r) => Object.assign([...r], { [i]: v }));
 
   it("rejects a missing, null or non-object envelope", async () => {
     await expectKind(loadEdited(rows(), () => null), "incomplete");
@@ -208,10 +216,13 @@ describe("envelope validation", () => {
     await expectKind(loadEdited(rows(), () => "ok"), "incomplete");
   });
 
-  it("rejects wrong version, completeness, fields and echoed scope", async () => {
-    const cases: Array<[string, (e: Record<string, unknown>) => unknown]> = [
-      ["version", (e) => ({ ...e, version: 2 })],
+  it("rejects v1/unknown versions, missing or extra keys, completeness and wrong echoed scope", async () => {
+    const cases: Array<[string, (e: Env) => unknown]> = [
+      ["v1", (e) => ({ ...e, version: 1 })],
+      ["v3", (e) => ({ ...e, version: 3 })],
       ["complete missing", (e) => { const { complete: _c, ...rest } = e; return rest; }],
+      ["staffIds missing", (e) => { const { staffIds: _s, ...rest } = e; return rest; }],
+      ["skus missing", (e) => { const { skus: _s, ...rest } = e; return rest; }],
       ["complete false", (e) => ({ ...e, complete: false })],
       ["extra field", (e) => ({ ...e, visibility: "site" })],
       ["site", (e) => ({ ...e, site: "au" })],
@@ -220,41 +231,59 @@ describe("envelope validation", () => {
       ["cutoff", (e) => ({ ...e, asOfUtc: "2026-01-19T00:00:00.000Z" })],
       ["rows not a list", (e) => ({ ...e, rows: {} })],
       ["rowCount type", (e) => ({ ...e, rowCount: "2" })],
-      ["truncated rows", (e) => ({ ...e, rows: (e.rows as unknown[]).slice(0, 1) })],
+      ["rowCount unsafe", (e) => ({ ...e, rowCount: 2 ** 53 })],
+      ["truncated rows", (e) => ({ ...e, rows: e.rows.slice(0, 1) })],
     ];
     for (const [name, edit] of cases) {
-      await expect(loadEdited(rows(), edit), name).rejects.toMatchObject({ kind: "incomplete" });
+      await expect(loadEdited(rows(), editEnv(edit)), name).rejects.toMatchObject({ kind: "incomplete" });
     }
   });
 
-  it("rejects short, long or badly typed tuples", async () => {
-    const edits: Array<(r: unknown[]) => unknown> = [
-      (r) => r.slice(0, 10),
-      (r) => [...r, "extra"],
-      (r) => ({ id: r[0] }),
-      (r) => Object.assign([...r], { 0: "" }),
-      (r) => Object.assign([...r], { 1: null }),
-      (r) => Object.assign([...r], { 3: 7 }),
-      (r) => Object.assign([...r], { 4: { n: 1 } }),
-      (r) => Object.assign([...r], { 6: "1" }),
-      (r) => Object.assign([...r], { 7: null }),
-      (r) => Object.assign([...r], { 8: "2026-01-15 nine o'clock" }),
-      (r) => Object.assign([...r], { 8: "2026-02-30T09:00:00Z" }),
+  it("rejects malformed, duplicate or unused dictionary entries", async () => {
+    const cases: Array<[string, (e: Env) => unknown]> = [
+      ["staffIds not a list", (e) => ({ ...e, staffIds: "x" })],
+      ["staff entry not text", (e) => ({ ...e, staffIds: [...e.staffIds.slice(0, -1), 7] })],
+      ["sku entry null", (e) => ({ ...e, skus: [null] })],
+      ["duplicate staff entry", (e) => ({ ...e, staffIds: [...e.staffIds, e.staffIds[0]] })],
+      ["unused staff entry", (e) => ({ ...e, staffIds: [...e.staffIds, "33333333-3333-4333-8333-333333333333"] })],
+      ["unused sku entry", (e) => ({ ...e, skus: [...e.skus, "INKA-UNUSED"] })],
+      ["entries on an empty result", (e) => ({ ...e, rowCount: 0, rows: [] })],
+      // Both copies used, so only the uniqueness rule can catch it.
+      ["duplicate staff entry, both used", (e) => {
+        const a = e.staffIds[e.rows[0][1] as number];
+        return { ...e, staffIds: [a, a], rows: e.rows.map((r, j) => Object.assign([...r], { 1: j === 0 ? 0 : 1 })) };
+      }],
+    ];
+    for (const [name, edit] of cases) {
+      await expect(loadEdited(rows(), editEnv(edit)), name).rejects.toMatchObject({ kind: "incomplete" });
+    }
+  });
+
+  it("rejects bad dictionary indexes: text, boolean, fraction, negative, out of range, unsafe", async () => {
+    for (const [i, bad] of ["0", true, 0.5, -1, 99, 2 ** 53].entries()) {
+      await expect(loadEdited(rows(), slot(1, bad)), `staff index ${i}`).rejects.toMatchObject({ kind: "incomplete" });
+      await expect(loadEdited(rows(), slot(4, bad)), `sku index ${i}`).rejects.toMatchObject({ kind: "incomplete" });
+    }
+  });
+
+  it("rejects ten-slot violations and badly typed slots", async () => {
+    const edits: Array<(e: Record<string, unknown>) => unknown> = [
+      editRow0((r) => r.slice(0, 9)),
+      editRow0((r) => [...r, "extra"]),
+      editRow0((r) => ({ id: r[0] })),
+      slot(0, ""),
+      slot(2, 7),
+      slot(3, { n: 1 }),
+      slot(5, "1"),
+      slot(6, null),
+      slot(7, "2026-01-15 nine o'clock"),
+      slot(7, "2026-02-30T09:00:00Z"),
+      slot(7, "2026-01-15T09:00:00.1234567Z"),
+      slot(8, 5),
+      slot(9, false),
     ];
     for (const [i, edit] of edits.entries()) {
-      const p = loadEdited(rows(), (e) => ({ ...e, rows: (e.rows as unknown[][]).map((r, j) => (j === 0 ? edit(r) : r)) }));
-      await expect(p, `edit ${i}`).rejects.toMatchObject({ kind: "incomplete" });
-    }
-  });
-
-  it("rejects another site's row in any family", async () => {
-    const early = verify({ order_number: "1001", line_sku: SKU.unSingle, line_quantity: 1, created_at: t("09:00", "2026-01-14") });
-    const done = complete({ order_number: "1001", created_at: t("09:00") });
-    for (const victim of [0, 1]) {
-      const p = loadEdited([early, done], (e) => ({
-        ...e, rows: (e.rows as unknown[][]).map((r, j) => (j === victim ? Object.assign([...r], { 1: "au" }) : r)),
-      }));
-      await expectKind(p, "incomplete");
+      await expect(loadEdited(rows(), edit), `edit ${i}`).rejects.toMatchObject({ kind: "incomplete" });
     }
   });
 
@@ -263,31 +292,130 @@ describe("envelope validation", () => {
     const stray = verify({ id: "stray", order_number: "9999", line_sku: SKU.unSingle, line_quantity: 1, created_at: t("09:00", "2026-01-14") });
     const strayCancel = ev({ id: "stray-cancel", event_type: "cancelled", parent_event_id: "nothing", created_at: t("09:00", "2026-01-17") });
     const wrongType = ev({ id: "start", event_type: "started", created_at: t("09:30") });
-    const tup = (r: ProductionEvidenceEvent) => [r.id, r.location, r.staff_id, r.department, r.order_number, r.line_sku, r.line_quantity, r.event_type, r.created_at, r.parent_event_id, r.cs_case_id];
+    // A v2 tuple reusing row 0's staff/SKU indexes, so only the time/family checks can catch it.
+    const tup = (r: ProductionEvidenceEvent, base: unknown[]) =>
+      [r.id, base[1], r.department, r.order_number, base[4], r.line_quantity, r.event_type, r.created_at, r.parent_event_id, r.cs_case_id];
     for (const extra of [late, stray, strayCancel, wrongType]) {
-      const p = loadEdited(rows(), (e) => ({ ...e, rowCount: (e.rowCount as number) + 1, rows: [...(e.rows as unknown[]), tup(extra)] }));
+      const p = loadEdited(rows(), editEnv((e) => ({ ...e, rowCount: e.rows.length + 1, rows: [...e.rows, tup(extra, e.rows.find((x) => x[0] === "a")!)] })));
       await expect(p, extra.id).rejects.toMatchObject({ kind: "incomplete" });
     }
-    // Inside the window but after a mid-window cutoff: only the cutoff check can catch it.
     const afterCutoff = v1({ id: "after-cutoff", created_at: t("11:00") });
-    const p = loadEdited(rows(), (e) => ({ ...e, rowCount: (e.rowCount as number) + 1, rows: [...(e.rows as unknown[]), tup(afterCutoff)] }), { asOfUtc: t("10:00") });
+    const p = loadEdited(rows(), editEnv((e) => ({ ...e, rowCount: e.rows.length + 1, rows: [...e.rows, tup(afterCutoff, e.rows.find((x) => x[0] === "a")!)] })), { asOfUtc: t("10:00") });
     await expect(p).rejects.toMatchObject({ kind: "incomplete", message: expect.stringContaining("after the cutoff") });
   });
 
   it("deduplicates identical rows but rejects conflicting payloads for one event as changed", async () => {
-    const dup = await loadEdited(rows(), (e) => ({ ...e, rowCount: 3, rows: [...(e.rows as unknown[]), (e.rows as unknown[])[0]] }));
+    const dup = await loadEdited(rows(), editEnv((e) => ({ ...e, rowCount: 3, rows: [...e.rows, e.rows[0]] })));
     expect(dup.events).toHaveLength(2);
-    const conflict = loadEdited(rows(), (e) => {
-      const first = (e.rows as unknown[][])[0];
-      return { ...e, rowCount: 3, rows: [...(e.rows as unknown[]), Object.assign([...first], { 6: 9 })] };
-    });
+    const conflict = loadEdited(rows(), editEnv((e) => ({ ...e, rowCount: 3, rows: [...e.rows, Object.assign([...e.rows[0]], { 5: 9 })] })));
     await expectKind(conflict, "changed");
+    const sameInstant = loadEdited(rows(), editEnv((e) => {
+      const r0 = e.rows[0];
+      const iso = String(r0[7]);
+      return { ...e, rowCount: 3, rows: [...e.rows, Object.assign([...r0], { 7: iso.replace(".000Z", "+00:00") })] };
+    }));
+    expect((await sameInstant).events).toHaveLength(2);
   });
 });
 
+describe("encoding v2 decoding and exactness", () => {
+  it("decodes indexes back to the saved values, including index 0, the last index, reuse and empty strings", async () => {
+    const staff = [WORKER_A, WORKER_B, "33333333-3333-4333-8333-333333333333"];
+    const events = [
+      v1({ id: "r1", staff_id: staff[0], line_sku: "" }),
+      v1({ id: "r2", staff_id: staff[1], line_sku: SKU.unSet2, created_at: t("09:01") }),
+      v1({ id: "r3", staff_id: staff[2], line_sku: SKU.unSet2, created_at: t("09:02") }),
+      v1({ id: "r4", staff_id: staff[0], line_sku: null, created_at: t("09:03"), department: "" }),
+      ev({ id: "r5", event_type: "line_verified", staff_id: null, line_sku: null, created_at: t("09:04") }),
+    ];
+    for (const order of ["reverse", "asis"] as const) {
+      const db = createFakeEventsDb(events, { order });
+      const snap = await loadProductionEvidence(db.client, req());
+      expect(snap.events).toEqual(events);
+    }
+  });
+
+  it("decodes the same evidence from shuffled dictionaries with remapped indexes", async () => {
+    const events = [v1({ id: "a", staff_id: WORKER_A, line_sku: SKU.unSingle }), v1({ id: "b", staff_id: WORKER_B, line_sku: SKU.unSet2, created_at: t("09:01") })];
+    const swap = editEnvAll((e) => {
+      const rows = (e.rows as unknown[][]).map((r) => Object.assign([...r], {
+        1: r[1] === null ? null : 1 - (r[1] as number),
+        4: r[4] === null ? null : 1 - (r[4] as number),
+      }));
+      return { ...e, staffIds: [...(e.staffIds as unknown[])].reverse(), skus: [...(e.skus as unknown[])].reverse(), rows };
+    });
+    expect((await loadEdited(events, swap)).events).toEqual(events);
+  });
+
+  it("accepts all-null dictionaries and an empty result", async () => {
+    const nulls = [ev({ id: "n1", event_type: "line_verified", staff_id: null, line_sku: null, created_at: t("09:00") })];
+    const db = createFakeEventsDb(nulls);
+    expect((await loadProductionEvidence(db.client, req())).events).toEqual(nulls);
+    const empty = createFakeEventsDb([]);
+    expect((await loadProductionEvidence(empty.client, req())).events).toEqual([]);
+  });
+
+  it("sorts once by exact instant, then id, whatever order the server sends", async () => {
+    // Reversed ids one microsecond apart: time wins over id.
+    const later = v1({ id: "a", created_at: "2026-01-15T09:00:00.000002+00:00" });
+    const earlier = v1({ id: "z", created_at: "2026-01-15T09:00:00.000001+00:00" });
+    // Same instant written two ways: id breaks the tie.
+    const tieB = v1({ id: "b", created_at: "2026-01-15T10:00:00Z" });
+    const tieA = v1({ id: "a2", created_at: "2026-01-15T20:00:00+10:00" });
+    for (const order of ["reverse", "asis"] as const) {
+      const db = createFakeEventsDb([later, earlier, tieB, tieA], { order });
+      expect((await loadProductionEvidence(db.client, req())).events.map((e) => e.id)).toEqual(["z", "a", "a2", "b"]);
+    }
+  });
+
+  it("keeps start, end and cutoff exact to the microsecond on both sides, including non-zero request microseconds", async () => {
+    const range = { startUtc: "2026-01-15T04:00:00.000500Z", endUtcExclusive: "2026-01-16T04:00:00.000500Z" };
+    const asOfUtc = "2026-01-16T04:00:00.000500Z";
+    const mk = (id: string, at: string) => v1({ id, created_at: at });
+    const rows = [
+      mk("start-1", "2026-01-15T04:00:00.000499+00:00"), mk("start", "2026-01-15T04:00:00.0005Z"), mk("start+1", "2026-01-15T14:00:00.000501+10:00"),
+      mk("end-1", "2026-01-16T04:00:00.000499Z"), mk("end", "2026-01-16T04:00:00.000500Z"), mk("end+1", "2026-01-16T04:00:00.000501Z"),
+    ];
+    const db = createFakeEventsDb(rows);
+    const snap = await loadProductionEvidence(db.client, req({ range, asOfUtc }));
+    expect(ids(snap.events)).toEqual(["end-1", "start", "start+1"].sort());
+    const cut = createFakeEventsDb(rows);
+    const snap2 = await loadProductionEvidence(cut.client, req({ range, asOfUtc: "2026-01-15T14:00:00.000501+10:00" }));
+    expect(ids(snap2.events)).toEqual(["start", "start+1"].sort());
+  });
+
+  it("every decoded row takes its site from the envelope; the fake never leaks another site's rows or dictionary entries", async () => {
+    const mine = v1({ id: "uk1", staff_id: WORKER_A, line_sku: SKU.unSingle });
+    const other = v1({ id: "au1", location: "au", staff_id: WORKER_B, line_sku: SKU.unSet2 });
+    const otherEarly = verify({ id: "au0", location: "au", order_number: "1001", staff_id: WORKER_B, line_sku: SKU.fnSet3, line_quantity: 1, created_at: t("09:00", "2026-01-14") });
+    const done = complete({ id: "uk2", order_number: "1001", staff_id: WORKER_A, created_at: t("09:30") });
+    let seen: Record<string, unknown> | null = null;
+    const db = createFakeEventsDb([mine, other, otherEarly, done], { rawResponse: (e) => (seen = e) });
+    const snap = await loadProductionEvidence(db.client, req());
+    expect(snap.events.every((e) => e.location === "uk")).toBe(true);
+    expect(ids(snap.events)).toEqual(["uk1", "uk2"]);
+    expect(seen!.staffIds).toEqual([WORKER_A]);
+    expect(seen!.skus).toEqual([SKU.unSingle]);
+  });
+
+  it("staff dictionaries never disclose other workers", async () => {
+    const mine = v1({ id: "m", staff_id: WORKER_A });
+    const theirs = v1({ id: "t", staff_id: WORKER_B, created_at: t("09:01") });
+    let seen: Record<string, unknown> | null = null;
+    const db = createFakeEventsDb([mine, theirs], { visible: (r) => r.staff_id === WORKER_A, rawResponse: (e) => (seen = e) });
+    await loadProductionEvidence(db.client, req({ visibility: productionVisibilityFor("staff", true) }));
+    expect(seen!.staffIds).toEqual([WORKER_A]);
+  });
+});
+
+/** Edit helper for a whole envelope (shared with the shuffled-dictionary test). */
+function editEnvAll(edit: (e: Record<string, unknown>) => unknown) {
+  return (e: Record<string, unknown>) => edit(e);
+}
+
 describe("failures, abort and deadline", () => {
   it("an RPC error (including a missing function) fails visibly", async () => {
-    const db = createFakeEventsDb([v1()], { beforeResponse: () => ({ error: { message: "function public.load_production_evidence does not exist" } }) });
+    const db = createFakeEventsDb([v1()], { beforeResponse: () => ({ error: { message: "function public.load_production_evidence_v2 does not exist" } }) });
     await expect(loadProductionEvidence(db.client, req())).rejects.toMatchObject({ kind: "failed", message: expect.stringContaining("does not exist") });
   });
 

@@ -55,6 +55,8 @@ export interface RunMetrics {
   /** All HTTP requests during the timed load, and those to the evidence RPC. */
   requests: number;
   evidenceCalls: number;
+  /** Calls to any other evidence RPC (e.g. the old v1); must be 0. */
+  otherEvidenceCalls: number;
   /** Request start to response headers, and headers to full body. */
   headersMs: number | null;
   bodyMs: number | null;
@@ -189,11 +191,13 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
   // Per-run instrumentation, filled by the fetch wrapper.
   let cur = blankNet();
   function blankNet() {
-    return { requests: 0, evidenceCalls: 0, headersMs: 0, bodyMs: 0, rawBytes: 0, wireBytes: null as number | null, contentEncoding: null as string | null, stage: "waiting" };
+    return { requests: 0, evidenceCalls: 0, otherEvidenceCalls: 0, headersMs: 0, bodyMs: 0, rawBytes: 0, wireBytes: null as number | null, contentEncoding: null as string | null, stage: "waiting" };
   }
   const countingFetch: typeof fetch = async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    const evidence = url.includes(`/rpc/${EVIDENCE_RPC}`);
+    const path = new URL(url).pathname;
+    const evidence = path.endsWith(`/rpc/${EVIDENCE_RPC}`);
+    if (!evidence && /\/rpc\/load_production_evidence/.test(path)) cur.otherEvidenceCalls++;
     const t0 = performance.now();
     const res = await fetch(input, init);
     const t1 = performance.now();
@@ -274,7 +278,7 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
         const t0 = performance.now();
         const beat = setInterval(() => progress("heartbeat", i + 1, performance.now() - t0), heartbeatMs);
         const m: RunMetrics = {
-          run: i + 1, error: null, requests: 0, evidenceCalls: 0, headersMs: null, bodyMs: null, rawBytes: 0,
+          run: i + 1, error: null, requests: 0, evidenceCalls: 0, otherEvidenceCalls: 0, headersMs: null, bodyMs: null, rawBytes: 0,
           wireBytes: null, contentEncoding: null, parseMs: null, parseCalls: 0, loadMs: null, validateMs: null,
           reducerMs: null, totalMs: null, rows: 0, inWindowRows: 0,
         };
@@ -305,7 +309,7 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
           clearInterval(beat);
         }
         Object.assign(m, {
-          requests: cur.requests, evidenceCalls: cur.evidenceCalls, rawBytes: cur.rawBytes, wireBytes: cur.wireBytes,
+          requests: cur.requests, evidenceCalls: cur.evidenceCalls, otherEvidenceCalls: cur.otherEvidenceCalls, rawBytes: cur.rawBytes, wireBytes: cur.wireBytes,
           contentEncoding: cur.contentEncoding,
           headersMs: cur.evidenceCalls ? cur.headersMs : null, bodyMs: cur.evidenceCalls ? cur.bodyMs : null,
         });
@@ -318,7 +322,7 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
       const totals = ok.map((r) => r.totalMs as number);
       const medianTotalMs = round(median(totals));
       const complete = caseError === null && done.length === runs && ok.length === runs
-        && done.every((r) => r.evidenceCalls === 1 && r.inWindowRows === serverCount);
+        && done.every((r) => r.evidenceCalls === 1 && r.otherEvidenceCalls === 0 && r.inWindowRows === serverCount);
       rows.push({
         label: c.label,
         scope: c.scope,
@@ -373,7 +377,7 @@ export function measureTable(result: MeasureResult): string {
   }
   lines.push(
     "",
-    "Per run (headers = request to response headers; body = transfer; parse = JSON.parse; validate = load − headers − body − parse):",
+    "Per run (headers = request to response headers; body = transfer; parse = JSON.parse; validate = load − headers − body − parse, which includes dictionary decoding and the single client sort):",
     "",
     "| Case | Run | RPCs | Requests | Rows | In-window | Raw | Wire | Encoding | Headers ms | Body ms | Parse ms | Validate ms | Load ms | Reducer ms | Total ms | Error |",
     "|---|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",

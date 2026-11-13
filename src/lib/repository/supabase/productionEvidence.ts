@@ -2,8 +2,9 @@
  * Complete, authorized production evidence reader (F1 / item-counting plan,
  * Task 4, one-call amendment).
  *
- * One call to the read-only RPC `public.load_production_evidence`
- * (migration 0034) returns one site's evidence as a single scalar envelope:
+ * One call to the read-only RPC `public.load_production_evidence_v2`
+ * (migration 0035, encoding v2) returns one site's evidence as a single
+ * scalar envelope:
  * the display window's count events plus the context the shared counter needs
  * (before-window verifications that qualify a completion, referenced
  * parents, and cancellations saved after the window), all under one fixed
@@ -12,10 +13,14 @@
  * Rules:
  *  - Exactly one RPC per load. No paging, no batches, no automatic re-read,
  *    no fallback to table reads.
- *  - The envelope (encoding v1) is validated strictly before any snapshot is
- *    built: version, completeness flag, echoed scope, row count, every tuple's
- *    shape, site, cutoff and family membership. Anything malformed or
- *    partial rejects; nothing success-shaped is returned from a bad read.
+ *  - The envelope (encoding v2) is validated strictly before any snapshot is
+ *    built: version, completeness flag, echoed scope, row count, the staff
+ *    and SKU dictionaries (text, unique, every entry used, every index in
+ *    range), every tuple's shape, cutoff and family membership. Rows carry no
+ *    site; each decoded row takes the validated envelope site. Anything
+ *    malformed or partial rejects; nothing success-shaped is returned.
+ *  - The server sends rows in no particular order; the loader sorts once by
+ *    exact instant (microseconds), then id.
  *  - Identical repeated rows are deduplicated; two different payloads for
  *    the same event reject as "changed".
  *  - The caller's client (and its RLS) is used as-is. This module never
@@ -63,7 +68,7 @@ export interface ProductionReadRequest {
   now?: () => number;
 }
 
-export const EVIDENCE_RPC = "load_production_evidence";
+export const EVIDENCE_RPC = "load_production_evidence_v2";
 
 /** Minimal structural view of supabase-js `rpc(...)` used here. */
 interface EvidenceRpcCall extends PromiseLike<{ data: unknown; error: unknown }> {
@@ -124,10 +129,12 @@ export function instantMicros(text: unknown): bigint | null {
 }
 
 // ---------------------------------------------------------------------------
-// Envelope v1
+// Envelope v2 (migration 0035)
 
-const ENVELOPE_KEYS = ["version", "site", "startUtc", "endUtcExclusive", "asOfUtc", "complete", "rowCount", "rows"] as const;
-const TUPLE_LENGTH = 11;
+const ENVELOPE_KEYS = [
+  "version", "site", "startUtc", "endUtcExclusive", "asOfUtc", "complete", "rowCount", "staffIds", "skus", "rows",
+] as const;
+const TUPLE_LENGTH = 10;
 const COUNT_TYPES = new Set(["line_verified", "completed", "dispatched", "cancelled"]);
 const EVIDENCE_TYPES = new Set(["line_verified", "completed", "dispatched"]);
 const TERMINAL_TYPES = new Set(["completed", "dispatched"]);
@@ -169,18 +176,54 @@ interface DecodedRow {
   event: ProductionEvidenceEvent;
   at: bigint;
   key: string;
-  tuple: string;
+  /** Decoded values with the time as an exact instant, for duplicate comparison. */
+  identity: string;
 }
 
-function decodeTuple(raw: unknown, index: number): DecodedRow {
-  if (!Array.isArray(raw) || raw.length !== TUPLE_LENGTH) throw bad(`row ${index} is not an ${TUPLE_LENGTH}-field tuple`);
-  const [id, location, staffId, department, orderNumber, lineSku, lineQuantity, eventType, createdAt, parentEventId, csCaseId] = raw;
+/** A dictionary: a list of unique strings; tracks which entries rows use. */
+class Dictionary {
+  private readonly used: boolean[];
+  constructor(
+    private readonly name: string,
+    readonly entries: readonly string[],
+  ) {
+    this.used = entries.map(() => false);
+  }
+
+  static parse(name: string, raw: unknown): Dictionary {
+    if (!Array.isArray(raw)) throw bad(`${name} is not a list`);
+    const seen = new Set<string>();
+    for (const [i, v] of raw.entries()) {
+      if (typeof v !== "string") throw bad(`${name}[${i}] is not text`);
+      if (seen.has(v)) throw bad(`${name} lists "${v}" twice`);
+      seen.add(v);
+    }
+    return new Dictionary(name, raw as string[]);
+  }
+
+  /** Decode a slot: null stays null; otherwise a safe in-range integer index. */
+  lookup(v: unknown, row: number): string | null {
+    if (v === null) return null;
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0 || v >= this.entries.length) {
+      throw bad(`row ${row} has an invalid ${this.name} index`);
+    }
+    this.used[v] = true;
+    return this.entries[v];
+  }
+
+  assertAllUsed(): void {
+    const unused = this.used.indexOf(false);
+    if (unused !== -1) throw bad(`${this.name}[${unused}] is not used by any row`);
+  }
+}
+
+function decodeTuple(raw: unknown, index: number, site: string, staff: Dictionary, skus: Dictionary): DecodedRow {
+  if (!Array.isArray(raw) || raw.length !== TUPLE_LENGTH) throw bad(`row ${index} is not a ${TUPLE_LENGTH}-slot tuple`);
+  const [id, staffIx, department, orderNumber, skuIx, lineQuantity, eventType, createdAt, parentEventId, csCaseId] = raw;
   if (typeof id !== "string" || !id) throw bad(`row ${index} has no id`);
-  if (typeof location !== "string" || !location) throw bad(`row ${index} has no site`);
   if (typeof eventType !== "string") throw bad(`row ${index} has no event type`);
   for (const [name, v] of [
-    ["staff_id", staffId], ["department", department], ["order_number", orderNumber],
-    ["line_sku", lineSku], ["parent_event_id", parentEventId], ["cs_case_id", csCaseId],
+    ["department", department], ["order_number", orderNumber], ["parent_event_id", parentEventId], ["cs_case_id", csCaseId],
   ] as const) {
     if (!isNullableString(v)) throw bad(`row ${index} has a non-text ${name}`);
   }
@@ -191,21 +234,25 @@ function decodeTuple(raw: unknown, index: number): DecodedRow {
   if (at === null) throw bad(`row ${index} has an unreadable time`);
   const event: ProductionEvidenceEvent = {
     id,
-    location,
-    staff_id: staffId as string | null,
+    location: site,
+    staff_id: staff.lookup(staffIx, index),
     department: department as string | null,
     order_number: orderNumber as string | null,
-    line_sku: lineSku as string | null,
+    line_sku: skus.lookup(skuIx, index),
     line_quantity: lineQuantity,
     event_type: eventType,
     created_at: createdAt as string,
     parent_event_id: parentEventId as string | null,
     cs_case_id: csCaseId as string | null,
   };
-  return { event, at, key: `${location}\u0000${id}`, tuple: JSON.stringify(raw) };
+  const identity = JSON.stringify([
+    event.id, event.staff_id, event.department, event.order_number, event.line_sku, event.line_quantity,
+    event.event_type, at.toString(), event.parent_event_id, event.cs_case_id,
+  ]);
+  return { event, at, key: `${site}\u0000${id}`, identity };
 }
 
-/** Validate an envelope against its request and return the events in (created_at, id) order. */
+/** Validate an envelope against its request and return the events in exact (created_at, id) order. */
 export function decodeEvidenceEnvelope(
   data: unknown,
   req: ProductionReadRequest,
@@ -218,7 +265,7 @@ export function decodeEvidenceEnvelope(
   const keys = Object.keys(env);
   for (const k of ENVELOPE_KEYS) if (!(k in env)) throw bad(`missing ${k}`);
   if (keys.length !== ENVELOPE_KEYS.length) throw bad("unexpected envelope fields");
-  if (env.version !== 1) throw bad(`unsupported encoding version ${String(env.version)}`);
+  if (env.version !== 2) throw bad(`unsupported encoding version ${String(env.version)}`);
   if (env.complete !== true) throw bad("the server did not mark the evidence complete");
   if (env.site !== req.site) throw bad("the evidence is for another site");
   if (instantMicros(env.startUtc) !== bounds.start || instantMicros(env.endUtcExclusive) !== bounds.end) {
@@ -230,23 +277,27 @@ export function decodeEvidenceEnvelope(
   const rowCount = env.rowCount;
   if (typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) || rowCount < 0) throw bad("rowCount is not a count");
   if (rowCount !== rows.length) throw bad(`the server counted ${rowCount} rows but sent ${rows.length}`);
+  const staff = Dictionary.parse("staffIds", env.staffIds);
+  const skus = Dictionary.parse("skus", env.skus);
+  checkLive();
 
-  // Pass 1: decode, check site/cutoff, deduplicate.
+  // Pass 1: decode, check cutoff, deduplicate.
   const unique = new Map<string, DecodedRow>();
   for (let i = 0; i < rows.length; i++) {
     if (i % CHECK_EVERY === 0) checkLive();
-    const row = decodeTuple(rows[i], i);
-    if (row.event.location !== req.site) throw bad(`row ${i} belongs to another site`);
+    const row = decodeTuple(rows[i], i, req.site, staff, skus);
     if (row.at > bounds.cutoff) throw bad(`row ${i} is after the cutoff`);
     const prior = unique.get(row.key);
     if (prior) {
-      if (prior.tuple !== row.tuple) {
+      if (prior.identity !== row.identity) {
         throw new ProductionReadError("changed", `Production event ${row.event.id} was returned with two different payloads.`);
       }
       continue;
     }
     unique.set(row.key, row);
   }
+  staff.assertAllUsed();
+  skus.assertAllUsed();
   checkLive();
 
   // Pass 2: index the window rows.

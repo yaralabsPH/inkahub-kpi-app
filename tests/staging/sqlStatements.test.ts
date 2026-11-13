@@ -49,7 +49,30 @@ describe("splitSqlStatements", () => {
     expect(new Set(gates.map((s) => s.label.split("gate:")[1])).size).toBe(48);
   });
 
-  it("03-query-evidence.sql is current with migration 0034 and the measured cases", async () => {
+  it("03 changes nothing and applies the API role's own time limit after every role switch", () => {
+    const sql = readFileSync("supabase/staging/item-counting/03-query-evidence.sql", "utf8").replace(/\r\n/g, "\n");
+    const stmts = splitSqlStatements(sql);
+    expect(stmts.at(-1)!.label).toBe("rollback");
+    expect(sql).not.toMatch(/\banalyze\s+public\./i);
+    expect(sql).not.toMatch(/\balter\s+(role|database|system|table|function)\b/i);
+    expect(sql).not.toMatch(/\b(insert|update|delete)\s+(into\s+)?public\./i);
+    // Never a hard-coded timeout: only the catalog-driven SET LOCAL inside the DO block.
+    expect(sql).not.toMatch(/set\s+(local\s+)?statement_timeout\s*(=|to)\s*'?\d/i);
+    const labels = stmts.map((s) => s.label.toLowerCase());
+    const roleSwitches = labels.flatMap((l, i) => (l === "set local role authenticated" ? [i] : []));
+    expect(roleSwitches).toHaveLength(4);
+    for (const i of roleSwitches) {
+      expect(stmts[i + 1].text).toMatch(/where r\.rolname = 'authenticated' and c like 'statement_timeout=%'/);
+      expect(stmts[i + 1].text).toMatch(/execute format\('set local statement_timeout = %L'/);
+      expect(stmts[i + 2].text).toMatch(/as effective_timeout_ms/);
+    }
+    // 36 real PostgREST-shape statements, each converting the whole wrapped body to text.
+    const text = stmts.filter((s) => /AS gate,\s+octet_length\(\(coalesce\(json_agg\(_postgrest_t\.pgrst_scalar\) -> 0, 'null'::json\)\)::text\)/.test(s.text));
+    expect(text).toHaveLength(36);
+    for (const s of text) expect(s.text).toMatch(/json_to_record\(pgrst_payload\.json_data\)/);
+  });
+
+  it("03-query-evidence.sql is current with migrations 0035 and the measured cases", async () => {
     const { buildQueryEvidenceSql } = await import("./generate-query-evidence");
     const onDisk = readFileSync("supabase/staging/item-counting/03-query-evidence.sql", "utf8").replace(/\r\n/g, "\n");
     expect(onDisk, "regenerate with: npx vite-node tests/staging/generate-query-evidence.ts --write").toBe(buildQueryEvidenceSql());

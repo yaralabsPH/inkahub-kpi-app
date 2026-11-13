@@ -12,7 +12,7 @@ function res(index: number, command: string, rows: Array<Record<string, unknown>
 
 function run(n: number, over: Partial<RunMetrics> = {}): RunMetrics {
   return {
-    run: n, error: null, requests: 1, evidenceCalls: 1, headersMs: 300, bodyMs: 200, rawBytes: 250_000, wireBytes: 40_000,
+    run: n, error: null, requests: 1, evidenceCalls: 1, otherEvidenceCalls: 0, headersMs: 300, bodyMs: 200, rawBytes: 250_000, wireBytes: 40_000,
     contentEncoding: "gzip", parseMs: 20, parseCalls: 1, loadMs: 700, validateMs: 180, reducerMs: 90, totalMs: 790,
     rows: 1313, inWindowRows: 1287, ...over,
   };
@@ -74,7 +74,7 @@ describe("buildReport", () => {
   it("shows the manager phase table and a settings error first", () => {
     const r = buildReport(state({
       runs: [], fatal: ".env.staging.local not found in the repo root.", finishedAt: "t",
-      phaseRecords: [{ phase: "denied-before", finishedAt: "2026-11-13T01:00:00Z", revision: "r1", fnDefinitionMd5: "abc", problems: [] }],
+      phaseRecords: [{ phase: "denied-before", finishedAt: "2026-11-13T01:00:00Z", revision: "r1", fnName: "load_production_evidence_v2", fnDefinitionMd5: "abc", encodingVersion: 2, harnessVersion: "h", problems: [] }],
     }));
     expect(r.status).toMatch(/^STATUS: FAILED – \.env\.staging\.local not found/);
     expect(r.markdown).toContain("| denied-before | 2026-11-13T01:00:00Z | r1 | passed |");

@@ -37,16 +37,14 @@ import {
   type MeasureProgress,
 } from "./measure-item-counting";
 import {
-  checkManager,
-  inferManagerPhase,
   MANAGER_PHASES,
   SQL_FILES,
-  checkSqlRuns,
   type FileRun,
   type GateMode,
   type ManagerPhase,
   type PhaseRecord,
 } from "./itemCountingEvidence";
+import { runGate, type GateIO } from "./itemCountingGate";
 import { buildReport, type GateState } from "./itemCountingReport";
 
 const ENV_FILE = ".env.staging.local";
@@ -226,67 +224,66 @@ async function runSqlFile(client: pg.Client, file: string, notices: string[]): P
 }
 
 async function main(): Promise<number> {
+  let settings: Settings | null = null;
   try {
-    const settings = readSettings();
+    settings = readSettings();
     const dbConfig = stagingDbConfig(settings.STAGING_DB_URL);
     assertStagingSupabaseUrl(settings.STAGING_SUPABASE_URL);
-    const repeat = Math.max(1, Number(settings.STAGING_RUNS ?? 3) || 3);
+    const s = settings;
+    const repeat = Math.max(1, Number(s.STAGING_RUNS ?? 3) || 3);
 
-    state.current = "connecting to the staging database";
-    saveReport();
-    const client = new pg.Client(dbConfig);
-    const notices: string[] = [];
-    client.on("notice", (n) => notices.push(n.message ?? String(n)));
-    await client.connect();
-    try {
-      const files = MODE === "full" ? SQL_FILES : (["03-query-evidence.sql"] as const);
-      for (const file of files) {
-        const run = await runSqlFile(client, file, notices);
-        if (run.results.some((r) => r.error) || run.results.length !== run.statements) break;
-      }
-    } finally {
-      await client.end();
-    }
-
-    const expectedFiles = MODE === "full" ? SQL_FILES.length : 1;
-    const sqlOk = state.runs.length === expectedFiles && state.runs.every((r) => !r.results.some((x) => x.error) && r.results.length === r.statements);
-    if (sqlOk) {
-      for (const who of ["owner", "manager"] as const) {
-        console.log(`\nMeasuring as ${who} (${repeat} run(s) per case)…`);
-        state.current = `measuring as ${who} · signing in`;
-        state.lastProgress = null;
+    const io: GateIO = {
+      async runSql(files) {
+        state.current = "connecting to the staging database";
         saveReport();
+        const client = new pg.Client(dbConfig);
+        const notices: string[] = [];
+        client.on("notice", (n) => notices.push(n.message ?? String(n)));
+        await client.connect();
         try {
-          state.measures[who] = await measureItemCounting({
-            supabaseUrl: settings.STAGING_SUPABASE_URL,
-            anonKey: settings.STAGING_SUPABASE_ANON_KEY,
-            email: who === "owner" ? settings.STAGING_OWNER_EMAIL : settings.STAGING_MANAGER_EMAIL,
-            password: who === "owner" ? settings.STAGING_OWNER_PASSWORD : settings.STAGING_MANAGER_PASSWORD,
-            runs: repeat,
-            asOfUtc: STAGING_CUTOFF,
-            onUpdate: (partial) => {
-              state.measures[who] = partial;
-              if (who === "manager") state.managerPhase = PHASE_ARG ?? inferManagerPhase(partial.sites, state.phaseRecords);
-              saveReport();
-            },
-            onProgress: (p) => {
-              const line = progressLine(who, p);
-              console.log(`  ${line}`);
-              state.current = `measuring as ${who} · case ${p.caseIndex}/${p.caseCount} ${p.label}${p.run ? ` · run ${p.run}/${p.runs}` : ""}`;
-              state.lastProgress = `${new Date().toISOString()} · ${line}`;
-              saveReport();
-            },
-          });
-        } catch (e) {
-          // Keep any finished cases; record the failure for the rest.
-          const message = e instanceof Error ? e.message : String(e);
-          const partial = state.measures[who];
-          if (partial && !("error" in partial) && partial.rows.length) state.fatal = `measurement as ${who} stopped: ${message}`;
-          else state.measures[who] = { error: message };
+          for (const file of files) {
+            const run = await runSqlFile(client, file, notices);
+            if (run.results.some((r) => r.error) || run.results.length !== run.statements) break;
+          }
+        } finally {
+          await client.end();
         }
-      }
-      recordManagerPhase();
-    }
+      },
+      measure(who, onUpdate) {
+        console.log(`\nMeasuring as ${who} (${repeat} run(s) per case)…`);
+        return measureItemCounting({
+          supabaseUrl: s.STAGING_SUPABASE_URL,
+          anonKey: s.STAGING_SUPABASE_ANON_KEY,
+          email: who === "owner" ? s.STAGING_OWNER_EMAIL : s.STAGING_MANAGER_EMAIL,
+          password: who === "owner" ? s.STAGING_OWNER_PASSWORD : s.STAGING_MANAGER_PASSWORD,
+          runs: repeat,
+          asOfUtc: STAGING_CUTOFF,
+          onUpdate,
+          onProgress: (p) => {
+            const line = progressLine(who, p);
+            console.log(`  ${line}`);
+            state.current = `measuring as ${who} · case ${p.caseIndex}/${p.caseCount} ${p.label}${p.run ? ` · run ${p.run}/${p.runs}` : ""}`;
+            state.lastProgress = `${new Date().toISOString()} · ${line}`;
+            saveReport();
+          },
+        });
+      },
+      save: () => void saveReport(),
+      writePhases(records) {
+        try {
+          writeFileSync(PHASES_FILE, JSON.stringify(records, null, 2), "utf8");
+        } catch (e) {
+          console.error(`Could not write ${PHASES_FILE}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      },
+      now: () => new Date().toISOString(),
+      log: (line) => console.log(line),
+    };
+    await runGate(state, io, {
+      mode: MODE,
+      files: MODE === "full" ? SQL_FILES : (["03-query-evidence.sql"] as const),
+      phaseArg: PHASE_ARG,
+    });
   } catch (e) {
     state.fatal = e instanceof Error ? e.message : String(e);
   }
@@ -298,26 +295,6 @@ async function main(): Promise<number> {
   if (report.slow.length) console.log(`${report.slow.length} case(s) over latency target.`);
   console.log(report.status);
   return report.problems.length ? 1 : 0;
-}
-
-/** Record this run's finished manager phase so later runs can complete the three-phase check. */
-function recordManagerPhase(): void {
-  const m = state.measures.manager;
-  if (!m || "error" in m || m.rows.length < 6 || !state.managerPhase) return;
-  const { facts } = checkSqlRuns(state.mode, state.runs);
-  const record: PhaseRecord = {
-    phase: state.managerPhase,
-    finishedAt: new Date().toISOString(),
-    revision: state.revision,
-    fnDefinitionMd5: facts?.fnDefinitionMd5 ?? null,
-    problems: checkManager(m, state.managerPhase, facts),
-  };
-  state.phaseRecords = [...state.phaseRecords, record];
-  try {
-    writeFileSync(PHASES_FILE, JSON.stringify(state.phaseRecords, null, 2), "utf8");
-  } catch (e) {
-    console.error(`Could not write ${PHASES_FILE}: ${e instanceof Error ? e.message : String(e)}`);
-  }
 }
 
 let stopping = false;
