@@ -58,6 +58,8 @@ import { buildReport, type GateState } from "./itemCountingReport";
 import { claimsSetting } from "./generate-query-evidence";
 import { signInClaims, SESSION_ROLES, type SessionRole } from "./stagingSessions";
 import { collectParitySnapshot } from "./policyParityRun";
+import { collectWriteCompat } from "./writeCompatRun";
+import { checkSet, compareSets, STEPS } from "./writeCompat";
 import {
   ARRANGEMENTS,
   checkSnapshot,
@@ -76,8 +78,11 @@ const PHASES_FILE = "staging-results-item-counting.phases.json";
 /** Policy parity snapshots/comparisons (git-ignored; synthetic row ids and catalog text only). */
 const PARITY_FILE = "staging-results-item-counting.policy-parity.json";
 const PARITY_REPORT = "staging-results-item-counting-policy-parity.md";
+/** Write-path/digest compatibility report (`--write-compat`; git-ignored). */
+const WRITE_COMPAT_REPORT = "staging-results-item-counting-write-compat.md";
 
 const ARGS = process.argv.slice(2);
+const WRITE_COMPAT = ARGS.includes("--write-compat");
 const MODE: GateMode = ARGS.includes("--measure-only") ? "measure-only" : "full";
 const PHASE_ARG = ARGS.find((a) => a.startsWith("--manager-phase="))?.split("=")[1] as ManagerPhase | undefined;
 if (PHASE_ARG !== undefined && !MANAGER_PHASES.includes(PHASE_ARG)) {
@@ -303,6 +308,7 @@ async function main(): Promise<number> {
     for (const [role, c] of Object.entries(sessions.sources)) console.log(`  ${role}: real session claims ${c.bytes} bytes${c.problems.length ? ` · ${c.problems[0]}` : ""}`);
 
     if (PARITY_ARG) return await runParity(dbConfig, PARITY_ARG);
+    if (WRITE_COMPAT) return await runWriteCompat(dbConfig);
 
     const io: GateIO = {
       async runSql(files) {
@@ -423,6 +429,54 @@ async function runParity(dbConfig: pg.ClientConfig, mode: "before" | "after"): P
   ].join("\n");
   writeFileSync(PARITY_REPORT, md, "utf8");
   console.log(`\nWrote ${PARITY_REPORT}`);
+  console.log(status);
+  return problems.length ? 1 : 0;
+}
+
+/** `--write-compat`: app write paths, digest and anon checks with 0036 and restored pre-0036 policies, all rolled back. */
+async function runWriteCompat(dbConfig: pg.ClientConfig): Promise<number> {
+  const lines: string[] = [];
+  const log = (l: string) => {
+    console.log(`  ${l}`);
+    lines.push(l);
+  };
+  console.log("\nWrite-path compatibility (one transaction, rolled back)");
+  const client = new pg.Client(dbConfig);
+  client.on("error", (e) => console.error(`  database connection error: ${redactSecrets(e.message)}`));
+  await client.connect();
+  const problems: string[] = [];
+  let table: string[] = [];
+  try {
+    for (const c of Object.values(state.claimsSources)) problems.push(...c.problems);
+    const { post, pre } = await collectWriteCompat(client, { claimsText, parity: readParity(), log });
+    problems.push(...checkSet(post), ...checkSet(pre), ...compareSets(post, pre));
+    const preBy = new Map(pre.steps.map((x) => [x.id, x.result]));
+    table = [
+      "| Step | Actor | What | With 0036 | Pre-0036 policies |", "|---|---|---|---|---|",
+      ...post.steps.map((x) => `| ${x.id} | ${x.actor} | ${STEPS.find((st) => st.id === x.id)?.what ?? ""} | ${x.result} | ${preBy.get(x.id) ?? "missing"} |`),
+      "", `- policy hash with 0036: ${post.policyHash} · restored pre-0036: ${pre.policyHash}`,
+    ];
+    const after = await client.query("select count(*)::int as n from public.production_events where id like 'wc-%'");
+    if (after.rows[0].n !== 0) problems.push(`${after.rows[0].n} write-compat rows remain after rollback`);
+    else log("after rollback: no write-compat rows remain; stock, ledger and policies unchanged");
+  } catch (e) {
+    problems.push(redactSecrets(e instanceof Error ? e.message : String(e)));
+  } finally {
+    await client.end().catch(() => {});
+  }
+  const status = problems.length ? `STATUS: FAILED – ${problems[0]}${problems.length > 1 ? ` (+${problems.length - 1} more)` : ""}` : "STATUS: COMPLETE";
+  const md = [
+    "# item-counting · write-path and digest compatibility (0036)", "",
+    `- project: ${STAGING_REF} (staging) · code revision: ${state.revision} · finished: ${new Date().toISOString()}`,
+    "- the app's own capture, deduction, correction and Reports remove statements on `staging` fixtures, the digest's service-role read and anon rejection;",
+    "  run with 0036 and again with the plan's pre-0036 rollback text, in one transaction that is rolled back (nothing is kept)",
+    "", "## Results", "", ...table,
+    "", "## Log", "", ...lines.map((l) => `- ${l}`),
+    "", "## Checks", "", ...(problems.length ? problems.map((p) => `- MISSING/WRONG: ${p}`) : ["- Every step behaved as expected and identically with and without 0036."]),
+    "", status, "",
+  ].join("\n");
+  writeFileSync(WRITE_COMPAT_REPORT, md, "utf8");
+  console.log(`\nWrote ${WRITE_COMPAT_REPORT}`);
   console.log(status);
   return problems.length ? 1 : 0;
 }

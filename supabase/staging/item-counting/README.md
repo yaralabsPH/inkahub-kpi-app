@@ -51,6 +51,20 @@ Results go to `staging-results-item-counting.policy-parity.json` and
 `staging-results-item-counting-policy-parity.md` (git-ignored, ending with a
 STATUS line).
 
+## Write paths, digest and anon (after 0036)
+
+`npm run staging:item-counting -- --write-compat` replays the app's own write
+statements on the `staging` site: kiosk clock-in, verify and complete for a
+scanned worker, auto-deduct and its retry, unverify, staff own and cross-worker
+inserts, manager and staff corrections, and the Reports remove (ledger, then
+event). It also runs v1 and v2 for owner, manager and the service role, the
+digest's service-role read, and anon calls. Each role uses its real session
+claims. Everything runs once with 0036 and once with the plan's pre-0036
+rollback text, inside ONE transaction that is rolled back, so no event, ledger
+row, stock change or policy change is kept. The policy hashes must match the
+parity before/after records. It writes
+`staging-results-item-counting-write-compat.md`, ending in the STATUS line.
+
 ## Real session claims
 
 The runner signs in all five test users and passes each session's real JWT

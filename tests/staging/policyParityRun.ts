@@ -20,7 +20,7 @@ import { STAGING_CUTOFF } from "./measure-item-counting";
 import { claimsSetting } from "./generate-query-evidence";
 import { V1_FUNCTION, V2_FUNCTION } from "./itemCountingEvidence";
 
-const APPLY_TIMEOUT = `do $$
+export const APPLY_TIMEOUT = `do $$
 declare entries text[];
 begin
   select array_agg(c) into entries from pg_catalog.pg_roles r, unnest(r.rolconfig) c
@@ -66,7 +66,7 @@ async function one<T extends Record<string, unknown>>(client: pg.Client, sql: st
   return ((await client.query(sql, params)).rows[0] ?? {}) as T;
 }
 
-async function catalog(client: pg.Client): Promise<ParitySnapshot["catalog"]> {
+export async function catalog(client: pg.Client): Promise<ParitySnapshot["catalog"]> {
   const pol = await client.query(`select schemaname, tablename, policyname, permissive, roles::text[] as roles, cmd, qual, with_check
     from pg_catalog.pg_policies where schemaname = 'public' and tablename = 'production_events' order by policyname`);
   const policies: PolicyRow[] = pol.rows.map((r) => ({
