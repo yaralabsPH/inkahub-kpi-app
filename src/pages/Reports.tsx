@@ -10,7 +10,6 @@ import {
   PRODUCTION_DEPARTMENT_LABELS,
   type ProductionDepartment,
 } from "@/lib/domain";
-import { isKpiEligibleSku, isKpiOrderSku, kpiUnitMultiplier, parseSku } from "@/lib/domain/skuRouting";
 import { cn } from "@/lib/utils/cn";
 import { useAuth } from "@/lib/auth/AuthProvider";
 import { OrderNotesPanel } from "@/components/OrderNotesPanel";
@@ -18,26 +17,37 @@ import { DailyTimesheetCard } from "@/components/DailyTimesheetCard";
 import { PackageUsageCard } from "@/components/PackageUsageCard";
 import { PackageHistoryCard } from "@/components/PackageHistoryCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
+import { ProductionCountStatus } from "@/components/ProductionCountStatus";
+import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
+import {
+  isProductionDate,
+  isReportSite,
+  productionDateAt,
+  productionRange,
+  shiftProductionDate,
+  type ProductionRange,
+} from "@/lib/domain/productionPeriods";
+import {
+  prepareProductionEvidence,
+  summarizeProduction,
+  type ProductionEvidenceEvent,
+  type WorkType,
+} from "@/lib/domain/productionCounts";
+import { buildProductionReportView, type ItemsOrders, type ReportDay } from "@/lib/domain/productionReportView";
+import { productionVisibilityFor } from "@/lib/repository/supabase/productionEvidence";
 
 /**
  * Reports tab — production analytics for owners + managers.
  *
- * Reads from production_events (append-only log) and joins:
- *   - staff_barcodes  → display_name
- *   - staff_rates     → hourly_rate for cost-per-frame
+ * Counts (F1): one production-evidence snapshot per refresh, loaded through
+ * the shared reader for the site's 04:00 production days, prepared once and
+ * projected by productionReportView.ts. Items, Orders, rework and coverage
+ * come from the shared reducer; frame timing (avg min, hours, cost) comes
+ * from productionFrameTiming.ts and never uses UN Items.
  *
- * Filters:
- *   - Date range (Today / 7d / 30d / Custom)
- *   - Staff member (All staff / individual selection)
- *   - Department  (All / A0 Framed / Framed / Unframed / Dispatch)
+ * Joins: staff_barcodes → display_name; staff_rates → hourly_rate for cost.
  *
- * Sections:
- *   1. Filter bar  — date preset chips + custom range + staff + department
- *   2. KPI tiles
- *   3. Output chart— units completed per day
- *   4. Staff board — all staff in range (click a row to filter)
- *   5. SKU board   — slowest SKUs (avg min/unit), reveals bottlenecks
- *   6. CSV export  — raw event log for the active filters
+ * Filters: production days (Today / 7d / 30d / Custom), staff, department.
  *
  * NavGate already restricts the route to users with `reports` in allowed_nav,
  * which (per role defaults) means owner + manager only.
@@ -45,41 +55,10 @@ import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard"
 
 type PresetRange = "today" | "7d" | "30d" | "custom";
 
-interface DateRange {
-  from: Date;
-  to: Date;
-  preset: PresetRange;
-}
-
-interface RawEvent {
-  id: string;
-  staff_id: string;
-  department: ProductionDepartment;
-  order_number: string;
-  line_sku: string | null;
-  line_quantity: number | null;
-  event_type: "started" | "completed" | "cancelled" | "dispatched" | "line_verified" | "clock_in" | "clock_out";
-  parent_event_id?: string | null;
-  station_id: string | null;
-  note: string;
-  created_at: string;
-}
-
 interface StaffLookup {
   user_id: string;
   display_name: string;
   hourly_rate: number | null;
-}
-
-interface CompletedLine {
-  staff_id: string;
-  department: ProductionDepartment;
-  order_number: string;
-  line_sku: string | null;
-  line_quantity: number;
-  started_at: number; // ms
-  completed_at: number; // ms
-  duration_min: number;
 }
 
 /* ============================================================
@@ -98,26 +77,18 @@ function endOfDay(d: Date): Date {
   return x;
 }
 
-function computeRange(preset: PresetRange, customFrom?: Date, customTo?: Date): DateRange {
+/** Browser-day window, kept only for the package-usage card (unchanged by F1). */
+function packageWindow(preset: PresetRange, customFrom?: Date, customTo?: Date): { from: Date; to: Date } {
   const now = new Date();
-  if (preset === "today") {
-    return { from: startOfDay(now), to: endOfDay(now), preset };
-  }
-  if (preset === "7d") {
+  if (preset === "today") return { from: startOfDay(now), to: endOfDay(now) };
+  if (preset === "7d" || preset === "30d") {
     const from = startOfDay(now);
-    from.setDate(from.getDate() - 6); // include today
-    return { from, to: endOfDay(now), preset };
+    from.setDate(from.getDate() - (preset === "7d" ? 6 : 29));
+    return { from, to: endOfDay(now) };
   }
-  if (preset === "30d") {
-    const from = startOfDay(now);
-    from.setDate(from.getDate() - 29);
-    return { from, to: endOfDay(now), preset };
-  }
-  // custom
   return {
     from: customFrom ? startOfDay(customFrom) : startOfDay(now),
     to: customTo ? endOfDay(customTo) : endOfDay(now),
-    preset: "custom",
   };
 }
 
@@ -128,8 +99,21 @@ function isoLocalDate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function dayKey(ms: number): string {
-  return isoLocalDate(new Date(ms));
+/** Production range for a preset; null with a reason when it cannot be built. */
+function reportRange(
+  site: string,
+  preset: PresetRange,
+  customFrom: string,
+  customTo: string,
+): { range: ProductionRange | null; problem: string | null } {
+  if (!isReportSite(site)) return { range: null, problem: null };
+  const today = productionDateAt(new Date(), site);
+  if (preset === "today") return { range: productionRange(site, today, today), problem: null };
+  if (preset === "7d") return { range: productionRange(site, shiftProductionDate(today, -6), today), problem: null };
+  if (preset === "30d") return { range: productionRange(site, shiftProductionDate(today, -29), today), problem: null };
+  if (!isProductionDate(customFrom) || !isProductionDate(customTo)) return { range: null, problem: "Choose a valid start and end date." };
+  if (customFrom > customTo) return { range: null, problem: "The custom range ends before it starts." };
+  return { range: productionRange(site, customFrom, customTo), problem: null };
 }
 
 function formatMinutes(m: number): string {
@@ -146,77 +130,9 @@ function formatHours(m: number): string {
   return `${(m / 60).toFixed(1)}h`;
 }
 
-/* ============================================================
- * Event → completed-lines reducer
- * ============================================================ */
-function deriveCompletedLines(events: RawEvent[]): {
-  completedLines: CompletedLine[];
-  unitsCompleted: number;
-  ordersCompleted: Set<string>;
-} {
-  // items-vs-orders split: UN counts for orders, not items.
-  //   isKpiOrderSku   - broad: includes UN. Bumps ordersCompleted.
-  //   isKpiEligibleSku - narrow: items only (excludes UN). Bumps units
-  //                     + duration aggregations.
-  // UN events still get pushed to completedLines (so unframed dept
-  // shows order counts on the staff board) but with line_quantity=0
-  // and duration_min=0 so they do not pollute items/avg-min stats.
-  // Iterates line_verified events for per-SKU granularity (not order-
-  // level completed/dispatched events). Cancelled verifies are
-  // dropped via the parent_event_id chain.
-  const sorted = [...events].sort((a, b) =>
-    a.created_at.localeCompare(b.created_at),
-  );
-
-  const GAP_CAP_MIN = 30;
-
-  const cancelledIds = new Set<string>();
-  for (const ev of sorted) {
-    if (ev.event_type === "cancelled" && ev.parent_event_id) {
-      cancelledIds.add(ev.parent_event_id);
-    }
-  }
-
-  const prevVerifyByWorker = new Map<string, RawEvent>();
-  const completedLines: CompletedLine[] = [];
-  const ordersCompleted = new Set<string>();
-  let unitsCompleted = 0;
-
-  for (const ev of sorted) {
-    if (ev.event_type !== "line_verified") continue;
-    if (cancelledIds.has(ev.id)) continue;
-    if (!isKpiOrderSku(ev.line_sku)) continue;
-
-    const isItem = isKpiEligibleSku(ev.line_sku);
-    const rawQty = ev.line_quantity ?? 1;
-    const itemUnits = isItem ? rawQty * kpiUnitMultiplier(ev.line_sku) : 0;
-
-    unitsCompleted += itemUnits;
-    ordersCompleted.add(ev.order_number);
-
-    const prev = prevVerifyByWorker.get(ev.staff_id);
-    const completedMs = Date.parse(ev.created_at);
-    const prevMs = prev ? Date.parse(prev.created_at) : completedMs;
-    const rawGapMin = (completedMs - prevMs) / 60_000;
-    // Duration only contributes when this event is an item (frame).
-    const validForAvg = !!prev && rawGapMin > 0 && rawGapMin <= GAP_CAP_MIN && isItem;
-    const duration_min = validForAvg ? rawGapMin : 0;
-
-    completedLines.push({
-      staff_id: ev.staff_id,
-      department: ev.department,
-      order_number: ev.order_number,
-      line_sku: ev.line_sku,
-      line_quantity: itemUnits,
-      started_at: prevMs,
-      completed_at: completedMs,
-      duration_min,
-    });
-
-    prevVerifyByWorker.set(ev.staff_id, ev);
-  }
-
-      return { completedLines, unitsCompleted, ordersCompleted };
+/** Items can be null when an exact total would overflow; never show a rounded guess. */
+function fmtItems(n: number | null): string {
+  return n === null ? "too large" : n.toLocaleString();
 }
 
 /* ============================================================
@@ -235,9 +151,28 @@ const DEPARTMENT_OPTIONS: { value: ProductionDepartment | typeof ALL_DEPARTMENTS
 ];
 
 export function Reports() {
+  // The Supabase client is only constructed on the Supabase path, so the
+  // local-only (Dexie) build renders this message without missing-key errors.
+  if (getBackendMode() !== "supabase") {
+    return (
+      <div className="p-6">
+        <Card>
+          <CardBody>
+            <div className="text-sm text-slate-600 dark:text-slate-400">
+              Reports require the Supabase backend. This dataset is running in
+              local-only mode.
+            </div>
+          </CardBody>
+        </Card>
+      </div>
+    );
+  }
+  return <SupabaseReports />;
+}
+
+function SupabaseReports() {
   const supabase = getSupabase();
   const location = useAppStore((s) => s.location);
-  const isSupabase = getBackendMode() === "supabase";
 
   const [preset, setPreset] = useState<PresetRange>("7d");
   const [customFrom, setCustomFrom] = useState<string>(() =>
@@ -251,43 +186,39 @@ export function Reports() {
   // === per-day-worked view ===
   const [chartMode, setChartMode] = useState<"totals" | "perDay">("totals");
 
-  const range = useMemo<DateRange>(() => {
+  // Production days at the site (04:00 boundaries). Recomputed on refresh so
+  // "today" rolls over at 04:00 site time.
+  const { range, problem: rangeProblem } = useMemo(
+    () => reportRange(location, preset, customFrom, customTo),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [location, preset, customFrom, customTo, refreshTick],
+  );
+  const pkgWindow = useMemo(() => {
     const cf = customFrom ? new Date(customFrom) : undefined;
     const ct = customTo ? new Date(customTo) : undefined;
-    return computeRange(preset, cf, ct);
+    return packageWindow(preset, cf, ct);
   }, [preset, customFrom, customTo]);
 
-  const [events, setEvents] = useState<RawEvent[]>([]);
-  const [staffLookup, setStaffLookup] = useState<Map<string, StaffLookup>>(new Map());
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const evidence = useProductionEvidence({ client: supabase, site: location, range, refreshKey: refreshTick });
 
-  // -------- fetch --------
+  const [staffLookup, setStaffLookup] = useState<Map<string, StaffLookup>>(new Map());
+  const [staffError, setStaffError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+
+  // Clear person filter and lookups when the site changes.
   useEffect(() => {
-    if (!isSupabase) return;
+    setSelectedStaff(ALL_STAFF);
+    setStaffLookup(new Map());
+  }, [location]);
+
+  // -------- staff names + rates (display only; counts never depend on them) --------
+  useEffect(() => {
     let cancelled = false;
-    setLoading(true);
-    setError(null);
+    setStaffError(null);
     (async () => {
       try {
-        const fromIso = range.from.toISOString();
-        const toIso = range.to.toISOString();
-        // Paginated production_events fetch - bypasses PostgRESTs 1000-row
-        // cap so the KPI tiles + staff board scale past ~2 days of busy
-        // production. fetchAllRows pages through with .range() until it
-        // hits a short page.
-        const [evRows, staffRes, rateRes] = await Promise.all([
-          fetchAllRows<RawEvent>((from, to) =>
-            supabase
-              .from("production_events")
-              .select("*")
-              .eq("location", location)
-              .in("event_type", ["line_verified", "cancelled", "completed", "dispatched"])
-              .gte("created_at", fromIso)
-              .lte("created_at", toIso)
-              .order("created_at", { ascending: true })
-              .range(from, to),
-          ),
+        const [staffRes, rateRes] = await Promise.all([
           supabase
             .from("staff_barcodes")
             .select("user_id, display_name, active")
@@ -329,281 +260,121 @@ export function Reports() {
           }
         }
         setStaffLookup(lookup);
-        setEvents(evRows);
       } catch (e) {
-        if (!cancelled) setError((e as Error).message);
-      } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setStaffError(`Staff names unavailable: ${(e as Error).message}`);
       }
     })();
     return () => { cancelled = true; };
-  }, [supabase, location, range.from, range.to, isSupabase, refreshTick]);
+  }, [supabase, location, refreshTick]);
+
+  const nameOf = useCallback(
+    (id: string) => staffLookup.get(id)?.display_name ?? `User ${id.slice(0, 8)}`,
+    [staffLookup],
+  );
+
+  const staffId = selectedStaff === ALL_STAFF ? null : selectedStaff;
+  const workType = selectedDepartment === ALL_DEPARTMENTS ? null : (selectedDepartment as WorkType);
+  const view = useMemo(
+    () => (evidence.prepared && range ? buildProductionReportView(evidence.prepared, { range, staffId, workType }) : null),
+    [evidence.prepared, range, staffId, workType],
+  );
 
   // -------- staff dropdown options --------
   const staffOptions = useMemo(() => {
     const ids = new Set<string>();
-    for (const ev of events) ids.add(ev.staff_id);
+    for (const r of view?.leaderboard ?? []) ids.add(r.staffId);
+    for (const e of view?.exportEvents ?? []) if (e.staff_id) ids.add(e.staff_id);
     for (const [id] of staffLookup) ids.add(id);
     return Array.from(ids)
-      .map((id) => ({
-        user_id: id,
-        display_name: staffLookup.get(id)?.display_name ?? `User ${id.slice(0, 8)}`,
-      }))
+      .map((id) => ({ user_id: id, display_name: nameOf(id) }))
       .sort((a, b) => a.display_name.localeCompare(b.display_name));
-  }, [events, staffLookup]);
+  }, [view, staffLookup, nameOf]);
 
-  // -------- apply staff + department filters --------
-  const filteredEvents = useMemo(() => {
-    return events.filter((e) => {
-      if (selectedStaff !== ALL_STAFF && e.staff_id !== selectedStaff) return false;
-      if (selectedDepartment !== ALL_DEPARTMENTS && e.department !== selectedDepartment) return false;
-      return true;
-    });
-  }, [events, selectedStaff, selectedDepartment]);
-
-  // Same as filteredEvents but ignoring the staff filter — used for the
-  // leaderboard so you always see everyone in the department for comparison.
-  const eventsForLeaderboard = useMemo(() => {
-    if (selectedDepartment === ALL_DEPARTMENTS) return events;
-    return events.filter((e) => e.department === selectedDepartment);
-  }, [events, selectedDepartment]);
-
-  // -------- derive metrics from filtered events --------
-  const derived = useMemo(() => deriveCompletedLines(filteredEvents), [filteredEvents]);
-  const { completedLines, unitsCompleted, ordersCompleted } = derived;
-
-  const dispatchedOrders = useMemo(() => {
-    const s = new Set<string>();
-    for (const ev of filteredEvents) {
-      if (ev.event_type === "dispatched") s.add(ev.order_number);
-    }
-    return s;
-  }, [filteredEvents]);
-
-  const totalDurationMin = useMemo(
-    () => completedLines.reduce((a, b) => a + b.duration_min, 0),
-    [completedLines],
+  const staffBoard = useMemo(
+    () =>
+      (view?.leaderboard ?? []).map((r) => {
+        const rate = staffLookup.get(r.staffId)?.hourly_rate ?? null;
+        return { ...r, display_name: nameOf(r.staffId), cost: rate != null ? (r.timing.durationMin / 60) * rate : null };
+      }),
+    [view, staffLookup, nameOf],
   );
-  const totalUnitsForAvg = useMemo(
-    () => completedLines.reduce((a, b) => a + (b.duration_min > 0 ? b.line_quantity : 0), 0),
-    [completedLines],
-  );
-  const avgMinPerUnit = totalUnitsForAvg > 0 ? totalDurationMin / totalUnitsForAvg : 0;
 
-  const activeStaffCount = useMemo(() => {
-    const s = new Set<string>();
-    for (const ev of filteredEvents) s.add(ev.staff_id);
-    return s.size;
-  }, [filteredEvents]);
-
-    // -------- staff leaderboard (respects department filter, not staff filter) --------
-  // Now also tracks days worked + computes orders_per_day / units_per_day.
-  // Sort is order_count desc (orders drive the leaderboard until size-effort
-  // data is available); units acts as tiebreaker.
-  const staffBoard = useMemo(() => {
-    type Row = {
-      staff_id: string;
-      display_name: string;
-      units: number;
-      units_for_avg: number;
-      orders: Set<string>;
-      daysWorked: Set<string>;
-      duration_min: number;
-      hourly_rate: number | null;
-    };
-    const map = new Map<string, Row>();
-    const lbDerived = deriveCompletedLines(eventsForLeaderboard);
-    for (const line of lbDerived.completedLines) {
-      const info = staffLookup.get(line.staff_id);
-      let row = map.get(line.staff_id);
-      if (!row) {
-        row = {
-          staff_id: line.staff_id,
-          display_name: info?.display_name ?? "User " + line.staff_id.slice(0, 8),
-          units: 0,
-          units_for_avg: 0,
-          orders: new Set(),
-          daysWorked: new Set(),
-          duration_min: 0,
-          hourly_rate: info?.hourly_rate ?? null,
-        };
-        map.set(line.staff_id, row);
-      }
-      row.units += line.line_quantity;
-      if (line.duration_min > 0) row.units_for_avg += line.line_quantity;
-      row.orders.add(line.order_number);
-      row.daysWorked.add(dayKey(line.completed_at));
-      row.duration_min += line.duration_min;
-    }
-    return Array.from(map.values())
-      .map((r) => {
-        const days = r.daysWorked.size;
-        return {
-          ...r,
-          order_count: r.orders.size,
-          days_worked: days,
-          units_per_day: days > 0 ? r.units / days : 0,
-          orders_per_day: days > 0 ? r.orders.size / days : 0,
-          avg_min: r.units_for_avg > 0 ? r.duration_min / r.units_for_avg : 0,
-          cost: r.hourly_rate != null ? (r.duration_min / 60) * r.hourly_rate : null,
-        };
-      })
-      .sort((a, b) => b.order_count - a.order_count || b.units - a.units);
-  }, [eventsForLeaderboard, staffLookup]);
-
-  // -------- per-staff order drill-down --------
-  // Active only when a single staff is selected. Groups filteredEvents
-  // (already narrowed by date + dept) by order_number for that staff.
-  const staffOrders = useMemo(() => {
-    if (selectedStaff === ALL_STAFF) return [];
-    type Row = {
-      order_number: string;
-      first_ms: number;
-      last_ms: number;
-      depts: Set<ProductionDepartment>;
-      verified_lines: number;
-      units: number;
-    };
-    const map = new Map<string, Row>();
-    for (const ev of filteredEvents) {
-      if (ev.staff_id !== selectedStaff) continue;
-      const ms = Date.parse(ev.created_at);
-      let row = map.get(ev.order_number);
-      if (!row) {
-        row = {
-          order_number: ev.order_number,
-          first_ms: ms,
-          last_ms: ms,
-          depts: new Set<ProductionDepartment>(),
-          verified_lines: 0,
-          units: 0,
-        };
-        map.set(ev.order_number, row);
-      }
-      row.first_ms = Math.min(row.first_ms, ms);
-      row.last_ms  = Math.max(row.last_ms, ms);
-      row.depts.add(ev.department);
-      if (ev.event_type === "line_verified") {
-        row.verified_lines += 1;
-        // Units must match the KPI definition - only framed / PF SKUs
-        // count. Hooks, gift cards, free prints, legacy / unparseable
-        // SKUs all return false from isKpiEligibleSku and contribute 0
-        // to units. Set prints multiply by setCount.
-        if (isKpiEligibleSku(ev.line_sku)) {
-          row.units += (ev.line_quantity ?? 1) * kpiUnitMultiplier(ev.line_sku);
-        }
-      }
-    }
-    return Array.from(map.values()).sort((a, b) => b.last_ms - a.last_ms);
-  }, [filteredEvents, selectedStaff]);
-
-  // -------- SKU bottleneck --------
-  // Groups by SIZE + VARIANT (e.g. A3-FN, A0-PW) rather than full SKU.
-  // This surfaces which TYPE of production work is slow rather than
-  // which specific artwork - far more actionable for planning.
-  // Legacy / unparseable SKUs are skipped (no size + variant to extract).
-  // Picture frames get their own bucket prefix (PF) since assembling a
-  // frame-only product is a different effort from print + frame.
-  const skuBoard = useMemo(() => {
-    type Row = { sku: string; units: number; units_for_avg: number; duration_min: number };
-    const map = new Map<string, Row>();
-    for (const line of completedLines) {
-      if (!line.line_sku) continue;
-      if (line.line_quantity <= 0) continue; // UN lines: count orders, not items
-      const p = parseSku(line.line_sku);
-      if (!p) continue; // legacy / unparseable - skip
-      if (!p.size || !p.variant) continue;
-      const key = p.type === "picture_frame"
-        ? `PF ${p.size}-${p.variant}`
-        : `${p.size}-${p.variant}`;
-      let row = map.get(key);
-      if (!row) {
-        row = { sku: key, units: 0, units_for_avg: 0, duration_min: 0 };
-        map.set(key, row);
-      }
-      row.units += line.line_quantity;
-      if (line.duration_min > 0) row.units_for_avg += line.line_quantity;
-      row.duration_min += line.duration_min;
-    }
-    return Array.from(map.values())
-      .map((r) => ({ ...r, avg_min: r.units_for_avg > 0 ? r.duration_min / r.units_for_avg : 0 }))
-      .sort((a, b) => b.avg_min - a.avg_min)
-      .slice(0, 20);
-  }, [completedLines]);
-
-  // -------- CSV export (respects all filters) --------
-  const handleExport = useCallback(() => {
-    const headers = [
-      "timestamp", "staff_name", "department",
-      "order_number", "sku", "quantity", "event_type",
-      "station_id", "note",
-    ];
-    const rows = filteredEvents.map((e) => {
-      const info = staffLookup.get(e.staff_id);
-      return [
-        e.created_at,
-        info?.display_name ?? e.staff_id,
-        PRODUCTION_DEPARTMENT_LABELS[e.department] ?? e.department,
-        e.order_number,
-        e.line_sku ?? "",
-        e.line_quantity ?? "",
-        e.event_type,
-        e.station_id ?? "",
-        (e.note ?? "").replace(/[\r\n]+/g, " "),
+  // -------- CSV export (respects all filters; raw saved values) --------
+  const handleExport = useCallback(async () => {
+    if (!view || !range) return;
+    const rowsToExport = view.exportEvents;
+    setExportError(null);
+    setExporting(true);
+    try {
+      // Note/station are display-only columns: fetched for the selected days
+      // only, never for every context row of the count snapshot.
+      const extra = await fetchAllRows<{ id: string; station_id: string | null; note: string | null }>((from, to) =>
+        supabase
+          .from("production_events")
+          .select("id, station_id, note")
+          .eq("location", location)
+          .in("event_type", ["line_verified", "cancelled", "completed", "dispatched"])
+          .gte("created_at", range.startUtc)
+          .lt("created_at", range.endUtcExclusive)
+          .order("created_at", { ascending: true })
+          .order("id", { ascending: true })
+          .range(from, to),
+      );
+      const byId = new Map(extra.map((r) => [r.id, r]));
+      const headers = [
+        "timestamp", "staff_name", "department",
+        "order_number", "sku", "quantity", "event_type",
+        "station_id", "note",
       ];
-    });
-    const csv = [headers, ...rows]
-      .map((r) =>
-        r
-          .map((cell) => {
-            const s = String(cell);
-            return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-          })
-          .join(","),
-      )
-      .join("\r\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const staffSuffix = selectedStaff === ALL_STAFF
-      ? "all-staff"
-      : (staffLookup.get(selectedStaff)?.display_name ?? selectedStaff).replace(/[^a-z0-9]+/gi, "-").toLowerCase();
-    const deptSuffix = selectedDepartment === ALL_DEPARTMENTS ? "all-depts" : selectedDepartment;
-    a.download = `production-events_${staffSuffix}_${deptSuffix}_${isoLocalDate(range.from)}_to_${isoLocalDate(range.to)}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, [filteredEvents, staffLookup, selectedStaff, selectedDepartment, range.from, range.to]);
+      const rows = rowsToExport.map((e: ProductionEvidenceEvent) => {
+        const x = byId.get(e.id);
+        return [
+          e.created_at,
+          e.staff_id ? (staffLookup.get(e.staff_id)?.display_name ?? e.staff_id) : "",
+          PRODUCTION_DEPARTMENT_LABELS[e.department as ProductionDepartment] ?? e.department ?? "",
+          e.order_number ?? "",
+          e.line_sku ?? "",
+          e.line_quantity == null ? "" : String(e.line_quantity),
+          e.event_type,
+          x?.station_id ?? "",
+          (x?.note ?? "").replace(/[\r\n]+/g, " "),
+        ];
+      });
+      const csv = [headers, ...rows]
+        .map((r) =>
+          r
+            .map((cell) => {
+              const s = String(cell);
+              return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+            })
+            .join(","),
+        )
+        .join("\r\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const staffSuffix = selectedStaff === ALL_STAFF
+        ? "all-staff"
+        : (staffLookup.get(selectedStaff)?.display_name ?? selectedStaff).replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+      const deptSuffix = selectedDepartment === ALL_DEPARTMENTS ? "all-depts" : selectedDepartment;
+      a.download = `production-events_${staffSuffix}_${deptSuffix}_${range.firstDate}_to_${range.lastDate}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setExportError(`Export failed: ${(e as Error).message}`);
+    } finally {
+      setExporting(false);
+    }
+  }, [view, range, supabase, location, staffLookup, selectedStaff, selectedDepartment]);
 
   /* ------------------------------------------------------------
    * Render
    * ------------------------------------------------------------ */
 
-  // === per-day-worked view ===
-  const totalStaffDays = staffBoard.reduce((s, r) => s + r.days_worked, 0);
-  const avgUnitsPerStaffDay = totalStaffDays > 0 ? unitsCompleted / totalStaffDays : 0;
-  const avgOrdersPerStaffDay = totalStaffDays > 0 ? ordersCompleted.size / totalStaffDays : 0;
-
-  if (!isSupabase) {
-    return (
-      <div className="p-6">
-        <Card>
-          <CardBody>
-            <div className="text-sm text-slate-600 dark:text-slate-400">
-              Reports require the Supabase backend. This dataset is running in
-              local-only mode.
-            </div>
-          </CardBody>
-        </Card>
-      </div>
-    );
-  }
-
-  const selectedStaffName = selectedStaff === ALL_STAFF
-    ? null
-    : staffLookup.get(selectedStaff)?.display_name ?? selectedStaff;
+  const selectedStaffName = staffId ? nameOf(staffId) : null;
   const selectedDeptLabel = selectedDepartment === ALL_DEPARTMENTS
     ? null
     : PRODUCTION_DEPARTMENT_LABELS[selectedDepartment];
@@ -613,6 +384,14 @@ export function Reports() {
     selectedStaffName ? selectedStaffName : null,
     selectedDeptLabel ? selectedDeptLabel : null,
   ].filter(Boolean).join(" · ");
+
+  const summary = view?.summary ?? null;
+  const itemsLabel = workType ? "Items" : "Items (all work types)";
+  const disclosures = [
+    workType ? null : "Items with all departments selected are work processed across the selected work types: a line verified at framing and at dispatch counts at both.",
+    "Orders are distinct completed orders; a person's or department's Orders overlap, so they do not add up to the total.",
+    "CS/rework is counted separately. Rework scanned without a case tag cannot be told apart from normal work.",
+  ].filter((x): x is string => !!x);
 
   return (
     <div className="p-4 md:p-6 space-y-4">
@@ -645,17 +424,17 @@ export function Reports() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={handleExport}
-            disabled={filteredEvents.length === 0}
+            onClick={() => void handleExport()}
+            disabled={!view || view.exportEvents.length === 0 || exporting}
             title="Download raw event log as CSV"
           >
             <Download size={14} />
-            Export CSV
+            {exporting ? "Exporting…" : "Export CSV"}
           </Button>
         </div>
       </div>
 
-      {/* Order lookup â€” independent of date filter */}
+      {/* Order lookup — independent of date filter */}
       <OrderLookupCard
         supabase={supabase}
         location={location}
@@ -764,44 +543,61 @@ export function Reports() {
           )}
 
           <div className="ml-auto text-xs text-slate-500 dark:text-slate-400">
-            {isoLocalDate(range.from)} → {isoLocalDate(range.to)}
-            {loading && <span className="ml-2 italic">loading…</span>}
-            {error && <span className="ml-2 text-red-600">{error}</span>}
+            {range ? `${range.firstDate} → ${range.lastDate}` : null}
+            {rangeProblem && <span className="ml-2 text-red-600">{rangeProblem}</span>}
+            {staffError && <span className="ml-2 text-red-600">{staffError}</span>}
+            {exportError && <span className="ml-2 text-red-600">{exportError}</span>}
           </div>
+          <ProductionCountStatus
+            className="basis-full"
+            state={evidence}
+            range={range}
+            coverage={summary?.coverage ?? null}
+            notes={disclosures}
+          />
         </CardBody>
       </Card>
 
       {/* KPI tiles */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
         <KpiTile
-          label="Units completed"
-          value={unitsCompleted.toLocaleString()}
+          label={itemsLabel}
+          value={summary ? fmtItems(summary.normal.items) : "--"}
+          sub={workType ? undefined : "work processed"}
         />
         <KpiTile
           label="Orders completed"
-          value={ordersCompleted.size.toLocaleString()}
+          value={summary ? summary.normal.orders.toLocaleString() : "--"}
           sub={
-            dispatchedOrders.size > 0
-              ? `${dispatchedOrders.size.toLocaleString()} dispatched`
+            view && view.dispatchedOrders > 0
+              ? `${view.dispatchedOrders.toLocaleString()} dispatched`
               : undefined
           }
         />
         <KpiTile
+          label="CS / rework"
+          value={summary ? `${fmtItems(summary.rework.items)} items` : "--"}
+          sub={summary ? `${summary.rework.orders.toLocaleString()} case order${summary.rework.orders === 1 ? "" : "s"}` : undefined}
+        />
+        <KpiTile
           label="Avg min / unit"
-          value={formatMinutes(avgMinPerUnit)}
+          value={view ? formatMinutes(view.timing.avgMinPerUnit) : "--"}
+          sub="framed units only"
         />
         <KpiTile
           label={selectedStaff === ALL_STAFF ? "Active staff" : "Hours worked"}
           value={
-            selectedStaff === ALL_STAFF
-              ? activeStaffCount.toLocaleString()
-              : formatHours(totalDurationMin)
+            !view
+              ? "--"
+              : selectedStaff === ALL_STAFF
+                ? view.activeStaff.toLocaleString()
+                : formatHours(view.timing.durationMin)
           }
         />
         <KpiTile
           label="Avg orders / staff-day"
-          value={avgOrdersPerStaffDay > 0 ? avgOrdersPerStaffDay.toFixed(1) : "--"}
-          sub={totalStaffDays > 0 ? `${totalStaffDays} staff-day${totalStaffDays === 1 ? "" : "s"}` : undefined}
+          value={view && view.avgOrdersPerStaffDay > 0 ? view.avgOrdersPerStaffDay.toFixed(1) : "--"}
+          sub={view && view.staffDays > 0 ? `${view.staffDays} staff-day${view.staffDays === 1 ? "" : "s"}` : undefined}
         />
       </div>
 
@@ -838,26 +634,26 @@ export function Reports() {
             </div>
           </div>
           <span className="text-xs text-slate-500 dark:text-slate-400">
-            Units (items) vs Orders per person
-            {subtitleSuffix ? ` -- ${subtitleSuffix}` : ""}
+            Items vs Orders per person (normal work; all visible staff)
+            {selectedDeptLabel ? ` -- ${selectedDeptLabel}` : ""}
           </span>
         </CardHeader>
         <CardBody>
           {staffBoard.length === 0 ? (
-            <Empty label="No completed units in this range." />
+            <Empty label={evidence.status === "loading" ? "Loading…" : "No credited items or orders in this range."} />
           ) : (
             <div style={{ width: "100%", height: 260 }}>
               <ResponsiveContainer>
                 <BarChart
                   data={staffBoard.map((s) => ({
-                    staff_id: s.staff_id,
+                    staff_id: s.staffId,
                     name: s.display_name,
-                    Units: chartMode === "perDay"
-                      ? Number(s.units_per_day.toFixed(1))
-                      : s.units,
+                    Items: chartMode === "perDay"
+                      ? Number(s.itemsPerDay.toFixed(1))
+                      : (s.normal.items ?? 0),
                     Orders: chartMode === "perDay"
-                      ? Number(s.orders_per_day.toFixed(1))
-                      : s.order_count,
+                      ? Number(s.ordersPerDay.toFixed(1))
+                      : s.normal.orders,
                   }))}
                   margin={{ top: 8, right: 16, bottom: 8, left: 0 }}
                   onClick={(state: any) => {
@@ -875,7 +671,7 @@ export function Reports() {
                     contentStyle={{ fontSize: 12, borderRadius: 6 }}
                   />
                   <Legend wrapperStyle={{ fontSize: 12 }} />
-                  <Bar dataKey="Units"  fill="#0f172a" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="Items"  fill="#0f172a" radius={[4, 4, 0, 0]} />
                   <Bar dataKey="Orders" fill="#94a3b8" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -890,12 +686,13 @@ export function Reports() {
         <CardHeader>
           <CardTitle>Staff leaderboard</CardTitle>
           <span className="text-xs text-slate-500 dark:text-slate-400">
-            {selectedDeptLabel ? `${selectedDeptLabel} only` : "All departments"} — click row to filter
+            {selectedDeptLabel ? `${selectedDeptLabel} only` : "All departments"} — all visible staff
+            {selectedStaffName ? ` (the tiles above show ${selectedStaffName} only)` : ""} — click row to filter
           </span>
         </CardHeader>
         <CardBody className="p-0">
           {staffBoard.length === 0 ? (
-            <Empty label="No production events from staff in this range." />
+            <Empty label="No credited production from staff in this range." />
           ) : (
             <div className="overflow-x-auto">
               <table className="min-w-full text-sm">
@@ -903,10 +700,11 @@ export function Reports() {
                   <tr>
                     <th className="text-left px-4 py-2 font-semibold">Staff</th>
                     <th className="text-right px-3 py-2 font-semibold">Orders</th>
-                    <th className="text-right px-3 py-2 font-semibold">Units</th>
+                    <th className="text-right px-3 py-2 font-semibold">Items</th>
+                    <th className="text-right px-3 py-2 font-semibold">Rework</th>
                     <th className="text-right px-3 py-2 font-semibold">Days</th>
                     <th className="text-right px-3 py-2 font-semibold">O/day</th>
-                    <th className="text-right px-3 py-2 font-semibold">U/day</th>
+                    <th className="text-right px-3 py-2 font-semibold">I/day</th>
                     <th className="text-right px-3 py-2 font-semibold">Hours</th>
                     <th className="text-right px-3 py-2 font-semibold">Avg min/unit</th>
                     <th className="text-right px-4 py-2 font-semibold">Est. cost</th>
@@ -914,12 +712,12 @@ export function Reports() {
                 </thead>
                 <tbody>
                   {staffBoard.map((r) => {
-                    const isSelected = selectedStaff === r.staff_id;
+                    const isSelected = selectedStaff === r.staffId;
                     return (
                       <tr
-                        key={r.staff_id}
+                        key={r.staffId}
                         onClick={() =>
-                          setSelectedStaff(isSelected ? ALL_STAFF : r.staff_id)
+                          setSelectedStaff(isSelected ? ALL_STAFF : r.staffId)
                         }
                         className={cn(
                           "border-t border-slate-100 dark:border-slate-800 cursor-pointer transition",
@@ -932,13 +730,16 @@ export function Reports() {
                         <td className="px-4 py-2 font-medium">
                           {r.display_name}
                         </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.order_count.toLocaleString()}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.units.toLocaleString()}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.days_worked.toLocaleString()}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.orders_per_day > 0 ? r.orders_per_day.toFixed(1) : "--"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.units_per_day > 0 ? r.units_per_day.toFixed(1) : "--"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{formatHours(r.duration_min)}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{formatMinutes(r.avg_min)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{r.normal.orders.toLocaleString()}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{fmtItems(r.normal.items)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-slate-500">
+                          {(r.rework.items ?? 0) > 0 || r.rework.orders > 0 ? `${fmtItems(r.rework.items)} / ${r.rework.orders}` : "--"}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums">{r.daysWorked.toLocaleString()}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{r.ordersPerDay > 0 ? r.ordersPerDay.toFixed(1) : "--"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{r.itemsPerDay > 0 ? r.itemsPerDay.toFixed(1) : "--"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{formatHours(r.timing.durationMin)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{formatMinutes(r.timing.avgMinPerUnit)}</td>
                         <td className="px-4 py-2 text-right tabular-nums">
                           {r.cost == null
                             ? <span className="text-slate-400 italic">no rate</span>
@@ -961,12 +762,12 @@ export function Reports() {
         <CardHeader>
           <CardTitle>Slowest variants</CardTitle>
           <span className="text-xs text-slate-500 dark:text-slate-400">
-            Grouped by size and variant. Top 20 by avg minutes per unit
+            Grouped by size and variant. Top 20 by avg minutes per framed unit
             {subtitleSuffix ? ` — ${subtitleSuffix}` : ""}
           </span>
         </CardHeader>
         <CardBody className="p-0">
-          {skuBoard.length === 0 ? (
+          {!view || view.skuBoard.length === 0 ? (
             <Empty label="No SKU-level events in this range." />
           ) : (
             <div className="overflow-x-auto">
@@ -974,21 +775,21 @@ export function Reports() {
                 <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
                   <tr>
                     <th className="text-left px-4 py-2 font-semibold">Size / Variant</th>
-                    <th className="text-right px-3 py-2 font-semibold">Units</th>
+                    <th className="text-right px-3 py-2 font-semibold">Timed units</th>
                     <th className="text-right px-3 py-2 font-semibold">Total time</th>
                     <th className="text-right px-4 py-2 font-semibold">Avg min/unit</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {skuBoard.map((r) => (
+                  {view.skuBoard.map((r) => (
                     <tr
                       key={r.sku}
                       className="border-t border-slate-100 dark:border-slate-800"
                     >
                       <td className="px-4 py-2 font-mono text-xs">{r.sku}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{r.units.toLocaleString()}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{formatHours(r.duration_min)}</td>
-                      <td className="px-4 py-2 text-right tabular-nums">{formatMinutes(r.avg_min)}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{r.weight.toLocaleString()}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{formatHours(r.durationMin)}</td>
+                      <td className="px-4 py-2 text-right tabular-nums">{formatMinutes(r.avgMin)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1000,12 +801,13 @@ export function Reports() {
       </CollapsibleSection>
 
       {/* Per-staff order drill-down - only when a single staff is selected */}
-      {selectedStaff !== ALL_STAFF && staffOrders.length > 0 ? (
+      {staffId && view && view.staffOrders.length > 0 ? (
         <Card>
           <CardHeader>
             <CardTitle>Orders handled by {selectedStaffName}</CardTitle>
             <span className="text-xs text-slate-500 dark:text-slate-400">
-              {staffOrders.length.toLocaleString()} distinct order{staffOrders.length === 1 ? "" : "s"} in this range. Click an order # to look it up.
+              {view.staffOrders.length.toLocaleString()} distinct order{view.staffOrders.length === 1 ? "" : "s"} touched in this range;{" "}
+              {view.summary.normal.orders.toLocaleString()} completed by {selectedStaffName}. Click an order # to look it up.
             </span>
           </CardHeader>
           <CardBody className="p-0">
@@ -1018,44 +820,48 @@ export function Reports() {
                     <th className="text-left px-3 py-2 font-semibold">Last touched</th>
                     <th className="text-left px-3 py-2 font-semibold">Departments</th>
                     <th className="text-right px-3 py-2 font-semibold">Lines verified</th>
-                    <th className="text-right px-4 py-2 font-semibold">Units</th>
+                    <th className="text-right px-3 py-2 font-semibold">Items</th>
+                    <th className="text-left px-4 py-2 font-semibold">Completed</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {staffOrders.map((r) => {
+                  {view.staffOrders.map((r) => {
                     const fmt = (ms: number) => new Date(ms).toLocaleString(undefined, {
                       month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                      ...(range ? { timeZone: range.timeZone } : {}),
                     });
                     return (
-                      <tr key={r.order_number} className="border-t border-slate-100 dark:border-slate-800">
+                      <tr key={r.key} className="border-t border-slate-100 dark:border-slate-800">
                         <td className="px-4 py-2 font-mono text-xs">
                           <button
                             type="button"
                             className="text-indigo-600 dark:text-indigo-400 hover:underline"
                             onClick={() => {
                               // Scroll to Order lookup and trigger search.
-                              const evt = new CustomEvent("inka:lookup-order", { detail: r.order_number });
+                              const evt = new CustomEvent("inka:lookup-order", { detail: r.orderNumber });
                               window.dispatchEvent(evt);
                               window.scrollTo({ top: 0, behavior: "smooth" });
                             }}
                             title="Look up this order"
                           >
-                            #{r.order_number}
+                            #{r.orderNumber}
                           </button>
+                          {r.caseId ? <span className="ml-1 text-[10px] text-amber-700">CS {r.caseId}</span> : null}
                         </td>
-                        <td className="px-3 py-2 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap">{fmt(r.first_ms)}</td>
-                        <td className="px-3 py-2 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap">{fmt(r.last_ms)}</td>
+                        <td className="px-3 py-2 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap">{fmt(r.firstMs)}</td>
+                        <td className="px-3 py-2 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap">{fmt(r.lastMs)}</td>
                         <td className="px-3 py-2">
                           <div className="flex flex-wrap gap-1">
-                            {Array.from(r.depts).map((d) => (
+                            {r.workTypes.map((d) => (
                               <span key={d} className="inline-flex items-center rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-[11px] px-2 py-0.5 ring-1 ring-slate-200 dark:ring-slate-700">
                                 {PRODUCTION_DEPARTMENT_LABELS[d]}
                               </span>
                             ))}
                           </div>
                         </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.verified_lines.toLocaleString()}</td>
-                        <td className="px-4 py-2 text-right tabular-nums">{r.units.toLocaleString()}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{r.verifiedLines.toLocaleString()}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{fmtItems(r.items)}</td>
+                        <td className="px-4 py-2 text-xs">{r.completed ? "yes" : "--"}</td>
                       </tr>
                     );
                   })}
@@ -1067,13 +873,11 @@ export function Reports() {
       ) : null}
 
       {/* Per-staff daily productivity chart */}
-      {selectedStaff !== ALL_STAFF && staffOrders.length > 0 ? (
+      {staffId && view?.personDaily && view.personTotals && view.staffOrders.length > 0 ? (
         <StaffProductivityChart
-          staffId={selectedStaff}
           staffName={selectedStaffName ?? "Staff"}
-          events={filteredEvents}
-          rangeFrom={range.from}
-          rangeTo={range.to}
+          daily={view.personDaily}
+          totals={view.personTotals.normal}
         />
       ) : null}
 
@@ -1082,8 +886,8 @@ export function Reports() {
       </CollapsibleSection>
 
       <PackageUsageCard
-        fromIso={range.from.toISOString()}
-        toIso={range.to.toISOString()}
+        fromIso={pkgWindow.from.toISOString()}
+        toIso={pkgWindow.to.toISOString()}
         rangeLabel={subtitleSuffix || "current range"}
       />
 
@@ -1157,6 +961,7 @@ interface OrderEvent {
   line_quantity: number | null;
   event_type: "started" | "completed" | "cancelled" | "dispatched" | "line_verified" | "clock_in" | "clock_out";
   parent_event_id?: string | null;
+  cs_case_id?: string | null;
   station_id: string | null;
   note: string;
   created_at: string;
@@ -1264,26 +1069,46 @@ function OrderLookupCard({
     return s;
   }, [events]);
 
-  // Total items in the order, deduped by SKU (any one event per unique sku).
-  // Returns null if no per-line qty info was logged for the order.
-  const totalItemsInOrder = useMemo(() => {
-    if (!events) return null;
-    const perSku = new Map<string, number>();
-    for (const ev of events) {
-      if (ev.line_sku && typeof ev.line_quantity === "number" && !perSku.has(ev.line_sku)) {
-        perSku.set(ev.line_sku, ev.line_quantity);
-      }
-    }
-    if (perSku.size === 0) return null;
-    let sum = 0;
-    for (const v of perSku.values()) sum += v;
-    return sum;
-  }, [events]);
-
   const auth = useAuth();
   const author = (auth.user && auth.profile)
     ? { user_id: auth.user.id, display_name: auth.profile.display_name }
     : null;
+
+  // Items on this order, counted by the shared F1 rules over its whole saved
+  // history (cancellations resolved, sets expanded, excluded lines ignored).
+  // This is work processed across work types, not a count of physical goods.
+  const role = auth.profile?.role ?? null;
+  const memberHere = auth.locations.includes(location);
+  const orderCounts = useMemo(() => {
+    if (!events || events.length === 0) return null;
+    const now = new Date().toISOString();
+    const range = { startUtc: "1970-01-01T00:00:00.000Z", endUtcExclusive: "9999-12-31T00:00:00.000Z" };
+    try {
+      const prepared = prepareProductionEvidence({
+        events: events.map((e) => ({
+          id: e.id,
+          location,
+          staff_id: e.staff_id,
+          department: e.department,
+          order_number: e.order_number,
+          line_sku: e.line_sku,
+          line_quantity: e.line_quantity,
+          event_type: e.event_type,
+          created_at: e.created_at,
+          parent_event_id: e.parent_event_id ?? null,
+          cs_case_id: e.cs_case_id ?? null,
+        })),
+        range,
+        asOfUtc: now,
+        loadedAtUtc: now,
+        visibility: productionVisibilityFor(role, memberHere),
+      });
+      const s = summarizeProduction(prepared, { range });
+      return { normal: s.normal.items, rework: s.rework.items, incomplete: s.coverage.incomplete };
+    } catch {
+      return null;
+    }
+  }, [events, location, role, memberHere]);
 // High-level status: dispatched > completed > started > cancelled-only > none
   const orderStatus = useMemo(() => {
     if (!events || events.length === 0) return null;
@@ -1386,9 +1211,14 @@ function OrderLookupCard({
                 <span className="font-mono text-sm font-semibold">
                   #{searched}
                 </span>
-                {totalItemsInOrder !== null ? (
-                  <span className="text-xs text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 rounded-full px-2 py-0.5">
-                    {totalItemsInOrder} item{totalItemsInOrder === 1 ? "" : "s"}
+                {orderCounts ? (
+                  <span
+                    className="text-xs text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 rounded-full px-2 py-0.5"
+                    title="Verified pieces across all work types: a piece verified at two stations counts at both."
+                  >
+                    {fmtItems(orderCounts.normal)} item{orderCounts.normal === 1 ? "" : "s"} processed
+                    {(orderCounts.rework ?? 0) > 0 ? ` · ${fmtItems(orderCounts.rework)} rework` : ""}
+                    {orderCounts.incomplete ? " · incomplete detail" : ""}
                   </span>
                 ) : null}
                 {orderStatus ? (
@@ -1525,83 +1355,61 @@ function OrderLookupCard({
  * ============================================================ */
 
 interface StaffProductivityProps {
-  staffId: string;
   staffName: string;
-  events: RawEvent[];
-  rangeFrom: Date;
-  rangeTo: Date;
+  /** One entry per production date (shared projection; no re-counting here). */
+  daily: ReportDay[];
+  /** Range totals: distinct Orders over the whole range, not a sum of days. */
+  totals: ItemsOrders;
 }
 
-function StaffProductivityChart({
-  staffId, staffName, events, rangeFrom, rangeTo,
-}: StaffProductivityProps) {
-  const daily = useMemo(() => {
-    const rows = new Map<string, { day: string; orders: Set<string>; items: number }>();
-    // Seed every day in the range so the chart shows zero-work days.
-    const startMs = new Date(rangeFrom.getFullYear(), rangeFrom.getMonth(), rangeFrom.getDate()).getTime();
-    const endMs = new Date(rangeTo.getFullYear(), rangeTo.getMonth(), rangeTo.getDate()).getTime();
-    for (let ms = startMs; ms <= endMs; ms += 86400000) {
-      const d = new Date(ms);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      rows.set(key, { day: key, orders: new Set(), items: 0 });
-    }
-    // Populate from events for this staff only.
-    for (const ev of events) {
-      if (ev.staff_id !== staffId) continue;
-      const d = new Date(ev.created_at);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-      const row = rows.get(key);
-      if (!row) continue;
-      if (ev.event_type === "completed" || ev.event_type === "dispatched") {
-        row.orders.add(ev.order_number);
-      }
-      if (ev.event_type === "line_verified" && isKpiEligibleSku(ev.line_sku)) {
-        row.items += (ev.line_quantity ?? 1) * kpiUnitMultiplier(ev.line_sku);
-      }
-    }
-    return Array.from(rows.values())
-      .map((r) => ({
-        day: r.day,
-        dayLabel: (() => {
-          const [y, m, dd] = r.day.split("-").map(Number);
-          const d = new Date(y, m - 1, dd);
-          return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
-        })(),
-        dayOfWeek: (() => {
-          const [y, m, dd] = r.day.split("-").map(Number);
-          return new Date(y, m - 1, dd).getDay();
-        })(),
-        orders: r.orders.size,
-        items: r.items,
-      }));
-  }, [events, staffId, rangeFrom, rangeTo]);
+/** Calendar label for a YYYY-MM-DD production date, independent of the browser's timezone. */
+function dateParts(date: string): { label: string; dayOfWeek: number } {
+  const [y, m, d] = date.split("-").map(Number);
+  const utc = new Date(Date.UTC(y, m - 1, d));
+  return {
+    label: utc.toLocaleDateString(undefined, { day: "2-digit", month: "short", timeZone: "UTC" }),
+    dayOfWeek: utc.getUTCDay(),
+  };
+}
+
+function StaffProductivityChart({ staffName, daily, totals }: StaffProductivityProps) {
+  const rows = useMemo(
+    () =>
+      daily.map((r) => {
+        const p = dateParts(r.date);
+        return { day: r.date, dayLabel: p.label, dayOfWeek: p.dayOfWeek, orders: r.normal.orders, items: r.normal.items ?? 0 };
+      }),
+    [daily],
+  );
 
   const summary = useMemo(() => {
-    const totalOrders = daily.reduce((s, r) => s + r.orders, 0);
-    const totalItems = daily.reduce((s, r) => s + r.items, 0);
-    const workedDays = daily.filter((r) => r.orders > 0 || r.items > 0).length;
-    const avgOrders = workedDays > 0 ? totalOrders / workedDays : 0;
-    const bestDay = daily.reduce((best, r) => (r.orders > best.orders ? r : best), { orders: 0, items: 0, dayLabel: "-" } as { orders: number; items: number; dayLabel: string });
-    const highestItemsDay = daily.reduce((best, r) => (r.items > best.items ? r : best), { orders: 0, items: 0, dayLabel: "-" } as { orders: number; items: number; dayLabel: string });
+    const totalOrders = totals.orders;
+    const totalItems = totals.items;
+    const worked = rows.filter((r) => r.orders > 0 || r.items > 0);
+    const dayOrderSum = worked.reduce((s, r) => s + r.orders, 0);
+    const avgOrders = worked.length > 0 ? dayOrderSum / worked.length : 0;
+    const bestDay = rows.reduce((best, r) => (r.orders > best.orders ? r : best), { orders: 0, items: 0, dayLabel: "-" } as { orders: number; items: number; dayLabel: string });
+    const highestItemsDay = rows.reduce((best, r) => (r.items > best.items ? r : best), { orders: 0, items: 0, dayLabel: "-" } as { orders: number; items: number; dayLabel: string });
     // 7-day rolling stdev of orders (last 7 days worked)
-    const workedOrders = daily.filter((r) => r.orders > 0 || r.items > 0).slice(-7).map((r) => r.orders);
+    const workedOrders = worked.slice(-7).map((r) => r.orders);
     let stdev = 0;
     if (workedOrders.length >= 2) {
       const mean = workedOrders.reduce((s, n) => s + n, 0) / workedOrders.length;
       const variance = workedOrders.reduce((s, n) => s + (n - mean) ** 2, 0) / workedOrders.length;
       stdev = Math.sqrt(variance);
     }
-    const weekendItems = daily.reduce((s, r) => s + ((r.dayOfWeek === 0 || r.dayOfWeek === 6) ? r.items : 0), 0);
-    const weekendPct = totalItems > 0 ? (weekendItems / totalItems) * 100 : 0;
+    const dayItemSum = rows.reduce((s, r) => s + r.items, 0);
+    const weekendItems = rows.reduce((s, r) => s + ((r.dayOfWeek === 0 || r.dayOfWeek === 6) ? r.items : 0), 0);
+    const weekendPct = dayItemSum > 0 ? (weekendItems / dayItemSum) * 100 : 0;
     return { totalOrders, totalItems, avgOrders, bestDay, highestItemsDay, stdev, weekendPct };
-  }, [daily]);
+  }, [rows, totals]);
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>{staffName} - daily productivity</CardTitle>
         <span className="text-xs text-slate-500 dark:text-slate-400">
-          Orders + items per day across the selected range
+          Orders + items per production day (04:00 to 04:00 site time). Range totals count each order once.
         </span>
       </CardHeader>
       <CardBody className="space-y-3">
@@ -1613,7 +1421,7 @@ function StaffProductivityChart({
           </div>
           <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
             <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Total items</div>
-            <div className="text-xl font-bold tabular-nums">{summary.totalItems.toLocaleString()}</div>
+            <div className="text-xl font-bold tabular-nums">{fmtItems(summary.totalItems)}</div>
           </div>
           <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
             <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Avg / day worked</div>
@@ -1623,7 +1431,7 @@ function StaffProductivityChart({
           <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
             <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Best day</div>
             <div className="text-xl font-bold tabular-nums">{summary.bestDay.orders}</div>
-            <div className="text-[10px] text-slate-500">orders {summary.bestDay.dayLabel !== "-" ? "\u00b7 " + summary.bestDay.dayLabel : ""}</div>
+            <div className="text-[10px] text-slate-500">orders {summary.bestDay.dayLabel !== "-" ? "· " + summary.bestDay.dayLabel : ""}</div>
           </div>
         </div>
 
@@ -1635,7 +1443,7 @@ function StaffProductivityChart({
           </div>
           <div style={{ width: "100%", height: 260 }}>
             <ResponsiveContainer>
-              <LineChart data={daily} margin={{ top: 4, right: 12, left: 0, bottom: 0 }}>
+              <LineChart data={rows} margin={{ top: 4, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
                 <XAxis dataKey="dayLabel" tick={{ fontSize: 10, fill: "#64748b" }} axisLine={{ stroke: "#e2e8f0" }} tickLine={false} />
                 <YAxis yAxisId="orders" orientation="left" tick={{ fontSize: 10, fill: "#64748b" }} axisLine={{ stroke: "#e2e8f0" }} tickLine={false} width={30} />
