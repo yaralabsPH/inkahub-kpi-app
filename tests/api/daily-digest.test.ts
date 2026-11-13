@@ -18,6 +18,10 @@ const h = vi.hoisted(() => {
   const state = {
     tables: {} as Record<string, Row[]>,
     tableErrors: {} as Record<string, { message: string }>,
+    /** Server row cap per request (PostgREST max-rows). */
+    maxRows: 1000,
+    /** Replace one page's response (failure injection). */
+    pageHook: null as null | ((table: string, win: [number, number] | null) => { data: unknown; error: unknown; count?: number | null } | null),
     queries: [] as QueryRecord[],
     rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
     /** Evidence RPC implementation, set after imports (see below). */
@@ -46,9 +50,11 @@ const h = vi.hoisted(() => {
     state.queries.push(rec);
     const q: Record<string, unknown> = {};
     let window: [number, number] | null = null;
+    let counted = false;
     for (const m of ["select", "eq", "gte", "lt", "lte", "in", "order"]) {
       q[m] = (...args: unknown[]) => {
-        if (m !== "select" && m !== "order") rec.ops.push([m, args]);
+        if (m === "select") counted = (args[1] as { count?: string } | undefined)?.count === "exact";
+        else if (m !== "order") rec.ops.push([m, args]);
         return q;
       };
     }
@@ -61,7 +67,7 @@ const h = vi.hoisted(() => {
       const rows = applyFilters(state.tables[table] ?? [], rec.ops);
       const result = err
         ? { data: null, error: err }
-        : { data: window ? rows.slice(window[0], window[1] + 1) : rows, error: null };
+        : { data: window ? rows.slice(window[0], Math.min(window[1] + 1, window[0] + state.maxRows)) : rows, error: null, count: counted ? rows.length : null };
       return Promise.resolve(result).then(resolve, reject);
     };
     return q;

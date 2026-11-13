@@ -2,7 +2,7 @@
 
 - Slug: `item-counting` · Spec: `docs/specs/item-counting.md`
 - Branch: `feature/item-counting`
-- Status: draft
+- Status: approved by CJ; Tasks 1–8 implemented, Task 9 waiting on CJ's staging browser checklist; in review (round 1 findings addressed, see `docs/reviews/item-counting-r1.md`)
 
 ## Approach
 
@@ -449,7 +449,7 @@ Coder writes here when it hits something this plan did not foresee; stop the aff
 
 ## Implementation log
 
-Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. All tasks are unstarted; no build, test, staging or deployment result is claimed by this plan.
+Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. (Written before implementation started; the entries below record what was actually done, including failed runs and amendments.)
 
 - 2026-11-12: CJ approved this plan in chat ("Plan approved"); header Status left as written by the planner.
 - Task 1: added `productionItems.ts` (classifier + strict quantity/overflow checks, current `INKA-AUX…` and legacy `AUX-FP` free prints, catalogue packaging codes + mail-tube IDs excluded) and 52 tests (37 classification, 15 routing/deduction/packaging characterization). Tests failed with the module absent, then passed. Decisions inside the plan's scope: a non-set `GW` single or `GW` picture frame is `unsupported_size` (GW is a set composite per `routeShopifyLineToCatalogueLines`); `S10…` reports `invalid_set_count`. Gate: `tsc -b` OK, `typecheck:digest` OK, 405/405 tests, build OK (only the existing Vite chunk-size warning; new module not yet imported). CI: draft PR #7 `check` passed on d46a1ed.

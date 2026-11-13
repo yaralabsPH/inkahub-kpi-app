@@ -9,6 +9,7 @@ import { ProductionCountStatus } from "@/components/ProductionCountStatus";
 import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
 import { isReportSite, productionDateAt, productionRange } from "@/lib/domain/productionPeriods";
 import { buildProductionWelcomeView, welcomeRange } from "@/lib/domain/productionWelcomeView";
+import { snapshotCovers } from "@/lib/domain/productionCounts";
 import {
   PRODUCTION_DEPARTMENT_LABELS,
   type ProductionDepartment,
@@ -85,7 +86,20 @@ function SupabaseWelcome() {
     return () => clearTimeout(t);
   }, [site, today, tick]);
 
-  const evidence = useProductionEvidence({ client: supabase, site: location, range, refreshKey: tick, refreshOnFocus: true });
+  // Returning to the tab re-derives the production date FIRST (tick), then the
+  // refresh runs for that date's range: never a new cutoff on yesterday's range.
+  useEffect(() => {
+    const onReturn = () => {
+      if (document.visibilityState === "visible") setTick((n) => n + 1);
+    };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, []);
+  const evidence = useProductionEvidence({ client: supabase, site: location, range, refreshKey: tick });
 
   const [staffNames, setStaffNames] = useState<Map<string, string>>(new Map());
   const [namesError, setNamesError] = useState<string | null>(null);
@@ -109,8 +123,11 @@ function SupabaseWelcome() {
   const nameOf = (id: string) => staffNames.get(id) ?? "User " + id.slice(0, 8);
 
   const view = useMemo(
-    () => (evidence.prepared && evidence.snapshot && site ? buildProductionWelcomeView(evidence.prepared, site, evidence.snapshot.asOfUtc) : null),
-    [evidence.prepared, evidence.snapshot, site],
+    () =>
+      evidence.prepared && evidence.snapshot && site && today && snapshotCovers(evidence.snapshot, range)
+        ? buildProductionWelcomeView(evidence.prepared, site, evidence.snapshot.asOfUtc, today)
+        : null,
+    [evidence.prepared, evidence.snapshot, site, today, range],
   );
   const shownToday = view?.today ?? today;
 
@@ -139,7 +156,7 @@ function SupabaseWelcome() {
       <ProductionCountStatus
         state={evidence}
         range={site && shownToday ? productionRange(site, shownToday, shownToday) : null}
-        coverage={view?.todaySummary.coverage ?? null}
+        coverage={view?.coverage ?? null}
         compact
       />
 

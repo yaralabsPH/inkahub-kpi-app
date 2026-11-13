@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { prepareProductionEvidence } from "../productionCounts";
+import { prepareProductionEvidence, snapshotCovers } from "../productionCounts";
 import { buildProductionWelcomeView, welcomeRange } from "../productionWelcomeView";
 import { CASE_1, SKU, WORKER_A, WORKER_B, cancel, complete, dispatch, resetIds, snapshot, verify } from "../../../../tests/fixtures/item-counting";
 
@@ -106,5 +106,31 @@ describe("buildProductionWelcomeView", () => {
       { day: "2026-01-14", orders: 4 },
     ]);
     expect(v.teamTotalYesterday).toBe(4);
+  });
+
+  it("shows a data gap that exists only on a comparison day (review r1 M5)", () => {
+    const events = [
+      complete({ order_number: "y-no-detail", created_at: at("2026-01-14", "09:00") }), // yesterday, no line detail
+      verify({ line_sku: SKU.unSingle, line_quantity: 1, created_at: at("2026-01-15", "09:00") }),
+      complete({ created_at: at("2026-01-15", "09:05") }),
+    ];
+    const v = buildProductionWelcomeView(snap(events), "uk", AS_OF);
+    expect(v.teamTotalYesterday).toBe(1); // y-no-detail still counts as an Order
+    expect(v.todaySummary.coverage.issueCounts.missing_completion_detail).toBe(0);
+    expect(v.coverage.issueCounts.missing_completion_detail).toBe(1);
+    expect(v.coverage.incomplete).toBe(true);
+  });
+
+  it("after 04:00, a snapshot of the previous day's range is not projected as the new day (review r1 S1)", () => {
+    // Loaded for "today" = 2026-01-15; the tab returns after 04:00 on the 16th.
+    const snapshotRange = { startUtc: RANGE.startUtc, endUtcExclusive: RANGE.endUtcExclusive };
+    const newRange = welcomeRange("uk", "2026-01-16");
+    expect(snapshotCovers({ range: snapshotRange }, RANGE)).toBe(true);
+    expect(snapshotCovers({ range: snapshotRange }, newRange)).toBe(false);
+    expect(snapshotCovers({ range: { startUtc: "2026-01-07T04:00:00Z", endUtcExclusive: "2026-01-16T04:00:00.000+00:00" } }, RANGE)).toBe(true);
+    expect(snapshotCovers(null, RANGE)).toBe(false);
+    // An explicit display day wins over a cutoff that has already rolled over.
+    const v = buildProductionWelcomeView(snap([]), "uk", "2026-01-16T05:00:00.000Z", "2026-01-15");
+    expect(v.today).toBe("2026-01-15");
   });
 });

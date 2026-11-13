@@ -86,6 +86,12 @@ export function ProductionCountStatus({ state, range, coverage, notes, className
           {snapshot ? ` · loaded ${fmtTime(snapshot.loadedAtUtc, range.timeZone)}` : ""}
         </div>
       ) : null}
+      {range && compact ? (
+        <div>
+          Production day {range.firstDate} from 04:00 {range.timeZone}
+          {snapshot ? ` · cutoff ${fmtTime(snapshot.asOfUtc, range.timeZone)}` : ""}
+        </div>
+      ) : null}
       {limited ? <div className="text-amber-700 dark:text-amber-300">{limited} Coverage is limited.</div> : null}
       {issueEntries.length ? (
         <div className="text-amber-700 dark:text-amber-300">

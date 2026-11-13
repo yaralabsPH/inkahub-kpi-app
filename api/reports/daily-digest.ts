@@ -115,17 +115,32 @@ function localStamp(iso: string, tz: string): string {
   return new Date(iso).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short", timeZone: tz });
 }
 
-type PageQuery = { range(from: number, to: number): PromiseLike<{ data: unknown; error: { message: string } | null }> };
+type PageQuery = {
+  range(from: number, to: number): PromiseLike<{ data: unknown; error: { message: string } | null; count?: number | null }>;
+};
 
-/** Read every page of a query with a stable order; any page error fails the report. */
+/**
+ * Read every row of a query with a stable, unique order and an exact count.
+ * Pages advance by the rows actually returned, so a server row cap smaller
+ * than PAGE_SIZE still completes. Any page error, a non-array body, a missing
+ * or changing count, an empty page before the count is reached, or more rows
+ * than counted fails the report: a short page is never taken as "done".
+ * The caller's query must request `{ count: "exact" }`.
+ */
 async function readAll<T>(build: () => PageQuery, label: string): Promise<T[]> {
   const out: T[] = [];
-  for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await build().range(from, from + PAGE_SIZE - 1);
+  let total: number | null = null;
+  for (let from = 0; ; ) {
+    const { data, error, count } = await build().range(from, from + PAGE_SIZE - 1);
     if (error) throw new Error(`${label}: ${error.message}`);
-    const rows = (data ?? []) as T[];
-    out.push(...rows);
-    if (rows.length < PAGE_SIZE) return out;
+    if (!Array.isArray(data)) throw new Error(`${label}: incomplete read (no rows array)`);
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) throw new Error(`${label}: incomplete read (no exact count)`);
+    if (total === null) total = count;
+    else if (count !== total) throw new Error(`${label}: rows changed while reading (${total} then ${count})`);
+    out.push(...(data as T[]));
+    if (out.length === total) return out;
+    if (out.length > total || data.length === 0) throw new Error(`${label}: incomplete read (${out.length} of ${total} rows)`);
+    from += data.length;
   }
 }
 
@@ -229,8 +244,9 @@ async function addBoxes(supabase: SupabaseClient, location: string, days: DayRep
     .eq("location", location)
     .in("code", Array.from(new Set([...A0_CODES, ...DISPATCH_CODES])));
   if (products.error) throw new Error(`products: ${products.error.message}`);
+  if (!Array.isArray(products.data)) throw new Error("products: incomplete read (no rows array)");
   const codeById = new Map<string, string>();
-  for (const p of (products.data ?? []) as Array<{ id: string; code: string }>) codeById.set(p.id, p.code);
+  for (const p of products.data as Array<{ id: string; code: string }>) codeById.set(p.id, p.code);
   const allPackageIds = Array.from(new Set<string>([...codeById.keys(), ...TUBE_IDS]));
 
   const first = days.reduce((a, d) => (d.range.startUtc < a ? d.range.startUtc : a), days[0].range.startUtc);
@@ -239,7 +255,7 @@ async function addBoxes(supabase: SupabaseClient, location: string, days: DayRep
     () =>
       supabase
         .from("ledger")
-        .select("id, product_id, delta, ts")
+        .select("id, product_id, delta, ts", { count: "exact" })
         .eq("location", location)
         .in("product_id", allPackageIds)
         .lt("delta", 0)
@@ -292,11 +308,14 @@ function statusLabel(m: ReportMeta): string {
 
 interface Note { severity: string; department: string; staff: string; note: string }
 
-function reportNotes(today: DayReport, m: ReportMeta): Note[] {
+function reportNotes(today: DayReport, yesterday: DayReport, m: ReportMeta): Note[] {
   const notes: Note[] = [];
   if (!m.closed) notes.push({ severity: "info", department: "-", staff: "-", note: `Counts as of ${localStamp(m.asOfUtc, m.tz)}; the production day was still open.` });
-  for (const [kind, count] of Object.entries(today.summary.coverage.issueCounts) as Array<[CoverageIssueKind, number]>) {
-    if (count > 0) notes.push({ severity: "warning", department: "-", staff: "-", note: `${count} ${ISSUE_LABELS[kind]}: totals may be incomplete.` });
+  // Warnings for every day whose figures are published: the report day and the comparison day.
+  for (const [day, label] of [[today, ""], [yesterday, ` on ${yesterday.date} (comparison day)`]] as const) {
+    for (const [kind, count] of Object.entries(day.summary.coverage.issueCounts) as Array<[CoverageIssueKind, number]>) {
+      if (count > 0) notes.push({ severity: "warning", department: "-", staff: "-", note: `${count} ${ISSUE_LABELS[kind]}${label}: totals may be incomplete.` });
+    }
   }
   for (const d of DEPARTMENTS) {
     const s = today.depts[d].summary;
@@ -317,13 +336,13 @@ function buildXlsx(payload: { meta: ReportMeta; today: DayReport; yesterday: Day
   const staffYesterday = yesterday.distinctStaff.size;
   const perStaffToday = staffToday > 0 && T.normal.items !== null ? T.normal.items / staffToday : 0;
   const perStaffYesterday = staffYesterday > 0 && Y.normal.items !== null ? Y.normal.items / staffYesterday : 0;
-  const notes = reportNotes(today, meta);
+  const notes = reportNotes(today, yesterday, meta);
 
   // Sheet 1 - Summary. orders_total is distinct completed orders across work types
   // (not a sum of departments); items_total is work processed across work types.
   const summarySheet = XLSX.utils.aoa_to_sheet([
     ["date", "location", "orders_total", "items_total", "orders_yesterday", "items_yesterday", "staff_on_shift", "staff_yesterday", "items_per_staff", "items_per_staff_yesterday", "notes",
-      "rework_orders", "rework_items", "rework_orders_yesterday", "rework_items_yesterday", "coverage_issues", "status", "timezone", "production_window", "window_start_utc", "window_end_utc", "as_of_utc", "loaded_at_utc", "generated_at_utc"],
+      "rework_orders", "rework_items", "rework_orders_yesterday", "rework_items_yesterday", "coverage_issues", "coverage_issues_yesterday", "status", "timezone", "production_window", "window_start_utc", "window_end_utc", "as_of_utc", "loaded_at_utc", "generated_at_utc"],
     [
       ymd, locLabel,
       T.normal.orders, n(T.normal.items),
@@ -332,7 +351,7 @@ function buildXlsx(payload: { meta: ReportMeta; today: DayReport; yesterday: Day
       Number(perStaffToday.toFixed(1)), Number(perStaffYesterday.toFixed(1)),
       notes.map((x) => x.note).join(" | "),
       T.rework.orders, n(T.rework.items), Y.rework.orders, n(Y.rework.items),
-      T.coverage.issues.length, statusLabel(meta), tz, windowLabel(meta),
+      T.coverage.issues.length, Y.coverage.issues.length, statusLabel(meta), tz, windowLabel(meta),
       meta.range.startUtc, meta.range.endUtcExclusive, meta.asOfUtc, meta.loadedAtUtc, meta.generatedAtUtc,
     ],
   ]);
@@ -416,14 +435,17 @@ function buildBodyText(payload: { meta: ReportMeta; today: DayReport; yesterday:
   lines.push(`Inka Arthouse — Daily KPI Report — ${locLabel} — ${displayDate}`);
   lines.push(`Production day: ${windowLabel(meta)}`);
   lines.push(`Status: ${statusLabel(meta)}`);
+  lines.push(`Cutoff (as of): ${localStamp(meta.asOfUtc, meta.tz)} (${meta.asOfUtc}); later corrections appear on a re-run.`);
   lines.push("");
   lines.push(`Orders completed    ${String(ot).padStart(6)}   (${pct(ot, oy)} vs ${oy} yesterday; each order once across departments)`);
   lines.push(`Items processed     ${String(n(it)).padStart(6)}   (${itemsPct} vs ${n(iy)} yesterday; work across all departments)`);
   lines.push(`CS / rework         ${String(T.rework.orders).padStart(6)}   orders, ${n(T.rework.items)} items (counted separately)`);
   lines.push(`Staff on shift      ${String(st).padStart(6)}   (${st - sy >= 0 ? "+" : ""}${st - sy} vs yesterday)`);
   lines.push(`Items / staff-day   ${perT.toFixed(1).padStart(6)}   (${pct(Math.round(perT * 10), Math.round(perY * 10))} normalised)`);
-  const issues = (Object.entries(T.coverage.issueCounts) as Array<[CoverageIssueKind, number]>).filter(([, c]) => c > 0);
-  if (issues.length) lines.push(`Data warnings: ${issues.map(([k, c]) => `${c} ${ISSUE_LABELS[k]}`).join(", ")}; totals may be incomplete.`);
+  for (const [summary, when] of [[T, "today"], [Y, `yesterday (${yesterday.date})`]] as const) {
+    const issues = (Object.entries(summary.coverage.issueCounts) as Array<[CoverageIssueKind, number]>).filter(([, c]) => c > 0);
+    if (issues.length) lines.push(`Data warnings ${when}: ${issues.map(([k, c]) => `${c} ${ISSUE_LABELS[k]}`).join(", ")}; totals may be incomplete.`);
+  }
   lines.push("");
   lines.push("Per department (Orders overlap across departments)");
   for (const d of DEPARTMENTS) {
@@ -684,7 +706,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       () =>
         supabase
           .from("production_events")
-          .select("id, staff_id, department, event_type, created_at")
+          .select("id, staff_id, department, event_type, created_at", { count: "exact" })
           .eq("location", location)
           .in("event_type", ["clock_in", "clock_out"])
           .gte("created_at", bothDays.startUtc)
@@ -708,10 +730,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         () =>
           supabase
             .from("staff_barcodes")
-            .select("user_id, display_name")
+            .select("user_id, display_name, barcode", { count: "exact" })
             .eq("location", location)
             .in("user_id", allStaffIds)
-            .order("user_id", { ascending: true }) as unknown as PageQuery,
+            .order("user_id", { ascending: true })
+            .order("barcode", { ascending: true }) as unknown as PageQuery,
         "staff_barcodes",
       );
       for (const r of staffRows) if (!staffNames.has(r.user_id)) staffNames.set(r.user_id, r.display_name);

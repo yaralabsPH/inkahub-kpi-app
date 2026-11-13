@@ -59,8 +59,14 @@ export interface ProductionWelcomeView {
   mostImproved: WelcomeMostImproved | null;
   sparkline: Array<{ day: string; orders: number }>;
   teamTotalYesterday: number;
-  /** Coverage for today's cards. */
+  /** Today's summary (cards). */
   todaySummary: ProductionSummary;
+  /**
+   * Coverage for EVERY displayed figure: today plus all comparison days
+   * (yesterday, same weekday last week, streak, most-improved and sparkline
+   * days), deduplicated. A gap on a comparison day is never hidden.
+   */
+  coverage: ProductionSummary["coverage"];
 }
 
 const counts = (g: { items: number | null; orders: number }): WelcomeCounts => ({ items: g.items, orders: g.orders });
@@ -83,8 +89,17 @@ function topOf(s: ProductionSummary): WelcomeTopWorker | null {
   return best;
 }
 
-export function buildProductionWelcomeView(evidence: PreparedProductionEvidence, site: ReportSite, asOfUtc: string): ProductionWelcomeView {
-  const today = productionDateAt(new Date(asOfUtc), site);
+/**
+ * `today` defaults to the production date at the snapshot's cutoff; pages pass
+ * the date they display (and only call this for a snapshot of welcomeRange(today)).
+ */
+export function buildProductionWelcomeView(
+  evidence: PreparedProductionEvidence,
+  site: ReportSite,
+  asOfUtc: string,
+  todayOverride?: string,
+): ProductionWelcomeView {
+  const today = todayOverride ?? productionDateAt(new Date(asOfUtc), site);
   const yesterday = shiftProductionDate(today, -1);
   const day = (date: string, workType?: WorkType) => {
     const r = productionRange(site, date, date);
@@ -138,6 +153,11 @@ export function buildProductionWelcomeView(evidence: PreparedProductionEvidence,
     return { day: d, orders: d === yesterday ? yesterdaySummary.normal.orders : day(d).normal.orders };
   });
 
+  const shown = welcomeRange(site, today);
+  const coverage = summarizeProduction(evidence, {
+    range: { startUtc: shown.startUtc, endUtcExclusive: shown.endUtcExclusive },
+  }).coverage;
+
   return {
     today,
     yesterday,
@@ -147,5 +167,6 @@ export function buildProductionWelcomeView(evidence: PreparedProductionEvidence,
     sparkline,
     teamTotalYesterday: yesterdaySummary.normal.orders,
     todaySummary,
+    coverage,
   };
 }

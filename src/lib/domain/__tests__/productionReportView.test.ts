@@ -131,4 +131,32 @@ describe("buildProductionReportView", () => {
     expect(view.exportEvents.map((e) => e.id)).toEqual([inDay.id]);
     expect(view.summary.normal.items).toBe(1);
   });
+
+  it("the selected person's orders per staff-day uses only that person's days (review r1 M2)", () => {
+    const events = [
+      complete({ order_number: "a1", created_at: at("09:00") }),
+      complete({ order_number: "b1", staff_id: WORKER_B, created_at: at("09:00") }),
+    ];
+    const prepared = prepareProductionEvidence(snapshot(events));
+    const a = buildProductionReportView(prepared, { range: DAY1, staffId: WORKER_A });
+    expect(a.summary.normal.orders).toBe(1);
+    expect(a.staffDays).toBe(1);
+    expect(a.avgOrdersPerStaffDay).toBe(1);
+    expect(a.leaderboard.find((r) => r.staffId === WORKER_A)?.ordersPerDay).toBe(1);
+    const all = buildProductionReportView(prepared, { range: DAY1 });
+    expect(all.staffDays).toBe(2);
+    expect(all.avgOrdersPerStaffDay).toBe(1);
+  });
+
+  it("shows another person's data gap while their leaderboard row is visible (review r1 M5)", () => {
+    const events = [
+      verify({ line_sku: SKU.unSingle, line_quantity: 1, created_at: at("09:00") }),
+      complete({ created_at: at("09:05") }),
+      complete({ order_number: "b-no-detail", staff_id: WORKER_B, created_at: at("10:00") }),
+    ];
+    const view = buildProductionReportView(prepareProductionEvidence(snapshot(events)), { range: BOTH, staffId: WORKER_A });
+    expect(view.summary.coverage.issueCounts.missing_completion_detail).toBe(0);
+    expect(view.coverage.issueCounts.missing_completion_detail).toBe(1);
+    expect(view.leaderboard.map((r) => r.staffId)).toContain(WORKER_B);
+  });
 });

@@ -8,12 +8,14 @@
  */
 import {
   overallOrderKey,
+  prepareProductionEvidence,
   summarizeProduction,
   type CountGroup,
   type PreparedProductionEvidence,
   type ProductionEvidenceEvent,
   type ProductionScope,
   type ProductionSummary,
+  type ProductionVisibility,
   type WorkType,
 } from "./productionCounts";
 import { productionDatesBetween, productionRange, type ProductionRange } from "./productionPeriods";
@@ -76,6 +78,12 @@ export interface ReportSkuRow {
 export interface ProductionReportView {
   /** Tiles: range + selected person + work type. */
   summary: ProductionSummary;
+  /**
+   * Coverage for everything on the page: the tiles AND the all-visible
+   * leaderboard (a superset when a person is selected), so another person's
+   * data gap is not hidden while their row is shown.
+   */
+  coverage: ProductionSummary["coverage"];
   dispatchedOrders: number;
   timing: FrameTimingTotals;
   /** People with credited Items or Orders in the tile scope. */
@@ -84,6 +92,7 @@ export interface ProductionReportView {
   leaderboard: ReportPersonRow[];
   /** True when a person is selected, so tiles and leaderboard cover different people. */
   leaderboardScopeDiffers: boolean;
+  /** Staff-days behind the tile average: all visible people, or the selected person's days. */
   staffDays: number;
   avgOrdersPerStaffDay: number;
   staffOrders: ReportOrderRow[];
@@ -140,7 +149,11 @@ export function buildProductionReportView(evidence: PreparedProductionEvidence, 
     };
   });
   leaderboard.sort((a, b) => b.normal.orders - a.normal.orders || (b.normal.items ?? 0) - (a.normal.items ?? 0) || (a.staffId < b.staffId ? -1 : 1));
-  const staffDays = leaderboard.reduce((n, r) => n + r.daysWorked, 0);
+  // Tile denominator matches the tile's scope: everyone's staff-days, or only
+  // the selected person's days (adding another worker never lowers A's rate).
+  const staffDays = staffId
+    ? leaderboard.find((r) => r.staffId === staffId)?.daysWorked ?? 0
+    : leaderboard.reduce((n, r) => n + r.daysWorked, 0);
 
   // Selected person's orders, with touch times from their own effective evidence.
   let staffOrders: ReportOrderRow[] = [];
@@ -221,6 +234,7 @@ export function buildProductionReportView(evidence: PreparedProductionEvidence, 
 
   return {
     summary,
+    coverage: everyone.coverage,
     dispatchedOrders: summary.byWorkType.dispatch.normal.orders,
     timing: timingFor(staffId),
     activeStaff: Object.keys(summary.byPerson).length,
@@ -234,4 +248,38 @@ export function buildProductionReportView(evidence: PreparedProductionEvidence, 
     skuBoard,
     exportEvents,
   };
+}
+
+export interface OrderLookupCounts {
+  normal: number | null;
+  rework: number | null;
+  /** Data issues or limited visibility in this order's evidence. */
+  incomplete: boolean;
+}
+
+/**
+ * Items on one looked-up order over its whole saved history, by the shared
+ * rules. Returns null when the read was not confirmed complete (a partial
+ * read must never look authoritative) or the evidence is contradictory.
+ * Each event's site is the site it was READ from, never the current one.
+ */
+export function orderLookupCounts(
+  events: ReadonlyArray<Omit<ProductionEvidenceEvent, "location">>,
+  read: { location: string; asOfUtc: string; complete: boolean; visibility: ProductionVisibility },
+): OrderLookupCounts | null {
+  if (!read.complete || events.length === 0) return null;
+  const range = { startUtc: "1970-01-01T00:00:00.000Z", endUtcExclusive: "9999-12-31T00:00:00.000Z" };
+  try {
+    const prepared = prepareProductionEvidence({
+      events: events.map((e) => ({ ...e, location: read.location })),
+      range,
+      asOfUtc: read.asOfUtc,
+      loadedAtUtc: read.asOfUtc,
+      visibility: read.visibility,
+    });
+    const s = summarizeProduction(prepared, { range });
+    return { normal: s.normal.items, rework: s.rework.items, incomplete: s.coverage.incomplete };
+  } catch {
+    return null;
+  }
 }

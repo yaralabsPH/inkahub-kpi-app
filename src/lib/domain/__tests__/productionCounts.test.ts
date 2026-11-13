@@ -414,3 +414,45 @@ describe("determinism, totals and visibility", () => {
     expect(summarizeProduction(prepared, { range: UK_DAY_2 }).coverage.issueCounts.unclassified_sku).toBe(0);
   });
 });
+
+describe("exact microsecond chronology (review r1 M1)", () => {
+  const all: ProductionScope = { range: UK_BOTH_DAYS };
+  const run = (events: ProductionEvidenceEvent[]) => summarizeProduction(prepareProductionEvidence(snapshot(events)), all);
+
+  it("an eligible line 800 µs after a completion in the same millisecond cannot qualify that earlier excluded-only completion", () => {
+    const events = [
+      verify({ line_sku: SKU.hook, line_quantity: 1, created_at: "2026-01-15T09:00:00.000000Z" }),
+      complete({ created_at: "2026-01-15T10:00:00.000100Z" }),
+      verify({ line_sku: SKU.unSingle, line_quantity: 1, created_at: "2026-01-15T10:00:00.000900Z" }),
+    ];
+    const s = run(events);
+    expect(s.normal.orders).toBe(0);
+    expect(s.normal.items).toBe(1);
+    expect(s.coverage.notes.excluded_only_completion).toBe(1);
+    expect(run(shuffled(events)).normal.orders).toBe(0);
+  });
+
+  it("a cancellation earlier than its parent by microseconds is rejected, not applied", () => {
+    const parent = verify({ line_sku: SKU.unSet2, line_quantity: 1, created_at: "2026-01-15T10:00:00.000900Z" });
+    const early = cancel(parent, { created_at: "2026-01-15T10:00:00.000100Z" });
+    const s = run([parent, early]);
+    expect(s.normal.items).toBe(2);
+    expect(s.coverage.issueCounts.unresolved_parent).toBe(1);
+  });
+
+  it("genuinely equal instants: the line counts as at-or-before the completion, and the cancellation applies", () => {
+    const line = verify({ line_sku: SKU.unSingle, line_quantity: 1, created_at: "2026-01-15T10:00:00.000500Z" });
+    const done = complete({ created_at: "2026-01-15T10:00:00.000500Z" });
+    expect(run([done, line]).normal).toMatchObject({ items: 1, orders: 1 });
+    const undo = cancel(line, { created_at: "2026-01-15T10:00:00.000500Z" });
+    expect(run([line, undo]).normal.items).toBe(0);
+  });
+
+  it("equivalent offset spellings are the same instant; different microseconds are different payloads", () => {
+    const a = verify({ id: "same", line_sku: SKU.unSingle, line_quantity: 1, created_at: "2026-01-15T10:00:00.000500Z" });
+    const b = { ...a, created_at: "2026-01-15T10:00:00.0005+00:00" };
+    expect(run([a, b]).normal.items).toBe(1);
+    const c = { ...a, created_at: "2026-01-15T10:00:00.000600Z" };
+    expect(() => prepareProductionEvidence(snapshot([a, c]))).toThrow(ProductionEvidenceError);
+  });
+});

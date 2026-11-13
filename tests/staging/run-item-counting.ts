@@ -94,6 +94,8 @@ if (PARITY_ARG !== undefined && PARITY_ARG !== "before" && PARITY_ARG !== "after
   console.error("--policy-parity must be before or after");
   process.exit(2);
 }
+/** Parity and write-compat runs never touch the performance report. */
+const ALTERNATE_MODE = !!(PARITY_ARG || WRITE_COMPAT);
 const ARRANGEMENT = (ARGS.find((a) => a.startsWith("--arrangement="))?.split("=")[1] ?? "standard") as Arrangement;
 if (!ARRANGEMENTS.includes(ARRANGEMENT)) {
   console.error(`--arrangement must be one of ${ARRANGEMENTS.join(", ")}`);
@@ -297,7 +299,8 @@ async function main(): Promise<number> {
     const repeat = Math.max(1, Number(s.STAGING_RUNS ?? 3) || 3);
 
     state.current = "signing in the five test users for real-session claims";
-    saveReport();
+    // Alternate modes write only their own reports; the performance report is left as it was.
+    if (!ALTERNATE_MODE) saveReport();
     const logins = Object.fromEntries(SESSION_ROLES.map((r) => {
       const up = r.toUpperCase() as Uppercase<SessionRole>;
       return [r, { email: s[`STAGING_${up}_EMAIL`], password: s[`STAGING_${up}_PASSWORD`] }];
@@ -364,6 +367,11 @@ async function main(): Promise<number> {
       phaseArg: PHASE_ARG,
     });
   } catch (e) {
+    if (ALTERNATE_MODE) {
+      console.error(redactSecrets(e instanceof Error ? e.message : String(e)));
+      console.log(`STATUS: FAILED – ${PARITY_ARG ? "policy parity" : "write compatibility"} run could not start`);
+      return 1;
+    }
     state.fatal = e instanceof Error ? e.message : String(e);
   }
 
@@ -485,6 +493,11 @@ let stopping = false;
 function stop(signal: string): void {
   if (stopping) process.exit(130);
   stopping = true;
+  if (ALTERNATE_MODE) {
+    console.log(`
+Stopped (${signal}). STATUS: FAILED – stopped before completion`);
+    process.exit(130);
+  }
   state.stopped = `${signal} received`;
   state.finishedAt = new Date().toISOString();
   const report = saveReport();

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshCw, Search, Trash2 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
@@ -27,13 +27,9 @@ import {
   shiftProductionDate,
   type ProductionRange,
 } from "@/lib/domain/productionPeriods";
-import {
-  prepareProductionEvidence,
-  summarizeProduction,
-  type ProductionEvidenceEvent,
-  type WorkType,
-} from "@/lib/domain/productionCounts";
-import { buildProductionReportView, type ItemsOrders, type ReportDay } from "@/lib/domain/productionReportView";
+import { type ProductionEvidenceEvent, type WorkType } from "@/lib/domain/productionCounts";
+import { buildProductionReportView, orderLookupCounts, type ItemsOrders, type ReportDay } from "@/lib/domain/productionReportView";
+import { loadOrderLookup } from "@/lib/repository/supabase/orderLookup";
 import { productionVisibilityFor } from "@/lib/repository/supabase/productionEvidence";
 
 /**
@@ -552,7 +548,7 @@ function SupabaseReports() {
             className="basis-full"
             state={evidence}
             range={range}
-            coverage={summary?.coverage ?? null}
+            coverage={view?.coverage ?? null}
             notes={disclosures}
           />
         </CardBody>
@@ -987,9 +983,25 @@ function OrderLookupCard({
 }) {
   const [input, setInput] = useState("");
   const [searched, setSearched] = useState<string | null>(null);
-  const [events, setEvents] = useState<OrderEvent[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const auth = useAuth();
+
+  // A result belongs to the user, site and order it was read for, under one
+  // cutoff. Changing user or site clears it, and a late response for an
+  // older search is discarded, so a count never appears under another site.
+  const scopeKey = `${auth.user?.id ?? "anon"}|${location}`;
+  const [lookup, setLookup] = useState<{
+    key: string; location: string; order: string; asOfUtc: string; events: OrderEvent[]; complete: boolean;
+  } | null>(null);
+  const searchSeq = useRef(0);
+  useEffect(() => {
+    searchSeq.current++;
+    setSearched(null);
+    setLookup(null);
+    setError(null);
+    setLoading(false);
+  }, [scopeKey]);
 
   const runSearch = useCallback(async () => {
     const normalized = normalizeOrderNumber(input);
@@ -997,25 +1009,24 @@ function OrderLookupCard({
       setError("Enter an order number first.");
       return;
     }
+    const mine = ++searchSeq.current;
+    const asOfUtc = new Date().toISOString();
     setError(null);
     setLoading(true);
     setSearched(normalized);
     try {
-      const { data, error: err } = await supabase
-        .from("production_events")
-        .select("*")
-        .eq("location", location)
-        .eq("order_number", normalized)
-        .order("created_at", { ascending: false });
-      if (err) throw err;
-      setEvents((data ?? []) as OrderEvent[]);
+      const res = await loadOrderLookup<OrderEvent>(supabase, { location, orderNumber: normalized, asOfUtc });
+      if (mine !== searchSeq.current) return;
+      setLookup({ key: `${scopeKey}|${normalized}`, location, order: normalized, asOfUtc, events: res.events, complete: res.complete });
     } catch (e) {
+      if (mine !== searchSeq.current) return;
       setError((e as Error).message);
-      setEvents(null);
+      setLookup(null);
     } finally {
-      setLoading(false);
+      if (mine === searchSeq.current) setLoading(false);
     }
-  }, [supabase, location, input]);
+  }, [supabase, location, input, scopeKey]);
+  const events = lookup && searched && lookup.key === `${scopeKey}|${searched}` ? lookup.events : null;
 
   // Per-event Remove action. Owner-only. Deletes the production_events
   // row + any matching ledger rows (parent_event_id) so the audit
@@ -1055,9 +1066,11 @@ function OrderLookupCard({
 
   const reset = () => {
     setInput("");
+    searchSeq.current++;
     setSearched(null);
-    setEvents(null);
+    setLookup(null);
     setError(null);
+    setLoading(false);
   };
 
   // Departments that touched this order (set of unique department values from
@@ -1069,7 +1082,6 @@ function OrderLookupCard({
     return s;
   }, [events]);
 
-  const auth = useAuth();
   const author = (auth.user && auth.profile)
     ? { user_id: auth.user.id, display_name: auth.profile.display_name }
     : null;
@@ -1077,38 +1089,28 @@ function OrderLookupCard({
   // Items on this order, counted by the shared F1 rules over its whole saved
   // history (cancellations resolved, sets expanded, excluded lines ignored).
   // This is work processed across work types, not a count of physical goods.
+  // Only a read confirmed complete, for the site it was read from, is counted.
   const role = auth.profile?.role ?? null;
-  const memberHere = auth.locations.includes(location);
+  const memberOfLookupSite = lookup ? auth.locations.includes(lookup.location) : false;
   const orderCounts = useMemo(() => {
-    if (!events || events.length === 0) return null;
-    const now = new Date().toISOString();
-    const range = { startUtc: "1970-01-01T00:00:00.000Z", endUtcExclusive: "9999-12-31T00:00:00.000Z" };
-    try {
-      const prepared = prepareProductionEvidence({
-        events: events.map((e) => ({
-          id: e.id,
-          location,
-          staff_id: e.staff_id,
-          department: e.department,
-          order_number: e.order_number,
-          line_sku: e.line_sku,
-          line_quantity: e.line_quantity,
-          event_type: e.event_type,
-          created_at: e.created_at,
-          parent_event_id: e.parent_event_id ?? null,
-          cs_case_id: e.cs_case_id ?? null,
-        })),
-        range,
-        asOfUtc: now,
-        loadedAtUtc: now,
-        visibility: productionVisibilityFor(role, memberHere),
-      });
-      const s = summarizeProduction(prepared, { range });
-      return { normal: s.normal.items, rework: s.rework.items, incomplete: s.coverage.incomplete };
-    } catch {
-      return null;
-    }
-  }, [events, location, role, memberHere]);
+    if (!lookup || !events || events.length === 0) return null;
+    const counts = orderLookupCounts(
+      events.map((e) => ({
+        id: e.id,
+        staff_id: e.staff_id,
+        department: e.department,
+        order_number: e.order_number,
+        line_sku: e.line_sku,
+        line_quantity: e.line_quantity,
+        event_type: e.event_type,
+        created_at: e.created_at,
+        parent_event_id: e.parent_event_id ?? null,
+        cs_case_id: e.cs_case_id ?? null,
+      })),
+      { location: lookup.location, asOfUtc: lookup.asOfUtc, complete: lookup.complete, visibility: productionVisibilityFor(role, memberOfLookupSite) },
+    );
+    return counts ?? { unavailable: true as const };
+  }, [lookup, events, role, memberOfLookupSite]);
 // High-level status: dispatched > completed > started > cancelled-only > none
   const orderStatus = useMemo(() => {
     if (!events || events.length === 0) return null;
@@ -1211,7 +1213,14 @@ function OrderLookupCard({
                 <span className="font-mono text-sm font-semibold">
                   #{searched}
                 </span>
-                {orderCounts ? (
+                {orderCounts && "unavailable" in orderCounts ? (
+                  <span
+                    className="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 rounded-full px-2 py-0.5"
+                    title="The order's history could not be confirmed complete, so no item count is shown."
+                  >
+                    item count unavailable (incomplete read)
+                  </span>
+                ) : orderCounts ? (
                   <span
                     className="text-xs text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 rounded-full px-2 py-0.5"
                     title="Verified pieces across all work types: a piece verified at two stations counts at both."

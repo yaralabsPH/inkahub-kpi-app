@@ -16,9 +16,14 @@ const h = vi.hoisted(() => {
   function makeQuery(table: string) {
     const ops: Op[] = [];
     let win: [number, number] | null = null;
+    let counted = false;
     const q: Record<string, unknown> = {};
     for (const m of ["select", "eq", "gte", "lt", "lte", "in", "order"]) {
-      q[m] = (...args: unknown[]) => { if (m !== "select" && m !== "order") ops.push([m, args]); return q; };
+      q[m] = (...args: unknown[]) => {
+        if (m === "select") counted = (args[1] as { count?: string } | undefined)?.count === "exact";
+        else if (m !== "order") ops.push([m, args]);
+        return q;
+      };
     }
     q.range = (a: number, b: number) => { win = [a, b]; return q; };
     q.then = (ok: (v: unknown) => unknown, bad: (e: unknown) => unknown) => {
@@ -31,7 +36,7 @@ const h = vi.hoisted(() => {
         if (op === "in") return (args[1] as unknown[]).includes(v);
         return true;
       }));
-      return Promise.resolve({ data: win ? rows.slice(win[0], win[1] + 1) : rows, error: null }).then(ok, bad);
+      return Promise.resolve({ data: win ? rows.slice(win[0], win[1] + 1) : rows, error: null, count: counted ? rows.length : null }).then(ok, bad);
     };
     return q;
   }

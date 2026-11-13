@@ -14,6 +14,10 @@ const h = vi.hoisted(() => {
   const state = {
     tables: {} as Record<string, Row[]>,
     tableErrors: {} as Record<string, { message: string }>,
+    /** Server row cap per request (PostgREST max-rows). */
+    maxRows: 1000,
+    /** Replace one page's response (failure injection). */
+    pageHook: null as null | ((table: string, win: [number, number] | null) => { data: unknown; error: unknown; count?: number | null } | null),
     queries: [] as Array<{ table: string; ops: Op[] }>,
     rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
     rpcImpl: null as null | ((name: string, args: Record<string, unknown>) => { data: unknown; error: unknown }),
@@ -39,9 +43,11 @@ const h = vi.hoisted(() => {
     state.queries.push(rec);
     const q: Record<string, unknown> = {};
     let win: [number, number] | null = null;
+    let counted = false;
     for (const m of ["select", "eq", "gte", "lt", "lte", "in", "order"]) {
       q[m] = (...args: unknown[]) => {
-        if (m !== "select" && m !== "order") rec.ops.push([m, args]);
+        if (m === "select") counted = (args[1] as { count?: string } | undefined)?.count === "exact";
+        else if (m !== "order") rec.ops.push([m, args]);
         return q;
       };
     }
@@ -49,7 +55,9 @@ const h = vi.hoisted(() => {
     q.then = (ok: (v: unknown) => unknown, bad: (e: unknown) => unknown) => {
       const err = state.tableErrors[table];
       const rows = applyFilters(state.tables[table] ?? [], rec.ops);
-      return Promise.resolve(err ? { data: null, error: err } : { data: win ? rows.slice(win[0], win[1] + 1) : rows, error: null }).then(ok, bad);
+      const hook = state.pageHook?.(table, win);
+      if (hook) return Promise.resolve(hook).then(ok, bad);
+      return Promise.resolve(err ? { data: null, error: err } : { data: win ? rows.slice(win[0], Math.min(win[1] + 1, win[0] + state.maxRows)) : rows, error: null, count: counted ? rows.length : null }).then(ok, bad);
     };
     return q;
   }
@@ -144,6 +152,8 @@ beforeEach(() => {
   h.state.queries = [];
   h.state.rpcCalls = [];
   h.state.rpcOverride = null;
+  h.state.maxRows = 1000;
+  h.state.pageHook = null;
   seq = 0;
   vi.stubGlobal("fetch", fetchMock);
   vi.useFakeTimers({ toFake: ["Date"] });
@@ -234,6 +244,7 @@ describe("digest counts use the shared F1 rules", () => {
     const text = emailText()!;
     expect(text).toContain("Production day: 2026-01-15 04:00 to 2026-01-16 04:00 Europe/London");
     expect(text).toContain("Status: final (day closed before the cutoff)");
+    expect(text).toContain("Cutoff (as of): 17 Jan 2026, 12:00 (2026-01-17T12:00:00.000Z)");
     expect(text).toMatch(/Orders completed\s+1\s/);
     expect(text).toMatch(/Items processed\s+5\s/);
     expect(text).toMatch(/CS \/ rework\s+1\s+orders, 1 items/);
@@ -357,5 +368,84 @@ describe("digest refuses to report from incomplete or unauthorized reads", () =>
     const out = await call({ location: "uk", date: "2026-01-15" });
     // Ben appears only through the row on the second page.
     expect(out.json).toMatchObject({ counts: { staff_today: 2 } });
+  });
+
+  describe("ancillary reads are complete even under a smaller server row cap (review r1 M3)", () => {
+    beforeEach(() => { h.state.maxRows = 500; });
+    const line = () => ev({ event_type: "line_verified", line_sku: "INKA-KAN0566-A4-UN", line_quantity: 1, created_at: "2026-01-15T10:00:00.000Z" });
+
+    it("clock rows: every page is read", async () => {
+      const rows: Row[] = [];
+      for (let i = 0; i < 1200; i++) rows.push(ev({ event_type: i % 2 ? "clock_out" : "clock_in", created_at: `2026-01-15T${String(8 + Math.floor(i / 200)).padStart(2, "0")}:00:00.000Z` }));
+      seed(...rows, ev({ staff_id: B, department: "dispatch", event_type: "clock_out", created_at: "2026-01-15T20:00:00.000Z" }), line());
+      const out = await call({ location: "uk", date: "2026-01-15" });
+      expect(out.json).toMatchObject({ counts: { staff_today: 2 } });
+      const pages = h.state.queries.filter((q) => q.table === "production_events");
+      expect(pages.length).toBe(3); // 500 + 500 + 201
+    });
+
+    it("ledger rows: boxes count every page", async () => {
+      h.state.tables.products = [{ id: "p-a0d", code: "A0-Double", location: "uk" }];
+      const ledger: Row[] = [];
+      for (let i = 0; i < 700; i++) ledger.push({ id: `l-${String(i).padStart(4, "0")}`, location: "uk", product_id: "p-a0d", delta: -1, ts: "2026-01-15T12:00:00.000Z" });
+      h.state.tables.ledger = ledger;
+      seed(line());
+      await call({ location: "uk", date: "2026-01-15" });
+      const a0 = byHeader(1).find((r) => r.department === "A0 Framed")!;
+      expect(a0.boxes_used).toBe(700);
+    });
+
+    it("staff names: a name on a later page is still found", async () => {
+      const names: Row[] = [];
+      for (let i = 0; i < 600; i++) names.push({ user_id: A, display_name: "Ana", barcode: `b${String(i).padStart(4, "0")}`, location: "uk" });
+      names.push({ user_id: B, display_name: "Ben", barcode: "z0001", location: "uk" });
+      h.state.tables.staff_barcodes = names;
+      seed(line(), ev({ staff_id: B, department: "dispatch", event_type: "dispatched", created_at: "2026-01-15T11:00:00.000Z" }));
+      await call({ location: "uk", date: "2026-01-15" });
+      expect(byHeader(2).map((r) => r.staff_name)).toContain("Ben");
+    });
+
+    const broken: Array<[string, string, () => { data: unknown; error: unknown; count?: number | null }]> = [
+      ["an error on the second page", "ledger", () => ({ data: null, error: { message: "page 2 failed" }, count: null })],
+      ["a body without rows and without an error", "ledger", () => ({ data: null, error: null, count: 700 })],
+      ["a count that changes between pages", "ledger", () => ({ data: [], error: null, count: 701 })],
+      ["an empty page before the count is reached", "production_events", () => ({ data: [], error: null, count: 1201 })],
+    ];
+    for (const [label, table, page] of broken) {
+      it(`fails before any workbook or email on ${label}`, async () => {
+        h.state.tables.products = [{ id: "p-a0d", code: "A0-Double", location: "uk" }];
+        h.state.tables.ledger = Array.from({ length: 700 }, (_, i) => ({ id: `l-${String(i).padStart(4, "0")}`, location: "uk", product_id: "p-a0d", delta: -1, ts: "2026-01-15T12:00:00.000Z" }));
+        const clocks: Row[] = [];
+        for (let i = 0; i < 1200; i++) clocks.push(ev({ event_type: "clock_in", created_at: "2026-01-15T08:00:00.000Z" }));
+        seed(...clocks, line());
+        h.state.pageHook = (t, win) => (t === table && win && win[0] >= 500 ? page() : null);
+        const out = await call({ location: "uk", date: "2026-01-15" });
+        expect(out.status).toBe(500);
+        expect(h.write).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+    }
+
+    it("a products read without rows fails the report", async () => {
+      seed(line());
+      h.state.pageHook = (t) => (t === "products" ? { data: null, error: null } : null);
+      const out = await call({ location: "uk", date: "2026-01-15" });
+      expect(out.status).toBe(500);
+      expect(h.write).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("warnings cover every published day (review r1 M5)", () => {
+  it("a gap only on the comparison day is reported, not hidden", async () => {
+    seed(
+      ev({ order_number: "y1", event_type: "completed", created_at: "2026-01-14T10:00:00.000Z" }), // yesterday, no line detail
+      ev({ event_type: "line_verified", line_sku: "INKA-KAN0566-A4-UN", line_quantity: 1, created_at: "2026-01-15T09:00:00.000Z" }),
+      ev({ event_type: "completed", created_at: "2026-01-15T09:05:00.000Z" }),
+    );
+    await call({ location: "uk", date: "2026-01-15" });
+    expect(byHeader(0)[0]).toMatchObject({ orders_yesterday: 1, coverage_issues: 0, coverage_issues_yesterday: 1 });
+    expect(byHeader(3).map((r) => r.note)).toContain("1 completions without line detail on 2026-01-14 (comparison day): totals may be incomplete.");
+    expect(emailText()).toContain("Data warnings yesterday (2026-01-14): 1 completions without line detail");
   });
 });

@@ -14,6 +14,7 @@
  */
 
 import { countProductionItems, type ItemCount } from "./productionItems.js";
+import { instantMicros } from "./productionInstant.js";
 
 export const WORK_TYPES = ["a0_framed", "framed", "unframed", "dispatch"] as const;
 export type WorkType = (typeof WORK_TYPES)[number];
@@ -54,6 +55,17 @@ export interface ProductionSnapshot {
   /** When the read finished. */
   loadedAtUtc: string;
   visibility: ProductionVisibility;
+}
+
+/**
+ * True when a snapshot was loaded for exactly this window. Pages project a
+ * snapshot only onto the period it was read for, so a snapshot of the
+ * previous production day is never shown as the new day after 04:00.
+ */
+export function snapshotCovers(snapshot: Pick<ProductionSnapshot, "range"> | null | undefined, span: UtcWindow | null | undefined): boolean {
+  if (!snapshot || !span) return false;
+  const same = (a: string, b: string) => exactInstant(a) !== null && exactInstant(a) === exactInstant(b);
+  return same(snapshot.range.startUtc, span.startUtc) && same(snapshot.range.endUtcExclusive, span.endUtcExclusive);
 }
 
 export class ProductionEvidenceError extends Error {
@@ -99,7 +111,10 @@ export interface ProductionCoverage {
 }
 
 interface ValidEvent extends ProductionEvidenceEvent {
+  /** Milliseconds: display and durations only. */
   ms: number;
+  /** Exact instant (epoch microseconds): every ordering and comparison. */
+  us: bigint;
   orderKey: string; // trimmed order number ("" when blank)
 }
 
@@ -161,14 +176,26 @@ function samePayload(a: ProductionEvidenceEvent, b: ProductionEvidenceEvent): bo
     a.line_sku === b.line_sku &&
     Object.is(a.line_quantity, b.line_quantity) &&
     a.event_type === b.event_type &&
-    Date.parse(a.created_at) === Date.parse(b.created_at) &&
+    exactInstant(a.created_at) === exactInstant(b.created_at) &&
     a.parent_event_id === b.parent_event_id &&
     a.cs_case_id === b.cs_case_id
   );
 }
 
-function byTime(a: { ms: number; id: string }, b: { ms: number; id: string }): number {
-  return a.ms - b.ms || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+function cmpUs(a: bigint, b: bigint): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function byTime(a: { us: bigint; id: string }, b: { us: bigint; id: string }): number {
+  return cmpUs(a.us, b.us) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/** Exact instant of saved text; falls back to whole milliseconds for other parseable forms. */
+function exactInstant(text: unknown): bigint | null {
+  const us = instantMicros(text);
+  if (us !== null) return us;
+  const ms = typeof text === "string" ? Date.parse(text) : Number.NaN;
+  return Number.isFinite(ms) ? BigInt(ms) * 1000n : null;
 }
 
 function isTerminalPair(eventType: string, department: unknown): department is WorkType {
@@ -208,12 +235,13 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
   const byKey = new Map<string, ValidEvent>();
   for (const [key, raw] of unique) {
     if (!RELEVANT_TYPES.has(raw.event_type)) continue; // clock/started rows are not count evidence
+    const us = exactInstant(raw.created_at);
     const ms = typeof raw.created_at === "string" ? Date.parse(raw.created_at) : Number.NaN;
-    if (!Number.isFinite(ms)) {
+    if (us === null || !Number.isFinite(ms)) {
       globalIssues.push({ kind: "invalid_event", eventId: raw.id, location: raw.location, detail: "invalid time" });
       continue;
     }
-    byKey.set(key, { ...raw, ms, orderKey: typeof raw.order_number === "string" ? raw.order_number.trim() : "" });
+    byKey.set(key, { ...raw, ms, us, orderKey: typeof raw.order_number === "string" ? raw.order_number.trim() : "" });
   }
 
   const issue = (ev: ValidEvent, workType: WorkType | null, kind: CoverageIssueKind, detail?: string) =>
@@ -266,7 +294,7 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
       issue(c, workType, "unresolved_parent", byKey.has(parentKey) ? "unsupported parent type" : "parent not found");
       continue;
     }
-    if (parent.ms > c.ms) {
+    if (parent.us > c.us) {
       issue(c, workType, "unresolved_parent", "parent is later than cancellation");
       continue;
     }
@@ -304,19 +332,19 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
 
   // 6. Terminal qualification: chronological sweep per site/order/work type/case,
   //    using ORIGINAL verifications at or before the terminal, from every worker.
-  const groups = new Map<string, Array<{ ms: number; id: string; v?: Verification; t?: Terminal }>>();
+  const groups = new Map<string, Array<{ us: bigint; id: string; v?: Verification; t?: Terminal }>>();
   const groupKey = (ev: ValidEvent, workType: WorkType, caseId: string | null) =>
     `${ev.location}\u0000${ev.orderKey}\u0000${workType}\u0000${caseId ?? ""}`;
-  const push = (k: string, entry: { ms: number; id: string; v?: Verification; t?: Terminal }) => {
+  const push = (k: string, entry: { us: bigint; id: string; v?: Verification; t?: Terminal }) => {
     const list = groups.get(k);
     if (list) list.push(entry);
     else groups.set(k, [entry]);
   };
-  for (const v of verifications.values()) push(groupKey(v.ev, v.workType, v.caseId), { ms: v.ev.ms, id: v.ev.id, v });
-  for (const t of terminals.values()) push(groupKey(t.ev, t.workType, t.caseId), { ms: t.ev.ms, id: t.ev.id, t });
+  for (const v of verifications.values()) push(groupKey(v.ev, v.workType, v.caseId), { us: v.ev.us, id: v.ev.id, v });
+  for (const t of terminals.values()) push(groupKey(t.ev, t.workType, t.caseId), { us: t.ev.us, id: t.ev.id, t });
   for (const list of groups.values()) {
     // Verifications at the same instant as a terminal count as "at or before" it.
-    list.sort((a, b) => a.ms - b.ms || (a.v ? 0 : 1) - (b.v ? 0 : 1) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    list.sort((a, b) => cmpUs(a.us, b.us) || (a.v ? 0 : 1) - (b.v ? 0 : 1) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     let eligible = 0;
     let unclassified = 0;
     let excluded = 0;
@@ -473,11 +501,12 @@ const NOTE_KINDS: CoverageNoteKind[] = [
 
 /** Project prepared evidence into one display scope. */
 export function summarizeProduction(evidence: PreparedProductionEvidence, scope: ProductionScope): ProductionSummary {
-  const startMs = Date.parse(scope.range.startUtc);
-  const endMs = Date.parse(scope.range.endUtcExclusive);
+  const startUs = exactInstant(scope.range.startUtc);
+  const endUs = exactInstant(scope.range.endUtcExclusive);
+  if (startUs === null || endUs === null) throw new RangeError("Invalid production scope range");
   const staff = scope.staffIds ? new Set(scope.staffIds) : null;
   const types = scope.workTypes ? new Set<string>(scope.workTypes) : null;
-  const inTime = (ev: ValidEvent) => ev.ms >= startMs && ev.ms < endMs;
+  const inTime = (ev: ValidEvent) => ev.us >= startUs && ev.us < endUs;
   const inScope = (ev: ValidEvent, workType: WorkType | null) =>
     inTime(ev) &&
     (!staff || (ev.staff_id != null && staff.has(ev.staff_id))) &&

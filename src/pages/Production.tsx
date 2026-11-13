@@ -43,7 +43,7 @@ import { ProductionCountStatus } from "@/components/ProductionCountStatus";
 import { useProductionEvidence, type ProductionEvidenceState } from "@/lib/hooks/useProductionSummary";
 import { isReportSite, productionDateAt, productionRange } from "@/lib/domain/productionPeriods";
 import { buildProductionCounterView, type ProductionCounterView } from "@/lib/domain/productionCounterView";
-import type { WorkType } from "@/lib/domain/productionCounts";
+import { snapshotCovers, type WorkType } from "@/lib/domain/productionCounts";
 import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { Modal } from "@/components/ui/Modal";
 
@@ -302,7 +302,19 @@ function ProductionStation({
     const t = setTimeout(() => setDayTick((n) => n + 1), ms);
     return () => clearTimeout(t);
   }, [counterRange, dayTick]);
-  const counterEvidence = useProductionEvidence({ client: supabase, site: location, range: counterRange, refreshOnFocus: true });
+  // Returning to the page re-derives the production date first, then refreshes it.
+  useEffect(() => {
+    const onReturn = () => {
+      if (document.visibilityState === "visible") setDayTick((n) => n + 1);
+    };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, []);
+  const counterEvidence = useProductionEvidence({ client: supabase, site: location, range: counterRange, refreshKey: dayTick });
   const refreshCounter = counterEvidence.refresh;
   // A worker/station/day switch only shows counts read after the switch:
   // the previous worker's numbers are never shown for the next one.
@@ -316,6 +328,7 @@ function ProductionStation({
   const counter = useMemo(() => {
     const snap = counterEvidence.snapshot;
     if (!activeStaff || !counterSite || !counterDate || !counterEvidence.prepared || !snap) return null;
+    if (!snapshotCovers(snap, counterRange)) return null;
     if (Date.parse(snap.asOfUtc) < counterSinceAt) return null;
     return buildProductionCounterView(counterEvidence.prepared, {
       site: counterSite,
@@ -323,7 +336,7 @@ function ProductionStation({
       staffId: activeStaff.user_id,
       workType: station.department as WorkType,
     });
-  }, [counterEvidence.prepared, counterEvidence.snapshot, activeStaff, counterSite, counterDate, station.department, counterSinceAt]);
+  }, [counterEvidence.prepared, counterEvidence.snapshot, activeStaff, counterSite, counterDate, counterRange, station.department, counterSinceAt]);
   /** Dispatch confirmation flash — order # that was just dispatched. */
   const [dispatchFlash, setDispatchFlash] = useState<string | null>(null);
   /**
@@ -1928,7 +1941,7 @@ function ActiveScreen({
             orderNumber={currentOrder.number}
             author={null}
             variant="loud"
-          />
+          />
           {/* Phase 4: per-line verification list with three colour states. */}
           <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
             <div className="px-5 py-2 text-xs uppercase tracking-widest text-slate-500 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
