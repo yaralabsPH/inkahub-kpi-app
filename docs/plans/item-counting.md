@@ -265,6 +265,41 @@ Coder writes here when it hits something this plan did not foresee; stop the aff
   - CJ chose the one-call approach above. Other historical alternatives—per-production-day paging or changing targets/workload—are not adopted. Replace the implementation's two-pass validation with one MVCC statement snapshot, preserving cutoff and later-refresh semantics required by the spec. This amendment changes Task 4, shared contracts/gates/release text and Task 8's dependent mock/read-failure wording only; existing checked steps and Implementation log entries remain historical records. CJ approval, function application and complete staging re-measurement are pending.
   - If a target still fails, the coder records a new Open question with role/site/window, each run's completeness and database/transfer/parse/reducer/total costs, then stops for CJ. A later separate RLS-policy rewrite that evaluates helper functions once per statement could be discussed there; it is explicitly NOT a step in this amendment. No target relaxation, additional index, policy/helper rewrite or reduced workload may be improvised.
 
+- **Task 4 staging gate — the one-call RPC times out for AU three months through the API (blocks Task 4; CJ/planner decision).** Run on 2026-11-13, code a127c1f, migration 0034 applied to staging by CJ, function md5 `ffef0f43a32e99832e5b91cc1897d1b5`.
+  - **Failing evidence:**
+    - AU 2026-08-01..10-31 failed on all six timed runs (owner and manager, three each) with `canceling statement due to statement timeout`, after 8.13–8.47 s to response headers and 0 rows.
+    - Staging Postgres logs show six cancellations per run, about 8.4 s apart.
+    - Every other case passed in both runs with complete rows. Median paired totals:
+      - owner: AU day 346 ms, UK day 269 ms, UK 3 months 695 ms, US day 278 ms, US 3 months 764 ms;
+      - manager (all-sites phase): 311 / 238 / 671 / 218 / 725 ms.
+    - Manager phases recorded: denied-before and all-sites, both FAILED on this case only; denied-after was not run.
+    - The SQL evidence itself passed: function catalog and grants correct; 48 plans; function `rowCount` equals the independent EXISTS expectation for every role and scope (AU three months: 118,244 = 118,226 window + 18 qualification).
+  - **Why direct SQL passed and the API failed** (read-only checks on staging as the owner test user with RLS on; nothing created or changed):
+    1. **Different time limit.** `pg_roles` shows `authenticated` with `statement_timeout=8s` (`authenticator` also 8s, `anon` 3s). PostgREST applies the impersonated role's setting to every API request. The 03 harness connects as `postgres` and runs `set local role authenticated`, which does not apply role settings, so its plans ran under the 120 s server default.
+    2. **EXPLAIN leaves out the output.** The 03 call plans measured execution only: 5.18–6.60 s for AU three months, without converting or sending the result. `pg_stat_statements` shows PostgREST's real statement wraps the scalar as `coalesce(json_agg(pgrst_scalar)->0, 'null')` after `json_to_record` argument binding. That exact shape measured 5.46 s under EXPLAIN. Run for real, with the 21.8 MB body converted to text, it took 6.54 s. Sending that body to PostgREST is also inside the 8 s limit.
+    3. **Small staging instance.** `shared_buffers` 224 MB, `work_mem` about 2 MB and 60 connections (the smallest compute tier). The `ORDER BY (created_at, id)` sort of 118k rows spills to disk (15 MB external merge; about 71 MB temp written per call). Timings for the same query varied from 5.2 to 6.6 s inside one run. Production compute size was not inspected.
+    - Together these put the API statement at or over 8 s. Even without the limit, about 6.5 s in the database plus transfer of 21.8 MB, client parse/validation and the reducer would leave little or no margin under the 10 s target.
+  - **Where the time goes** (AU three months, full window + qualification rows, including conversion to text):
+
+    | Variant | Time | Body |
+    |---|---|---|
+    | Current function shape (sorted, location on every row) | 6.54 s | 21.8 MB |
+    | Same rows, no SQL `ORDER BY` | 4.41 s | 21.1 MB |
+    | No sort, staff and SKU dictionary-encoded, time as epoch microseconds | 4.19 s | 14.1 MB |
+    | Same rows read as the database owner, without RLS (lower bound only, never a design option) | 1.39 s | – |
+
+    So RLS helper calls cost about 3.0 s (about 25 µs per row), the in-database sort and JSON build about 2 s, and the context lookups and the rest under 1 s.
+  - **Proposed bounded fix**, for CJ and Astra; nothing implemented. Keep the workload, security model, RLS policies, the 8 s role timeout and the 2 s / 10 s targets.
+    - (a) **New expand-only migration `0035`** adding `public.load_production_evidence_v2` with the same signature, security (STABLE, SECURITY INVOKER, `search_path=''`), grants and four families, and encoding v2:
+      - no SQL `ORDER BY`; the client sorts once by exact `(created_at, id)`, which it already does after validation;
+      - no `location` in each row; the envelope's `site` applies to all rows;
+      - staff ids and SKUs sent once in dictionary arrays, with rows holding indexes.
+      - `0034` stays in place for old code (contract later); the loader switches to v2 and validates it as strictly as v1.
+      - Measured candidate: about 4.2–4.4 s in the database, including text, and 14 MB, versus 6.5 s and 21.8 MB. That leaves about 3.5 s under the 8 s limit; the end-to-end 10 s target must be proven by re-measuring.
+    - (b) **Harness fix (test-only, no database change).** In `03-query-evidence.sql`, after `set local role authenticated`, apply the role's real settings with `set local statement_timeout = '8s'` (read from `pg_roles`, so it can't drift). Measure the real PostgREST statement shape including the text body (`octet_length`), not only EXPLAIN. The gate then fails in SQL before the API runs.
+    - (c) **Not proposed here, for CJ to decide separately:** most of the remaining 3.0 s is the per-row RLS helper cost. A semantics-preserving policy rewrite that evaluates `current_user_role()` / `can_access_location()` once per statement (for example `(select …)` init-plans) would address it, but it is a policy change and needs its own approved amendment. Also rejected without approval: raising any statement timeout; splitting the read into several calls, which loses the single snapshot; an index, which doesn't address RLS or serialization cost.
+    - If (a)+(b) still miss the AU three-month target on staging, the only levers left are (c) or a target/workload decision, both CJ's.
+
 ## Implementation log
 
 Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. All tasks are unstarted; no build, test, staging or deployment result is claimed by this plan.
@@ -300,3 +335,4 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - New `--measure-only` and `--manager-phase=` flags.
     - New file `tests/staging/measure-item-counting.test.ts`.
   - **Gate:** `tsc -b` OK, `typecheck:digest` OK, 514/514 tests, build OK. Checked locally: with no settings file, the run ends FAILED with exit 1; a bad `--manager-phase` exits 2.
+- 2026-11-13 staging gate run (a127c1f; CJ applied 0034 on staging): FAILED. AU three months timed out at the API's 8 s `authenticated` statement_timeout on all six owner/manager runs; every other case passed (medians 218–974 ms). Investigation and proposed fix are under Open questions. Task 4 stays unticked; Task 5 not started.
