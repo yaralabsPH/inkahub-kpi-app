@@ -328,6 +328,25 @@ Coder writes here when it hits something this plan did not foresee; stop the aff
     - (c) **Not proposed here, for CJ to decide separately:** most of the remaining 3.0 s is the per-row RLS helper cost. A semantics-preserving policy rewrite that evaluates `current_user_role()` / `can_access_location()` once per statement (for example `(select …)` init-plans) would address it, but it is a policy change and needs its own approved amendment. Also rejected without approval: raising any statement timeout; splitting the read into several calls, which loses the single snapshot; an index, which doesn't address RLS or serialization cost.
     - If (a)+(b) still miss the AU three-month target on staging, the only levers left are (c) or a target/workload decision, both CJ's.
 
+- **Task 4 staging gate — v2 still times out through the API; the per-row RLS cost depends on JWT size (blocks Task 4; CJ decision).** Run on 2026-11-13 at code b0c1e21. Astra applied 0035 on staging on CJ's instruction (definition md5 `9b3098a4926cdb26bbda6c5869a79892`; anon can't execute, authenticated can). Manager AU-only; phase denied-before only. Astra stopped as instructed and did not run all-sites or denied-after; the manager was left AU-only (both checked).
+  - **SQL gate passed, the API failed.** After the 8 s catalog timeout was applied with RLS on, the exact PostgREST statement with the full body as text took 5.09–5.21 s (owner) and 5.56–5.86 s (manager) for AU three months (15.4 MB). Call EXPLAINs took 5.0–6.9 s. All other SQL evidence passed. Through the API:
+    - owner AU three months: run 1 completed in 9,360 ms total (7,943 ms to headers, 300 ms body, 68 ms parse, 398 ms validate, 652 ms reducer; 118,244 rows, 14.7 MB); runs 2–3 were cancelled by the statement timeout (8.6 / 9.4 s);
+    - manager: all three runs cancelled (about 8.3 s);
+    - every other case passed (AU day median owner 439 ms, manager 371 ms).
+  - **Why the SQL harness was still about 2.5 s faster:** the JWT. The harness sets `request.jwt.claims` to `{sub, role}` (74 bytes). The API passes Supabase's full claims (aud, exp, iss, email, app/user metadata, amr, session_id …; about 630 bytes). `auth.uid()` parses that JSON on every call, and the policies call it several times per row (inline `staff_id = auth.uid()` in both SELECT policies, plus `can_access_location()`, `current_user_role()` and `is_manager_or_higher()`, which all call it). Read-only, as the owner with RLS on, counting the 118,226 AU three-month window rows took:
+    - 2.95 s with the 74-byte claims;
+    - **5.18 s with realistic 628-byte claims.**
+    So the real API statement is about 5.1 + 2.2 s, over 8 s.
+  - **What a once-per-statement rule costs.** The same access rule, written so each helper runs once per statement (`(select can_access_location('au'))`, `(select auth.uid())`, `(select current_user_role())`), with the same realistic claims, counted the same 118,226 rows in **78 ms** instead of 5,180 ms. This was read-only, as the table owner, with the rule as an explicit WHERE; no policy was changed.
+  - **Proposed fix (needs CJ's approval as a policy amendment; nothing implemented):**
+    - (c) A new expand-only migration that rewrites `production_events`' two SELECT policies with the same logic, but with every helper/`auth.uid()` call wrapped as a scalar subquery so Postgres evaluates it once per statement (Supabase's documented RLS performance pattern). Who can see what stays the same; no helper, role setting, timeout, target or workload changes.
+      - Verify on staging with the existing role matrix (owner/manager/staff/kiosk/cs, cross-site denial) and before/after row parity.
+      - Rollback is the previous policy text.
+      - Expected: AU three months at about 2–3 s in the database instead of 7+ s.
+    - (d) **Harness correction (test-only):** 03 must set realistic JWT claims, the same shape and size as a real session, so the SQL gate reproduces the API's RLS cost instead of under-measuring it by about 2 s.
+    - Rejected without approval: raising timeouts, splitting the read, reducing the workload or targets.
+  - The saved report is `staging-results-item-counting-v2-denied-before.md` (git-ignored). The earlier v1 copy was renamed `staging-results-item-counting-v1-copy-not-v2.md`.
+
 ## Implementation log
 
 Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. All tasks are unstarted; no build, test, staging or deployment result is claimed by this plan.
@@ -379,3 +398,4 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The evidence row records the JWT subject, not the email: `authenticated` can't read `auth.users`.
     - New `itemCountingGate.ts` (not named in the plan) runs the gate in order so it can be tested: API timing only after a clean SQL gate; phases recorded only for clean runs, tagged with v2 name / definition md5 / encoding / harness version; a `--manager-phase` that contradicts memberships is refused. Any calls to the old v1 RPC are counted and fail the run. Pending-only phases give a distinct "awaiting … (expected)" STATUS.
   - **Gate:** `tsc -b` OK, `typecheck:digest` OK, 536/536 tests, build OK.
+- 2026-11-13 v2 staging gate (b0c1e21; Astra applied 0035 on staging on CJ's instruction, first tries were blocked by Codex sandbox limits, then run with full access): FAILED in phase denied-before. The SQL gate passed, but AU three months timed out through the API on 5 of 6 runs (the one owner success took 9.36 s). Cause and proposed policy fix are under Open questions. Task 4 stays unticked; Task 5 not started.
