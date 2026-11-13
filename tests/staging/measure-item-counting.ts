@@ -98,6 +98,21 @@ export interface MeasureRow {
   withinTarget: boolean;
 }
 
+/** Statuses whose responses must not carry a body (Fetch spec "null body status"). */
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * Copy of an already-read response. The body is decoded, so the wire
+ * encoding/length are dropped; null-body statuses (e.g. sign-out's 204) get no body.
+ */
+export function rebuildResponse(res: Response, body: ArrayBuffer): Response {
+  const headers = new Headers(res.headers);
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  const init = { status: res.status, statusText: res.statusText, headers };
+  return new Response(NULL_BODY_STATUSES.has(res.status) ? null : body, init);
+}
+
 export interface MeasureResult {
   email: string;
   role: string | null;
@@ -215,11 +230,7 @@ export async function measureItemCounting(opts: MeasureOptions): Promise<Measure
       cur.contentEncoding = res.headers.get("content-encoding");
       cur.stage = "validating";
     }
-    // The body is already decoded; don't advertise the wire encoding/length on the copy.
-    const headers = new Headers(res.headers);
-    headers.delete("content-encoding");
-    headers.delete("content-length");
-    return new Response(body, { status: res.status, statusText: res.statusText, headers });
+    return rebuildResponse(res, body);
   };
 
   const client = createClient(opts.supabaseUrl, opts.anonKey, {

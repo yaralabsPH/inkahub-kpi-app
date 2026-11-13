@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { productionRange } from "../../src/lib/domain/productionPeriods";
-import { assertStagingSupabaseUrl, MEASURE_CASES, median, STAGING_CUTOFF, withJsonParseTimer } from "./measure-item-counting";
+import { assertStagingSupabaseUrl, MEASURE_CASES, median, rebuildResponse, STAGING_CUTOFF, withJsonParseTimer } from "./measure-item-counting";
 
 describe("withJsonParseTimer", () => {
   it("delegates exactly once per call, returns the same values and restores JSON.parse", async () => {
@@ -50,5 +50,22 @@ describe("measurement setup", () => {
     expect(() => assertStagingSupabaseUrl("https://ybrzhrgfrnvtcwymjdrq.supabase.co")).not.toThrow();
     expect(() => assertStagingSupabaseUrl("https://lkboboagiikvozvbcpvg.supabase.co")).toThrow(/Refusing/);
     expect(() => assertStagingSupabaseUrl("https://evil.example/ybrzhrgfrnvtcwymjdrq.")).toThrow(/Refusing/);
+  });
+});
+
+describe("rebuildResponse", () => {
+  it("rebuilds a 204 (sign-out) response without a body", async () => {
+    const copy = rebuildResponse(new Response(null, { status: 204 }), new ArrayBuffer(0));
+    expect(copy.status).toBe(204);
+    expect(copy.body).toBeNull();
+  });
+
+  it("keeps the decoded body and drops wire encoding and length", async () => {
+    const res = new Response("{}", { status: 200, headers: { "content-encoding": "gzip", "content-length": "99", "x-a": "1" } });
+    const copy = rebuildResponse(res, new TextEncoder().encode('{"ok":1}').buffer);
+    expect(await copy.json()).toEqual({ ok: 1 });
+    expect(copy.headers.get("content-encoding")).toBeNull();
+    expect(copy.headers.get("content-length")).not.toBe("99");
+    expect(copy.headers.get("x-a")).toBe("1");
   });
 });
