@@ -126,8 +126,6 @@ interface Verification {
   effective: boolean;
 }
 
-type Qualification = "eligible" | "uncertain" | "missing" | "excluded_only";
-
 interface Terminal {
   ev: ValidEvent;
   workType: WorkType;
@@ -156,19 +154,92 @@ export interface PreparedProductionEvidence {
 const PRODUCTION_LINE_WORK_TYPES = new Set<string>(["a0_framed", "framed", "unframed"]);
 const RELEVANT_TYPES = new Set(["line_verified", "cancelled", "completed", "dispatched"]);
 
-function isWorkType(v: unknown): v is WorkType {
+// ---------------------------------------------------------------------------
+// Shared rule primitives (also used by reporting facts; behavior unchanged)
+// ---------------------------------------------------------------------------
+
+/** Event types that are count evidence (clock/started rows are not). */
+export function isCountEvidenceType(eventType: unknown): boolean {
+  return typeof eventType === "string" && RELEVANT_TYPES.has(eventType);
+}
+
+export function isWorkType(v: unknown): v is WorkType {
   return typeof v === "string" && (WORK_TYPES as readonly string[]).includes(v);
 }
 
-function nonBlank(v: unknown): v is string {
+export function nonBlank(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+/** Trimmed order number used for grouping ("" when blank). */
+export function evidenceOrderKey(orderNumber: unknown): string {
+  return typeof orderNumber === "string" ? orderNumber.trim() : "";
+}
+
+/** Line identity used to detect possible legacy repeats. */
+export function repeatLineKey(sku: unknown): string {
+  return typeof sku === "string" ? sku.trim().toUpperCase() : "";
+}
+
+export type EvidenceRole =
+  | { role: "cancellation"; workType: WorkType | null }
+  | { role: "verification"; workType: WorkType }
+  | { role: "terminal"; workType: WorkType }
+  | { role: "invalid"; workType: WorkType | null; detail: string };
+
+/** Classify one count-evidence event with a valid time (identity rules only). */
+export function classifyEvidenceEvent(ev: Pick<ProductionEvidenceEvent, "event_type" | "department" | "staff_id" | "order_number">): EvidenceRole {
+  const workType = isWorkType(ev.department) ? ev.department : null;
+  const orderKey = evidenceOrderKey(ev.order_number);
+  if (ev.event_type === "cancelled") return { role: "cancellation", workType };
+  if (ev.event_type === "line_verified") {
+    if (!workType || !nonBlank(ev.staff_id) || !orderKey) return { role: "invalid", workType, detail: "verification without work type, person or order" };
+    return { role: "verification", workType };
+  }
+  if (!isTerminalPair(ev.event_type, ev.department) || !nonBlank(ev.staff_id) || !orderKey) {
+    return { role: "invalid", workType, detail: "terminal without valid work type, person or order" };
+  }
+  return { role: "terminal", workType: ev.department as WorkType };
+}
+
+export type CancellationPairOutcome = "valid" | "mismatch" | "case_differs";
+
+/** Pair rule for a cancellation and its (verification or terminal) parent, once both are present and in order. */
+export function cancellationPairOutcome(
+  c: Pick<ProductionEvidenceEvent, "department" | "order_number" | "cs_case_id">,
+  parent: Pick<ProductionEvidenceEvent, "department" | "order_number" | "cs_case_id">,
+): CancellationPairOutcome {
+  const cOrder = evidenceOrderKey(c.order_number);
+  if (c.department !== parent.department || (cOrder && cOrder !== evidenceOrderKey(parent.order_number))) return "mismatch";
+  // Current unverify writes omit the case tag; inherit the parent's. A conflicting tag is not guessed.
+  if (c.cs_case_id != null && c.cs_case_id !== parent.cs_case_id) return "case_differs";
+  return "valid";
+}
+
+export type UnresolvedParentReason = "self" | "missing" | "unsupported" | "later" | "mismatch" | "case_differs";
+
+export const UNRESOLVED_PARENT_DETAIL: Readonly<Record<UnresolvedParentReason, string>> = Object.freeze({
+  self: "self-referencing cancellation",
+  missing: "parent not found",
+  unsupported: "unsupported parent type",
+  later: "parent is later than cancellation",
+  mismatch: "cancellation does not match parent order/work type",
+  case_differs: "cancellation case differs from parent",
+});
+
+export type Qualification = "eligible" | "uncertain" | "missing" | "excluded_only";
+
+/** Terminal qualification from ORIGINAL verifications at or before it. */
+export function qualificationFrom(eligible: number, unclassified: number, excluded: number): Qualification {
+  return eligible > 0 ? "eligible" : unclassified > 0 ? "uncertain" : excluded > 0 ? "excluded_only" : "missing";
 }
 
 function eventKey(location: string, id: string): string {
   return `${location}\u0000${id}`;
 }
 
-function samePayload(a: ProductionEvidenceEvent, b: ProductionEvidenceEvent): boolean {
+/** Two retrievals of one (location, id) carry the same saved payload. */
+export function samePayload(a: ProductionEvidenceEvent, b: ProductionEvidenceEvent): boolean {
   return (
     a.staff_id === b.staff_id &&
     a.department === b.department &&
@@ -191,7 +262,7 @@ function byTime(a: { us: bigint; id: string }, b: { us: bigint; id: string }): n
 }
 
 /** Exact instant of saved text; falls back to whole milliseconds for other parseable forms. */
-function exactInstant(text: unknown): bigint | null {
+export function exactInstant(text: unknown): bigint | null {
   const us = instantMicros(text);
   if (us !== null) return us;
   const ms = typeof text === "string" ? Date.parse(text) : Number.NaN;
@@ -234,14 +305,14 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
   // 2. Validate time; index everything relevant by key.
   const byKey = new Map<string, ValidEvent>();
   for (const [key, raw] of unique) {
-    if (!RELEVANT_TYPES.has(raw.event_type)) continue; // clock/started rows are not count evidence
+    if (!isCountEvidenceType(raw.event_type)) continue; // clock/started rows are not count evidence
     const us = exactInstant(raw.created_at);
     const ms = typeof raw.created_at === "string" ? Date.parse(raw.created_at) : Number.NaN;
     if (us === null || !Number.isFinite(ms)) {
       globalIssues.push({ kind: "invalid_event", eventId: raw.id, location: raw.location, detail: "invalid time" });
       continue;
     }
-    byKey.set(key, { ...raw, ms, us, orderKey: typeof raw.order_number === "string" ? raw.order_number.trim() : "" });
+    byKey.set(key, { ...raw, ms, us, orderKey: evidenceOrderKey(raw.order_number) });
   }
 
   const issue = (ev: ValidEvent, workType: WorkType | null, kind: CoverageIssueKind, detail?: string) =>
@@ -254,26 +325,21 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
   const terminals = new Map<string, Terminal>();
   const cancellations: ValidEvent[] = [];
   for (const [key, ev] of byKey) {
-    const workType = isWorkType(ev.department) ? ev.department : null;
-    if (ev.event_type === "cancelled") {
+    const cls = classifyEvidenceEvent(ev);
+    if (cls.role === "cancellation") {
       cancellations.push(ev);
       continue;
     }
-    if (ev.event_type === "line_verified") {
-      if (!workType || !nonBlank(ev.staff_id) || !ev.orderKey) {
-        issue(ev, workType, "invalid_event", "verification without work type, person or order");
-        continue;
-      }
+    if (cls.role === "invalid") {
+      issue(ev, cls.workType, "invalid_event", cls.detail);
+      continue;
+    }
+    if (cls.role === "verification") {
       const item = countProductionItems(ev.line_sku, ev.line_quantity);
-      verifications.set(key, { ev, workType, caseId: ev.cs_case_id ?? null, item, effective: true });
+      verifications.set(key, { ev, workType: cls.workType, caseId: ev.cs_case_id ?? null, item, effective: true });
       continue;
     }
-    // completed / dispatched
-    if (!isTerminalPair(ev.event_type, ev.department) || !nonBlank(ev.staff_id) || !ev.orderKey) {
-      issue(ev, workType, "invalid_event", "terminal without valid work type, person or order");
-      continue;
-    }
-    terminals.set(key, { ev, workType: ev.department as WorkType, caseId: ev.cs_case_id ?? null, qualification: "missing", reversed: false });
+    terminals.set(key, { ev, workType: cls.workType, caseId: ev.cs_case_id ?? null, qualification: "missing", reversed: false });
   }
 
   // 4. Resolve parent cancellations once, before any display filter.
@@ -284,27 +350,23 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
     const workType = isWorkType(c.department) ? c.department : null;
     const parentKey = eventKey(c.location, c.parent_event_id);
     if (c.parent_event_id === c.id) {
-      issue(c, workType, "unresolved_parent", "self-referencing cancellation");
+      issue(c, workType, "unresolved_parent", UNRESOLVED_PARENT_DETAIL.self);
       continue;
     }
     const v = verifications.get(parentKey);
     const t = terminals.get(parentKey);
     const parent = v?.ev ?? t?.ev;
     if (!parent) {
-      issue(c, workType, "unresolved_parent", byKey.has(parentKey) ? "unsupported parent type" : "parent not found");
+      issue(c, workType, "unresolved_parent", byKey.has(parentKey) ? UNRESOLVED_PARENT_DETAIL.unsupported : UNRESOLVED_PARENT_DETAIL.missing);
       continue;
     }
     if (parent.us > c.us) {
-      issue(c, workType, "unresolved_parent", "parent is later than cancellation");
+      issue(c, workType, "unresolved_parent", UNRESOLVED_PARENT_DETAIL.later);
       continue;
     }
-    if (c.department !== parent.department || (c.orderKey && c.orderKey !== parent.orderKey)) {
-      issue(c, workType, "unresolved_parent", "cancellation does not match parent order/work type");
-      continue;
-    }
-    // Current unverify writes omit the case tag; inherit the parent's. A conflicting tag is not guessed.
-    if (c.cs_case_id != null && c.cs_case_id !== parent.cs_case_id) {
-      issue(c, workType, "unresolved_parent", "cancellation case differs from parent");
+    const pair = cancellationPairOutcome(c, parent);
+    if (pair !== "valid") {
+      issue(c, workType, "unresolved_parent", UNRESOLVED_PARENT_DETAIL[pair]);
       continue;
     }
     if (v) cancelledVerifications.add(parentKey);
@@ -357,8 +419,7 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
         continue;
       }
       const t = entry.t!;
-      t.qualification =
-        eligible > 0 ? "eligible" : unclassified > 0 ? "uncertain" : excluded > 0 ? "excluded_only" : "missing";
+      t.qualification = qualificationFrom(eligible, unclassified, excluded);
       if (t.reversed) continue;
       if (t.qualification === "missing" || t.qualification === "uncertain") {
         issue(t.ev, t.workType, "missing_completion_detail", t.qualification === "missing" ? "no line detail" : "only unclassified lines");
@@ -372,8 +433,7 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
   const repeats = new Map<string, Verification[]>();
   for (const v of verifications.values()) {
     if (!v.effective) continue;
-    const sku = typeof v.ev.line_sku === "string" ? v.ev.line_sku.trim().toUpperCase() : "";
-    const k = `${groupKey(v.ev, v.workType, v.caseId)}\u0000${sku}`;
+    const k = `${groupKey(v.ev, v.workType, v.caseId)}\u0000${repeatLineKey(v.ev.line_sku)}`;
     const list = repeats.get(k);
     if (list) list.push(v);
     else repeats.set(k, [v]);
