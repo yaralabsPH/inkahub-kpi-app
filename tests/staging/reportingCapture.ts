@@ -196,6 +196,11 @@ export interface CaptureStep {
   params?: ("staff" | "manager")[];
   /** Run inside its own savepoint that is rolled back afterwards (failure/rollback probes). */
   isolated?: CaptureActor | null;
+  /**
+   * Multi-step scenario: "begin" opens a group savepoint before this step,
+   * "end" rolls the whole group back after it (steps in between run normally).
+   */
+  group?: "begin" | "end";
   /** Statements run as postgres inside the isolated savepoint before `sql`. */
   setup?: string[];
   /** Expected normalised result: a row-count string, a value, or `error <sqlstate>`. */
@@ -232,6 +237,20 @@ export const CAPTURE_STEPS: readonly CaptureStep[] = [
   { id: "c17", actor: "staff", what: "journal insert refused (privilege revoked) -> the save fails", sql: ins("rc-fail1"), params: ["staff"], isolated: "postgres", setup: ["revoke insert on reporting_private.changes from reporting_capture"], expect: DENIED },
   { id: "c18", actor: "staff", what: "control row missing -> the save fails visibly", sql: ins("rc-fail2"), params: ["staff"], isolated: "postgres", setup: ["delete from reporting_private.control"], expect: "error P0001" },
   { id: "c19", actor: "postgres", what: "neither failed save exists", sql: `select count(*)::text as result from public.production_events where id in ('rc-fail1', 'rc-fail2')`, expect: "0" },
+  // Event-ID change (review T12-5): both old and new keys and images survive.
+  { id: "c20", actor: "staff", what: "staff saves a line that will be renamed", sql: ins("rc-idold"), params: ["staff"], expect: "1" },
+  { id: "c21", actor: "owner", what: "owner changes the event id", sql: `update public.production_events set id = 'rc-idnew' where location = 'au' and id = 'rc-idold'`, expect: "1" },
+  { id: "c22", actor: "postgres", what: "journal keeps the old and new id in keys and images", sql: `select op || '|' || old_site || '/' || old_event_id || '>' || new_site || '/' || new_event_id || ':' || (old_image ->> 'id') || '>' || (new_image ->> 'id') as result from reporting_private.changes where op = 'UPDATE' and old_event_id = 'rc-idold'`, expect: "UPDATE|au/rc-idold>au/rc-idnew:rc-idold>rc-idnew" },
+  // Supported-site journal + ordinary stock deduction and idempotent retry (review T12-5).
+  // Synthetic products only; the whole group is rolled back (existing AU fixtures untouched).
+  { id: "k01", actor: "postgres", what: "synthetic au products (group start)", group: "begin", sql: `insert into public.products (location, id, code, supplier, current_on_hand) values ('au', 'rc-sup-frame', 'RC-SUP-FRAME', 'rc-test', 10), ('au', 'rc-sup-box', 'RC-SUP-BOX', 'rc-test', 5)`, expect: "2" },
+  { id: "k02", actor: "kiosk", what: "kiosk completes an au order for the scanned worker", sql: `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, cs_case_id, parent_event_id)
+     values ('au', 'rc-sup-done', $1::uuid, 'framed', 'RC-SUP-1', null, null, 'completed', 'rc-station', 'reporting capture stock check', ${RC_TIME}, null, null)`, params: ["staff"], expect: "1" },
+  { id: "k03", actor: "kiosk", what: "auto-deduct at au", sql: `select (r ->> 'status') || ':' || (r ->> 'deducted') || ':' || (r ->> 'skipped_idempotent') as result from (select public.deduct_inventory_for_event('rc-sup-done', '[{"code":"RC-SUP-FRAME","qty":2},{"code":"RC-SUP-BOX","qty":1}]'::jsonb) as r) x`, expect: "ok:2:0" },
+  { id: "k04", actor: "kiosk", what: "auto-deduct retry at au is idempotent", sql: `select (r ->> 'status') || ':' || (r ->> 'deducted') || ':' || (r ->> 'skipped_idempotent') as result from (select public.deduct_inventory_for_event('rc-sup-done', '[{"code":"RC-SUP-FRAME","qty":2},{"code":"RC-SUP-BOX","qty":1}]'::jsonb) as r) x`, expect: "ok:0:2" },
+  { id: "k05", actor: "postgres", what: "stock moved exactly once, two ledger rows", sql: `select string_agg(id || '=' || current_on_hand::text, ',' order by id) || ';ledger=' || (select count(*) from public.ledger where location = 'au' and parent_event_id = 'rc-sup-done') as result from public.products where location = 'au' and id in ('rc-sup-box', 'rc-sup-frame')`, expect: "rc-sup-box=4,rc-sup-frame=8;ledger=2" },
+  { id: "k06", actor: "postgres", what: "the completion is journalled with the deduction (group rolled back)", group: "end", sql: J("'rc-sup-done'"), expect: "INSERT|/>au/rc-sup-done" },
+  { id: "k07", actor: "postgres", what: "no synthetic product, ledger row or event remains", sql: `select (select count(*) from public.products where id like 'rc-sup-%') || ':' || (select count(*) from public.ledger where parent_event_id = 'rc-sup-done') || ':' || (select count(*) from public.production_events where id = 'rc-sup-done') as result`, expect: "0:0:0" },
   // Client denial.
   ...(["anon", "staff", "kiosk", "cs", "manager", "owner"] as const).flatMap((a, i) => [
     { id: `d${i}1`, actor: a, what: `${a} reads the journal`, sql: `select count(*)::text as result from reporting_private.changes`, expect: DENIED },
@@ -337,14 +356,182 @@ export interface CaptureReport {
   concurrency: ConcurrencyResult | null;
   concurrencyProblems: string[];
   errors: string[];
+  /** Existing session settings recorded at start (never changed by the runner). */
+  settings: string | null;
+  /** Verified by a fresh, guarded audit AFTER cleanup; null = not (yet) verified. */
+  restorationVerified: boolean | null;
   restoration: string | null;
+  restorationProblems: string[];
+}
+
+export function newCaptureReport(mode: string, revision: string, startedAt: string): CaptureReport {
+  return {
+    mode, revision, startedAt, finishedAt: "", catalog: null, catalogProblems: [], steps: [], stepProblems: [], writeCompatProblems: [], writeCompatJournalRows: null,
+    overhead: null, concurrency: null, concurrencyProblems: [], errors: [], settings: null, restorationVerified: null, restoration: null, restorationProblems: [],
+  };
 }
 
 export function captureStatus(r: CaptureReport): string {
-  const all = [...r.errors, ...r.catalogProblems, ...r.stepProblems, ...r.writeCompatProblems, ...r.concurrencyProblems];
+  const all = [...r.errors, ...r.catalogProblems, ...r.stepProblems, ...r.writeCompatProblems, ...r.concurrencyProblems, ...r.restorationProblems];
   if (!r.finishedAt) all.unshift("run not finished");
   if (r.mode !== "concurrency" && !r.overhead) all.push("trigger overhead was not measured");
+  if (r.restorationVerified !== true && !all.some((x) => x.startsWith("restoration not verified"))) all.push("restoration not verified");
   return all.length ? `STATUS: FAILED – ${all[0]}${all.length > 1 ? ` (+${all.length - 1} more)` : ""}` : "STATUS: COMPLETE";
+}
+
+// ---------------------------------------------------------------------------
+// Immutable staging target, enforced at EVERY client query (review T12-2)
+// ---------------------------------------------------------------------------
+
+export interface StagingTarget {
+  readonly host: string;
+  readonly user: string;
+}
+
+/** Parse the connection target once and freeze it. Throws for anything that is not staging. */
+export function stagingTarget(connectionString: string): StagingTarget {
+  let url: URL;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    throw new Error("STAGING_DB_URL is not a valid postgres:// URL.");
+  }
+  if (!/^postgres(ql)?:$/.test(url.protocol)) throw new Error("STAGING_DB_URL must start with postgresql://");
+  const t = Object.freeze({ host: url.hostname, user: decodeURIComponent(url.username) });
+  assertStagingTarget(t);
+  return t;
+}
+
+/** Local check only (no SQL), so it also works inside an aborted transaction. */
+export function assertStagingTarget(t: StagingTarget): void {
+  if (!Object.isFrozen(t) || !(t.host.includes(STAGING_PROJECT_REF) || t.user.includes(STAGING_PROJECT_REF))) {
+    throw new Error(`Refusing to run SQL: the target is not the staging project ${STAGING_PROJECT_REF}.`);
+  }
+}
+
+export const STAGING_PROJECT_REF = "ybrzhrgfrnvtcwymjdrq";
+
+/**
+ * The client's own connection parameters (pg.Client exposes `host`/`user`)
+ * must be exactly the frozen target's. Local check, no SQL.
+ */
+function assertClientTarget(client: object, target: StagingTarget): void {
+  assertStagingTarget(target);
+  const c = client as { host?: unknown; user?: unknown };
+  if (c.host !== target.host || c.user !== target.user) {
+    throw new Error(`Refusing to run SQL: this client is not connected to the staging target ${STAGING_PROJECT_REF}.`);
+  }
+}
+
+/** Every `query` call asserts the frozen target and the client's own connection first; nothing is sent otherwise. */
+export function guardClient<T extends { query: (...args: never[]) => unknown }>(client: T, target: StagingTarget): T {
+  assertClientTarget(client, target);
+  return new Proxy(client, {
+    get(obj, prop, receiver) {
+      const v = Reflect.get(obj, prop, receiver);
+      if (prop !== "query" || typeof v !== "function") return typeof v === "function" ? v.bind(obj) : v;
+      return (...args: unknown[]) => {
+        try {
+          assertClientTarget(obj, target);
+        } catch (e) {
+          return Promise.reject(e); // pg's query is promise-based: refuse the same way, without sending anything
+        }
+        return (v as (...a: unknown[]) => unknown).apply(obj, args);
+      };
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Restoration audit: state before vs a fresh read after cleanup (review T12-4)
+// ---------------------------------------------------------------------------
+
+export interface StateSnapshot {
+  catalog: ReportingCatalog | null;
+  roleExists: boolean;
+  triggers: string;
+  fixtures: string;
+}
+
+export function compareSnapshots(before: StateSnapshot, after: StateSnapshot): string[] {
+  const p: string[] = [];
+  if (JSON.stringify(after.catalog) !== JSON.stringify(before.catalog)) p.push(`reporting schema/ACL/control/site state differ (${before.catalog ? "present" : "absent"} before, ${after.catalog ? "present" : "absent"} after)`);
+  if (after.roleExists !== before.roleExists) p.push(`reporting_capture role ${after.roleExists ? "exists" : "is missing"} (before: ${before.roleExists ? "existed" : "absent"})`);
+  if (after.triggers !== before.triggers) p.push(`production_events triggers "${after.triggers}" (before "${before.triggers}")`);
+  if (after.fixtures !== before.fixtures) p.push(`fixture state "${after.fixtures}" (before "${before.fixtures}")`);
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+// Run outputs are immutable per invocation (review T12-4)
+// ---------------------------------------------------------------------------
+
+export function runOutputName(mode: string, startedAt: string, runId: string): string {
+  if (!/^[0-9a-f]{8,}$/.test(runId)) throw new Error("run id must be hex");
+  return `staging-results-reporting-capture-${mode}-${startedAt.replace(/[^0-9TZ]/g, "")}-${runId}.md`;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle: body, cleanup, then a FRESH audit on success and on failure
+// ---------------------------------------------------------------------------
+
+export interface LifecycleClient {
+  query(sql: string, params?: unknown[]): Promise<unknown>;
+  end(): Promise<void>;
+}
+
+export interface LifecycleIO<C extends LifecycleClient> {
+  /** Open a new guarded connection (already target-checked). */
+  open(): Promise<C>;
+  /** Everything the mode does; may leave a transaction open on failure. */
+  body(client: C): Promise<void>;
+  /** Restoration audit on a fresh connection; returns problems (empty = verified). */
+  audit(client: C): Promise<string[]>;
+  save(): void;
+  now(): string;
+  redact(text: string): string;
+}
+
+export async function runCaptureLifecycle<C extends LifecycleClient>(report: CaptureReport, io: LifecycleIO<C>): Promise<CaptureReport> {
+  const msg = (e: unknown) => io.redact(e instanceof Error ? e.message : String(e));
+  let primary: C | null = null;
+  try {
+    primary = await io.open();
+    await io.body(primary);
+  } catch (e) {
+    report.errors.push(msg(e));
+  } finally {
+    if (primary) {
+      try {
+        await primary.query("rollback");
+      } catch (e) {
+        report.errors.push(`cleanup failed: rollback: ${msg(e)}`);
+      }
+      try {
+        await primary.end();
+      } catch (e) {
+        report.errors.push(`cleanup failed: disconnect: ${msg(e)}`);
+      }
+    }
+    io.save();
+  }
+  let auditor: C | null = null;
+  try {
+    auditor = await io.open();
+    const problems = await io.audit(auditor);
+    report.restorationProblems = problems.map((p) => `restoration: ${p}`);
+    report.restorationVerified = problems.length === 0;
+    report.restoration = problems.length ? "fresh audit found differences (see problems)" : "verified by a fresh audit after cleanup";
+  } catch (e) {
+    report.restorationVerified = false;
+    report.restoration = null;
+    report.errors.push(`restoration not verified: ${msg(e)}`);
+  } finally {
+    if (auditor) await auditor.end().catch(() => {});
+    report.finishedAt = io.now();
+    io.save();
+  }
+  return report;
 }
 
 export function captureMarkdown(r: CaptureReport): string {
@@ -354,7 +541,8 @@ export function captureMarkdown(r: CaptureReport): string {
     "",
     `- project: ybrzhrgfrnvtcwymjdrq (staging) · code revision: ${r.revision}`,
     `- started: ${r.startedAt} · finished: ${r.finishedAt || "(not finished)"}`,
-    "- every check ran inside a transaction that was ROLLED BACK; nothing was kept; credentials are not recorded",
+    "- every phase runs inside a transaction that is always rolled back; what was kept is decided only by the fresh audit below; credentials are not recorded",
+    r.settings ? `- session settings (unchanged by the runner): ${r.settings}` : "",
     "",
     "## Catalog and access",
     "",
@@ -385,7 +573,10 @@ export function captureMarkdown(r: CaptureReport): string {
       : "- not run in this mode",
     ...r.concurrencyProblems.map((x) => `- PROBLEM: ${x}`),
     "",
-    r.restoration ? `- after rollback: ${r.restoration}` : "",
+    "## Restoration",
+    "",
+    r.restorationVerified === true ? `- ${r.restoration}` : r.restorationVerified === false ? "- NOT verified: something may have been kept or could not be checked" : "- not yet verified",
+    ...r.restorationProblems.map((x) => `- PROBLEM: ${x}`),
     ...r.errors.map((x) => `- ERROR: ${x}`),
     "",
     captureStatus(r),

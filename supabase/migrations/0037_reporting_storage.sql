@@ -527,23 +527,33 @@ GRANT SELECT ON reporting_private.control TO reporting_capture;
 GRANT INSERT ON reporting_private.changes TO reporting_capture;
 GRANT USAGE ON SEQUENCE reporting_private.changes_change_id_seq TO reporting_capture;
 
--- Hand the capture function to reporting_capture. ALTER ... OWNER needs the
--- new owner to hold CREATE on the schema at that moment (non-superuser
--- migration role); grant it, transfer, revoke it, all in this transaction.
-GRANT reporting_capture TO CURRENT_USER WITH INHERIT FALSE, SET TRUE;
-GRANT CREATE ON SCHEMA reporting_private TO reporting_capture;
-ALTER FUNCTION reporting_private.capture_production_event_change() OWNER TO reporting_capture;
-REVOKE CREATE ON SCHEMA reporting_private FROM reporting_capture;
-REVOKE reporting_capture FROM CURRENT_USER;
--- The new owner gets EXECUTE automatically; nobody else may run it directly.
+-- Nobody may run the capture function directly. Done while the migration role
+-- still owns it (review T12-1): after the hand-over below it no longer could.
 REVOKE ALL ON FUNCTION reporting_private.capture_production_event_change() FROM PUBLIC, anon, authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
--- The one trigger on the source table
+-- The one trigger on the source table (created while the migration role still
+-- owns, and so can EXECUTE, the function)
 -- ---------------------------------------------------------------------------
 
 CREATE TRIGGER production_events_reporting_capture
   AFTER INSERT OR UPDATE OR DELETE ON public.production_events
   FOR EACH ROW EXECUTE FUNCTION reporting_private.capture_production_event_change();
+
+-- ---------------------------------------------------------------------------
+-- LAST: hand the capture function to reporting_capture, then remove every
+-- temporary privilege. ALTER ... OWNER needs the migration role (not a
+-- superuser) to be able to SET ROLE to the new owner, and the new owner to
+-- hold CREATE on the schema at that moment. The ownership change keeps the
+-- ACL above (the new owner gets EXECUTE; PUBLIC/anon/authenticated/
+-- service_role stay revoked). Nothing after these statements needs the
+-- migration role to own or execute the function.
+-- ---------------------------------------------------------------------------
+
+GRANT reporting_capture TO CURRENT_USER WITH INHERIT FALSE, SET TRUE;
+GRANT CREATE ON SCHEMA reporting_private TO reporting_capture;
+ALTER FUNCTION reporting_private.capture_production_event_change() OWNER TO reporting_capture;
+REVOKE CREATE ON SCHEMA reporting_private FROM reporting_capture;
+REVOKE reporting_capture FROM CURRENT_USER;
 
 COMMIT;

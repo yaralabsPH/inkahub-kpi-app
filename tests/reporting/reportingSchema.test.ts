@@ -27,6 +27,7 @@ import {
   checkConcurrency,
   checkSteps,
   expectedTablePrivs,
+  newCaptureReport,
   INSTALLED_0036_POLICY_HASH,
   overheadSummary,
   parseCaptureMode,
@@ -117,6 +118,29 @@ describe("0037 migration text", () => {
     expect(codes).toContain("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA reporting_private FROM PUBLIC, anon, authenticated, service_role");
     expect(codes).toContain("REVOKE ALL ON FUNCTION reporting_private.capture_production_event_change() FROM PUBLIC, anon, authenticated, service_role");
     expect(codes).toContain("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA reporting_private TO service_role");
+  });
+
+  it("T12-1: function ACL and the source trigger come BEFORE the ownership hand-over; temporary privileges are revoked LAST", () => {
+    const i = (re: RegExp) => codes.findIndex((c) => re.test(c));
+    const revokeFn = i(/^REVOKE ALL ON FUNCTION reporting_private\.capture_production_event_change\(\) FROM PUBLIC, anon, authenticated, service_role$/);
+    const trigger = i(/^CREATE TRIGGER production_events_reporting_capture /);
+    const grantMember = i(/^GRANT reporting_capture TO CURRENT_USER WITH INHERIT FALSE, SET TRUE$/);
+    const grantCreate = i(/^GRANT CREATE ON SCHEMA reporting_private TO reporting_capture$/);
+    const alterOwner = i(/^ALTER FUNCTION reporting_private\.capture_production_event_change\(\) OWNER TO reporting_capture$/);
+    for (const x of [revokeFn, trigger, grantMember, grantCreate, alterOwner]) expect(x).toBeGreaterThan(0);
+    expect(revokeFn).toBeLessThan(alterOwner);
+    expect(trigger).toBeLessThan(alterOwner);
+    expect(grantMember).toBeGreaterThan(trigger);
+    expect(grantCreate).toBeGreaterThan(trigger);
+    // The last statements before COMMIT: owner change, then the two temporary-privilege revocations.
+    expect(codes.slice(-4)).toEqual([
+      "ALTER FUNCTION reporting_private.capture_production_event_change() OWNER TO reporting_capture",
+      "REVOKE CREATE ON SCHEMA reporting_private FROM reporting_capture",
+      "REVOKE reporting_capture FROM CURRENT_USER",
+      "COMMIT",
+    ]);
+    // Nothing after the hand-over needs the migration role to own or execute the function.
+    for (const c of codes.slice(alterOwner + 1)) expect(c).not.toMatch(/capture_production_event_change|CREATE TRIGGER/);
   });
 
   it("creates the capture role non-login, non-inheriting, without BYPASSRLS or other privileges", () => {
@@ -309,9 +333,9 @@ describe("runner modes, overhead, concurrency and status", () => {
 
   it("reports COMPLETE only when every part passed, and always ends with one STATUS line", () => {
     const base: CaptureReport = {
-      mode: "check", revision: "abc", startedAt: "t0", finishedAt: "t1", catalog: goodCatalog(), catalogProblems: [], steps: goodSteps(), stepProblems: [],
-      writeCompatProblems: [], writeCompatJournalRows: 0, overhead: { offPerRowMs: 0.5, onPerRowMs: 0.6, deltaPerRowMs: 0.1, ratio: 1.2, rounds: 3 },
-      concurrency: null, concurrencyProblems: [], errors: [], restoration: "control, site state unchanged and no rc- events kept",
+      ...newCaptureReport("check", "abc", "t0"),
+      finishedAt: "t1", catalog: goodCatalog(), steps: goodSteps(), writeCompatJournalRows: 0, overhead: { offPerRowMs: 0.5, onPerRowMs: 0.6, deltaPerRowMs: 0.1, ratio: 1.2, rounds: 3 },
+      restorationVerified: true, restoration: "verified by a fresh audit after cleanup",
     };
     expect(captureStatus(base)).toBe("STATUS: COMPLETE");
     expect(captureStatus({ ...base, finishedAt: "" })).toMatch(/^STATUS: FAILED – run not finished/);

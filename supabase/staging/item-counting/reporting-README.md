@@ -28,10 +28,29 @@ version before any production step (agents do not inspect production).
 ## Runner
 
 `npm run staging:reporting-capture -- <one mode>` reads `.env.staging.local`
-(same keys as `staging:item-counting`; values are never printed). It refuses
-any database that is not staging: the URL must carry the staging ref, and the
-database must have the `staging` location and its test users. That guard runs
-before every phase. Every phase is ONE transaction that is always ROLLED BACK.
+(same keys as `staging:item-counting`; values are never printed).
+
+- **Target guard at every query.** The staging target is parsed once and
+  frozen. Every client is wrapped, so EACH query (including role changes,
+  helper queries, migration statements and cleanup) first checks locally,
+  with no SQL, that the frozen target and the client's own connection host
+  and user are the staging project. That also works inside an aborted
+  transaction. Each new connection also runs the staging-marker check: the
+  `staging` location and its test users.
+- **No timeout overrides.** The runner sets no statement or idle timeout; it
+  records the existing values in the report. The only setting it changes is
+  a transaction-local `lock_timeout = 3s` in the concurrency probe.
+- Every phase is ONE transaction that is always ROLLED BACK. Afterwards, on
+  success AND on failure, a **fresh guarded connection audits** the result.
+  It compares the reporting schema/ACL/control/site state, whether the
+  capture role exists, the `production_events` triggers, and fixture state
+  (test events, synthetic products, test ledger rows, staging stock and an AU
+  stock fingerprint) with the state captured at the start. A rollback,
+  disconnect or audit failure makes the run FAILED ("restoration not
+  verified"); a run is COMPLETE only when that audit passes.
+- Each invocation writes its own report,
+  `staging-results-reporting-capture-<mode>-<start>-<id>.md` (git-ignored),
+  and never overwrites an earlier one. Partial results are saved as it goes.
 
 | Mode | Needs | Does |
 | --- | --- | --- |
@@ -50,6 +69,8 @@ Checks (`tests/staging/reportingCapture.ts`):
   - `production_events` policy hash still the installed 0036 hash.
 - **Capture steps** (`c..`, `d..`, `e..`), using real session claims for each role:
   - save, correction (order/person/time), move au→uk, no-op update and delete are journalled with full images;
+  - an event-ID change keeps the old and new keys and images;
+  - a rolled-back AU scenario on two synthetic products (`rc-sup-*`): a kiosk completion is journalled, the ordinary deduction moves stock exactly once with two ledger rows, the retry is idempotent, and nothing remains afterwards. Existing AU products are never touched;
   - the staging site is not journalled;
   - identical saves are both kept;
   - a rolled-back save leaves no journal row;
@@ -61,8 +82,9 @@ Checks (`tests/staging/reportingCapture.ts`):
 - **Existing write paths**: the Task 4 write-compat steps (kiosk/staff/manager/owner inserts, RLS denial, inventory deduction exactly once plus idempotent retry, corrections, deletes, Reports remove, digest read, anon denial) run with capture enabled and must behave exactly as before. They write no journal rows, because they use the staging site.
 - **Overhead**: 3 alternating rounds of 200 staff inserts at au with capture off/on; median ms per row, delta and ratio.
 
-Report: `staging-results-reporting-capture-<mode>.md` (git-ignored), ending
-with exactly one `STATUS: COMPLETE` or `STATUS: FAILED – <reason>` line.
+Each report ends with exactly one `STATUS: COMPLETE` or
+`STATUS: FAILED – <reason>` line. Trigger overhead here is diagnostic only;
+Task 19 owns the capture p95 gate.
 
 ## Suggested staging order (planner/CJ decide each step)
 
