@@ -52,6 +52,7 @@ export const REPORTING_FUNCTIONS_0038 = [
   "lock_batch",
   "order_key",
   "owner_partition",
+  "publication_fingerprint",
   "site_pending_changes",
   "stage_one",
   "staged_row_problem",
@@ -60,7 +61,7 @@ export const REPORTING_FUNCTIONS_0038 = [
 /** Trigger functions added by 0038: nobody executes them directly. */
 export const REPORTING_TRIGGER_FUNCTIONS_0038 = ["partition_work_guard", "source_candidate_guard"] as const;
 /** Tables added by 0038 (B1 candidate; T11-4 fifth result family). */
-export const REPORTING_TABLES_0038 = ["source_candidate", "source_issue_facts"] as const;
+export const REPORTING_TABLES_0038 = ["source_candidate", "source_issue_facts", "source_versions"] as const;
 /** Service-only public RPCs added by 0038 (Task 13 Part A). */
 export const PUBLIC_RPCS_0038 = [
   "abandon_reporting_batch",
@@ -71,6 +72,7 @@ export const PUBLIC_RPCS_0038 = [
   "freeze_reporting_rebuild",
   "get_reporting_job_status",
   "plan_reporting_work",
+  "publish_reporting_batch",
   "renew_reporting_lease",
   "resume_reporting_batch",
   "seal_reporting_work",

@@ -3,6 +3,14 @@
  * STAGING ONLY (ybrzhrgfrnvtcwymjdrq); requires migration 0038 applied.
  *
  *   npm run staging:reporting-jobs -- --fence
+ *   npm run staging:reporting-jobs -- --rehearse-migration --sites=A,B [--max-pages=N]
+ *   npm run staging:reporting-jobs -- --check-installed --sites=A,B [--max-pages=N]
+ *   npm run staging:reporting-jobs -- --interleavings --sites=A,B [--max-pages=N]
+ *
+ * The last three are Task 13 Part B2b's publication evidence
+ * (tests/staging/reportingPublication.ts): the full 0038 draft applied inside
+ * ONE always-rolled-back transaction, the same flow against an installed
+ * 0038, and multi-connection lock/fault checks. None of them commits.
  *
  * Several real connections. Every source write is rolled back. Capture
  * toggles go through public.set_reporting_capture as service_role and are
@@ -24,6 +32,22 @@ import { redactSecrets } from "./itemCountingPolicyParity";
 import { become } from "./writeCompatRun";
 import { CATALOG_SQL, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
 import { capLimit, checkFence, fenceMarkdown, fenceStatus, launch, newFenceReport, type FenceObservation } from "./reportingFence";
+import { catalog } from "./policyParityRun";
+import { catalogLevel, checkCatalog } from "./reportingCapture";
+import {
+  BASELINE_SQL,
+  MIGRATION_0038,
+  migrationBody,
+  newPublicationReport,
+  parsePublicationArgs,
+  publicationMarkdown,
+  publicationStatus,
+  runInterleavings,
+  runPublicationFlow,
+  sha256File,
+  type Db,
+  type Observation,
+} from "./reportingPublication";
 
 const ENV_FILE = ".env.staging.local";
 
@@ -281,10 +305,104 @@ async function snapshot(c: pg.Client): Promise<Snap> {
   return { catalog: norm, enabled, fixtures: String(f.rows[0].s) };
 }
 
+/** Part B2b: publication rehearsal / installed flow / interleavings. Every transaction is rolled back. */
+async function publicationMain(argv: string[]): Promise<number> {
+  const { mode, sites, maxPages, problems } = parsePublicationArgs(argv);
+  if (!mode || !sites) {
+    console.error(problems.join("; "));
+    return 2;
+  }
+  const revision = (() => {
+    try {
+      return execSync("git rev-parse --short HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      return "unknown";
+    }
+  })();
+  const report = newPublicationReport(mode, sites, revision, new Date().toISOString(), sha256File(MIGRATION_0038));
+  const out = `staging-results-reporting-publication-${mode}-${report.startedAt.replace(/[^0-9TZ]/g, "")}-${randomBytes(4).toString("hex")}.md`;
+  if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`);
+  const save = () => {
+    writeFileSync(`${out}.tmp`, publicationMarkdown(report));
+    renameSync(`${out}.tmp`, out);
+  };
+  save();
+  console.log(`report: ${out}`);
+  let open: () => Promise<pg.Client>;
+  let claims: Record<string, string>;
+  try {
+    const s = readSettings();
+    assertStagingSupabaseUrl(s.STAGING_SUPABASE_URL);
+    const target = stagingTarget(s.STAGING_DB_URL);
+    const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
+    claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
+    open = () => openGuarded(s.STAGING_DB_URL, target);
+  } catch (e) {
+    report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
+    report.finishedAt = new Date().toISOString();
+    save();
+    console.log(publicationStatus(report));
+    return 1;
+  }
+  const record = (o: Observation) => {
+    report.observations.push(o);
+    console.log(redactSecrets(`${o.ok ? "ok " : "NO "} ${o.id} ${o.what}: ${o.result}`));
+    save();
+  };
+  const as = async (c: Db, service: boolean) => {
+    if (service) await become(c as pg.Client, "service_role", claims);
+    else await c.query("reset role");
+  };
+  let before: string | null = null;
+  await runCaptureLifecycle(report, {
+    open,
+    now: () => new Date().toISOString(),
+    redact: redactSecrets,
+    save,
+    body: async (main) => {
+      const st = await main.query("select current_setting('statement_timeout') as st, current_setting('lock_timeout') as lt, current_setting('idle_in_transaction_session_timeout') as it");
+      report.settings = `statement_timeout=${st.rows[0].st}, lock_timeout=${st.rows[0].lt}, idle_in_transaction_session_timeout=${st.rows[0].it}`;
+      const staff = String((await main.query("select id::text as id from auth.users where email = 'staff@inka-staging.test'")).rows[0]?.id ?? "");
+      if (!staff) throw new Error("staff test user not found");
+      const installed = Boolean((await main.query("select exists (select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'publish_reporting_batch') as x")).rows[0]?.x);
+      if (mode === "rehearse-migration" && installed) throw new Error("0038 is already installed; use --check-installed");
+      if (mode !== "rehearse-migration" && !installed) throw new Error("0038 is not installed; use --rehearse-migration");
+      before = JSON.stringify((await main.query(BASELINE_SQL)).rows[0].j);
+      if (mode === "interleavings") {
+        await runInterleavings({ sites, staff, open, as, record, redact: redactSecrets, now: () => performance.now(), sleep: async (ms) => void (await sleep(ms)), maxPages }, report.cleanup);
+        return;
+      }
+      await main.query("begin");
+      if (mode === "rehearse-migration") {
+        const body = migrationBody(readFileSync(MIGRATION_0038, "utf8"));
+        for (const sql of body) await main.query(sql);
+        report.statementsApplied = body.length;
+        save();
+      }
+      const cat = (await main.query(CATALOG_SQL)).rows[0].j as ReportingCatalog;
+      cat.sourcePolicyHash = (await catalog(main)).policyHash;
+      report.catalogProblems = [...(catalogLevel(cat) === "0038" ? [] : ["catalog is not at the 0038 level"]), ...checkCatalog(cat)];
+      save();
+      await runPublicationFlow(main, { sites, maxPages, staff, as, record, redact: redactSecrets, now: () => performance.now() });
+      await main.query("rollback");
+    },
+    audit: async (fresh) => {
+      if (!before) throw new Error("no starting baseline was taken, so nothing can be compared");
+      const after = JSON.stringify((await fresh.query(BASELINE_SQL)).rows[0].j);
+      return after === before ? [] : [`baseline differs after rollback: before ${before.slice(0, 400)} after ${after.slice(0, 400)}`];
+    },
+  });
+  save();
+  const status = publicationStatus(report);
+  console.log(status);
+  return status === "STATUS: COMPLETE" ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const flags = process.argv.slice(2).filter((a) => a.startsWith("--"));
+  if (flags.some((f) => f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings")) return publicationMain(flags);
   if (flags.join(" ") !== "--fence") {
-    console.error("usage: npm run staging:reporting-jobs -- --fence");
+    console.error("usage: npm run staging:reporting-jobs -- --fence | --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N]");
     return 2;
   }
   const revision = (() => {

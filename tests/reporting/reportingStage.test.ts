@@ -708,7 +708,7 @@ describe("0038 B2a SQL", () => {
     expect(codes).toContain("ALTER TABLE reporting_private.source_issue_facts ENABLE ROW LEVEL SECURITY");
     expect(codes).toContain("REVOKE ALL ON TABLE reporting_private.source_issue_facts FROM PUBLIC, anon, authenticated");
     expect(codes).toContain("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE reporting_private.source_issue_facts TO service_role");
-    expect(codes.filter((c) => c.startsWith("CREATE INDEX source_issue_facts_"))).toHaveLength(4);
+    expect(codes.filter((c) => c.startsWith("CREATE INDEX source_issue_facts_"))).toHaveLength(7); // 4 read + owner/installed/current (B2b)
     // 0037 stays byte-identical; the fifth table is new in 0038 only.
     expect(readFileSync("supabase/migrations/0037_reporting_storage.sql", "utf8")).not.toMatch(/source_issue_facts/);
   });

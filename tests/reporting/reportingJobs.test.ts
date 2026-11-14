@@ -44,9 +44,10 @@ describe("0038 migration text (Part A)", () => {
     for (const c of codes) {
       expect(c).not.toMatch(/^(DROP|TRUNCATE|DELETE|ALTER ROLE|ALTER DEFAULT)/i);
       if (/^ALTER TABLE/i.test(c)) {
-        // Only RLS enabling and B2a's additive nullable columns on private tables.
+        // Only RLS enabling and additive nullable columns/constraints on private tables
+        // (an "IS NOT NULL" predicate inside a CHECK is not a NOT NULL column constraint).
         expect(c).toMatch(/^ALTER TABLE reporting_private\.\w+ (ENABLE ROW LEVEL SECURITY|ADD COLUMN .*)$/);
-        expect(c).not.toMatch(/NOT NULL|DROP|RENAME|ALTER COLUMN|TYPE /i);
+        expect(c).not.toMatch(/(?<!IS )NOT NULL|DROP|RENAME|ALTER COLUMN|TYPE /i);
       }
       expect(c).not.toMatch(/ON public\.(?!production_events\b)\w+ /);
       expect(c).not.toMatch(/statement_timeout|idle_in_transaction/i);

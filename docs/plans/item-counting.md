@@ -1443,3 +1443,79 @@ Coder adds one line per task with focused/full check results, CI evidence and re
 
     In TypeScript, weakening the leap rule, the 30/31-day months or the month bound alone survives. These are equivalent, because the native `Date` round trip independently rejects those days. Removing the round trip alone also survives, because the arithmetic covers it. With both layers broken, each combination fails (Julian leap, every year leap, 31-day months, month 13: 1 failed each).
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; 1005/1005 tests; build OK.
+- 2026-11-15 (Claude, Task 13 Part B2b; 0038 still an unapplied draft; 0034–0037 byte-identical, 0037 SHA-256 531BB2C5…; no SQL run, nothing applied, capture/processors untouched; Task 13 stays OPEN until reviewed staging evidence passes):
+  - **0038 additions** (SHA-256 bdc61aa7…):
+    - Owner columns on the four 0037 fact tables: nullable `partition_kind`/`partition_key`, both or neither, with current-owner indexes. On the new `source_issue_facts` they are required.
+    - Retired/installed and current-key indexes.
+    - `batches.published_generation_id`, checked to be present exactly when the batch is published.
+    - Private, versioned `source_versions` with one current image per event and service-only access.
+    - `reporting_private.publication_fingerprint`.
+    - Service-only `public.publish_reporting_batch(p_batch, p_fence)`.
+  - **Publication, in one transaction:**
+    - **Lock order and replay:** control share lock, then the site row, then the batch row. A lost-response replay of a published batch with the same fence returns its generation and writes nothing (another fence fails). After that, `lock_batch` checks epoch/rule/base/fence and the live lease.
+    - **Integrity:** the batch must be sealed and frozen with its manifest unchanged, and every work done with contiguous chunks and the recomputed digest.
+    - **Generation S and fact replacement:**
+      - every current row of every planned (audience, owner) is closed in all five families, so empty replacements delete;
+      - a rebuild closes everything at the site, every audience;
+      - staged rows are installed via `jsonb_populate_recordset`, with site/audience/owner/rule/validity taken only from trusted metadata.
+    - **Refusals:** an undated verification, or two current rows for one event (an unplanned old owner), fail the publication.
+    - **Daily groups:** groups touched by retired/installed verifications or by a changed edge's parent (rebuild: all) are closed and recomputed from current facts:
+      - lines = every effective verification;
+      - Items count only `item_status = 'counted'` (the planner's note: item_status gates Items only, never lines or groups);
+      - a line is cancelled only by a current edge with `pair = 'valid'`, a verification parent, not self, and parent time ≤ cancellation time;
+      - totals above 2^53−1 are stored as overflow;
+      - a group with no effective line is removed.
+    - **Mirror and versions:** a refresh applies the frozen images and tombstones; a rebuild applies the frozen candidate.
+    - **Wrap-up:** the old published generation is superseded with a 7-day expiry, then the new one is published with its fingerprint; the batch is marked published (per-site receipt); the acknowledgement pass runs; the site moves to the new generation and verified cutoff. `read_mode` is never touched.
+  - **Decisions inside the contract, for review:**
+    - **(a) Acknowledgement locking:** the Part A pass `acknowledge_received_changes` now locks candidates in change-id order with `FOR UPDATE … SKIP LOCKED`. Two sites publishing a shared move at once therefore cannot deadlock; skipped rows are left for a later pass, as the Part A contract already allows.
+    - **(b) Fingerprint:** SHA-256 over these lines:
+      - `item-counting-publication-v1`;
+      - site, kind, rule and epoch;
+      - the cutoff in integer microseconds;
+      - the sealed manifest hash;
+      - the result digests in manifest order.
+
+      It has no time-zone or DateStyle dependence, and TypeScript `publicationFingerprint` matches it.
+    - **(c)** A daily group with zero effective lines is removed rather than written as zero.
+    - **(d)** `production_date` is required only on verification facts.
+  - **TypeScript:** new `api/_lib/reporting-publish.ts` (wrapper with the sequence kept as a decimal string, plus the fingerprint model). The shared `tests/fixtures/reporting-rows.ts` maps real projector output to the five arrays, with owners. Both are added to `typecheck:digest`. Catalog expectations: `source_versions`, `publication_fingerprint`, `publish_reporting_batch`.
+  - **Tests (`reportingPublish.test.ts`, 29; `reportingPublicationRunner.test.ts`, 11):**
+    - **Reference model:** a model of `publish_reporting_batch` runs on the real Task 11 projector output for `history()`. Its daily groups equal the reducer for the site audience and Anna's self audience: Items, lines, absent groups, excluded/unclassified zero-Item lines, rework, and the hidden 5008 cancellation, which differs by one line between site and self.
+    - **Semantics:** replacement, empty-replacement deletion, moves (both owners, and refusal when only the new one is planned), rebuild closing a departed audience, a cancellation in another owner's partition, a cancellation saved before its parent, overflow, undated refusal, no-change, replay/fence/unsealed/incomplete, mirror/versions, and AU→UK receipts.
+    - **SQL text and code:** every rule, including closing before install, trusted columns only, item_status appearing exactly once (in the Items sum), step order, and SKIP LOCKED; plus the fingerprint bytes and the wrapper.
+  - **Staging runner** (`npm run staging:reporting-jobs -- --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N]`; the module is `tests/staging/reportingPublication.ts`; the `--fence` path is unchanged). Rehearsal applies the whole draft inside ONE outer transaction, with its BEGIN/COMMIT stripped and any inner transaction control refused, then runs the 0038 catalog check and the flow. It ALWAYS rolls back, then a fresh guarded audit compares a baseline: control, site state, reporting row counts, fixtures and per-site source md5. The flow:
+    - **Setup and rebuild:** enable capture and processors inside the transaction, insert `rp-*` fixtures (counted/excluded/unclassified/cancelled/invalid/whitespace-id rows), rebuild A, and plan the fixture owners for both audiences plus 650 keys of 800 quotes.
+    - **Real-SQL regressions:**
+      - B2a-3: each claim is ≤ 1 MiB, more than one call is needed, and nothing is stranded;
+      - B2a-1: null role, 2026-02-30, 2100-02-29;
+      - B2a-2: wrong staff, whitespace id as a fact, valid id as an issue;
+      - a four-array envelope;
+      - no refused chunk is stored;
+      - an incomplete publish is refused.
+    - **Publish checks:** daily totals equal the reducer on the frozen fixture for site and self; mirror = versions = candidate; no ownerless fact; the whitespace-id row is an issue only; replay returns the same generation; another fence fails.
+    - **Refresh A** after an update, a delete, an insert and an A→B move:
+      - an expired lease (fixture time shift inside the transaction) is taken over, and the old fence is refused for both publish and claim;
+      - an empty replacement deletes;
+      - daily totals equal the reducer;
+      - versions are closed;
+      - the move stays pending for B;
+      - the old generation is superseded with a 7-day expiry.
+    - **Then:** rebuild B, which acknowledges the move, and a no-change publication that touches no fact.
+    - **Interleavings** (installed; capture and processors must already be enabled by the operator; every connection rolls back):
+      - I1: a duplicate worker waits on the site row;
+      - I2: an uncommitted write is invisible to a freeze;
+      - I3: a source write during an open publication does not wait;
+      - I4: two sites publish concurrently without deadlock;
+      - I5: a backend killed before commit leaves no generation/batch/mirror row.
+
+      Every cleanup failure fails the run.
+  - **Not covered without commits:** the committed "smaller id commits after the snapshot" case and the cross-connection takeover of a committed batch. Both need committed staging state; the runner never commits, and these are left for the planner's installed checks.
+  - **Deliberate breaks** (92 focused tests; all 20 killed, 1 failed each):
+    - SQL (11): rebuild-only close; lines filtered by item_status; a later cancellation still cancelling; no replay; replay ignoring the fence; one-day retention; no SKIP LOCKED; no timing duplicate check; fingerprint staff order; `read_mode` flipped; tombstone left in the mirror.
+    - TypeScript (3): fingerprint ignoring manifest order; numeric sequence accepted; cutoff in milliseconds.
+    - Runner (6): probe without savepoint rollback; role reset masking errors; inner COMMIT allowed; status ignoring cleanup; connections not rolled back; fixture losing its excluded line.
+  - **Surprises:**
+    - `rp-x1` (blank order) is an invalid verification in Task 11, so it is not a daily line; my first hand count was wrong and the reducer check caught it.
+    - The Part A expand-only test regex flagged the `IS NOT NULL` predicate in a CHECK; it now rejects only real NOT NULL column constraints.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict tsc on the staging runner OK; 1045/1045 tests; build OK.
