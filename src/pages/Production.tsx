@@ -22,8 +22,6 @@ import {
   friendlySize,
   friendlyVariant,
   parseSku,
-  kpiUnitMultiplier,
-  isKpiEligibleSku,
   detectOrientation,
   shouldDeductAtDept,
   routeShopifyLineToCatalogueLines,
@@ -41,6 +39,11 @@ import {
   type ProductionDepartment,
 } from "@/lib/domain";
 import { cn } from "@/lib/utils/cn";
+import { ProductionCountStatus } from "@/components/ProductionCountStatus";
+import { useProductionEvidence, type ProductionEvidenceState } from "@/lib/hooks/useProductionSummary";
+import { isReportSite, productionDateAt, productionRange } from "@/lib/domain/productionPeriods";
+import { buildProductionCounterView, type ProductionCounterView } from "@/lib/domain/productionCounterView";
+import { snapshotCovers, type WorkType } from "@/lib/domain/productionCounts";
 import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { Modal } from "@/components/ui/Modal";
 
@@ -275,9 +278,65 @@ function ProductionStation({
   const [lineStates, setLineStates] = useState<Map<string, LineRecord>>(new Map());
   /** A 1-second tick to drive live timers on started lines. */
   const [tick, setTick] = useState(0);
-  /** Today's completed-line count for the active staff, for the header chip. */
-  const [todayCount, setTodayCount] = useState<number | null>(null);
-  const [todayLineUnits, setTodayLineUnits] = useState<number | null>(null);
+  /**
+   * Today's counter for the active worker (F1): read from saved evidence for
+   * the site's production day, never incremented locally. Every successful
+   * save calls refreshCounter() without awaiting it, so capture and stock
+   * deduction never wait on reporting.
+   */
+  const counterSite = isReportSite(location) ? location : null;
+  const [dayTick, setDayTick] = useState(0);
+  const counterDate = useMemo(
+    () => (counterSite ? productionDateAt(new Date(), counterSite) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [counterSite, dayTick],
+  );
+  const counterRange = useMemo(
+    () => (counterSite && counterDate ? productionRange(counterSite, counterDate, counterDate) : null),
+    [counterSite, counterDate],
+  );
+  // Roll over at the next site-local 04:00 (re-checked at most every 5 minutes).
+  useEffect(() => {
+    if (!counterRange) return;
+    const ms = Math.max(1_000, Math.min(Date.parse(counterRange.endUtcExclusive) - Date.now() + 1_000, 5 * 60_000));
+    const t = setTimeout(() => setDayTick((n) => n + 1), ms);
+    return () => clearTimeout(t);
+  }, [counterRange, dayTick]);
+  // Returning to the page re-derives the production date first, then refreshes it.
+  useEffect(() => {
+    const onReturn = () => {
+      if (document.visibilityState === "visible") setDayTick((n) => n + 1);
+    };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, []);
+  const counterEvidence = useProductionEvidence({ client: supabase, site: location, range: counterRange, refreshKey: dayTick });
+  const refreshCounter = counterEvidence.refresh;
+  // A worker/station/day switch only shows counts read after the switch:
+  // the previous worker's numbers are never shown for the next one.
+  const counterKey = activeStaff && counterDate ? `${activeStaff.user_id}|${station.department}|${counterDate}` : "";
+  const counterSince = useRef<{ key: string; at: number }>({ key: "", at: 0 });
+  if (counterSince.current.key !== counterKey) counterSince.current = { key: counterKey, at: Date.now() };
+  const counterSinceAt = counterSince.current.at;
+  useEffect(() => {
+    if (counterKey) refreshCounter();
+  }, [counterKey, refreshCounter]);
+  const counter = useMemo(() => {
+    const snap = counterEvidence.snapshot;
+    if (!activeStaff || !counterSite || !counterDate || !counterEvidence.prepared || !snap) return null;
+    if (!snapshotCovers(snap, counterRange)) return null;
+    if (Date.parse(snap.asOfUtc) < counterSinceAt) return null;
+    return buildProductionCounterView(counterEvidence.prepared, {
+      site: counterSite,
+      date: counterDate,
+      staffId: activeStaff.user_id,
+      workType: station.department as WorkType,
+    });
+  }, [counterEvidence.prepared, counterEvidence.snapshot, activeStaff, counterSite, counterDate, counterRange, station.department, counterSinceAt]);
   /** Dispatch confirmation flash — order # that was just dispatched. */
   const [dispatchFlash, setDispatchFlash] = useState<string | null>(null);
   /**
@@ -420,68 +479,11 @@ function ProductionStation({
   }, [currentOrder, location, supabase, station.department]);
 
   // When the active staff changes, reset all order state (different worker,
-  // different in-progress lines). Also fetch today's count.
+  // different in-progress lines). The counter refreshes through counterKey.
   useEffect(() => {
     setCurrentOrder(null);
     setLineStates(new Map());
     setDispatchFlash(null);
-    if (!activeStaff) {
-      setTodayCount(null);
-      setTodayLineUnits(null);
-      return;
-    }
-    // Load today's completed count for this staff.
-    void (async () => {
-      const now = new Date();
-      const reset = new Date();
-      reset.setHours(4, 0, 0, 0);
-      if (now < reset) { reset.setDate(reset.getDate() - 1); }
-      const completedEvType = station.department === "dispatch" ? "dispatched" : "completed";
-      // Two queries: orders completed today (for order count), and
-      // line_verified +/- cancelled events today (for items count).
-      const [ordersRes, itemsRes] = await Promise.all([
-        supabase
-          .from("production_events")
-          .select("order_number")
-          .eq("location", location)
-          .eq("staff_id", activeStaff.user_id)
-          .eq("department", station.department)
-          .eq("event_type", completedEvType)
-          .gte("created_at", reset.toISOString()),
-        supabase
-          .from("production_events")
-          .select("event_type, line_quantity, line_sku, parent_event_id")
-          .eq("location", location)
-          .eq("staff_id", activeStaff.user_id)
-          .eq("department", station.department)
-          .in("event_type", ["line_verified", "cancelled"])
-          .gte("created_at", reset.toISOString()),
-      ]);
-      // Count completed / dispatched events instead of unique order
-      // numbers so a legitimate resend of a previously-processed order
-      // adds another point to the worker's KPI. Under normal flow the
-      // filter (staff + dept + type + today) already means one row per
-      // completion, so this doesn't double-count.
-      const orderRows = (ordersRes.data ?? []) as Array<{ order_number: string | null }>;
-      const itemRows = (itemsRes.data ?? []) as Array<{
-        event_type: string; line_quantity: number | null; line_sku: string | null; parent_event_id: string | null;
-      }>;
-      let lineUnits = 0;
-      for (const r of itemRows) {
-        const qty = typeof r.line_quantity === "number" ? r.line_quantity : 0;
-        // Set SKUs multiply: a 3-set verify with line_quantity=1 scores
-        // as 3 items. Non-set SKUs return 1 so nothing changes.
-        const mult = kpiUnitMultiplier(r.line_sku);
-        if (r.event_type === "line_verified") {
-          lineUnits += qty * mult;
-        } else if (r.event_type === "cancelled" && r.parent_event_id) {
-          // Cancellation of a verify - credit back the items (also set-aware).
-          lineUnits -= qty * mult;
-        }
-      }
-      setTodayCount(orderRows.length);
-      setTodayLineUnits(Math.max(0, lineUnits));
-    })();
   }, [activeStaff, supabase, location, station.department]);
 
   // Live timer — re-render every second while any line is "started" so
@@ -680,12 +682,10 @@ function ProductionStation({
       verifiedLinesRef.current = next as unknown as Map<string, unknown>;
       return next;
     });
-    // Credit back the items live when a verification is undone.
-    if (isKpiEligibleSku(line.sku)) {
-      setTodayLineUnits((n) => Math.max(0, (n ?? 0) - line.quantity * kpiUnitMultiplier(line.sku)));
-    }
+    // Saved: re-read the counter (the saved parent's value is removed by the shared rules).
+    refreshCounter();
     lastActivityRef.current = Date.now();
-  }, [activeStaff, currentOrder, verifiedLines, insertEvent]);
+  }, [activeStaff, currentOrder, verifiedLines, insertEvent, refreshCounter]);
 
   // Phase 4: tap-to-verify. Writes a line_verified event tagged with
   // activeCaseId (when present) and updates local map for instant UI.
@@ -730,12 +730,10 @@ function ProductionStation({
       next.set(activeStaff.user_id, activeStaff.display_name);
       return next;
     });
-    // Live update: items count tracks every verification for KPI-eligible SKUs only.
-    if (isKpiEligibleSku(line.sku)) {
-      setTodayLineUnits((n) => (n ?? 0) + line.quantity * kpiUnitMultiplier(line.sku));
-    }
+    // Saved: re-read the counter from saved evidence (no local +quantity).
+    refreshCounter();
     lastActivityRef.current = Date.now();
-  }, [activeStaff, currentOrder, verifiedLines, insertEvent, activeCase, station.department]);
+  }, [activeStaff, currentOrder, verifiedLines, insertEvent, activeCase, station.department, refreshCounter]);
 
   /** Worker tapped Start on a line. Insert event, transition state. */
   const handleStartLine = useCallback(async (line: OrderLine) => {
@@ -911,9 +909,9 @@ function ProductionStation({
       });
       return next;
     });
-    setTodayCount((n) => (n ?? 0) + 1);
+    refreshCounter();
     lastActivityRef.current = Date.now();
-  }, [activeStaff, currentOrder, insertEvent]);
+  }, [activeStaff, currentOrder, insertEvent, refreshCounter]);
 
   /** Worker tapped Cancel mid-progress. Insert cancel event, reset to idle. */
   const handleCancelLine = useCallback(async (line: OrderLine) => {
@@ -980,8 +978,8 @@ function ProductionStation({
       cs_case_id: activeCase?.caseId ?? null,
     });
     if (!inserted) return;
-    // Order count tracks completions; items already counted per-verify.
-    setTodayCount((n) => (n ?? 0) + 1);
+    // Saved: re-read the counter. Not awaited, so deduction below never waits on reporting.
+    refreshCounter();
     lastActivityRef.current = Date.now();
 
     // Phase A: auto-deduct catalogue components for lines this dept owns.
@@ -1025,7 +1023,7 @@ function ProductionStation({
       setCurrentOrder(null);
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, refreshCounter]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
@@ -1522,7 +1520,8 @@ function ProductionStation({
             department={station.department}
             scanBuffer={scanBuffer}
             error={scanError}
-            todayCount={todayCount}
+            counter={counter}
+            counterState={counterEvidence}
             currentOrder={currentOrder}
             lineStates={lineStates}
             dispatchFlash={dispatchFlash}
@@ -1530,7 +1529,6 @@ function ProductionStation({
             onCompleteLine={(line) => void handleCompleteLine(line)}
             onCancelLine={(line) => void handleCancelLine(line)}
             onClearOrder={handleClearOrder}
-            todayLineUnits={todayLineUnits}
             onCompleteOrder={() => void handleCompleteOrder()}
             onScrapOrder={() => void handleScrapOrder()}
             onManualOrderSubmit={(n) => void processScan(n)}
@@ -1704,9 +1702,9 @@ function IdleScreen({
 // ============================================================
 
 function ActiveScreen({
-  staff, department, scanBuffer, error, todayCount,
+  staff, department, scanBuffer, error, counter, counterState,
   currentOrder, lineStates, dispatchFlash,
-  onStartLine, onCompleteLine, onCancelLine, onClearOrder, onCompleteOrder, onScrapOrder, todayLineUnits,
+  onStartLine, onCompleteLine, onCancelLine, onClearOrder, onCompleteOrder, onScrapOrder,
   onManualOrderSubmit,
   packages, onRemovePackage, onClearPackages,
   verifiedLines, onVerifyLine, onUnverifyLine, staffNames, activeCase,
@@ -1716,7 +1714,8 @@ function ActiveScreen({
   department: ProductionDepartment;
   scanBuffer: string;
   error: string | null;
-  todayCount: number | null;
+  counter: ProductionCounterView | null;
+  counterState: ProductionEvidenceState;
   currentOrder: CurrentOrder | null;
   lineStates: Map<string, LineRecord>;
   dispatchFlash: string | null;
@@ -1724,7 +1723,6 @@ function ActiveScreen({
   onCompleteLine: (line: OrderLine) => void;
   onCancelLine: (line: OrderLine) => void;
   onClearOrder: () => void;
-  todayLineUnits: number | null;
   onCompleteOrder: () => void;
   onScrapOrder: () => void;
   onManualOrderSubmit: (orderNum: string) => void;
@@ -1764,17 +1762,29 @@ function ActiveScreen({
         </div>
         <div className="flex items-center gap-3">
           <div className="rounded-lg ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 px-4 py-2 text-center">
-            <div className="text-2xl font-semibold tabular-nums">
-              {todayCount === null ? "—" : todayCount}
+            <div className={cn("text-2xl font-semibold tabular-nums", counterState.updating && "opacity-60")}>
+              {counter ? counter.normal.orders : "—"}
               <span className="text-base font-normal text-slate-500 ml-1">orders</span>
             </div>
-            <div className="text-2xl font-semibold tabular-nums">
-              {todayLineUnits === null ? "—" : todayLineUnits}
+            <div className={cn("text-2xl font-semibold tabular-nums", counterState.updating && "opacity-60")}>
+              {counter ? (counter.normal.items === null ? "too many" : counter.normal.items) : "—"}
               <span className="text-base font-normal text-slate-500 ml-1">items</span>
             </div>
+            {counter && ((counter.rework.items ?? 0) > 0 || counter.rework.orders > 0) ? (
+              <div className="text-xs text-amber-700 dark:text-amber-300 tabular-nums">
+                + CS/rework {counter.rework.items ?? "—"} items · {counter.rework.orders} orders
+              </div>
+            ) : null}
             <div className="text-[10px] uppercase tracking-widest text-slate-500">
-              today (since 4am)
+              today (since 4am{counter ? ` ${counter.range.timeZone.split("/").pop()?.replace("_", " ")}` : ""})
             </div>
+            <ProductionCountStatus
+              className="mt-1 max-w-[16rem] text-left"
+              state={counterState}
+              range={counter?.range ?? null}
+              coverage={counter?.coverage ?? null}
+              compact
+            />
           </div>
         </div>
       </div>
@@ -1931,8 +1941,7 @@ function ActiveScreen({
             orderNumber={currentOrder.number}
             author={null}
             variant="loud"
-          />
-
+          />
           {/* Phase 4: per-line verification list with three colour states. */}
           <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
             <div className="px-5 py-2 text-xs uppercase tracking-widest text-slate-500 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
