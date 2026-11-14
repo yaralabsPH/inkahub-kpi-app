@@ -53,8 +53,8 @@ describe("0037 migration text", () => {
   it("is the next unused number and the only 0037", () => {
     const names = readdirSync("supabase/migrations").filter((n) => /^\d{4}_/.test(n)).sort();
     expect(names.filter((n) => n.startsWith("0037_"))).toEqual(["0037_reporting_storage.sql"]);
-    expect(names.at(-1)).toBe("0037_reporting_storage.sql");
-    expect(names.at(-2)).toBe("0036_production_events_select_initplans.sql");
+    const at = names.indexOf("0037_reporting_storage.sql");
+    expect(names[at - 1]).toBe("0036_production_events_select_initplans.sql");
   });
 
   it("is ONE transaction with no IF NOT EXISTS / OR REPLACE shortcuts", () => {

@@ -42,6 +42,10 @@ export const REPORTING_TABLES = [
   "timing_facts",
 ] as const;
 export const REPORTING_FUNCTIONS = [CAPTURE_FUNCTION, "control_guard", "generations_guard"] as const;
+/** Added by 0038 (Task 13 Part A): internal helpers the server may execute. */
+export const REPORTING_FUNCTIONS_0038 = ["acknowledge_received_changes", "site_pending_changes"] as const;
+/** Service-only public RPCs added by 0038 (Task 13 Part A). */
+export const PUBLIC_RPCS_0038 = ["begin_reporting_batch", "get_reporting_job_status", "set_reporting_capture"] as const;
 const ROLES = ["anon", "authenticated", "service_role", CAPTURE_ROLE] as const;
 const CLIENT_ROLES = ["anon", "authenticated", "authenticator", "service_role"];
 
@@ -88,6 +92,14 @@ export const CATALOG_SQL = `select json_build_object(
                   union all select p.proname, coalesce(p.proacl::text, '=X') from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = '${REPORTING_SCHEMA}'
                   union all select c.relname, coalesce(c.relacl::text, '') from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = '${REPORTING_SCHEMA}') x),
   'exposed', (select coalesce(array_to_string(rolconfig, ';'), '') from pg_catalog.pg_roles where rolname = 'authenticator'),
+  'controlColumnUpdate', (select coalesce(json_agg(a.attname order by a.attname), '[]'::json) from pg_catalog.pg_attribute a
+                            where a.attrelid = '${REPORTING_SCHEMA}.control'::regclass and a.attnum > 0 and not a.attisdropped
+                              and pg_catalog.has_column_privilege('${CAPTURE_ROLE}', a.attrelid, a.attnum, 'UPDATE')),
+  'publicRpcs', (select coalesce(json_agg(json_build_object('f', p.proname, 'owner', pg_catalog.pg_get_userbyid(p.proowner), 'secdef', p.prosecdef, 'config', p.proconfig,
+                    'anon', pg_catalog.has_function_privilege('anon', p.oid, 'EXECUTE'), 'auth', pg_catalog.has_function_privilege('authenticated', p.oid, 'EXECUTE'),
+                    'service', pg_catalog.has_function_privilege('service_role', p.oid, 'EXECUTE'), 'public', coalesce(p.proacl::text, '=X') ~ '(^|[{,])=') order by p.proname), '[]'::json)
+                   from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+                  where n.nspname = 'public' and p.proname in ('${PUBLIC_RPCS_0038.join("','")}')),
   'control', (select row_to_json(c) from ${REPORTING_SCHEMA}.control c),
   'siteState', (select json_agg(json_build_object('site', site, 'processor', processor_enabled, 'mode', read_mode) order by site) from ${REPORTING_SCHEMA}.site_state)
 ) as j`;
@@ -106,6 +118,9 @@ export interface ReportingCatalog {
   functionExec: Array<{ role: string; f: string; x: boolean }>;
   publicAcl: Array<{ o: string; public: boolean }>;
   exposed: string;
+  /** Columns of control the capture role may UPDATE (0038: only updated_at, for the FOR SHARE lock). */
+  controlColumnUpdate?: string[];
+  publicRpcs?: Array<{ f: string; owner: string; secdef: boolean; config: string[] | null; anon: boolean; auth: boolean; service: boolean; public: boolean }>;
   control: { capture_epoch: number; capture_enabled: boolean; rule_version: string } | null;
   siteState: Array<{ site: string; processor: boolean; mode: string }> | null;
   /** Filled by the runner from the shared policy catalog. */
@@ -119,7 +134,13 @@ export function expectedTablePrivs(role: string, table: string): string {
   return "";
 }
 
-/** Every catalog problem (empty = the access model is exactly as designed). */
+/** 0038 is installed when ANY of its objects is present; then ALL of them must be exactly as designed. */
+export function catalogLevel(c: ReportingCatalog): "0037" | "0038" {
+  const any = (c.policies ?? []).some((x) => x.p === "control_capture_lock") || (c.publicRpcs ?? []).length > 0 || (c.functions ?? []).some((f) => (REPORTING_FUNCTIONS_0038 as readonly string[]).includes(f.f)) || (c.controlColumnUpdate ?? []).length > 0;
+  return any ? "0038" : "0037";
+}
+
+/** Every catalog problem (empty = the access model is exactly as designed for the installed level). */
 export function checkCatalog(c: ReportingCatalog): string[] {
   const p: string[] = [];
   if (c.schema !== REPORTING_SCHEMA) return [`schema ${REPORTING_SCHEMA} is not installed`];
@@ -129,8 +150,10 @@ export function checkCatalog(c: ReportingCatalog): string[] {
     if (!t.rls) p.push(`RLS is off on ${t.t}`);
     if (t.owner === CAPTURE_ROLE) p.push(`${CAPTURE_ROLE} owns table ${t.t}`);
   }
+  const level = catalogLevel(c);
   const fns = c.functions ?? [];
-  if (fns.map((f) => f.f).join(",") !== [...REPORTING_FUNCTIONS].sort().join(",")) p.push(`functions are [${fns.map((f) => f.f).join(", ")}]`);
+  const wantFns = [...REPORTING_FUNCTIONS, ...(level === "0038" ? REPORTING_FUNCTIONS_0038 : [])].sort();
+  if (fns.map((f) => f.f).join(",") !== wantFns.join(",")) p.push(`functions are [${fns.map((f) => f.f).join(", ")}], expected [${wantFns.join(", ")}] for ${level}`);
   for (const f of fns) {
     const cfg = (f.config ?? []).join(";");
     if (cfg !== 'search_path=""') p.push(`${f.f} search_path is "${cfg}", expected search_path=""`);
@@ -144,7 +167,11 @@ export function checkCatalog(c: ReportingCatalog): string[] {
     }
   }
   const pol = (c.policies ?? []).map((x) => `${x.t}.${x.p}:${x.cmd}:${x.roles.join("|")}:${x.permissive}`).sort();
-  const wantPol = [`changes.changes_capture_insert:INSERT:${CAPTURE_ROLE}:PERMISSIVE`, `control.control_capture_select:SELECT:${CAPTURE_ROLE}:PERMISSIVE`];
+  const wantPol = [
+    `changes.changes_capture_insert:INSERT:${CAPTURE_ROLE}:PERMISSIVE`,
+    ...(level === "0038" ? [`control.control_capture_lock:UPDATE:${CAPTURE_ROLE}:PERMISSIVE`] : []),
+    `control.control_capture_select:SELECT:${CAPTURE_ROLE}:PERMISSIVE`,
+  ];
   if (pol.join(",") !== wantPol.join(",")) p.push(`policies are [${pol.join(", ")}], expected only [${wantPol.join(", ")}]`);
   const r = c.role;
   if (!r) p.push(`role ${CAPTURE_ROLE} is missing`);
@@ -171,7 +198,22 @@ export function checkCatalog(c: ReportingCatalog): string[] {
     const want = expectedTablePrivs(t.role, t.t);
     if (t.privs !== want) p.push(`${t.role} on ${t.t} has [${t.privs}], expected [${want}]`);
   }
-  for (const f of c.functionExec) if (f.x) p.push(`${f.role} can execute ${f.f}`);
+  for (const f of c.functionExec) {
+    const allowed = level === "0038" && f.role === "service_role" && (REPORTING_FUNCTIONS_0038 as readonly string[]).includes(f.f);
+    if (f.x !== allowed) p.push(`${f.role} ${f.x ? "can" : "cannot"} execute ${f.f}`);
+  }
+  const colUpd = [...(c.controlColumnUpdate ?? [])].sort().join(",");
+  const wantColUpd = level === "0038" ? "updated_at" : "";
+  if (colUpd !== wantColUpd) p.push(`${CAPTURE_ROLE} may UPDATE control columns [${colUpd}], expected [${wantColUpd}]`);
+  const rpcs = c.publicRpcs ?? [];
+  const wantRpcs = level === "0038" ? [...PUBLIC_RPCS_0038] : [];
+  if (rpcs.map((r) => r.f).join(",") !== wantRpcs.join(",")) p.push(`public reporting RPCs are [${rpcs.map((r) => r.f).join(", ")}], expected [${wantRpcs.join(", ")}]`);
+  for (const r of rpcs) {
+    if (r.secdef) p.push(`${r.f} must be SECURITY INVOKER`);
+    if ((r.config ?? []).join(";") !== 'search_path=""') p.push(`${r.f} search_path is not empty`);
+    if (r.anon || r.auth || r.public) p.push(`${r.f} is executable by a client role or PUBLIC`);
+    if (!r.service) p.push(`${r.f} is not executable by service_role`);
+  }
   for (const a of c.publicAcl) if (a.public) p.push(`PUBLIC holds a privilege on ${a.o}`);
   if (/pgrst\.db_schemas=[^;]*reporting_private/.test(c.exposed)) p.push("reporting_private is in the Data API exposed schemas");
   if (!c.control) p.push("control row is missing");
@@ -472,7 +514,7 @@ export async function openGuardedClient<C extends OpenableClient>(make: () => C,
     } catch (ce) {
       cleanup = `; cleanup failed: disconnect: ${redact(ce instanceof Error ? ce.message : String(ce))}`;
     }
-    const err = new Error(`${redact(e instanceof Error ? e.message : String(e))}${cleanup}`, { cause: e });
+    const err = Object.assign(new Error(`${redact(e instanceof Error ? e.message : String(e))}${cleanup}`), { cause: e });
     const code = (e as { code?: unknown }).code;
     if (code !== undefined) Object.assign(err, { code });
     throw err;
@@ -549,7 +591,10 @@ export async function concurrencyProbe<C extends RowsClient>(
     try {
       await b.query("rollback");
     } finally {
-      await b.end().catch(() => {});
+      // A failed disconnect of the second connection is evidence, never swallowed (plan, Task 13).
+      await b.end().catch((e) => {
+        report.errors.push(`cleanup failed: second connection disconnect: ${e instanceof Error ? e.message : String(e)}`);
+      });
     }
   }
 }
@@ -604,7 +649,16 @@ export interface LifecycleIO<C extends LifecycleClient> {
   redact(text: string): string;
 }
 
-export async function runCaptureLifecycle<C extends LifecycleClient>(report: CaptureReport, io: LifecycleIO<C>): Promise<CaptureReport> {
+/** The report fields the lifecycle maintains (shared by the capture and fence runners). */
+export interface LifecycleReport {
+  errors: string[];
+  finishedAt: string;
+  restorationVerified: boolean | null;
+  restoration: string | null;
+  restorationProblems: string[];
+}
+
+export async function runCaptureLifecycle<C extends LifecycleClient, R extends LifecycleReport>(report: R, io: LifecycleIO<C>): Promise<R> {
   const msg = (e: unknown) => io.redact(e instanceof Error ? e.message : String(e));
   let primary: C | null = null;
   try {

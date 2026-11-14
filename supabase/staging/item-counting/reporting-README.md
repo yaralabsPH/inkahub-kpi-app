@@ -97,3 +97,42 @@ Task 19 owns the capture p95 gate.
 Rollback (a new migration if ever needed): drop the trigger (stops capture
 immediately; source writes are exactly as before 0037), then
 `DROP SCHEMA reporting_private CASCADE; DROP ROLE reporting_capture;`.
+
+## Activation fence (Task 13, migration 0038 Part A)
+
+0038 (draft until the planner applies it) changes the capture trigger
+function to read the control row `FOR SHARE`. That lock is shared by
+ordinary writers and held until the source transaction ends, so a capture
+toggle waits for writes that started before it. 0038 also adds:
+
+- `UPDATE(updated_at)` plus a lock-only policy (`WITH CHECK (false)`) for
+  `reporting_capture`;
+- the service-only `public.set_reporting_capture(boolean)`, with a lock wait
+  of at most 3 s that keeps a stricter existing limit;
+- per-site batch receipts with delayed global acknowledgement;
+- `public.begin_reporting_batch(site)` (a single-statement freeze; refresh
+  only) and `public.get_reporting_job_status(site)`.
+
+`npm run staging:reporting-jobs -- --fence` (needs 0038 applied) drives real
+connections:
+
+| id | proves |
+| --- | --- |
+| F1 | two source writers at au with capture enabled do not wait on each other |
+| F2 | enabling waits for an open disabled-period write; a READ COMMITTED writer queued behind the uncommitted toggle then journals at the new epoch |
+| F3 | a REPEATABLE READ writer whose snapshot predates the enable fails with 40001 |
+| F4 | disable → re-enable advances the epoch by one each; a later write carries the new epoch |
+| F5 | a toggle blocked by an open writer fails with 55P03 near 3 s, or after 1 s under a stricter session limit, and control is unchanged |
+| F6 | as `reporting_capture` (membership granted inside a rolled-back transaction): the `FOR SHARE` lock works; UPDATE of `updated_at` (RLS `WITH CHECK false`) and of `capture_enabled` (no privilege) are both refused with 42501 |
+
+Source writes (`rj-*` ids) are always rolled back. Capture toggles are
+committed: each advances the epoch. Capture is returned to its starting
+on/off state, and the fresh audit checks the catalog (with the epoch and
+`updated_at` excluded), the capture state and that no `rj-*` events or
+journal rows remain. Every client is guarded and marker-checked, every
+scenario connection is rolled back and ended, and every cleanup failure is
+reported. The report is `staging-results-reporting-fence-<start>-<id>.md`.
+
+The per-site receipt orders (AU→UK publication in both orders, one side
+failing and restarting, delayed global acknowledgement) need publication.
+They are added with Part B.

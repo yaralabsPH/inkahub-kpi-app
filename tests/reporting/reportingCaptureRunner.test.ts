@@ -386,3 +386,25 @@ describe("concurrencyProbe: the second connection resets its role before reading
     expect(b.ended).toBe(true);
   });
 });
+
+describe("Task 13: a failed disconnect of the second concurrency connection is reported", () => {
+  it("records the cleanup failure and the run cannot be COMPLETE", async () => {
+    const before: StateSnapshot = {
+      catalog: {
+        schema: "reporting_private", tables: [], functions: [], policies: [], role: null, memberOf: [], members: [], triggers: [], schemaPrivs: [], tablePrivs: [],
+        functionExec: [], publicAcl: [], exposed: "", siteState: [], control: { capture_epoch: 2, capture_enabled: true, rule_version: "item-counting-summary-v1" },
+      },
+      roleExists: true,
+      triggers: CAPTURE_TRIGGER,
+      fixtures: "",
+    };
+    const a = new PgFake();
+    const b = new PgFake({ endFails: true, rows: (sql) => (sql === CC_JOURNAL_SQL ? [{ n: 1 }] : []) });
+    const report = newCaptureReport("concurrency", "rev", "t0");
+    await concurrencyProbe(a, async () => b, before, report, { staff: "s" }, {}, (async (c: PgFake) => void (await c.query("set local role authenticated"))) as never);
+    expect(report.errors).toEqual(["cleanup failed: second connection disconnect: socket already closed"]);
+    report.finishedAt = "t1";
+    report.restorationVerified = true;
+    expect(captureStatus(report)).toMatch(/^STATUS: FAILED – cleanup failed: second connection disconnect/);
+  });
+});

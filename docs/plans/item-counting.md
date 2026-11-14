@@ -353,6 +353,27 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
   **Planner disposition (2026-11-14):** the proposed order is accepted, but none of its SQL steps is released until T12-1 through T12-5 below are fixed and verified. Task 12's bulk insert medians are diagnostic only; they do not satisfy or replace Task 19's full capture p95 gate. Production version/hosting evidence stays a release blocker, not a reason to inspect production overnight.
 - **Capture activation boundary — planner design checkpoint before Task 13/15 activation or backfill publication.** A source transaction can observe capture disabled, remain uncommitted while capture is enabled and the backfill snapshot runs, then commit without a journal entry. An epoch increment alone cannot prove continuity. The operator/rebuild design must fence or drain pre-toggle writers (including a transaction with an older snapshot) or otherwise prove repair before declaring a generation complete. Add an adversarial two-connection test for that sequence and disable/re-enable. No source-table scan or lock on every ordinary write is authorized by this note; resolve the smallest safe transition protocol in the plan before implementing it. Task 12's rollback rehearsal and capture-only concurrency check do not certify a rebuild boundary.
   **Resolved for implementation:** follow Activation fence and cross-site acknowledgement above in 0038. The sole new ordinary-write lock is a compatible shared lock on the private control row, not a source-table or per-site-state lock. Real interleaving, privilege and performance tests remain mandatory; no publication is approved by this design decision alone.
+- **Task 13 Part B — interface/algorithm questions for the planner (2026-11-14; Part A is committed; Part B SQL is not written).** Installed 0037 fixes the table shapes, and Task 14 owns materialization and dependency enumeration. These points decide Part B's SQL; each has a proposal:
+  1. **Who creates `partition_work`.** The five listed RPCs have no way to add work, and dependency partitions (parents, inverse children, previously missing parents) are Task 14's enumeration. *Proposal:* one more service-only RPC, `plan_reporting_work(p_batch, p_fence, p_items jsonb)`. The worker inserts `(audience, partition kind, partition key, input hash)` rows computed in TypeScript from `batch_events` plus `source_current`. `claim_reporting_work` then leases pending rows and returns each one's frozen input. Alternative: begin creates order/event partitions for frozen keys only, and Task 14 adds dependency partitions later.
+  2. **`stage_reporting_result(p_batch, p_fence, p_partition text, p_chunk jsonb)` identity and envelope.** *Proposal:*
+     - `p_partition` = the decimal `partition_work.work_id`, which is unambiguous and avoids delimiter-joined keys.
+     - `p_chunk` = `{chunkNo, chunkCount, chunkHash, resultDigest, rows: {event_facts, cancel_edges, order_occurrences, timing_facts}}`, with rows in table column names, at most 1 MiB, `chunkHash` = SHA-256 of the canonical JSON of `rows`, and `resultDigest` = SHA-256 of the ordered chunk hashes.
+     - An identical replay is a no-op; a different hash for the same chunk number fails; `done` is set only when `chunkCount` chunks match `resultDigest`.
+  3. **Superseding old fact versions at publish.** Installed fact tables have no partition column, so publish cannot tell which current rows a re-materialized partition replaces. *Proposal:* 0038 adds nullable `partition_kind`/`partition_key` (expand-only) plus an index to `event_facts`, `cancel_edges`, `order_occurrences` and `timing_facts`. Publish closes (`valid_to_seq`) current rows of each re-materialized `(site, audience, partition)` and installs the staged rows with `valid_from_seq` = the new generation. Alternative: close by the set of event ids in the staged rows plus the frozen tombstones.
+  4. **`daily_totals` maintenance.** Additive Items per production day cross partition boundaries, and the production-date rule (site zone, 04:00) lives in TypeScript. *Options:*
+     - (a) Publish recomputes affected `(site, audience, date, staff, work type, rework)` groups in SQL from current `event_facts`, adding a `production_date` column to `event_facts` (computed by TypeScript at materialization) so SQL only sums.
+     - (b) Staged delta rows per partition, applied additively, which needs per-partition old contributions.
+     - *Recommendation:* (a), which keeps the date rule in TypeScript and makes publish a pure aggregation of saved facts.
+  5. **Backfill/rebuild flow.** Begin (Part A) refuses until a continuous published base exists, so the first generation needs a rebuild path. 0037 has `batches.rebuild_cursor` but no candidate mirror. *Proposal:* 0038 adds `reporting_private.source_candidate(batch_id, site, event_id, image, event_created_at, order_key, parent_event_id, staff_id)` and service-only RPCs:
+     - `begin_reporting_rebuild(p_site)`: requires capture enabled; reserves the site's sole batch; records the epoch.
+     - `copy_reporting_source_page(p_batch, p_fence, p_after_event_id)`: at most 1,000 rows keyset by `(location, id)`, with a persisted cursor and page checksum.
+     - `freeze_reporting_rebuild(p_batch, p_fence)`: single-statement journal freeze and overlay onto the candidate.
+
+     Publish then swaps the candidate into `source_current`. These go beyond the five listed RPCs.
+  6. **Lease renewal.** The 30 s heartbeat is Task 15's, but needs an RPC. *Proposal:* `renew_reporting_lease(p_batch, p_fence)`, which extends the lease and returns the fence, and refuses an obsolete fence; or `claim_reporting_work` doubles as renewal.
+  7. **Self audiences per batch.** *Proposal:* a refresh re-materializes the site audience plus every staff id in the frozen old/new images of the batch's changed and dependency partitions. A rebuild covers every staff id with rows at the site.
+
+  Until these are decided, Part B is not written, and Task 13 stays unchecked. Part A can be reviewed, rehearsed and applied independently; the fence runner needs it applied.
 - No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
 
 ## Amendment implementation log
@@ -478,6 +499,36 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
   - Enabled capture at epoch 2 for `staging-results-reporting-capture-concurrency-20261114T150210669Z-35dbd11a.md`: COMPLETE; first transaction held 680 ms, second finished in 90 ms, exact private journal check and fresh restoration passed. Then disabled capture again, epoch 3, pending the activation protocol.
   - Final fresh SQL: capture false, journal/generations/test events/synthetic products all zero; all three sites legacy/off. Installed schema remains. No production access, source fixture retention, merge or deploy. Evidence artifacts remain ignored/uncommitted; this plan records their disposition.
   - Task 13 includes the explicit activation/shared-lock and cross-site receipt decisions above. Prepare its code/tests, common gate, commit/push and pause for migration review before any SQL application. Existing 0037 is now installed and immutable. Task 19 performance and Task 20 browser/hosting/release evidence remain open.
+- 2026-11-14 (Claude, Task 13 Part A; no SQL run; checkbox open; Part B blocked on Open questions "Task 13 Part B"):
+  - **`supabase/migrations/0038_reporting_jobs.sql` (draft, Part A)**, one transaction:
+    - **Fence:** `GRANT UPDATE (updated_at)` on control and policy `control_capture_lock` (`FOR UPDATE TO reporting_capture USING (singleton) WITH CHECK (false)`). `CREATE OR REPLACE` of the capture function: the identical 0037 body, except the control read is `FOR SHARE`, before the enabled check. Owner, ACL and trigger are unchanged. Replacing it needs the owner's privileges, so the migration role holds `INHERIT TRUE, SET FALSE` membership for exactly that statement.
+    - **`public.set_reporting_capture(boolean)`:** SECURITY INVOKER, `search_path=''`, service_role only. It sets the transaction-local `lock_timeout` to 3 s only when the current limit is 0 or above 3 s, then updates control only when the value changes (0037's guard advances the epoch) and returns epoch/enabled. No source writes, no exception handler.
+    - **Receipts:**
+      - Internal `site_pending_changes(site)` (STABLE SQL; pending = unacknowledged, touches the site, no PUBLISHED receipt of that site).
+      - Internal `acknowledge_received_changes(site, batch)` (idempotent; acknowledges only when every distinct supported side has a published receipt; `batch_id` = the completing batch or, in a delayed pass, the latest published receipt, as 0037's ack check requires).
+      - New index `batches(site, state)`. `changes.batch_id` is never a claim, and no max-id cursor is used.
+    - **`public.begin_reporting_batch(site)`:**
+      - Lock order: control `FOR SHARE`, then `site_state FOR UPDATE`. An active batch is returned unchanged (`reused`).
+      - Requires processor enabled, capture enabled, and a published base with `source_epoch` = current epoch; otherwise it says a rebuild is required.
+      - It runs the delayed acknowledgement pass, creates a `refresh` batch with fence +1 and a 360 s lease, then freezes in ONE `WITH` statement: exact membership from `site_pending_changes`, plus the current image or tombstone of this site's old/new keys, plus due future keys from `source_current`. No LIMIT.
+    - **`public.get_reporting_job_status(site)`:** metadata only.
+  - **`api/_lib/reporting-jobs.ts`:** typed wrappers (`setReportingCapture`, `beginReportingBatch`, `getReportingJobStatus`) over a minimal RPC interface. Strict row validation; DB error codes are kept; no env or credentials. Also the pure receipt rules (`pendingForSite`, `acknowledgeable`).
+  - **Runner `tests/staging/reporting-jobs.ts --fence`** (`npm run staging:reporting-jobs`; needs 0038 applied): scenarios F1–F6, with pure checks in the new `tests/staging/reportingFence.ts`.
+    - Guarded/marker-checked clients and no timeout override (scenario-local `lock_timeout` only where the scenario is about lock waits).
+    - Source writes are rolled back. Toggles are committed through the RPC as service_role, and capture returns to its starting state.
+    - A fresh audit runs after success and failure. Every scenario connection is rolled back and ended, and every cleanup failure is reported.
+  - **Capture runner and catalog:**
+    - The concurrency probe now records a failed second-connection disconnect (`cleanup failed: second connection disconnect`).
+    - `CATALOG_SQL` and `checkCatalog` gain 0038 expectations: control column UPDATE privileges, the public RPCs' definer/search_path/execute ACL, helper EXECUTE for service_role only, and the lock policy. `catalogLevel` expects all of 0038 when any of its objects is present, so a partial install fails. 0037's expectations are unchanged.
+    - `runCaptureLifecycle` is now generic over the report type.
+  - Shared helpers moved within the capture module; `package.json` gains `staging:reporting-jobs`, and `typecheck:digest` now includes `api/_lib/reporting-jobs.ts` and `tests/reporting/reportingJobs.test.ts`.
+  - **Tests:** `tests/reporting/reportingJobs.test.ts` and additions to the capture runner/schema tests.
+    - The 0037 file hash is pinned to its installed SHA-256.
+    - 0038 text: fence, privileges, lock order, single-statement freeze, receipts, service-only ACLs.
+    - Receipt model: AU→UK in both publication orders, failure/restart, the other site's active batch, delayed acknowledgement, a late smaller id.
+    - Wrapper validation; 0038 catalog acceptance plus 9 rejected deviations; fence checks plus 12 rejected deviations; runner structure; disconnect reporting.
+  - **Mutations:** 13 deliberate breaks are each caught: FOR KEY SHARE; the lock after the enabled check; a capture_enabled privilege; a permissive lock policy; an uncapped timeout; the wrong lock order; pending ignoring the receipt site; ack after one side; a LIMIT/max-id freeze; a swallowed disconnect; the catalog accepting a capture_enabled UPDATE; fence accepting any old-snapshot result; the receipt model ignoring the site.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest` (now incl. the new API module and tests), 890/890 tests, build OK; strict `tsc --noEmit` clean on the runners and tests; 0037 byte-identical. Part B (claim/stage/publish, rebuild/backfill, receipt interleavings on staging) waits for the planner.
 
 ---
 
