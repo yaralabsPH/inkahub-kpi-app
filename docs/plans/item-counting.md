@@ -328,6 +328,7 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
   - After ROLLBACK, `work_mem` was 2,184 kB again and the user was back to `postgres`.
   - Report: `staging-results-item-counting-timeout-diag-1.md`. Interpretation under Open questions.
 - 2026-11-14 (Astra): wrote the planner decision and pending Task 10 amendment v2 with matching Task 19/global-constraint proposals, document-only; retained evidence reviewed, no staging/SQL/benchmark run, app edit, checkbox change, commit or approval claimed.
+- 2026-11-14 (Claude, recording CJ's decision): CJ approved "Proposed Task 10 amendment v2" and the matching Task 19 and global-constraints proposals, and explicitly accepted the interim operational risk in the Planner decision ("Approve, accept risk"). Possible intermittent slow or unavailable three-month Reports until the published path is enabled; first-call outliers on operational reads. Task 10 now closes on the retained evidence listed in v2, plus review round 3 (last allowed), focused/common checks, green PR CI and the Vercel entitlement record (still a deployment blocker). No checkbox changed; no staging run requested.
 
 ---
 
