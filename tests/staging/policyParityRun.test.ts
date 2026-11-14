@@ -5,7 +5,7 @@
  * No real database or network.
  */
 import { describe, expect, it, vi } from "vitest";
-import { collectCaseParity, PRE_0036_RESTORE, readerSql, type QueryClient } from "./policyParityRun";
+import { collectCaseParity, placeholderCount, PRE_0036_RESTORE, readerParams, readerSql, type QueryClient } from "./policyParityRun";
 import { PRE_0036_RESTORE as WRITE_COMPAT_RESTORE } from "./writeCompatRun";
 import {
   casesModeArgProblems,
@@ -69,6 +69,9 @@ class FakeDb implements QueryClient {
   async query(raw: string, params: unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount?: number }> {
     const sql = raw.trim().replace(/\s+/g, " ");
     this.log.push({ sql, params, inTx: this.inTx, policy: this.state.policy });
+    // Like Postgres' extended protocol: bind values must match the statement's placeholders exactly.
+    const need = placeholderCount(sql);
+    if (params.length !== need) throw new Error(`bind message supplies ${params.length} parameters, but prepared statement "" requires ${need}`);
     const err = this.failWhen(sql, params, this);
     if (err) throw err;
     const ok = { rows: [{ ok: true }] };
@@ -260,7 +263,9 @@ describe("collectCaseParity (review r1 M6, r2)", () => {
     expect(reads.length).toBeGreaterThan(0);
     expect(reads.every((x) => x.sql.includes("created_at <= $4::timestamptz") && x.params[3] === "2026-11-12T00:00:00.000Z")).toBe(true);
     const replays = db.log.filter((x) => x.sql.startsWith("select (to_jsonb(t)"));
-    expect(replays.every((x) => x.params[1] === "2026-11-12T00:00:00.000Z")).toBe(true);
+    expect(replays.length).toBeGreaterThan(0);
+    // Replays that use the cutoff ($2) bind it; fixed-window readers bind only the site.
+    expect(replays.every((x) => (x.sql.includes("$2") ? x.params[1] === "2026-11-12T00:00:00.000Z" : x.params.length === 1))).toBe(true);
     for (const probe of READER_PROBES) {
       const sql = readerSql(probe);
       expect(sql.includes("$2::timestamptz") || /< '20\d\d-/.test(sql)).toBe(true);
@@ -268,6 +273,19 @@ describe("collectCaseParity (review r1 M6, r2)", () => {
     // The readers keep their own limits.
     expect(readerSql("live-order-completions")).toContain("limit 500");
     expect(readerSql("production-clock-state")).toContain("limit 1");
+  });
+
+  it("each reader replay binds exactly the placeholders its SQL uses (staging run 2026-11-14)", async () => {
+    expect(readerParams("daily-timesheet", "au")).toEqual(["au"]);
+    expect(readerParams("reports-export-extras", "au")).toEqual(["au"]);
+    expect(readerParams("currently-clocked-in", "au")).toEqual(["au", "2026-11-12T00:00:00.000Z"]);
+    expect(readerParams("reports-order-search", "uk")).toEqual(["uk", "2026-11-12T00:00:00.000Z", ["VOL-UK-20260915-1", "VOL-UK-20260915-2", "VOL-UK-20260915-3"]]);
+    for (const probe of READER_PROBES) expect(readerParams(probe, "au").length).toBe(placeholderCount(readerSql(probe)));
+    // The fake rejects a bind-count mismatch the way Postgres does, so the whole collection proves it end to end.
+    const db = new FakeDb();
+    const coll = await collectCaseParity(db, opts());
+    expect(coll.problems.filter((p) => p.includes("bind message"))).toEqual([]);
+    await expect(db.query("select $1::text", ["a", "b"])).rejects.toThrow(/bind message supplies 2 parameters/);
   });
 
   it("the same count with different ids under the restored policies fails", async () => {

@@ -132,6 +132,18 @@ export function readerSql(probe: (typeof READER_PROBES)[number]): string {
   return `select (to_jsonb(t) - 'parity_ord')::text as j from (${inner}) t order by t.parity_ord`;
 }
 
+/** The highest `$N` placeholder a statement uses (Postgres requires exactly that many bind values). */
+export function placeholderCount(sql: string): number {
+  let n = 0;
+  for (const m of sql.matchAll(/\$(\d+)/g)) n = Math.max(n, Number(m[1]));
+  return n;
+}
+
+/** Bind values for one reader replay: only the placeholders its SQL uses. */
+export function readerParams(probe: (typeof READER_PROBES)[number], site: string): unknown[] {
+  return [site, STAGING_CUTOFF, sampleOrders(site)].slice(0, placeholderCount(readerSql(probe)));
+}
+
 /** A session with no subject: authenticated, but auth.uid() is NULL (must see nothing). */
 export const NO_SUBJECT_CLAIMS = JSON.stringify({ role: "authenticated", aud: "authenticated" });
 
@@ -262,7 +274,7 @@ export async function readRoleSnapshot(client: QueryClient, role: string, bounds
       if (snap.errors.length) break;
       await client.query("savepoint parity_read");
       try {
-        const r = await client.query(readerSql(probe), [site, STAGING_CUTOFF, sampleOrders(site)]);
+        const r = await client.query(readerSql(probe), readerParams(probe, site));
         const rows = r.rows.map((x) => String(x.j));
         snap.readers[`${probe}:${site}`] = READER_SPECS[probe].order ? rows : rows.sort();
         await client.query("release savepoint parity_read");
