@@ -4,7 +4,7 @@
  * never show one scope's events or counts under another.
  */
 import { describe, expect, it } from "vitest";
-import { createOrderLookupSession, type OrderLookupView } from "../orderLookupSession";
+import { createOrderLookupSession, viewForScope, type OrderLookupView } from "../orderLookupSession";
 import { loadOrderLookup, type OrderLookupRequest, type OrderLookupResult } from "../orderLookup";
 import { orderLookupCounts } from "../../../domain/productionReportView";
 
@@ -148,5 +148,52 @@ describe("createOrderLookupSession", () => {
       if (complete) expect(counts).not.toBeNull();
       else expect(counts).toBeNull();
     }
+  });
+
+  // Review r3 R3-2: OrderLookupCard renders `viewForScope(session view, current scopeKey)` and only calls
+  // setScope in an effect AFTER that render. These tests render at the new scope before setScope runs.
+  describe("render before the scope-change effect runs (R3-2)", () => {
+    const render = (s: { view(): OrderLookupView<Ev> }, scopeKey: string) => viewForScope(s.view(), scopeKey);
+
+    it("a resolved old-site result is not rendered under the new site", async () => {
+      const { s, d } = session();
+      const p = s.search("1001");
+      d.pending[0].resolve(hit("au"));
+      await p;
+      expect(render(s, "userA|au").events?.map((e) => e.id)).toEqual(["au-0", "au-1"]);
+      const v = render(s, "userA|uk");
+      expect(v).toEqual({ scopeKey: "userA|uk", searched: null, loading: false, error: null, lookup: null, events: null });
+      s.setScope("userA|uk", "uk"); // the effect
+      expect(render(s, "userA|uk").events).toBeNull();
+    });
+
+    it("a resolved result is not rendered under another account at the same site", async () => {
+      const { s, d } = session();
+      const p = s.search("1001");
+      d.pending[0].resolve(hit("au"));
+      await p;
+      expect(render(s, "userB|au")).toMatchObject({ lookup: null, events: null, searched: null, error: null });
+    });
+
+    it("a late old-scope response arriving before the effect is never rendered, and is discarded once it runs", async () => {
+      const { s, d } = session();
+      const p = s.search("1001");
+      expect(render(s, "userA|uk")).toMatchObject({ loading: false, events: null });
+      d.pending[0].resolve(hit("au")); // lands before setScope: the session still holds scope userA|au
+      await p;
+      expect(s.view().events?.length).toBe(2);
+      expect(render(s, "userA|uk")).toMatchObject({ lookup: null, events: null });
+      s.setScope("userA|uk", "uk");
+      expect(s.view()).toMatchObject({ lookup: null, events: null, searched: null });
+    });
+
+    it("an old-scope error is not rendered under the new scope", async () => {
+      const { s, d } = session();
+      const p = s.search("1001");
+      d.pending[0].reject(new Error("AU read failed"));
+      await p;
+      expect(render(s, "userA|au").error).toBe("AU read failed");
+      expect(render(s, "userA|uk").error).toBeNull();
+    });
   });
 });

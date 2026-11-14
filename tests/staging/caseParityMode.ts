@@ -49,6 +49,9 @@ export function pendingCollection(id: string, at: string, revision: string): Cas
   };
 }
 
+/** Recorded when the run is cancelled after collection but before the evidence is published. */
+export const CANCELLED_AT_PUBLICATION = "cancelled before publication";
+
 export async function runCasesMode(io: CasesModeIO): Promise<{ code: number; status: string; collection: CaseCollection }> {
   const redact = io.redact ?? ((s: string) => s);
   const art: ParityArtifact = io.readArtifact() ?? { snapshots: [], comparisons: [] };
@@ -84,6 +87,8 @@ export async function runCasesMode(io: CasesModeIO): Promise<{ code: number; sta
     if (heartbeat) clearInterval(heartbeat);
     if (client) await client.end().catch(() => {});
   }
+  // A cancel that lands after collection (e.g. while the connection closes) must still fail publication (R3-1).
+  if (io.signal?.aborted && !coll.problems.includes(CANCELLED_AT_PUBLICATION)) coll.problems.push(CANCELLED_AT_PUBLICATION);
   // 3. Store every final validation failure in the collection itself, then publish.
   const problems = caseParityProblems(baselineCatalog(art), coll).map(redact);
   for (const p of problems) if (!coll.problems.includes(p) && !p.startsWith(`parity case `)) coll.problems.push(p);

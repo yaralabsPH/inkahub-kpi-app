@@ -3,7 +3,7 @@ import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshC
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
-import { createOrderLookupSession, type OrderLookupView } from "@/lib/repository/supabase/orderLookupSession";
+import { createOrderLookupSession, viewForScope, type OrderLookupView } from "@/lib/repository/supabase/orderLookupSession";
 import { useAppStore } from "@/lib/state/appStore";
 import { Card, CardHeader, CardTitle, CardBody } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -1008,10 +1008,15 @@ function OrderLookupCard({
     [],
   );
   useEffect(() => session.setScope(scopeKey, location), [session, scopeKey, location]);
-  const current = view ?? session.view();
+  // Filter at render time too: the effect above runs after this render, so a
+  // view from the previous user/site must not be shown in the meantime.
+  const current = viewForScope(view ?? session.view(), scopeKey);
   const { searched, loading, error, lookup, events } = current;
   const setError = useCallback((message: string | null) => session.setError(message), [session]);
-  const runSearch = useCallback(() => session.search(input), [session, input]);
+  const runSearch = useCallback(() => {
+    session.setScope(scopeKey, location);
+    return session.search(input);
+  }, [session, scopeKey, location, input]);
 
   // Per-event Remove action. Owner-only. Deletes the production_events
   // row + any matching ledger rows (parent_event_id) so the audit

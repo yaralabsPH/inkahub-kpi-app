@@ -18,7 +18,7 @@ import {
   type CaseCollection,
   type CaseUser,
 } from "./itemCountingParityCases";
-import { runCasesMode, type CasesModeIO } from "./caseParityMode";
+import { CANCELLED_AT_PUBLICATION, runCasesMode, type CasesModeIO } from "./caseParityMode";
 import { claimsSetting } from "./generate-query-evidence";
 import { checkParityArtifact, parityArtifactHash, policyHash, READER_PROBES, type ParityArtifact } from "./itemCountingPolicyParity";
 import { CATALOG_OTHER, claimsSources, legacyParityArtifact, POST_POLICY_HASH, postPolicies, prePolicies, sessionClaims } from "./gateTestFixtures";
@@ -580,6 +580,28 @@ describe("runCasesMode lifecycle (R2-1)", () => {
     const t2 = io({ newId: () => "coll-10" });
     await runCasesMode(t2.value);
     expect(parityArtifactHash(t1.artifact()!)).not.toBe(parityArtifactHash(t2.artifact()!));
+  });
+
+  it("a cancel while the connection closes, after a clean collection, fails publication (R3-1)", async () => {
+    const ac = new AbortController();
+    const t = io({ signal: ac.signal });
+    let release!: () => void;
+    const closed = new Promise<void>((r) => (release = r));
+    t.value.connect = async () => Object.assign(t.db, { end: async () => { ac.abort(); await closed; } });
+    const run = runCasesMode(t.value);
+    await new Promise((r) => setTimeout(r, 0));
+    release();
+    const r = await run;
+    expect(ac.signal.aborted).toBe(true);
+    expect(r.code).toBe(1);
+    expect(r.status).toMatch(/^STATUS: FAILED – /);
+    expect(t.artifact()!.cases!.problems).toContain(CANCELLED_AT_PUBLICATION);
+    // The gate reads this artifact before any API timing or phase write; a failing artifact blocks both.
+    expect(checkParityArtifact(t.artifact(), POST_POLICY_HASH).length).toBeGreaterThan(0);
+    expect(t.reports.at(-1)!).toMatch(/STATUS: FAILED – /);
+    // Rollback and the fresh restoration check still ran.
+    expect(t.db.log.some((x) => x.sql === "rollback")).toBe(true);
+    expect(t.artifact()!.cases!.restoration).not.toBeNull();
   });
 
   it("never writes a heartbeat after finishing", async () => {

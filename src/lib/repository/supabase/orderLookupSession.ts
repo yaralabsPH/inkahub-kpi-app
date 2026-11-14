@@ -36,6 +36,17 @@ export interface OrderLookupSession<T> {
   reset(): void;
 }
 
+/**
+ * What a render may show for the CURRENT scope. Until the scope change has
+ * reached the session (React runs `setScope` in an effect after rendering),
+ * a view from another user/site is replaced by an empty one, so old results,
+ * counts or errors never render under the new scope (review r3 R3-2).
+ */
+export function viewForScope<T>(view: OrderLookupView<T>, scopeKey: string): OrderLookupView<T> {
+  if (view.scopeKey === scopeKey) return view;
+  return { scopeKey, searched: null, loading: false, error: null, lookup: null, events: null };
+}
+
 export function createOrderLookupSession<T>(deps: {
   load: (req: OrderLookupRequest) => Promise<OrderLookupResult<T>>;
   normalize: (raw: string) => string;
