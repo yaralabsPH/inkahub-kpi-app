@@ -328,17 +328,17 @@ describe("staging catalog check at 0038", () => {
 // Fence staging checks (pure) and runner structure
 // ---------------------------------------------------------------------------
 
-import { checkFence, FENCE_SCENARIOS, fenceMarkdown, fenceStatus, newFenceReport, type FenceObservation } from "../staging/reportingFence";
+import { capLimit, checkFence, FENCE_SCENARIOS, fenceMarkdown, fenceStatus, launch, near, newFenceReport, type FenceObservation } from "../staging/reportingFence";
 
 const FENCE_RUNNER = readFileSync("tests/staging/reporting-jobs.ts", "utf8");
 
 function goodFence(): FenceObservation[] {
   return [
-    { id: "F1", secondWriterMs: 40, secondWriterError: null },
+    { id: "F1", existingLockMs: 0, writerLimitMs: 3000, secondWriterMs: 40, secondWriterError: null },
     { id: "F2", toggleWaited: true, queuedWriterWaited: true, epochBefore: 4, epochAfter: 5, journalRows: 1, journalEpoch: 5 },
     { id: "F3", oldSnapshotError: "error 40001" },
     { id: "F4", epochBefore: 6, epochAfterDisable: 7, epochAfterEnable: 8, journalRows: 1, journalEpoch: 8 },
-    { id: "F5", timeoutError: "error 55P03", timeoutMs: 3010, stricterError: "error 55P03", stricterMs: 1005, controlUnchanged: true },
+    { id: "F5", existingLockMs: 0, defaultLimitMs: 3000, timeoutError: "error 55P03", timeoutMs: 3010, stricterLimitMs: 1000, stricterError: "error 55P03", stricterMs: 1005, controlUnchanged: true },
     { id: "F6", lockRows: 1, updateUpdatedAtError: "error 42501", updateEnabledError: "error 42501" },
   ];
 }
@@ -356,8 +356,8 @@ describe("activation fence checks", () => {
     ["queued writer missed the new row", (o) => void Object.assign(o[1], { journalRows: 0, journalEpoch: null }), /F2: queued writer journal rows 0/],
     ["old snapshot wrote untracked", (o) => void (o[2].oldSnapshotError = null), /F3: old-snapshot writer gave no error/],
     ["epoch not advanced per toggle", (o) => void (o[3].epochAfterEnable = 7), /F4: epochs/],
-    ["timeout beyond 3 s", (o) => void (o[4].timeoutMs = 8000), /F5: default limit/],
-    ["stricter limit ignored", (o) => void (o[4].stricterMs = 3000), /F5: stricter/],
+    ["timeout beyond 3 s", (o) => void (o[4].timeoutMs = 8000), /F5: toggle gave error 55P03 after 8000 ms/],
+    ["stricter limit ignored", (o) => void (o[4].stricterMs = 3000), /F5: stricter toggle/],
     ["control changed by a timed-out toggle", (o) => void (o[4].controlUnchanged = false), /F5: control changed/],
     ["capture role could update", (o) => void (o[5].updateUpdatedAtError = null), /F6: UPDATE\(updated_at\)/],
     ["capture role could not lock", (o) => void (o[5].lockRows = 0), /F6: capture role FOR SHARE/],
@@ -398,5 +398,138 @@ describe("activation fence checks", () => {
     expect(FENCE_RUNNER).toMatch(/const queuedWriterWaited = await waitingOnLock\(mon, dPid\);\r?\n\s+await c\.query\("commit"\);/);
     expect(FENCE_RUNNER).toMatch(/cleanup failed: scenario connection/);
     expect(FENCE_RUNNER).toMatch(/runCaptureLifecycle\(report, \{/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 13 Part A focused review fixes (T13A-1..3)
+// ---------------------------------------------------------------------------
+
+import { captureStatus as captureStatus13, newCaptureReport, runCaptureLifecycle, type LifecycleClient } from "../staging/reportingCapture";
+
+const flush = () => new Promise((r) => setTimeout(r, 30));
+
+describe("T13A-1: launched queries are observed at once", () => {
+  function watchUnhandled() {
+    const seen: unknown[] = [];
+    const on = (e: unknown) => void seen.push(e);
+    process.on("unhandledRejection", on);
+    return { seen, stop: () => void process.off("unhandledRejection", on) };
+  }
+
+  it("an early query failure raises no unhandledRejection and is rethrown, unchanged, where awaited", async () => {
+    const w = watchUnhandled();
+    try {
+      const err = Object.assign(new Error("permission denied for function set_reporting_capture"), { code: "42501" });
+      const q = launch(Promise.reject(err));
+      await flush();
+      expect(w.seen).toEqual([]);
+      expect(q.settled()).toBe(true);
+      await expect(q.result()).rejects.toBe(err);
+      const ok = launch(Promise.resolve({ rows: [{ capture_epoch: 5 }] }));
+      expect((await ok.result()).rows[0].capture_epoch).toBe(5);
+    } finally {
+      w.stop();
+    }
+  });
+
+  it("a polling failure while a query is pending: the polling error surfaces, the pending rejection is observed, cleanup runs", async () => {
+    const w = watchUnhandled();
+    try {
+      const queryErr = Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" });
+      const pending = launch(new Promise((_, rej) => setTimeout(() => rej(queryErr), 20)));
+      const cleaned: string[] = [];
+      const pollFails = async (): Promise<boolean> => {
+        throw new Error("monitor connection lost"); // e.g. waitingOnLock() failing
+      };
+      const scenario = async () => {
+        try {
+          await pollFails();
+          await pending.result();
+        } finally {
+          cleaned.push("rollback", "end");
+        }
+      };
+      await expect(scenario()).rejects.toThrow("monitor connection lost");
+      expect(cleaned).toEqual(["rollback", "end"]);
+      await flush();
+      expect(w.seen).toEqual([]);
+      expect(pending.settled()).toBe(true);
+      await expect(pending.result()).rejects.toBe(queryErr);
+    } finally {
+      w.stop();
+    }
+  });
+
+  it("the runner launches F2's toggle and queued write through launch() and inspects them where awaited", () => {
+    expect(FENCE_RUNNER).toMatch(/const enable = launch\(c\.query\("select capture_epoch from public\.set_reporting_capture\(true\)"\)\);/);
+    expect(FENCE_RUNNER).toMatch(/const write = launch\(d\.query\(INS\("rj-f2-d"\), \[ctx\.staff\]\)\);/);
+    expect(FENCE_RUNNER).toMatch(/await enable\.result\(\)/);
+    expect(FENCE_RUNNER).toMatch(/await write\.result\(\)/);
+    // No other query promise is held un-awaited in a variable.
+    expect(FENCE_RUNNER).not.toMatch(/const \w+ = (?!await |launch\()[a-z]\.query\(/);
+  });
+});
+
+describe("T13A-2: an audit connection that cannot be closed fails the evidence", () => {
+  it("records the cleanup failure and the run is FAILED even though the fresh audit passed", async () => {
+    let opened = 0;
+    const client = (endFails: boolean): LifecycleClient => ({
+      query: async () => ({ rows: [] }),
+      end: async () => {
+        if (endFails) throw new Error("terminating connection due to administrator command");
+      },
+    });
+    const report = newCaptureReport("check", "rev", "t0");
+    report.overhead = { offPerRowMs: 0.5, onPerRowMs: 0.6, deltaPerRowMs: 0.1, ratio: 1.2, rounds: 3 };
+    await runCaptureLifecycle(report, {
+      open: async () => client(opened++ === 1),
+      body: async () => {},
+      audit: async () => [],
+      save: () => {},
+      now: () => "t1",
+      redact: (x: string) => x,
+    });
+    expect(report.restorationVerified).toBe(true);
+    expect(report.errors).toEqual(["cleanup failed: audit disconnect: terminating connection due to administrator command"]);
+    expect(captureStatus13(report)).toMatch(/^STATUS: FAILED – cleanup failed: audit disconnect/);
+  });
+});
+
+describe("T13A-3: scenario lock limits never loosen a stricter existing limit", () => {
+  it("capLimit keeps a stricter existing limit and applies the scenario limit otherwise", () => {
+    expect(capLimit(3000, 0)).toBe(3000);
+    expect(capLimit(3000, 500)).toBe(500);
+    expect(capLimit(1000, 500)).toBe(500);
+    expect(capLimit(3000, 8000)).toBe(3000);
+    expect(capLimit(1000, 2000)).toBe(1000);
+    expect(capLimit(3000, undefined)).toBeNaN();
+    expect(near(510, 500)).toBe(true);
+    expect(near(3010, 500)).toBe(false);
+    expect(near(300, 500)).toBe(false);
+  });
+
+  it("a 500 ms existing limit stays 500 ms and is assessed correctly", () => {
+    const o = goodFence().map((x) => ({ ...x }));
+    Object.assign(o[0], { existingLockMs: 500, writerLimitMs: 500, secondWriterMs: 40 });
+    Object.assign(o[4], { existingLockMs: 500, defaultLimitMs: 500, timeoutMs: 512, stricterLimitMs: 500, stricterMs: 507 });
+    expect(checkFence(o)).toEqual([]);
+    const loosened = o.map((x) => ({ ...x }));
+    Object.assign(loosened[0], { writerLimitMs: 3000 });
+    expect(checkFence(loosened).join()).toMatch(/F1: writer limit 3000 ms does not respect the existing 500 ms/);
+    const wrongAssessment = o.map((x) => ({ ...x }));
+    Object.assign(wrongAssessment[4], { defaultLimitMs: 3000, timeoutMs: 3010 });
+    expect(checkFence(wrongAssessment).join()).toMatch(/F5: function limit 3000 ms, expected 500 ms/);
+    const early = o.map((x) => ({ ...x }));
+    Object.assign(early[4], { timeoutMs: 100 });
+    expect(checkFence(early).join()).toMatch(/F5: toggle gave error 55P03 after 100 ms \(expected 55P03 near 500 ms\)/);
+  });
+
+  it("the runner reads the existing limit, never hard-codes one, and records what it used", () => {
+    expect(FENCE_RUNNER).not.toMatch(/set local lock_timeout/i);
+    expect(FENCE_RUNNER).toMatch(/const limit = await setLocalLockLimit\(b, 3000\);/);
+    expect(FENCE_RUNNER).toMatch(/if \(stricter\) await setLocalLockLimit\(c, 1000\);/);
+    expect(FENCE_RUNNER).toMatch(/const defaultLimitMs = capLimit\(3000, existing\);/);
+    expect(FENCE_RUNNER).toMatch(/if \(used !== existing\) await c\.query\("select set_config\('lock_timeout', \$1, true\)", \[`\$\{used\}ms`\]\);/);
   });
 });

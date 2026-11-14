@@ -23,7 +23,7 @@ import { assertStagingSupabaseUrl } from "./measure-item-counting";
 import { redactSecrets } from "./itemCountingPolicyParity";
 import { become } from "./writeCompatRun";
 import { CATALOG_SQL, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
-import { checkFence, fenceMarkdown, fenceStatus, newFenceReport, type FenceObservation } from "./reportingFence";
+import { capLimit, checkFence, fenceMarkdown, fenceStatus, launch, newFenceReport, type FenceObservation } from "./reportingFence";
 
 const ENV_FILE = ".env.staging.local";
 
@@ -81,6 +81,19 @@ async function toggle(ctx: Ctx, enabled: boolean): Promise<number> {
   }
 }
 
+/** The connection's effective lock_timeout in ms (0 = none); never changed by the runner. */
+async function existingLockMs(c: pg.Client): Promise<number> {
+  return Number((await c.query("select setting::bigint as ms from pg_catalog.pg_settings where name = 'lock_timeout'")).rows[0].ms);
+}
+
+/** Set a scenario-local lock limit that never loosens the existing one. */
+async function setLocalLockLimit(c: pg.Client, wantMs: number): Promise<{ existing: number; used: number }> {
+  const existing = await existingLockMs(c);
+  const used = capLimit(wantMs, existing);
+  if (used !== existing) await c.query("select set_config('lock_timeout', $1, true)", [`${used}ms`]);
+  return { existing, used };
+}
+
 async function controlState(c: pg.Client): Promise<{ epoch: number; enabled: boolean }> {
   const r = await c.query(`select capture_epoch, capture_enabled from ${REPORTING_SCHEMA}.control where singleton`);
   return { epoch: Number(r.rows[0].capture_epoch), enabled: Boolean(r.rows[0].capture_enabled) };
@@ -125,14 +138,14 @@ async function f1(ctx: Ctx): Promise<FenceObservation> {
     await become(a, "staff", ctx.claims);
     await a.query(INS("rj-f1-a"), [ctx.staff]);
     await b.query("begin");
-    await b.query("set local lock_timeout = '3s'");
+    const limit = await setLocalLockLimit(b, 3000);
     await become(b, "staff", ctx.claims);
     const t = performance.now();
     try {
       await b.query(INS("rj-f1-b"), [ctx.staff]);
-      return { id: "F1", secondWriterMs: Math.round(performance.now() - t), secondWriterError: null };
+      return { id: "F1", existingLockMs: limit.existing, writerLimitMs: limit.used, secondWriterMs: Math.round(performance.now() - t), secondWriterError: null };
     } catch (e) {
-      return { id: "F1", secondWriterMs: null, secondWriterError: errText(e) };
+      return { id: "F1", existingLockMs: limit.existing, writerLimitMs: limit.used, secondWriterMs: null, secondWriterError: errText(e) };
     }
   });
 }
@@ -146,18 +159,19 @@ async function f2(ctx: Ctx): Promise<FenceObservation> {
     const cPid = Number((await c.query("select pg_backend_pid() as p")).rows[0].p);
     await c.query("begin");
     await become(c, "service_role", ctx.claims);
-    const enable = c.query("select capture_epoch from public.set_reporting_capture(true)");
+    // T13A-1: observed at once, inspected (or rethrown) where awaited; polling failures still clean up.
+    const enable = launch(c.query("select capture_epoch from public.set_reporting_capture(true)"));
     const toggleWaited = await waitingOnLock(mon, cPid);
     await a.query("rollback"); // the disabled-period write ends (nothing kept)
-    const epochAfter = Number((await enable).rows[0].capture_epoch);
+    const epochAfter = Number((await enable.result()).rows[0].capture_epoch);
     // The toggle is applied but NOT committed: a READ COMMITTED writer queues behind it.
     const dPid = Number((await d.query("select pg_backend_pid() as p")).rows[0].p);
     await d.query("begin");
     await become(d, "staff", ctx.claims);
-    const write = d.query(INS("rj-f2-d"), [ctx.staff]);
+    const write = launch(d.query(INS("rj-f2-d"), [ctx.staff]));
     const queuedWriterWaited = await waitingOnLock(mon, dPid);
     await c.query("commit");
-    await write;
+    await write.result();
     await d.query("reset role");
     const j = await d.query(`select count(*)::int as n, max(capture_epoch) as e from ${REPORTING_SCHEMA}.changes where new_event_id = 'rj-f2-d'`);
     return { id: "F2", toggleWaited, queuedWriterWaited, epochBefore, epochAfter, journalRows: Number(j.rows[0].n), journalEpoch: j.rows[0].e === null ? null : Number(j.rows[0].e) };
@@ -200,9 +214,11 @@ async function f5(ctx: Ctx): Promise<FenceObservation> {
     await a.query("begin");
     await become(a, "staff", ctx.claims);
     await a.query(INS("rj-f5-a"), [ctx.staff]); // holds the control share lock
+    const existing = await existingLockMs(c);
+    const defaultLimitMs = capLimit(3000, existing); // what set_reporting_capture applies
     const attempt = async (stricter: boolean) => {
       await c.query("begin");
-      if (stricter) await c.query("set local lock_timeout = '1s'");
+      if (stricter) await setLocalLockLimit(c, 1000);
       await become(c, "service_role", ctx.claims);
       const t = performance.now();
       try {
@@ -218,7 +234,10 @@ async function f5(ctx: Ctx): Promise<FenceObservation> {
     const s = await attempt(true);
     await a.query("rollback");
     const after = await controlState(mon);
-    return { id: "F5", timeoutError: d.error, timeoutMs: d.ms, stricterError: s.error, stricterMs: s.ms, controlUnchanged: after.epoch === before.epoch && after.enabled === before.enabled };
+    return {
+      id: "F5", existingLockMs: existing, defaultLimitMs, timeoutError: d.error, timeoutMs: d.ms, stricterLimitMs: capLimit(1000, existing),
+      stricterError: s.error, stricterMs: s.ms, controlUnchanged: after.epoch === before.epoch && after.enabled === before.enabled,
+    };
   });
 }
 

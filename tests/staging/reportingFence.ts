@@ -11,7 +11,7 @@ export const FENCE_SCENARIOS = [
   { id: "F2", what: "enabling capture waits for an uncommitted disabled-period write; a READ COMMITTED writer queued behind the toggle then sees capture enabled" },
   { id: "F3", what: "a REPEATABLE READ writer whose snapshot predates the enable fails with a serialization error instead of writing untracked" },
   { id: "F4", what: "disable then re-enable advances the epoch by one each; a later write carries the new epoch" },
-  { id: "F5", what: "a toggle blocked by an open writer times out after at most 3 s (or a stricter existing limit) and leaves control unchanged" },
+  { id: "F5", what: "a toggle blocked by an open writer times out after at most 3 s (or a stricter existing limit, kept as is) and leaves control unchanged" },
   { id: "F6", what: "the capture role can lock the control row but cannot update it (WITH CHECK false; no capture_enabled privilege)" },
 ] as const;
 export type FenceId = (typeof FENCE_SCENARIOS)[number]["id"];
@@ -19,6 +19,10 @@ export type FenceId = (typeof FENCE_SCENARIOS)[number]["id"];
 /** Observed facts per scenario; every value is measured by the runner, never assumed. */
 export interface FenceObservation {
   id: FenceId;
+  /** Effective session lock_timeout on the scenario connection, ms (0 = no limit). */
+  existingLockMs?: number;
+  /** F1: the scenario-local limit actually used (min of 3 s and the existing limit). */
+  writerLimitMs?: number;
   /** F1: second writer finished; ms. */
   secondWriterMs?: number | null;
   secondWriterError?: string | null;
@@ -39,14 +43,53 @@ export interface FenceObservation {
   /** F5: default and stricter-limit toggle attempts. */
   timeoutError?: string | null;
   timeoutMs?: number;
+  /** F5: the limit set_reporting_capture applies (min of 3 s and the existing limit). */
+  defaultLimitMs?: number;
   stricterError?: string | null;
   stricterMs?: number;
+  /** F5: the stricter scenario-local limit used (min of 1 s and the existing limit). */
+  stricterLimitMs?: number;
   controlUnchanged?: boolean;
   /** F6: results as the capture role. */
   lockRows?: number | null;
   updateUpdatedAtError?: string | null;
   updateEnabledError?: string | null;
   error?: string | null;
+}
+
+/** A scenario-local limit never loosens an existing one (0 = no existing limit). */
+export function capLimit(wantMs: number, existingMs: number | undefined): number {
+  if (existingMs === undefined || !Number.isFinite(existingMs) || existingMs < 0) return Number.NaN;
+  return existingMs > 0 && existingMs < wantMs ? existingMs : wantMs;
+}
+
+/** A lock timeout fired close to its limit: not early, and not long after. */
+export function near(ms: number | undefined, limitMs: number | undefined): boolean {
+  if (typeof ms !== "number" || typeof limitMs !== "number" || !Number.isFinite(limitMs)) return false;
+  return ms >= limitMs * 0.8 && ms < limitMs * 1.5 + 500;
+}
+
+/** Observe a launched query at once (no unhandled rejection), and inspect or rethrow it later. */
+export interface Launched<T> {
+  /** Resolves with the value or rejects with the original error, when awaited. */
+  result(): Promise<T>;
+  /** True once the promise has settled (either way). */
+  settled(): boolean;
+}
+export function launch<T>(p: PromiseLike<T>): Launched<T> {
+  let done = false;
+  const outcome: Promise<{ ok: true; v: T } | { ok: false; e: unknown }> = Promise.resolve(p).then(
+    (v) => ((done = true), { ok: true as const, v }),
+    (e) => ((done = true), { ok: false as const, e }),
+  );
+  return {
+    settled: () => done,
+    result: async () => {
+      const o = await outcome;
+      if (o.ok) return o.v;
+      throw o.e;
+    },
+  };
 }
 
 export function checkFence(obs: readonly FenceObservation[]): string[] {
@@ -65,7 +108,8 @@ export function checkFence(obs: readonly FenceObservation[]): string[] {
     const want = (ok: boolean, msg: string) => void (ok || p.push(`${s.id}: ${msg}`));
     switch (s.id) {
       case "F1":
-        want(!o.secondWriterError && typeof o.secondWriterMs === "number" && o.secondWriterMs < 3000, `second writer ${o.secondWriterError ?? `took ${o.secondWriterMs} ms`}`);
+        want(typeof o.writerLimitMs === "number" && o.writerLimitMs > 0 && o.writerLimitMs <= 3000 && o.writerLimitMs === capLimit(3000, o.existingLockMs), `writer limit ${o.writerLimitMs} ms does not respect the existing ${o.existingLockMs} ms`);
+        want(!o.secondWriterError && typeof o.secondWriterMs === "number" && o.secondWriterMs < (o.writerLimitMs ?? 0), `second writer ${o.secondWriterError ?? `took ${o.secondWriterMs} ms`} (limit ${o.writerLimitMs} ms)`);
         break;
       case "F2":
         want(o.toggleWaited === true, "the enable did not wait for the open disabled-period write");
@@ -81,8 +125,10 @@ export function checkFence(obs: readonly FenceObservation[]): string[] {
         want(o.journalRows === 1 && o.journalEpoch === o.epochAfterEnable, `journal rows ${o.journalRows} at epoch ${o.journalEpoch}`);
         break;
       case "F5":
-        want(o.timeoutError === "error 55P03" && typeof o.timeoutMs === "number" && o.timeoutMs >= 2500 && o.timeoutMs < 6000, `default limit gave ${o.timeoutError} after ${o.timeoutMs} ms (expected 55P03 near 3 s)`);
-        want(o.stricterError === "error 55P03" && typeof o.stricterMs === "number" && o.stricterMs < 2500, `stricter 1 s limit gave ${o.stricterError} after ${o.stricterMs} ms`);
+        want(o.defaultLimitMs === capLimit(3000, o.existingLockMs), `function limit ${o.defaultLimitMs} ms, expected ${capLimit(3000, o.existingLockMs)} ms for an existing ${o.existingLockMs} ms`);
+        want(o.timeoutError === "error 55P03" && near(o.timeoutMs, o.defaultLimitMs), `toggle gave ${o.timeoutError} after ${o.timeoutMs} ms (expected 55P03 near ${o.defaultLimitMs} ms)`);
+        want(o.stricterLimitMs === capLimit(1000, o.existingLockMs), `stricter limit ${o.stricterLimitMs} ms, expected ${capLimit(1000, o.existingLockMs)} ms`);
+        want(o.stricterError === "error 55P03" && near(o.stricterMs, o.stricterLimitMs), `stricter toggle gave ${o.stricterError} after ${o.stricterMs} ms (expected 55P03 near ${o.stricterLimitMs} ms)`);
         want(o.controlUnchanged === true, "control changed after a timed-out toggle");
         break;
       case "F6":

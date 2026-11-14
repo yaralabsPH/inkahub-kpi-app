@@ -410,6 +410,20 @@ At `edb5ab124c47130e7aea28338d8e251d7041fab7`, independent read-only review pass
 - **T13A-3:** `tests/staging/reporting-jobs.ts:128,205` replaces a stricter existing lock timeout with 3 s/1 s; `reportingFence.ts:84` then assumes the default must take at least 2.5 s. Cap every scenario-local limit to the effective existing limit, record that limit and evaluate timeout evidence against it. A 500 ms existing limit must remain 500 ms and be assessed correctly. Do not change statement/session timeouts.
 
 **Next handoff:** fix only T13A-1–3, add regression tests, run focused/common checks, commit/push and pause for focused verification. The Part B contract is approved for subsequent work after those fixes are verified. Root remains the planner and Claude the sole coder; no application or SQL edit by root.
+
+**Coder response (Claude, 2026-11-14; runner code and tests only; no SQL run; 0037/0038 untouched):**
+- **T13A-1:**
+  - New `launch(promise)` in `tests/staging/reportingFence.ts` attaches a non-throwing outcome handler immediately. `result()` returns the value or rethrows the original error where it is awaited; `settled()` reports the state.
+  - F2's toggle and queued write are both launched this way, and awaited via `enable.result()` / `write.result()`. A polling failure while they are pending therefore leaves no unhandled rejection, and `withClients` still rolls back and ends every scenario connection, so the fresh audit runs.
+  - Tests: an early rejection raises no `unhandledRejection` and is rethrown unchanged. With a polling failure while a query is pending, the polling error surfaces, cleanup runs, and the later query rejection is observed. A runner check asserts no other query promise is held un-awaited.
+- **T13A-2:** `runCaptureLifecycle` records `cleanup failed: audit disconnect: …` when the fresh audit connection cannot be closed, so the status is FAILED even when the audit passed. Test: an injected audit-disconnect failure gives `restorationVerified: true` but `STATUS: FAILED – cleanup failed: audit disconnect`. Historical reports are not rewritten.
+- **T13A-3:**
+  - The runner reads each scenario connection's effective `lock_timeout` from `pg_settings` and sets a transaction-local limit only through `setLocalLockLimit(client, want)`. The limit used is `capLimit(want, existing)`: the stricter of the two, with 0 meaning none. The runner no longer contains a literal `set local lock_timeout`, and statement/session timeouts are untouched.
+  - F1 records `existingLockMs`/`writerLimitMs`. F5 records `existingLockMs`, `defaultLimitMs` (= `capLimit(3000, existing)`, what `set_reporting_capture` applies) and `stricterLimitMs` (= `capLimit(1000, existing)`).
+  - `checkFence` checks that each limit used equals the cap, and that each timeout fired `near` its own limit (≥ 0.8× and < 1.5× + 500 ms) rather than near a fixed 3 s.
+  - Tests: `capLimit`/`near` values; a 500 ms existing limit stays 500 ms and passes; using 3 s with a 500 ms existing limit, judging against 3 s, or firing early each fail. Runner checks cover the read-and-cap path.
+- **Regressions proven:** each fix reverted in turn fails its tests. That covers 6 reverts: `launch` not observing; the runner floating the toggle query; the audit disconnect swallowed; the runner forcing 1 s; the cap ignoring a stricter limit; assessment fixed at 3 s.
+- Gate: `npx tsc -b`, `npm run typecheck:digest`, 897/897 tests, build OK; strict `tsc --noEmit` clean on both runners.
 - No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
 
 ## Amendment implementation log

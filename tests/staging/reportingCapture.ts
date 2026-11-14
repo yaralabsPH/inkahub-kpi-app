@@ -693,7 +693,14 @@ export async function runCaptureLifecycle<C extends LifecycleClient, R extends L
     report.restoration = null;
     report.errors.push(`restoration not verified: ${msg(e)}`);
   } finally {
-    if (auditor) await auditor.end().catch(() => {});
+    if (auditor) {
+      try {
+        await auditor.end();
+      } catch (e) {
+        // T13A-2: an audit connection that cannot be closed is a cleanup failure, even when the audit passed.
+        report.errors.push(`cleanup failed: audit disconnect: ${msg(e)}`);
+      }
+    }
     report.finishedAt = io.now();
     io.save();
   }
