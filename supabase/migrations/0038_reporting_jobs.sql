@@ -4,8 +4,9 @@
 -- fence, capture control transition, per-site acknowledgement receipts, the
 -- single-statement batch freeze and job status. Part B1: batch identity and
 -- drift checks, the resumable candidate rebuild (begin/copy/freeze) and lease
--- renewal/takeover/abandon. Part B2 (planning/sealing, chunks, publication)
--- is added to THIS draft at the next checkpoint.
+-- renewal/takeover/abandon. Part B2a: work planning/sealing, bounded claims
+-- and single/bulk chunk staging with exact hash/envelope/ownership checks.
+-- Part B2b (atomic publication) is added to THIS draft at the next checkpoint.
 --
 -- Expand-only. 0034–0037 are not edited. Source table, source policies,
 -- helpers, grants and every timeout are unchanged.
@@ -870,6 +871,489 @@ END
 $fn$;
 
 -- ---------------------------------------------------------------------------
+-- 3c. Task 13 Part B2a: work planning/sealing, bounded claims, chunk staging
+-- ---------------------------------------------------------------------------
+
+-- Additive metadata only (nullable columns; 0037's definitions are unchanged).
+ALTER TABLE reporting_private.batches
+  ADD COLUMN sealed_at timestamptz,
+  ADD COLUMN sealed_work_count integer CHECK (sealed_work_count IS NULL OR sealed_work_count >= 0),
+  ADD COLUMN sealed_manifest_hash text CHECK (sealed_manifest_hash IS NULL OR sealed_manifest_hash ~ '^[0-9a-f]{64}$'),
+  ADD CONSTRAINT batches_seal_all_or_none CHECK ((sealed_at IS NULL) = (sealed_work_count IS NULL) AND (sealed_at IS NULL) = (sealed_manifest_hash IS NULL));
+ALTER TABLE reporting_private.partition_work
+  ADD COLUMN expected_chunk_count integer CHECK (expected_chunk_count IS NULL OR expected_chunk_count >= 1),
+  ADD COLUMN expected_result_digest text CHECK (expected_result_digest IS NULL OR expected_result_digest ~ '^[0-9a-f]{64}$'),
+  ADD CONSTRAINT partition_work_expected_pair CHECK ((expected_chunk_count IS NULL) = (expected_result_digest IS NULL));
+-- Production date computed by TypeScript (site zone, 04:00) at materialization.
+ALTER TABLE reporting_private.event_facts ADD COLUMN production_date date;
+
+-- No work is added to a sealed batch, and a descriptor's identity never changes.
+CREATE FUNCTION reporting_private.partition_work_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF EXISTS (SELECT 1 FROM reporting_private.batches b WHERE b.batch_id = NEW.batch_id AND b.sealed_at IS NOT NULL) THEN
+      RAISE EXCEPTION 'reporting batch % is sealed; no work can be added', NEW.batch_id;
+    END IF;
+  ELSIF NEW.batch_id IS DISTINCT FROM OLD.batch_id OR NEW.audience_kind IS DISTINCT FROM OLD.audience_kind
+     OR NEW.audience_staff IS DISTINCT FROM OLD.audience_staff OR NEW.partition_kind IS DISTINCT FROM OLD.partition_kind
+     OR NEW.partition_key IS DISTINCT FROM OLD.partition_key OR NEW.input_hash IS DISTINCT FROM OLD.input_hash THEN
+    RAISE EXCEPTION 'partition work % descriptor is immutable', OLD.work_id;
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+CREATE TRIGGER partition_work_guard BEFORE INSERT OR UPDATE ON reporting_private.partition_work
+  FOR EACH ROW EXECUTE FUNCTION reporting_private.partition_work_guard();
+
+-- The batch's frozen view of one event: a rebuild's candidate; a refresh's
+-- frozen replacement (NULL image = tombstone), else the published mirror.
+CREATE FUNCTION reporting_private.frozen_image(p_batch uuid, p_event_id text)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+  b   record;
+  img jsonb;
+BEGIN
+  SELECT x.batch_id, x.site, x.kind INTO b FROM reporting_private.batches x WHERE x.batch_id = p_batch;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  IF b.kind = 'rebuild' THEN
+    SELECT sc.image INTO img FROM reporting_private.source_candidate sc WHERE sc.batch_id = p_batch AND sc.site = b.site AND sc.event_id = p_event_id;
+    RETURN img;
+  END IF;
+  SELECT be.image INTO img FROM reporting_private.batch_events be WHERE be.batch_id = p_batch AND be.site = b.site AND be.event_id = p_event_id;
+  IF FOUND THEN RETURN img; END IF;
+  SELECT s.image INTO img FROM reporting_private.source_current s WHERE s.site = b.site AND s.event_id = p_event_id;
+  RETURN img;
+END
+$fn$;
+
+-- The owning partition of a source image: its trimmed nonblank order, else its event id.
+CREATE FUNCTION reporting_private.owner_partition(p_image jsonb)
+RETURNS TABLE (partition_kind text, partition_key text)
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT CASE WHEN coalesce(reporting_private.order_key(p_image ->> 'order_number'), '') <> '' THEN 'order' ELSE 'event' END,
+         CASE WHEN coalesce(reporting_private.order_key(p_image ->> 'order_number'), '') <> '' THEN reporting_private.order_key(p_image ->> 'order_number') ELSE p_image ->> 'id' END
+$fn$;
+
+-- SHA-256 manifest over the batch's saved descriptors (byte-for-byte equal to
+-- reportingManifestHash in api/_lib/reporting-stage.ts): one JSON array line
+-- per work [audienceKind, audienceStaff|null, partitionKind, partitionKey,
+-- inputHash], ordered by audience kind, staff (NULL first), partition kind,
+-- partition key (bytewise, COLLATE "C"), joined by \n, no trailing newline.
+CREATE FUNCTION reporting_private.work_manifest(p_batch uuid)
+RETURNS TABLE (work_count integer, manifest_hash text)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT count(*)::integer,
+         pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(coalesce(string_agg(
+           '[' || pg_catalog.to_json(w.audience_kind)::text || ',' || coalesce(pg_catalog.to_json(w.audience_staff::text)::text, 'null') || ','
+               || pg_catalog.to_json(w.partition_kind)::text || ',' || pg_catalog.to_json(w.partition_key)::text || ',' || pg_catalog.to_json(w.input_hash)::text || ']',
+           E'\n' ORDER BY w.audience_kind COLLATE "C", w.audience_staff::text COLLATE "C" NULLS FIRST, w.partition_kind COLLATE "C", w.partition_key COLLATE "C"), ''), 'UTF8')), 'hex')
+    FROM reporting_private.partition_work w
+   WHERE w.batch_id = p_batch
+$fn$;
+
+-- Save at most 1,000 descriptors (1 MiB) for a frozen, unsealed batch.
+-- Identical replay is a no-op; a conflicting descriptor (same audience and
+-- partition, different input hash) fails the whole call.
+CREATE FUNCTION public.plan_reporting_work(p_batch uuid, p_fence bigint, p_items jsonb)
+RETURNS TABLE (inserted integer, replayed integer, planned_total integer)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  b          reporting_private.batches;
+  v_bad      text;
+  v_inserted integer;
+  v_total    integer;
+BEGIN
+  b := reporting_private.lock_batch(p_batch, p_fence, true);
+  IF b.state <> 'frozen' THEN RAISE EXCEPTION 'reporting batch % is % (planning needs a frozen batch)', p_batch, b.state; END IF;
+  IF b.sealed_at IS NOT NULL THEN RAISE EXCEPTION 'reporting batch % is sealed; no work can be added', p_batch; END IF;
+  IF p_items IS NULL OR pg_catalog.jsonb_typeof(p_items) <> 'array' THEN RAISE EXCEPTION 'plan_reporting_work: items must be an array'; END IF;
+  IF pg_catalog.jsonb_array_length(p_items) > 1000 THEN RAISE EXCEPTION 'plan_reporting_work: at most 1000 descriptors per call'; END IF;
+  IF pg_catalog.octet_length(p_items::text) > 1048576 THEN RAISE EXCEPTION 'plan_reporting_work: request over 1 MiB'; END IF;
+
+  -- Exact descriptor shape: the first problem, in input order.
+  SELECT 'descriptor ' || x.ord || ': ' || x.problem INTO v_bad
+    FROM (
+      SELECT e.ord, CASE
+               WHEN pg_catalog.jsonb_typeof(e.v) <> 'object' THEN 'not an object'
+               WHEN (SELECT string_agg(k, ',' ORDER BY k COLLATE "C") FROM pg_catalog.jsonb_object_keys(e.v) AS k) IS DISTINCT FROM 'audienceKind,audienceStaff,inputHash,partitionKey,partitionKind' THEN 'unexpected keys'
+               WHEN pg_catalog.jsonb_typeof(e.v -> 'audienceKind') <> 'string' OR e.v ->> 'audienceKind' NOT IN ('site', 'self') THEN 'bad audienceKind'
+               WHEN pg_catalog.jsonb_typeof(e.v -> 'audienceStaff') NOT IN ('null', 'string') THEN 'bad audienceStaff'
+               WHEN (e.v ->> 'audienceKind' = 'site') <> (pg_catalog.jsonb_typeof(e.v -> 'audienceStaff') = 'null') THEN 'audienceStaff must be null exactly for the site audience'
+               WHEN pg_catalog.jsonb_typeof(e.v -> 'audienceStaff') = 'string' AND (e.v ->> 'audienceStaff') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN 'bad audienceStaff'
+               WHEN pg_catalog.jsonb_typeof(e.v -> 'partitionKind') <> 'string' OR e.v ->> 'partitionKind' NOT IN ('order', 'event') THEN 'bad partitionKind'
+               WHEN pg_catalog.jsonb_typeof(e.v -> 'partitionKey') <> 'string' OR e.v ->> 'partitionKey' = '' THEN 'bad partitionKey'
+               WHEN e.v ->> 'partitionKind' = 'order' AND reporting_private.order_key(e.v ->> 'partitionKey') IS DISTINCT FROM e.v ->> 'partitionKey' THEN 'order partition key is not a trimmed order key'
+               WHEN pg_catalog.jsonb_typeof(e.v -> 'inputHash') <> 'string' OR e.v ->> 'inputHash' !~ '^[0-9a-f]{64}$' THEN 'bad inputHash'
+             END AS problem
+        FROM pg_catalog.jsonb_array_elements(p_items) WITH ORDINALITY AS e(v, ord)) x
+   WHERE x.problem IS NOT NULL
+   ORDER BY x.ord
+   LIMIT 1;
+  IF v_bad IS NOT NULL THEN RAISE EXCEPTION 'plan_reporting_work: %', v_bad; END IF;
+
+  -- Conflicts: inside this call, or against saved work.
+  WITH items AS (
+    SELECT e.v ->> 'audienceKind' AS ak, (e.v ->> 'audienceStaff')::uuid AS st, e.v ->> 'partitionKind' AS pk, e.v ->> 'partitionKey' AS key, e.v ->> 'inputHash' AS h
+      FROM pg_catalog.jsonb_array_elements(p_items) AS e(v)
+  )
+  SELECT 'conflicting descriptor for ' || i.ak || '/' || coalesce(i.st::text, '-') || '/' || i.pk || '/' || i.key INTO v_bad
+    FROM items i
+   WHERE EXISTS (SELECT 1 FROM items j WHERE j.ak = i.ak AND j.st IS NOT DISTINCT FROM i.st AND j.pk = i.pk AND j.key = i.key AND j.h <> i.h)
+      OR EXISTS (SELECT 1 FROM reporting_private.partition_work w
+                  WHERE w.batch_id = p_batch AND w.audience_kind = i.ak AND w.audience_staff IS NOT DISTINCT FROM i.st
+                    AND w.partition_kind = i.pk AND w.partition_key = i.key AND w.input_hash <> i.h)
+   LIMIT 1;
+  IF v_bad IS NOT NULL THEN RAISE EXCEPTION 'plan_reporting_work: %', v_bad; END IF;
+
+  WITH items AS (
+    SELECT DISTINCT e.v ->> 'audienceKind' AS ak, (e.v ->> 'audienceStaff')::uuid AS st, e.v ->> 'partitionKind' AS pk, e.v ->> 'partitionKey' AS key, e.v ->> 'inputHash' AS h
+      FROM pg_catalog.jsonb_array_elements(p_items) AS e(v)
+  ), ins AS (
+    INSERT INTO reporting_private.partition_work (batch_id, audience_kind, audience_staff, partition_kind, partition_key, input_hash)
+    SELECT p_batch, i.ak, i.st, i.pk, i.key, i.h FROM items i
+    ON CONFLICT (batch_id, audience_kind, audience_staff, partition_kind, partition_key) DO NOTHING
+    RETURNING 1
+  )
+  SELECT count(*)::integer INTO v_inserted FROM ins;
+  SELECT count(*)::integer INTO v_total FROM reporting_private.partition_work w WHERE w.batch_id = p_batch;
+  RETURN QUERY SELECT v_inserted, pg_catalog.jsonb_array_length(p_items) - v_inserted, v_total;
+END
+$fn$;
+
+-- Seal: the exact saved count and manifest must match the worker's; then no
+-- more work. An identical re-seal is a no-op; a different one fails.
+CREATE FUNCTION public.seal_reporting_work(p_batch uuid, p_fence bigint, p_expected_count integer, p_manifest_hash text)
+RETURNS TABLE (batch_id uuid, work_count integer, manifest_hash text, sealed_at timestamptz, replay boolean)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  b       reporting_private.batches;
+  m       record;
+  v_now   timestamptz := now();
+BEGIN
+  b := reporting_private.lock_batch(p_batch, p_fence, true);
+  IF b.state <> 'frozen' THEN RAISE EXCEPTION 'reporting batch % is % (sealing needs a frozen batch)', p_batch, b.state; END IF;
+  IF p_expected_count IS NULL OR p_expected_count < 0 OR p_manifest_hash IS NULL OR p_manifest_hash !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'seal_reporting_work: expected count and a SHA-256 manifest hash are required';
+  END IF;
+  IF b.sealed_at IS NOT NULL THEN
+    IF b.sealed_work_count = p_expected_count AND b.sealed_manifest_hash = p_manifest_hash THEN
+      RETURN QUERY SELECT p_batch, b.sealed_work_count, b.sealed_manifest_hash, b.sealed_at, true;
+      RETURN;
+    END IF;
+    RAISE EXCEPTION 'reporting batch % is already sealed with a different manifest', p_batch;
+  END IF;
+  SELECT * INTO m FROM reporting_private.work_manifest(p_batch);
+  IF m.work_count <> p_expected_count THEN
+    RAISE EXCEPTION 'seal_reporting_work: % saved descriptors, expected %', m.work_count, p_expected_count;
+  END IF;
+  IF m.manifest_hash <> p_manifest_hash THEN
+    RAISE EXCEPTION 'seal_reporting_work: manifest hash mismatch';
+  END IF;
+  UPDATE reporting_private.batches x
+     SET sealed_at = v_now, sealed_work_count = m.work_count, sealed_manifest_hash = m.manifest_hash, updated_at = now()
+   WHERE x.batch_id = p_batch;
+  RETURN QUERY SELECT p_batch, m.work_count, m.manifest_hash, v_now, false;
+END
+$fn$;
+
+-- Claim a bounded list (1..1000 descriptors, at most 1 MiB) of pending work
+-- of a sealed frozen batch under this fence. work_id is returned as text so
+-- JavaScript never rounds it.
+CREATE FUNCTION public.claim_reporting_work(p_batch uuid, p_fence bigint, p_limit integer DEFAULT 100)
+RETURNS TABLE (work_id text, audience_kind text, audience_staff uuid, partition_kind text, partition_key text, input_hash text,
+               expected_chunk_count integer, staged_chunks integer)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  b reporting_private.batches;
+BEGIN
+  b := reporting_private.lock_batch(p_batch, p_fence, true);
+  IF b.state <> 'frozen' OR b.sealed_at IS NULL THEN RAISE EXCEPTION 'reporting batch % is not a sealed frozen batch', p_batch; END IF;
+  IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000 THEN RAISE EXCEPTION 'claim_reporting_work: limit must be 1..1000'; END IF;
+  RETURN QUERY
+  WITH picked AS (
+    SELECT w.work_id
+      FROM reporting_private.partition_work w
+     WHERE w.batch_id = p_batch AND w.state = 'pending'
+     ORDER BY w.work_id
+     LIMIT p_limit
+       FOR UPDATE SKIP LOCKED
+  ), sized AS (
+    SELECT w.work_id, sum(pg_catalog.octet_length(w.partition_key) + 200) OVER (ORDER BY w.work_id ROWS UNBOUNDED PRECEDING) AS run
+      FROM reporting_private.partition_work w JOIN picked p ON p.work_id = w.work_id
+  ), claimed AS (
+    UPDATE reporting_private.partition_work w
+       SET state = 'leased', lease_fence = p_fence
+      FROM sized s
+     WHERE w.work_id = s.work_id AND s.run <= 1048576
+    RETURNING w.*
+  )
+  SELECT c.work_id::text, c.audience_kind, c.audience_staff, c.partition_kind, c.partition_key, c.input_hash, c.expected_chunk_count,
+         (SELECT count(*)::integer FROM reporting_private.partition_results r WHERE r.work_id = c.work_id)
+    FROM claimed c
+   ORDER BY c.work_id;
+END
+$fn$;
+
+-- Validate one staged chunk against its work and the frozen view, store it,
+-- and complete the work when every chunk is present with the declared digest.
+-- Internal: callers have already locked the batch at p_fence.
+CREATE FUNCTION reporting_private.stage_one(p_batch uuid, p_fence bigint, p_partition text, p_chunk jsonb)
+RETURNS TABLE (work_id text, chunk_no integer, stored boolean, done boolean)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  w       reporting_private.partition_work;
+  v_id    bigint;
+  v_no    integer;
+  v_count integer;
+  v_hash  text;
+  v_dig   text;
+  v_text  text;
+  v_rows  jsonb;
+  v_prev  text;
+  v_bad   text;
+  v_have  integer;
+  v_all   text;
+BEGIN
+  IF p_partition IS NULL OR p_partition !~ '^[1-9][0-9]{0,18}$' THEN RAISE EXCEPTION 'stage: partition must be a positive decimal work id'; END IF;
+  v_id := p_partition::bigint;
+  SELECT * INTO w FROM reporting_private.partition_work x WHERE x.work_id = v_id FOR UPDATE;
+  IF NOT FOUND OR w.batch_id <> p_batch THEN RAISE EXCEPTION 'stage: work % does not belong to batch %', p_partition, p_batch; END IF;
+
+  -- Envelope: exact keys and types, at most 1 MiB.
+  IF p_chunk IS NULL OR pg_catalog.jsonb_typeof(p_chunk) <> 'object' THEN RAISE EXCEPTION 'stage: chunk must be an object'; END IF;
+  IF pg_catalog.octet_length(p_chunk::text) > 1048576 THEN RAISE EXCEPTION 'stage: chunk envelope over 1 MiB'; END IF;
+  IF (SELECT string_agg(k, ',' ORDER BY k COLLATE "C") FROM pg_catalog.jsonb_object_keys(p_chunk) AS k) IS DISTINCT FROM 'canonicalRows,chunkCount,chunkHash,chunkNo,resultDigest' THEN
+    RAISE EXCEPTION 'stage: chunk envelope has unexpected keys';
+  END IF;
+  IF pg_catalog.jsonb_typeof(p_chunk -> 'chunkNo') <> 'number' OR (p_chunk ->> 'chunkNo') !~ '^(0|[1-9][0-9]{0,8})$'
+     OR pg_catalog.jsonb_typeof(p_chunk -> 'chunkCount') <> 'number' OR (p_chunk ->> 'chunkCount') !~ '^[1-9][0-9]{0,8}$' THEN
+    RAISE EXCEPTION 'stage: chunkNo/chunkCount must be non-negative/positive integers';
+  END IF;
+  v_no := (p_chunk ->> 'chunkNo')::integer;
+  v_count := (p_chunk ->> 'chunkCount')::integer;
+  IF v_no >= v_count THEN RAISE EXCEPTION 'stage: chunkNo % is outside chunkCount %', v_no, v_count; END IF;
+  IF pg_catalog.jsonb_typeof(p_chunk -> 'chunkHash') <> 'string' OR (p_chunk ->> 'chunkHash') !~ '^[0-9a-f]{64}$'
+     OR pg_catalog.jsonb_typeof(p_chunk -> 'resultDigest') <> 'string' OR (p_chunk ->> 'resultDigest') !~ '^[0-9a-f]{64}$'
+     OR pg_catalog.jsonb_typeof(p_chunk -> 'canonicalRows') <> 'string' THEN
+    RAISE EXCEPTION 'stage: chunkHash/resultDigest must be SHA-256 hex and canonicalRows a string';
+  END IF;
+  v_hash := p_chunk ->> 'chunkHash';
+  v_dig := p_chunk ->> 'resultDigest';
+  v_text := p_chunk ->> 'canonicalRows';
+  -- The hash covers the EXACT UTF-8 bytes JavaScript's canonicalJson produced (not jsonb::text).
+  IF pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(v_text, 'UTF8')), 'hex') <> v_hash THEN
+    RAISE EXCEPTION 'stage: chunkHash does not match canonicalRows';
+  END IF;
+
+  -- Work-level consistency (count and digest are fixed by the first chunk).
+  IF w.expected_chunk_count IS NOT NULL AND (w.expected_chunk_count <> v_count OR w.expected_result_digest <> v_dig) THEN
+    RAISE EXCEPTION 'stage: work % chunkCount/resultDigest differ from its saved ones', p_partition;
+  END IF;
+  -- Identical replay is a no-op (also after completion); different content fails.
+  SELECT r.chunk_hash INTO v_prev FROM reporting_private.partition_results r WHERE r.work_id = v_id AND r.chunk_no = v_no;
+  IF FOUND THEN
+    IF v_prev = v_hash THEN
+      RETURN QUERY SELECT p_partition, v_no, false, w.state = 'done';
+      RETURN;
+    END IF;
+    RAISE EXCEPTION 'stage: chunk % of work % was already saved with different content', v_no, p_partition;
+  END IF;
+  IF w.state = 'done' THEN RAISE EXCEPTION 'stage: work % is complete; chunk % is not part of it', p_partition, v_no; END IF;
+  IF w.state <> 'leased' OR w.lease_fence IS DISTINCT FROM p_fence THEN
+    RAISE EXCEPTION 'stage: work % is not claimed under fence %', p_partition, p_fence;
+  END IF;
+
+  -- Rows: exactly the four arrays, at most 1,000 rows in all.
+  BEGIN
+    v_rows := v_text::jsonb;
+  EXCEPTION WHEN invalid_text_representation THEN
+    RAISE EXCEPTION 'stage: canonicalRows is not JSON';
+  END;
+  IF pg_catalog.jsonb_typeof(v_rows) <> 'object'
+     OR (SELECT string_agg(k, ',' ORDER BY k COLLATE "C") FROM pg_catalog.jsonb_object_keys(v_rows) AS k) IS DISTINCT FROM 'cancel_edges,event_facts,order_occurrences,timing_facts'
+     OR pg_catalog.jsonb_typeof(v_rows -> 'event_facts') <> 'array' OR pg_catalog.jsonb_typeof(v_rows -> 'cancel_edges') <> 'array'
+     OR pg_catalog.jsonb_typeof(v_rows -> 'order_occurrences') <> 'array' OR pg_catalog.jsonb_typeof(v_rows -> 'timing_facts') <> 'array' THEN
+    RAISE EXCEPTION 'stage: canonicalRows must hold exactly the arrays event_facts, cancel_edges, order_occurrences, timing_facts';
+  END IF;
+  IF pg_catalog.jsonb_array_length(v_rows -> 'event_facts') + pg_catalog.jsonb_array_length(v_rows -> 'cancel_edges')
+     + pg_catalog.jsonb_array_length(v_rows -> 'order_occurrences') + pg_catalog.jsonb_array_length(v_rows -> 'timing_facts') > 1000 THEN
+    RAISE EXCEPTION 'stage: more than 1000 rows in one chunk';
+  END IF;
+
+  v_bad := reporting_private.check_staged_rows(p_batch, w, v_rows);
+  IF v_bad IS NOT NULL THEN RAISE EXCEPTION 'stage: work %: %', p_partition, v_bad; END IF;
+
+  INSERT INTO reporting_private.partition_results (work_id, chunk_no, chunk, chunk_hash) VALUES (v_id, v_no, v_rows, v_hash);
+  IF w.expected_chunk_count IS NULL THEN
+    UPDATE reporting_private.partition_work x SET expected_chunk_count = v_count, expected_result_digest = v_dig WHERE x.work_id = v_id;
+  END IF;
+
+  SELECT count(*)::integer, pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(string_agg(r.chunk_hash, E'\n' ORDER BY r.chunk_no), 'UTF8')), 'hex')
+    INTO v_have, v_all
+    FROM reporting_private.partition_results r WHERE r.work_id = v_id;
+  IF v_have = v_count THEN
+    IF v_all <> v_dig THEN RAISE EXCEPTION 'stage: work % resultDigest does not match its chunks', p_partition; END IF;
+    UPDATE reporting_private.partition_work x
+       SET state = 'done', chunk_count = v_count, result_digest = v_dig, completed_at = now()
+     WHERE x.work_id = v_id;
+    RETURN QUERY SELECT p_partition, v_no, true, true;
+    RETURN;
+  END IF;
+  RETURN QUERY SELECT p_partition, v_no, true, false;
+END
+$fn$;
+
+-- Row shape, trusted-metadata exclusion and ownership against the frozen view.
+-- Returns NULL when every row is valid, else the first problem.
+CREATE FUNCTION reporting_private.check_staged_rows(p_batch uuid, p_work reporting_private.partition_work, p_rows jsonb)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+  b      record;
+  r      record;
+  img    jsonb;
+  own    record;
+  v_keys text;
+  v_id   text;
+BEGIN
+  SELECT x.site, x.source_cutoff INTO b FROM reporting_private.batches x WHERE x.batch_id = p_batch;
+  FOR r IN
+    SELECT t.tbl, e.v, e.ord
+      FROM (VALUES ('event_facts'), ('cancel_edges'), ('order_occurrences'), ('timing_facts')) AS t(tbl)
+      CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(p_rows -> t.tbl) WITH ORDINALITY AS e(v, ord)
+  LOOP
+    IF pg_catalog.jsonb_typeof(r.v) <> 'object' THEN RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] is not an object'; END IF;
+    SELECT string_agg(k, ',' ORDER BY k COLLATE "C") INTO v_keys FROM pg_catalog.jsonb_object_keys(r.v) AS k;
+    IF v_keys IS DISTINCT FROM (SELECT string_agg(c, ',' ORDER BY c COLLATE "C") FROM pg_catalog.unnest(pg_catalog.string_to_array(
+         CASE r.tbl
+           WHEN 'event_facts' THEN 'case_id,created_at,department,event_id,event_type,invalid_detail,item_issue_detail,item_issue_kind,item_status,items,line_key,order_key,parent_event_id,product_kind,production_date,quantity,raw_order,role,sku,staff_id,timing_stream,timing_weight,work_type'
+           WHEN 'cancel_edges' THEN 'cancel_event_id,is_self,pair,parent_created_at,parent_event_id,parent_role'
+           WHEN 'order_occurrences' THEN 'case_id,occurred_at,order_key,raw_order,staff_id,terminal_event_id,work_type'
+           ELSE 'event_id,occurred_at,prev_all_event_id,prev_same_type_event_id,staff_id,weight,work_type' END, ',')) AS c) THEN
+      RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] has unexpected keys (site, audience, partition, rule and validity are set by the server)';
+    END IF;
+    -- Typed parse (raises on a wrong type).
+    CASE r.tbl
+      WHEN 'event_facts' THEN PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.event_facts, r.v);
+      WHEN 'cancel_edges' THEN PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.cancel_edges, r.v);
+      WHEN 'order_occurrences' THEN PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.order_occurrences, r.v);
+      ELSE PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.timing_facts, r.v);
+    END CASE;
+    v_id := CASE r.tbl WHEN 'cancel_edges' THEN r.v ->> 'cancel_event_id' WHEN 'order_occurrences' THEN r.v ->> 'terminal_event_id' ELSE r.v ->> 'event_id' END;
+    IF v_id IS NULL OR v_id = '' THEN RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] has no source event id'; END IF;
+    img := reporting_private.frozen_image(p_batch, v_id);
+    IF img IS NULL THEN RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] event ' || coalesce((v_id)::text, '') || ' is not in the frozen view'; END IF;
+    SELECT * INTO own FROM reporting_private.owner_partition(img);
+    IF own.partition_kind <> p_work.partition_kind OR own.partition_key <> p_work.partition_key THEN
+      RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] event ' || coalesce((v_id)::text, '') || ' belongs to partition ' || coalesce((own.partition_kind)::text, '') || '/' || coalesce((own.partition_key)::text, '') || ', not ' || coalesce((p_work.partition_kind)::text, '') || '/' || coalesce((p_work.partition_key)::text, '');
+    END IF;
+    IF p_work.audience_kind = 'self' AND (img ->> 'staff_id') IS DISTINCT FROM p_work.audience_staff::text THEN
+      RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] event ' || coalesce((v_id)::text, '') || ' is not the self audience''s own row';
+    END IF;
+    IF r.tbl = 'event_facts' THEN
+      IF (r.v ->> 'created_at')::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] created_at differs from the frozen source'; END IF;
+      IF (r.v ->> 'created_at')::timestamptz > b.source_cutoff THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] is after the batch cutoff'; END IF;
+      IF (r.v ->> 'raw_order') IS DISTINCT FROM (img ->> 'order_number') THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] raw_order differs from the frozen source'; END IF;
+      IF (r.v ->> 'order_key') IS DISTINCT FROM coalesce(reporting_private.order_key(r.v ->> 'raw_order'), '') THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] order_key is not the trimmed raw order'; END IF;
+    ELSIF r.tbl = 'cancel_edges' THEN
+      IF (r.v ->> 'parent_event_id') IS DISTINCT FROM (img ->> 'parent_event_id') THEN RETURN 'cancel_edges[' || coalesce((r.ord)::text, '') || '] parent differs from the frozen cancellation'; END IF;
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END
+$fn$;
+
+-- Single-work staging (retries/tests) and bounded bulk staging: at most 100
+-- {partition, chunk} entries and 1 MiB per request; all succeed or none do.
+CREATE FUNCTION public.stage_reporting_result(p_batch uuid, p_fence bigint, p_partition text, p_chunk jsonb)
+RETURNS TABLE (work_id text, chunk_no integer, stored boolean, done boolean)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  b reporting_private.batches;
+BEGIN
+  b := reporting_private.lock_batch(p_batch, p_fence, true);
+  IF b.state <> 'frozen' OR b.sealed_at IS NULL THEN RAISE EXCEPTION 'reporting batch % is not a sealed frozen batch', p_batch; END IF;
+  RETURN QUERY SELECT * FROM reporting_private.stage_one(p_batch, p_fence, p_partition, p_chunk);
+END
+$fn$;
+
+CREATE FUNCTION public.stage_reporting_results(p_batch uuid, p_fence bigint, p_results jsonb)
+RETURNS TABLE (work_id text, chunk_no integer, stored boolean, done boolean)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  b reporting_private.batches;
+  e record;
+BEGIN
+  b := reporting_private.lock_batch(p_batch, p_fence, true);
+  IF b.state <> 'frozen' OR b.sealed_at IS NULL THEN RAISE EXCEPTION 'reporting batch % is not a sealed frozen batch', p_batch; END IF;
+  IF p_results IS NULL OR pg_catalog.jsonb_typeof(p_results) <> 'array' THEN RAISE EXCEPTION 'stage_reporting_results: results must be an array'; END IF;
+  IF pg_catalog.jsonb_array_length(p_results) > 100 THEN RAISE EXCEPTION 'stage_reporting_results: at most 100 entries per request'; END IF;
+  IF pg_catalog.octet_length(p_results::text) > 1048576 THEN RAISE EXCEPTION 'stage_reporting_results: request over 1 MiB'; END IF;
+  FOR e IN SELECT x.v, x.ord FROM pg_catalog.jsonb_array_elements(p_results) WITH ORDINALITY AS x(v, ord) ORDER BY x.ord LOOP
+    IF pg_catalog.jsonb_typeof(e.v) <> 'object'
+       OR (SELECT string_agg(k, ',' ORDER BY k COLLATE "C") FROM pg_catalog.jsonb_object_keys(e.v) AS k) IS DISTINCT FROM 'chunk,partition'
+       OR pg_catalog.jsonb_typeof(e.v -> 'partition') <> 'string' THEN
+      RAISE EXCEPTION 'stage_reporting_results: entry % must be exactly {partition, chunk}', e.ord;
+    END IF;
+    -- Any failure raises and rolls back every entry of this request.
+    RETURN QUERY SELECT * FROM reporting_private.stage_one(p_batch, p_fence, e.v ->> 'partition', e.v -> 'chunk');
+  END LOOP;
+END
+$fn$;
+
+-- ---------------------------------------------------------------------------
 -- 4. Privileges: service-only
 -- ---------------------------------------------------------------------------
 
@@ -907,5 +1391,28 @@ GRANT EXECUTE ON FUNCTION public.freeze_reporting_rebuild(uuid, bigint) TO servi
 GRANT EXECUTE ON FUNCTION public.renew_reporting_lease(uuid, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.resume_reporting_batch(uuid, bigint) TO service_role;
 GRANT EXECUTE ON FUNCTION public.abandon_reporting_batch(uuid, bigint, text) TO service_role;
+
+-- Part B2a.
+REVOKE ALL ON FUNCTION reporting_private.partition_work_guard() FROM PUBLIC, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION reporting_private.frozen_image(uuid, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.owner_partition(jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.work_manifest(uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.stage_one(uuid, bigint, text, jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.check_staged_rows(uuid, reporting_private.partition_work, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.frozen_image(uuid, text) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.owner_partition(jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.work_manifest(uuid) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.stage_one(uuid, bigint, text, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.check_staged_rows(uuid, reporting_private.partition_work, jsonb) TO service_role;
+REVOKE ALL ON FUNCTION public.plan_reporting_work(uuid, bigint, jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.seal_reporting_work(uuid, bigint, integer, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.claim_reporting_work(uuid, bigint, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.stage_reporting_result(uuid, bigint, text, jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.stage_reporting_results(uuid, bigint, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.plan_reporting_work(uuid, bigint, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION public.seal_reporting_work(uuid, bigint, integer, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.claim_reporting_work(uuid, bigint, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.stage_reporting_result(uuid, bigint, text, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION public.stage_reporting_results(uuid, bigint, jsonb) TO service_role;
 
 COMMIT;

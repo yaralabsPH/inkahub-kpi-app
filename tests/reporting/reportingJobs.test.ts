@@ -43,7 +43,11 @@ describe("0038 migration text (Part A)", () => {
   it("does not touch source tables, source policies, client roles or timeouts", () => {
     for (const c of codes) {
       expect(c).not.toMatch(/^(DROP|TRUNCATE|DELETE|ALTER ROLE|ALTER DEFAULT)/i);
-      if (/^ALTER TABLE/i.test(c)) expect(c).toMatch(/^ALTER TABLE reporting_private\.\w+ ENABLE ROW LEVEL SECURITY$/);
+      if (/^ALTER TABLE/i.test(c)) {
+        // Only RLS enabling and B2a's additive nullable columns on private tables.
+        expect(c).toMatch(/^ALTER TABLE reporting_private\.\w+ (ENABLE ROW LEVEL SECURITY|ADD COLUMN .*)$/);
+        expect(c).not.toMatch(/NOT NULL|DROP|RENAME|ALTER COLUMN|TYPE /i);
+      }
       expect(c).not.toMatch(/ON public\.(?!production_events\b)\w+ /);
       expect(c).not.toMatch(/statement_timeout|idle_in_transaction/i);
     }

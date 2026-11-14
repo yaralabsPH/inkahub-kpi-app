@@ -1280,3 +1280,28 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - Tests: gate fixtures now build a passing four-case artifact plus `legacyParityArtifact()`; 9 new four-case tests and 1 evidence test. Gate: tsc, typecheck:digest, 663/663 tests, build OK.
   - **Not done yet (stopped before starting):** the `--policy-parity=cases` collector in `policyParityRun.ts` (one rolled-back REPEATABLE READ transaction, nested pre-0036 restore, fresh post-rollback restoration check) and its runner mode, README text, the staging collection run, and the three v2.3 manager phase reruns. Until these run, `checkParityArtifact` fails on the real artifact, so the staging gate stays FAILED. That is intended: the earlier certification is withdrawn.
 
+- 2026-11-15 (Claude, Task 13 Part B2a; 0038 still an unapplied draft; 0037 byte-identical; no SQL run):
+  - **0038 schema additions** (nullable only): `batches.sealed_at`/`sealed_work_count`/`sealed_manifest_hash` (all set together or none), `partition_work.expected_chunk_count`/`expected_result_digest`, and `event_facts.production_date`. The `partition_work_guard` trigger refuses new work on a sealed batch and any change to a descriptor.
+  - **Helpers:** `frozen_image` (the batch's view of an event: rebuild candidate; else frozen replacement or tombstone; else mirror), `owner_partition` (trimmed nonblank order, else event id), `work_manifest`, `stage_one` and `check_staged_rows`.
+  - **`plan_reporting_work`:** needs a frozen, unsealed batch under a live fence; at most 1,000 descriptors and 1 MiB. Descriptor shape is exact, and an order key must be a trimmed order. A conflict, inside the call or against saved work, fails the whole call; an identical replay is a no-op.
+  - **`seal_reporting_work`:** the exact count and manifest must match. An identical re-seal is a no-op; a different one fails.
+  - **`claim_reporting_work(p_limit DEFAULT 100)`:** limit 1..1,000, `SKIP LOCKED`, at most 1 MiB, and work ids returned as text.
+  - **`stage_reporting_result` / `stage_reporting_results`:** the bulk call takes at most 100 entries and 1 MiB, and all entries succeed or none do. Each chunk is checked in this order:
+    - the work id is a positive decimal belonging to this batch;
+    - the envelope has exactly its keys and types and is at most 1 MiB;
+    - SHA-256 of the EXACT UTF-8 bytes of `canonicalRows` matches, checked before parsing;
+    - it holds exactly the four arrays and at most 1,000 rows;
+    - each work keeps one chunk count and digest;
+    - an identical replay is a no-op, including after completion, while different content fails, also after completion;
+    - the work is claimed under this fence;
+    - every row has the exact keys (payload cannot set site, audience, partition, rule or validity), parses to its type, is in the frozen view, belongs to the work's partition (and to the self worker where relevant), matches the frozen source's time/order/key/parent, and is not after the cutoff;
+    - the work is done only when every chunk is present and the recomputed digest matches.
+  - **`api/_lib/reporting-stage.ts`** (new, in `typecheck:digest`): descriptor validation; a byte-order (COLLATE "C") manifest with JSON lines that escape exactly as PostgreSQL `to_json` does; `buildChunks` (at most 1,000 rows and 1 MiB with a jsonb margin; an empty result is one chunk; an oversized row fails); `packStageRequests` (at most 100 entries and 1 MiB); typed wrappers that validate before calling.
+  - **Tests:** `tests/reporting/reportingStage.test.ts`, 40 tests:
+    - hash agreement with Unicode, null, quote, backslash and control-character data;
+    - manifest escaping and UTF-8 versus UTF-16 ordering, and the zero-work hash;
+    - descriptor rules; chunk and request bounds;
+    - a reference model of the 0038 staging rules: missing, duplicate and contradictory chunks; forged hash and digest; bad envelope; ownership, self, frozen-view, drift and cutoff; forged trusted metadata; unclaimed or wrong-fence work; bulk rollback and bulk-equals-single;
+    - SQL text for every rule; wrappers.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 982/982 tests, build OK.
+  - **Not done (stopped at the usage limit):** a deliberate-break run for B2a was not performed this time. B2b (publication and runtime runner) is not started; Task 13 is open.

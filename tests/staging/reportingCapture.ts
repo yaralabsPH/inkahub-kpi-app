@@ -44,9 +44,20 @@ export const REPORTING_TABLES = [
 export const REPORTING_FUNCTIONS = [CAPTURE_FUNCTION, "control_guard", "generations_guard"] as const;
 /** Added by 0038 (Task 13 Part A): internal helpers the server may execute. */
 /** Internal helpers added by 0038 that the server may execute (Part A + B1). */
-export const REPORTING_FUNCTIONS_0038 = ["acknowledge_received_changes", "batch_drift", "lock_batch", "order_key", "site_pending_changes"] as const;
+export const REPORTING_FUNCTIONS_0038 = [
+  "acknowledge_received_changes",
+  "batch_drift",
+  "check_staged_rows",
+  "frozen_image",
+  "lock_batch",
+  "order_key",
+  "owner_partition",
+  "site_pending_changes",
+  "stage_one",
+  "work_manifest",
+] as const;
 /** Trigger functions added by 0038: nobody executes them directly. */
-export const REPORTING_TRIGGER_FUNCTIONS_0038 = ["source_candidate_guard"] as const;
+export const REPORTING_TRIGGER_FUNCTIONS_0038 = ["partition_work_guard", "source_candidate_guard"] as const;
 /** Tables added by 0038 (B1). */
 export const REPORTING_TABLES_0038 = ["source_candidate"] as const;
 /** Service-only public RPCs added by 0038 (Task 13 Part A). */
@@ -54,12 +65,17 @@ export const PUBLIC_RPCS_0038 = [
   "abandon_reporting_batch",
   "begin_reporting_batch",
   "begin_reporting_rebuild",
+  "claim_reporting_work",
   "copy_reporting_source_page",
   "freeze_reporting_rebuild",
   "get_reporting_job_status",
+  "plan_reporting_work",
   "renew_reporting_lease",
   "resume_reporting_batch",
+  "seal_reporting_work",
   "set_reporting_capture",
+  "stage_reporting_result",
+  "stage_reporting_results",
 ] as const;
 const ROLES = ["anon", "authenticated", "service_role", CAPTURE_ROLE] as const;
 const CLIENT_ROLES = ["anon", "authenticated", "authenticator", "service_role"];
