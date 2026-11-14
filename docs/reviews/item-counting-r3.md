@@ -173,4 +173,16 @@ Fixed in `7a4a323` (Claude, 2026-11-14), under CJ's overnight delegation. No sta
 - Gate: `npx tsc -b` OK, `npm run typecheck:digest` OK, 718/718 tests, build OK.
 - **Evidence disposition (for the planner):** R3-1 changes only the publication boundary of a cancelled run. The retained collection `90d3da63…` was not cancelled, and its hash was verified in this review; its collected data and checks are unchanged. R3-2 is app UI code outside the parity harness. My view is that neither change affects the retained Task 10 v2 evidence, but under v2's evidence-disposition rule that is the planner's call. Round 3 was the last allowed review round, so a planner decision is needed on accepting these fixes without a round 4.
 
+## Focused closure verification under CJ's overnight delegation
+
+2026-11-14, Codex planner: CJ instructed Codex to monitor Claude, make routine decisions autonomously and continue overnight. This is verification of the two named round-3 fixes, not a fourth whole-branch review or a release approval. The original review above remains the record of `9881540`.
+
+At `2cb9089089b2ebf65b6366916eee2298d4a6ae99` (code fix `7a4a323`), R3-1 and R3-2 are **closed**. A focused independent read-only reviewer inspected the actual wrapper/runner and card/session integration and freshly ran 82/82 tests across `policyParityRun`, `run-item-counting`, `itemCountingPolicyParity` and `orderLookupSession`. Cancellation is checked after the final await and before synchronous publication; the saved artifact fails on deferred-shutdown cancellation. Render-time scope filtering hides prior-site/account data before effects run, and searches set the current scope first. Existing rollback/restoration and Remove/ledger semantics are unchanged.
+
+The retained collection `90d3da63-cf68-4041-921d-aa1f4b43af47` remains eligible under Task 10 v2: fresh local hash recomputation equals `26330a488dc15dd2c89c3e26b15c0256d41dc6945a067e1f63df5b38d26eaa8b`; the current checker returns zero problems. In-memory non-cancelled publication preserves that hash; cancelled publication is rejected. These changes do not change collection/comparison rules, database policies, fixtures or the retained SQL gate. The round-3 criteria assessment above remains applicable. No staging rerun is needed; historical FAILED results remain FAILED and no current database-state certification is implied.
+
+Root independently verified PR #7 CI **SUCCESS** for exact head `2cb9089089b2ebf65b6366916eee2298d4a6ae99`, completed `2026-11-14T13:53:16Z`: [CI check](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43601917624/job/132468289904). Claude's full local gate records 718 tests and both type-checks/build passing. Verification left the working tree clean.
+
+**Decision: approve the amended Task 10 gate and proceed to Task 11.** This does not certify raw long-range performance or release readiness. Vercel entitlement remains a deployment blocker; Tasks 19/20 and the stated focus/rollover/browser/capture/stock checks remain open. No production access, merge, deployment, paid upgrade or weakened acceptance criterion is authorized.
+
 STATUS: COMPLETE
