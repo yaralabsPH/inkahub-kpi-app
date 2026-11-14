@@ -325,6 +325,17 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
 
   Items credit for window verifications is selection-independent: every valid cancellation of a window line is itself selected. So additive daily Items are safe. Orders, qualification and coverage need read-time evaluation over event-level facts (`event_facts`/`cancel_edges` plus the selection), as `referenceSummary` does. They cannot come from additive daily totals or a stored per-terminal qualification. Task 16's SQL must reproduce `selectFactFamilies` + `evaluateSelection`; Task 11's reference is its test oracle. The planner should confirm this is the intended Task 14/16 shape before Task 12 storage work, especially the `daily_totals` scope and whether the qualification raw-order quirk is kept for exact parity (current answer) or fixed as a separately approved rule change.
   **Resolved by planner under CJ's overnight delegation, 2026-11-14:** this is the intended classified-fact combination. Follow the explicit decomposition decision in Rule reuse above. Preserve the whitespace behavior and all original counting rules. The focused reviewer agrees this is anticipated by the approved contract. Task 12 is nevertheless blocked on the three Task 11 code findings below, not on this design question.
+- **Task 12 staging steps — planner review needed before any staging SQL (2026-11-14).** 0037 and its runner are ready for the planner's migration/runner security review. Nothing has run on staging. Proposed order, each step only on the planner's go:
+  1. `npm run staging:reporting-capture -- --rehearse-migration`: applies 0037 inside a rolled-back transaction and runs every check. This is the first real test of the non-superuser ownership transfer, the sequence grant and RLS-under-definer capture.
+  2. Apply 0037 to staging as one transaction.
+  3. `--check`.
+  4. Commit `capture_enabled = true` on staging (an operator step that advances the epoch), then `--concurrency`.
+  5. Decide whether capture stays enabled on staging.
+
+  Notes:
+  - 0037 needs PostgreSQL 16+ (`WITH INHERIT FALSE, SET TRUE`, `NULLS NOT DISTINCT`, `pg_auth_members.inherit_option`). Staging is 17.x; CJ must confirm production's version before any production step.
+  - Trigger overhead is recorded, not gated, in Task 12. Task 19 owns the ≤10% capture p95 regression gate.
+  - Task 12 stays unchecked until the staging capture/ACL/overhead/concurrency evidence passes.
 - No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
 
 ## Amendment implementation log
@@ -389,6 +400,27 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
   - Raw-order whitespace qualification semantics are unchanged, as the planner directed.
 
 - 2026-11-14 (Codex planner, focused fix verification at `8cf3dcc4664088892ada2b449a7006d88821e8f6`): **T11-1, T11-2 and T11-3 closed; Task 11 approved for continuation to Task 12.** Independent read-only inspection and a fresh 119/119 focused test run (60 projection, 37 counts, 12 report-view, 10 Welcome) verify selected-stream timing and both boundary/context regressions, explicit bounded report scalars, and malformed optional-selector rejection. The existing millisecond timing semantics and counting rules are preserved. Root verified exact-head CI SUCCESS, completed `2026-11-14T14:19:29Z` ([check](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43604191521/job/132475177496)); Claude's full gate records 778/778 tests plus type-checks/build. The timing paragraph now carries the selected-stream rule into Task 16. All future SQL, authorization, scale and release gates remain open. Task 12 may prepare migration/tests and run local checks; pause for planner review before any staging migration application. Staging-only execution will verify `ybrzhrgfrnvtcwymjdrq` before every SQL call under CJ's overnight delegation. No production action is authorized.
+- 2026-11-14 (Claude, Task 12 code; staging evidence pending, checkbox open):
+  - Read-only staging catalog inspection first, with the target checked: `production_events` has no triggers, and 0036 is the last migration. A new function gets PUBLIC execute by default, so 0037 revokes it explicitly.
+  - **`supabase/migrations/0037_reporting_storage.sql`**: one transaction, expand-only, no IF NOT EXISTS / OR REPLACE.
+    - Schema `reporting_private` with the 15 plan tables. Keys/checks: one active batch and one published generation per site; audience shape `(site ⇔ no staff)`; non-negative and safe-integer counts; journal image/key consistency; at least one supported site per change; ≤1 MiB chunks. Explicit tuple keys use `UNIQUE NULLS NOT DISTINCT`. Staged results reference work by a surrogate `work_id`, because a composite FK over the nullable audience would skip site rows.
+    - Facts are versioned by a `generation_seq` interval, with indexes per the plan.
+    - Guards (SECURITY INVOKER, `search_path=''`): any `capture_enabled` change advances `capture_epoch`, which never decreases; a published/superseded/expired generation's identity is immutable and its state only moves forward.
+    - Capture function (SECURITY DEFINER, `search_path=''`, no dynamic SQL, no exception handler): explicit INSERT/UPDATE/DELETE branches; supported old/new site only; identical-row UPDATE skipped; reads only the singleton control row; inserts one journal row with full old/new images; raises if control is missing.
+    - Defaults: capture disabled, processors off, every site `legacy`.
+    - **Access** (per the planner's capture-role clarification):
+      - Role `reporting_capture`: NOLOGIN NOINHERIT NOBYPASSRLS. It gets schema USAGE, control SELECT, changes INSERT and change-id sequence USAGE, plus two policies addressed only to it.
+      - No grants to PUBLIC/anon/authenticated. service_role gets USAGE and DML and cannot execute the trigger functions.
+      - The function is handed to the role via a temporary `GRANT reporting_capture TO CURRENT_USER WITH INHERIT FALSE, SET TRUE` and a temporary schema CREATE. Both are revoked in the same transaction. This is needed because the migration role is not a superuser.
+    - Rollback text is in the header.
+  - **Runner** `tests/staging/reporting-capture.ts` (`npm run staging:reporting-capture`) with pure checks in `tests/staging/reportingCapture.ts`. The second file is not named in the plan; it keeps the runner logic testable.
+    - Modes: `--rehearse-migration` (0037 applied inside a rolled-back transaction), `--check`, `--concurrency`.
+    - Every phase is target-guarded (URL ref plus the staging location and test users) and rolled back. The report is redacted and ends in exactly one STATUS line.
+    - It reuses the Task 4 write-compat replay with capture enabled. `become`/`runSteps` are now exported from `writeCompatRun.ts`, with no behavior change. The new npm script is in `package.json`.
+  - README: `supabase/staging/item-counting/reporting-README.md`.
+  - **Tests:** `tests/reporting/reportingSchema.test.ts`, 41 tests: the migration's text shape, plus the runner's catalog/step/overhead/concurrency/status checks against a designed-good state and 23 rejected deviations. 11 deliberate breaks of the migration (capture on by default, a client grant, CREATE kept, a swallowed failure, an INVOKER capture function, RLS missing on the journal, a client policy, a state-row lock, staging captured, an inheriting role, a journalled no-op) are each caught by a real test.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 819/819 tests, build OK. The new staging files also type-check under strict `tsc --noEmit`.
+  - **Not done:** any staging run. See Open questions "Task 12 staging steps".
 
 ---
 

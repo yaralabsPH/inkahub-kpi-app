@@ -15,7 +15,7 @@ import { deductSummary, STEPS, type Actor, type PolicySet, type SetOutcome, type
 /** The plan's policy rollback body (shared with the four-case parity collector). */
 export { PRE_0036_RESTORE };
 
-async function become(client: pg.Client, actor: Actor, claimsText: Record<string, string>): Promise<void> {
+export async function become(client: pg.Client, actor: Actor, claimsText: Record<string, string>): Promise<void> {
   await client.query("reset role");
   if (actor === "postgres") return;
   const claims = actor === "service_role" ? JSON.stringify({ role: "service_role" }) : actor === "anon" ? JSON.stringify({ role: "anon" }) : claimsText[actor];
@@ -28,7 +28,7 @@ async function become(client: pg.Client, actor: Actor, claimsText: Record<string
   if (actor !== "service_role" && actor !== "anon") await client.query(APPLY_TIMEOUT);
 }
 
-async function runSteps(client: pg.Client, ctx: { staff: string; manager: string }, claimsText: Record<string, string>, log: (l: string) => void): Promise<StepOutcome[]> {
+export async function runSteps(client: pg.Client, ctx: { staff: string; manager: string }, claimsText: Record<string, string>, log: (l: string) => void): Promise<StepOutcome[]> {
   const out: StepOutcome[] = [];
   for (const step of STEPS) {
     await client.query("savepoint wc_step");

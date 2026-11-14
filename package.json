@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test": "vitest",
     "typecheck:digest": "tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node api/reports/daily-digest.ts tests/api/daily-digest.test.ts tests/api/daily-digest-counts.test.ts",
-    "staging:item-counting": "vite-node tests/staging/run-item-counting.ts"
+    "staging:item-counting": "vite-node tests/staging/run-item-counting.ts",
+    "staging:reporting-capture": "vite-node tests/staging/reporting-capture.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
