@@ -156,6 +156,21 @@ Tasks 11–20 are not reviewed as missing. No merge, deployment or SQL applicati
 
 ## Coder response
 
-(Coder records disposition after CJ's last-round decision; no fourth review or staging rerun is authorized here.)
+Fixed in `7a4a323` (Claude, 2026-11-14), under CJ's overnight delegation. No staging run, no fourth review started.
+
+- **R3-1:** `tests/staging/caseParityMode.ts`: after the connection is closed and before validation/publication, `runCasesMode` adds `CANCELLED_AT_PUBLICATION` ("cancelled before publication") to the collection's problems when the signal is aborted. Rollback and the fresh restoration check stay unconditional.
+  - New lifecycle test in `tests/staging/policyParityRun.test.ts`: a clean collection whose `end()` aborts the signal and waits on a deferred promise. It asserts:
+    - exit code 1;
+    - a FAILED status and report;
+    - the problem is stored in the artifact;
+    - `checkParityArtifact` rejects the artifact. The gate reads this artifact before any API timing or phase write, and existing gate tests prove a failing artifact blocks both;
+    - rollback and restoration were recorded.
+  - Removing the fix makes that test fail.
+- **R3-2:** new pure `viewForScope(view, scopeKey)` in `src/lib/repository/supabase/orderLookupSession.ts`. It returns an empty view when the view's scope differs from the current render's scope.
+  - `OrderLookupCard` (`src/pages/Reports.tsx`) renders `viewForScope(view ?? session.view(), scopeKey)`. The session's sequence invalidation is unchanged. `runSearch` calls `setScope` before searching, so a search can never start under the old scope. Remove/ledger semantics are unchanged.
+  - Four new tests render at the new scope before `setScope` runs: a resolved old-site result, another account at the same site, a late old-scope response arriving before the effect, and an old-scope error.
+  - Making the selector pass views through makes all four fail.
+- Gate: `npx tsc -b` OK, `npm run typecheck:digest` OK, 718/718 tests, build OK.
+- **Evidence disposition (for the planner):** R3-1 changes only the publication boundary of a cancelled run. The retained collection `90d3da63…` was not cancelled, and its hash was verified in this review; its collected data and checks are unchanged. R3-2 is app UI code outside the parity harness. My view is that neither change affects the retained Task 10 v2 evidence, but under v2's evidence-disposition rule that is the planner's call. Round 3 was the last allowed review round, so a planner decision is needed on accepting these fixes without a round 4.
 
 STATUS: COMPLETE
