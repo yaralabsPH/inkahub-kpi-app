@@ -685,9 +685,12 @@ export interface LifecycleIO<C extends LifecycleClient> {
   body(client: C): Promise<void>;
   /** Restoration audit on a fresh connection; returns problems (empty = verified). */
   audit(client: C): Promise<string[]>;
+  /** Persist the report. May throw; the lifecycle records the failure and continues. */
   save(): void;
   now(): string;
   redact(text: string): string;
+  /** Where a persistence failure is written (default: console.error). */
+  stderr?(text: string): void;
 }
 
 /** The report fields the lifecycle maintains (shared by the capture and fence runners). */
@@ -699,8 +702,49 @@ export interface LifecycleReport {
   restorationProblems: string[];
 }
 
+/**
+ * T13B2b-3: write the report BEFORE any database connection. If it cannot be
+ * written, the run refuses to connect (returns false) and says so on stderr.
+ */
+export function initialReport(save: () => void, stderr: (t: string) => void = (t) => console.error(t)): boolean {
+  try {
+    save();
+    return true;
+  } catch (e) {
+    stderr(`refusing to connect: the report file cannot be written: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
+/**
+ * After the lifecycle: a failed final write is recorded (so the status is
+ * FAILED) and the complete report text goes to stderr instead of being lost.
+ */
+export function finalReport(save: () => void, render: () => string, errors: string[], stderr: (t: string) => void = (t) => console.error(t)): boolean {
+  try {
+    save();
+    return true;
+  } catch (e) {
+    errors.push(`report persistence failed (after the run): ${e instanceof Error ? e.message : String(e)}`);
+    stderr(render());
+    return false;
+  }
+}
+
 export async function runCaptureLifecycle<C extends LifecycleClient, R extends LifecycleReport>(report: R, io: LifecycleIO<C>): Promise<R> {
   const msg = (e: unknown) => io.redact(e instanceof Error ? e.message : String(e));
+  // T13B2b-3: report persistence never interrupts cleanup or the fresh audit.
+  // A failure is sticky (kept in errors, so the run is FAILED) and is written to
+  // stderr; the lifecycle carries on to rollback, disconnect and audit.
+  const persist = (when: string) => {
+    try {
+      io.save();
+    } catch (e) {
+      const line = `report persistence failed (${when}): ${msg(e)}`;
+      if (!report.errors.includes(line)) report.errors.push(line);
+      (io.stderr ?? ((t: string) => console.error(t)))(line);
+    }
+  };
   let primary: C | null = null;
   try {
     primary = await io.open();
@@ -720,7 +764,7 @@ export async function runCaptureLifecycle<C extends LifecycleClient, R extends L
         report.errors.push(`cleanup failed: disconnect: ${msg(e)}`);
       }
     }
-    io.save();
+    persist("after cleanup");
   }
   let auditor: C | null = null;
   try {
@@ -743,7 +787,7 @@ export async function runCaptureLifecycle<C extends LifecycleClient, R extends L
       }
     }
     report.finishedAt = io.now();
-    io.save();
+    persist("final");
   }
   return report;
 }

@@ -33,9 +33,12 @@ import { become } from "./writeCompatRun";
 import { CATALOG_SQL, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
 import { capLimit, checkFence, fenceMarkdown, fenceStatus, launch, newFenceReport, type FenceObservation } from "./reportingFence";
 import { catalog } from "./policyParityRun";
-import { catalogLevel, checkCatalog } from "./reportingCapture";
+import { catalogLevel, checkCatalog, finalReport, initialReport } from "./reportingCapture";
+import { committedAllowance, newOwnership, runCommitted, type Ownership } from "./reportingCommitted";
 import {
-  BASELINE_SQL,
+  compareFullState,
+  fullState,
+  ROLLBACK_ONLY,
   MIGRATION_0038,
   migrationBody,
   newPublicationReport,
@@ -46,6 +49,7 @@ import {
   runPublicationFlow,
   sha256File,
   type Db,
+  type FullState,
   type Observation,
 } from "./reportingPublication";
 
@@ -326,7 +330,7 @@ async function publicationMain(argv: string[]): Promise<number> {
     writeFileSync(`${out}.tmp`, publicationMarkdown(report));
     renameSync(`${out}.tmp`, out);
   };
-  save();
+  if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
   let open: () => Promise<pg.Client>;
   let claims: Record<string, string>;
@@ -353,7 +357,8 @@ async function publicationMain(argv: string[]): Promise<number> {
     if (service) await become(c as pg.Client, "service_role", claims);
     else await c.query("reset role");
   };
-  let before: string | null = null;
+  let before: FullState | null = null;
+  let own: Ownership | null = null;
   await runCaptureLifecycle(report, {
     open,
     now: () => new Date().toISOString(),
@@ -367,7 +372,14 @@ async function publicationMain(argv: string[]): Promise<number> {
       const installed = Boolean((await main.query("select exists (select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'publish_reporting_batch') as x")).rows[0]?.x);
       if (mode === "rehearse-migration" && installed) throw new Error("0038 is already installed; use --check-installed");
       if (mode !== "rehearse-migration" && !installed) throw new Error("0038 is not installed; use --rehearse-migration");
-      before = JSON.stringify((await main.query(BASELINE_SQL)).rows[0].j);
+      before = await fullState(main);
+      if (mode === "committed-interleavings") {
+        // Prepared under the plan's approved harness; COMMITS only its documented, owned state and always cleans up.
+        own = newOwnership(sites);
+        report.ownership = own as unknown as Record<string, unknown>;
+        await runCommitted({ sites, staff, maxPages, open, as, record, save, redact: redactSecrets, now: () => performance.now() }, own, report.cleanup);
+        return;
+      }
       if (mode === "interleavings") {
         await runInterleavings({ sites, staff, open, as, record, redact: redactSecrets, now: () => performance.now(), sleep: async (ms) => void (await sleep(ms)), maxPages }, report.cleanup);
         return;
@@ -388,11 +400,13 @@ async function publicationMain(argv: string[]): Promise<number> {
     },
     audit: async (fresh) => {
       if (!before) throw new Error("no starting baseline was taken, so nothing can be compared");
-      const after = JSON.stringify((await fresh.query(BASELINE_SQL)).rows[0].j);
-      return after === before ? [] : [`baseline differs after rollback: before ${before.slice(0, 400)} after ${after.slice(0, 400)}`];
+      // Every surface (payloads, stock, ledger, memberships, catalog/ACL, all private rows, control, site state) must be identical,
+      // except, for the committed harness only, its declared epoch increments and the run sites' lease bookkeeping.
+      const allow = mode === "committed-interleavings" && own ? committedAllowance(own) : ROLLBACK_ONLY;
+      return compareFullState(before, await fullState(fresh), allow).map((d) => `baseline differs after the run: ${d}`);
     },
   });
-  save();
+  finalReport(save, () => publicationMarkdown(report), report.errors);
   const status = publicationStatus(report);
   console.log(status);
   return status === "STATUS: COMPLETE" ? 0 : 1;
@@ -400,7 +414,7 @@ async function publicationMain(argv: string[]): Promise<number> {
 
 async function main(): Promise<number> {
   const flags = process.argv.slice(2).filter((a) => a.startsWith("--"));
-  if (flags.some((f) => f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings")) return publicationMain(flags);
+  if (flags.some((f) => f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings" || f === "--committed-interleavings")) return publicationMain(flags);
   if (flags.join(" ") !== "--fence") {
     console.error("usage: npm run staging:reporting-jobs -- --fence | --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N]");
     return 2;
@@ -419,7 +433,7 @@ async function main(): Promise<number> {
     writeFileSync(`${out}.tmp`, fenceMarkdown(report));
     renameSync(`${out}.tmp`, out);
   };
-  save();
+  if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
   let ctx: Ctx;
   try {
@@ -476,7 +490,7 @@ async function main(): Promise<number> {
       return p;
     },
   });
-  save();
+  finalReport(save, () => fenceMarkdown(report), report.errors);
   const status = fenceStatus(report);
   console.log(status);
   return status === "STATUS: COMPLETE" ? 0 : 1;

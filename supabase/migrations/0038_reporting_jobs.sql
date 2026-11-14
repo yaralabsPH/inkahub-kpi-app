@@ -1643,7 +1643,7 @@ SET search_path = ''
 AS $fn$
   SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
            'item-counting-publication-v1' || E'\n' || b.site || E'\n' || b.kind || E'\n' || b.rule_version || E'\n' || b.capture_epoch::text || E'\n'
-           || (pg_catalog.extract(epoch FROM b.source_cutoff) * 1000000)::bigint::text || E'\n' || b.sealed_manifest_hash
+           || (EXTRACT(epoch FROM b.source_cutoff) * 1000000)::bigint::text || E'\n' || b.sealed_manifest_hash
            || coalesce((SELECT string_agg(E'\n' || w.result_digest, '' ORDER BY w.audience_kind COLLATE "C", w.audience_staff::text COLLATE "C" NULLS FIRST, w.partition_kind COLLATE "C", w.partition_key COLLATE "C")
                           FROM reporting_private.partition_work w WHERE w.batch_id = b.batch_id), ''),
            'UTF8')), 'hex')

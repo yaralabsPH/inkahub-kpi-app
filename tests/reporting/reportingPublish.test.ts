@@ -22,7 +22,7 @@ import { reportingManifestHash, RESULT_TABLES, resultRowProblem, type ResultRows
 import { acknowledgeable, pendingForSite, ReportingJobError, type BatchRow, type JournalRow, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { splitSqlStatements } from "../staging/sqlStatements";
 import { rowsByOwner, type Owner } from "../fixtures/reporting-rows";
-import { ANNA, at, BEN, cancel, CUTOFF, day, fourFamilySnapshot, history, resetIds, SITE, SKU, verify } from "../fixtures/reporting-history";
+import { ANNA, at, BEN, cancel, complete, CUTOFF, day, fourFamilySnapshot, history, resetIds, SITE, SKU, verify } from "../fixtures/reporting-history";
 
 const H = (c: string) => c.repeat(64);
 const MAX_SAFE = 9007199254740991;
@@ -304,6 +304,30 @@ describe("publication semantics (reference model of 0038)", () => {
     expect(() => bad.publish(batchFrom(bad, "refresh", [[SITE_AUD, project(moved, SITE_AUD), (o) => o.partitionKey === "9002"]]), 1)).toThrow(/v2 has another current row \(an old owner was not planned\)/);
   });
 
+  it("T13B2b-2: order occurrences and timing facts are installed, replaced (old version retained) and deleted by an empty replacement", () => {
+    const src = [...base(), complete({ id: "t1", order_number: "9001", created_at: at(12, "09:30") })];
+    const db = rebuild(src);
+    const cur = (t: "order_occurrences" | "timing_facts", aud: [string, string | null] = ["site", null]) => db.current(t, SITE, aud).map((f) => `${f.id}@${f.from}`).sort();
+    // Non-vacuous: both families have real rows from the projector (terminal identity; effective stream lines with predecessors).
+    expect(cur("order_occurrences")).toEqual(["t1@1"]);
+    expect(cur("timing_facts")).toEqual(["v1@1", "v2@1", "v3@1"]);
+    expect(cur("timing_facts", ["self", ANNA])).toEqual(["v1@1", "v2@1"]);
+    expect(db.current("timing_facts", SITE, ["site", null]).find((f) => f.id === "v2")!.row.prev_all_event_id).toBe("v1");
+    // Replacement: a changed terminal time re-installs the occurrence; the old version is retained (closed, not deleted).
+    const moved = [...src.slice(0, 3), { ...src[3], created_at: at(12, "09:40") }];
+    db.publish(batchFrom(db, "refresh", [[SITE_AUD, project(moved, SITE_AUD), (o) => o.partitionKey === "9001"]]), 1);
+    expect(cur("order_occurrences")).toEqual(["t1@2"]);
+    expect(db.facts.filter((f) => f.family === "order_occurrences" && f.id === "t1" && f.audKind === "site").map((f) => `${f.from}-${f.to}`)).toEqual(["1-2", "2-null"]);
+    expect(cur("timing_facts")).toEqual(["v1@2", "v2@2", "v3@1"]);
+    // Deletion: an empty replacement of 9001 closes its occurrence and timing rows; every closed version stays.
+    db.publish(batchFrom(db, "refresh", [], {}, [[SITE_AUD, { partitionKind: "order", partitionKey: "9001" }]]), 1);
+    expect(cur("order_occurrences")).toEqual([]);
+    expect(cur("timing_facts")).toEqual(["v3@1"]);
+    expect(db.facts.filter((f) => (f.family === "order_occurrences" || f.family === "timing_facts") && f.audKind === "site" && f.id !== "v3").map((f) => `${f.family}:${f.id}:${f.from}-${f.to}`).sort()).toEqual([
+      "order_occurrences:t1:1-2", "order_occurrences:t1:2-3", "timing_facts:v1:1-2", "timing_facts:v1:2-3", "timing_facts:v2:1-2", "timing_facts:v2:2-3",
+    ]);
+  });
+
   it("a rebuild closes every current row of the site, including departed audiences and empty partitions", () => {
     const db = rebuild(base());
     expect(ids(db, ["self", ANNA])).toEqual(["v1", "v2"]);
@@ -530,7 +554,10 @@ describe("0038 B2b SQL", () => {
 
   it("the fingerprint SQL is the TypeScript model's exact byte layout", () => {
     const f = fn("reporting_private.publication_fingerprint");
-    expect(f).toContain("'item-counting-publication-v1' || E'\\n' || b.site || E'\\n' || b.kind || E'\\n' || b.rule_version || E'\\n' || b.capture_epoch::text || E'\\n' || (pg_catalog.extract(epoch FROM b.source_cutoff) * 1000000)::bigint::text || E'\\n' || b.sealed_manifest_hash");
+    // T13B2b-1: EXTRACT is special grammar; a schema-qualified "pg_catalog.extract(x FROM y)" does not parse.
+    expect(f).not.toMatch(/pg_catalog\.extract\s*\(/i);
+    expect(f).toContain("(EXTRACT(epoch FROM b.source_cutoff) * 1000000)::bigint::text");
+    expect(f).toContain("'item-counting-publication-v1' || E'\\n' || b.site || E'\\n' || b.kind || E'\\n' || b.rule_version || E'\\n' || b.capture_epoch::text || E'\\n' || (EXTRACT(epoch FROM b.source_cutoff) * 1000000)::bigint::text || E'\\n' || b.sealed_manifest_hash");
     expect(f).toContain("string_agg(E'\\n' || w.result_digest, '' ORDER BY w.audience_kind COLLATE \"C\", w.audience_staff::text COLLATE \"C\" NULLS FIRST, w.partition_kind COLLATE \"C\", w.partition_key COLLATE \"C\")");
   });
 });
@@ -575,5 +602,14 @@ describe("publication fingerprint and wrapper", () => {
     expect(err).toBeInstanceOf(ReportingJobError);
     expect(err.code).toBe("P0001");
     expect((await publishReportingBatch(fake([{ ...row, replay: true }]).client, B, 7)).replay).toBe(true);
+  });
+});
+
+describe("T13B2b-1: no schema-qualified special-grammar function anywhere in 0038", () => {
+  it("EXTRACT/OVERLAY/POSITION/SUBSTRING…FROM/TRIM…FROM/COLLATION FOR use their SQL grammar, never pg_catalog.name(…)", () => {
+    const sql = readFileSync("supabase/migrations/0038_reporting_jobs.sql", "utf8").replace(/--[^\n]*/g, " ");
+    expect(sql).not.toMatch(/pg_catalog\.(extract|overlay|position|collation)\s*\(/i);
+    expect(sql).not.toMatch(/pg_catalog\.(substring|trim)\s*\([^)]*\bFROM\b/i);
+    expect(sql).toContain("EXTRACT(epoch FROM b.source_cutoff)");
   });
 });

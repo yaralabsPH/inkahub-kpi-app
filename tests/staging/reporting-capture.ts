@@ -41,6 +41,8 @@ import {
   checkCatalog,
   checkSteps,
   compareSnapshots,
+  finalReport,
+  initialReport,
   concurrencyProbe,
   openGuardedClient,
   newCaptureReport,
@@ -224,7 +226,7 @@ async function main(): Promise<number> {
     renameSync(`${out}.tmp`, out);
   };
   const log = (l: string) => console.log(redactSecrets(l));
-  save();
+  if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
 
   let settings: Record<string, string>;
@@ -269,6 +271,7 @@ async function main(): Promise<number> {
       return compareSnapshots(before, await snapshot(fresh));
     },
   });
+  finalReport(save, () => captureMarkdown(report), report.errors);
   const status = captureStatus(report);
   console.log(status);
   return status === "STATUS: COMPLETE" ? 0 : 1;

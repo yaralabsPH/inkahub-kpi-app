@@ -46,6 +46,20 @@ export function rowsByOwner(r: PartitionResult): Map<string, { owner: Owner; row
       production_date: v ? productionDateAt(new Date(f.ms), r.site as ReportSite) : null,
     });
   }
+  for (const f of r.facts) {
+    const o = factOwner.get(f.id)!;
+    // Order identity of a terminal with a work type, person and order (exact terminal identity; qualification is read-time).
+    if (f.role === "terminal" && f.workType && f.staffId && f.orderKey && f.rawOrder !== null) {
+      at(o).order_occurrences.push({ terminal_event_id: f.id, order_key: f.orderKey, raw_order: f.rawOrder, case_id: f.caseId, work_type: f.workType, staff_id: f.staffId, occurred_at: f.createdAt });
+    }
+    // Timing observation of an effective stream line, with its full-history predecessors (index hints).
+    if (f.role === "verification" && !f.cancelledBy.length && f.timing?.stream && f.staffId && f.workType) {
+      at(o).timing_facts.push({
+        event_id: f.id, staff_id: f.staffId, work_type: f.workType, occurred_at: f.createdAt, weight: f.timing.weight,
+        prev_all_event_id: f.timing.prevAll?.id ?? null, prev_same_type_event_id: f.timing.prevSameType?.id ?? null,
+      });
+    }
+  }
   for (const e of r.edges) {
     at(factOwner.get(e.cancelId)!).cancel_edges.push({
       cancel_event_id: e.cancelId, parent_event_id: e.parentId, is_self: e.self, parent_role: e.parentRole,

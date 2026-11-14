@@ -1537,3 +1537,84 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - `rp-x1` (blank order) is an invalid verification in Task 11, so it is not a daily line; my first hand count was wrong and the reducer check caught it.
     - The Part A expand-only test regex flagged the `IS NOT NULL` predicate in a CHECK; it now rejects only real NOT NULL column constraints.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict tsc on the staging runner OK; 1045/1045 tests; build OK.
+- 2026-11-15 — B2b review round 1 (T13B2b-1 to 7) and the prepared installed-commit harness, plus the planner's three early harness notes:
+  - **State:**
+    - 0038 is still an unapplied draft (SHA-256 14a808ea…).
+    - 0034–0037 are byte-identical (0037: 531BB2C5…).
+    - No SQL was run and no staging mode was executed.
+    - Task 13 stays OPEN.
+  - **T13B2b-1:** `publication_fingerprint` now uses valid `EXTRACT(epoch FROM …)`. The test that endorsed the qualified spelling is corrected, and a whole-file guard rejects any schema-qualified special-grammar call (EXTRACT, OVERLAY, POSITION, COLLATION FOR, SUBSTRING/TRIM … FROM).
+  - **T13B2b-2:** the shared `rowsByOwner` fixture now emits:
+    - `order_occurrences` for every terminal with a work type, person and order;
+    - `timing_facts` for effective stream verifications, with the projector's full-history predecessors.
+
+    The fixture asserts that all five families are non-empty.
+    - **Model test:** occurrence/timing install, replacement (old version retained as closed) and deletion by empty replacement.
+    - **Rollback flow:** new order RP-9 (one timing row, one occurrence), deleted in the refresh. New checks:
+      - P2f: all five families are non-empty;
+      - P2g: exact current rows per family and audience after the rebuild;
+      - F9g: exact current rows after replacement and deletion;
+      - F9h: RP-9 has no current occurrence/timing row, and its closed rows are retained at the old generation;
+      - F9i: replaced RP-1 occurrence/timing rows have a retained closed version and a new current one.
+  - **T13B2b-3:**
+    - `runCaptureLifecycle` persists through a sticky, non-throwing `persist()`. A failure is kept in errors, so the run is FAILED, and written to stderr, and rollback, disconnect and the fresh audit still run. An actual-helper injection test shows `open 1, rollback, end 1, open 2, AUDIT, end 2` with two persistence errors.
+    - New `initialReport` refuses the database connection when the report cannot be written. It is used by all three runners (fence, publication, capture).
+    - New `finalReport` records a failed final write and prints the whole report to stderr.
+    - Saves inside a run still throw, which stops further scenario work.
+  - **T13B2b-4:** the audit compares a full-state fingerprint:
+    - every row image of `production_events`, `products`, `ledger`, `user_locations` and `profiles`;
+    - functions (source md5, ACL, config, security definer, owner);
+    - relations, columns (with ACL), constraints, indexes, policies and triggers;
+    - schema ACLs and the capture role with its memberships;
+    - every `reporting_private` table's full rows;
+    - control and site state, field by field.
+
+    Identity-sequence positions are deliberately excluded, because rolled-back inserts advance them. Rollback-only modes allow NO difference, so 0038 left behind after a rehearsal is caught. The committed harness allows exactly its declared capture-epoch increments and the run sites' lease bookkeeping (a fence that goes backwards is refused).
+  - **T13B2b-5:** `migrationBody` classifies statements by their first executable keywords, skipping whitespace, line comments and NESTED block comments. ROLLBACK, END, ABORT, SAVEPOINT, RELEASE and PREPARE TRANSACTION are refused inside the body. Quoted function bodies and `PREPARE name AS …` are not mistaken for transaction control. The reviewer's `BEGIN; /* c */ COMMIT; SELECT 1; COMMIT;` now throws.
+  - **T13B2b-6:** I5 uses `killOwnVictim`. The victim is tagged with a run-unique `application_name`, and `pg_terminate_backend` runs only for that pid AND tag. Expected 57P01 notices are counted as evidence; any other error event or end() failure is a cleanup failure (proved by injection).
+  - **T13B2b-7:**
+    - P2d compares exact (event_id, image) sets of candidate, mirror and current versions in both directions, instead of counts.
+    - F9j checks exact fixture images: mirror = `to_jsonb(source row)`, version = mirror, and deleted ids are not current.
+    - I2, I4, F5 and P3 are relabelled to their narrower evidence and point to the committed cases.
+  - **Installed-commit harness** (`npm run staging:reporting-jobs -- --committed-interleavings --sites=A,B`; module `tests/staging/reportingCommitted.ts`) — PREPARED, NOT RUN:
+    - **Preflight refuses** unless: capture is off; no batch is active anywhere; both sites are legacy with processor off, no generation, no derived/mirror/candidate/batch rows and no unacknowledged journal rows; and the run-unique `rc-<run>-` fixture prefix collides with nothing.
+    - **Ownership** (original settings, fixtures, then batches, generations and sequences as they are created) is saved BEFORE the first commit; a failed save stops with nothing committed.
+    - **Scenarios:**
+      - A: a lower change id, uncommitted while a higher one commits and freezes, commits later and stays pending until the next publication receives and acknowledges it;
+      - B: a committed batch survives its worker's disconnect and is taken over from another connection (only this run's lease is shifted, by a committed update); the old fence is refused for claim and publish;
+      - C: a publication committed on one connection with its response "lost", then replayed from another: same generation, no duplicate credit, no new generation;
+      - D: a committed A→B move of a run fixture. Both sites publish concurrently, with an explicit empty replacement of the old owner, and the change is acknowledged, directly or by at most one recorded deferred pass. The moved facts are current only at B.
+    - **Cleanup** always runs, even after failures:
+      - abandon this run's unfinished batches;
+      - restore capture off (an expected epoch increment, never reset);
+      - classify journal rows by exact id; external rows are RETAINED and reported;
+      - delete only rows scoped to this run's sites AND its generation sequences, generation ids, batch ids, change ids or prefixed fixture ids — no unscoped delete, no trigger/constraint suppression;
+      - remove generations newest first;
+      - then end every session.
+
+      The lifecycle's fresh full audit runs last.
+  - **Planner's early notes:**
+    - **(1)** Every committed service RPC goes through `serviceCall`: begin, become service_role, PROVE `current_user` and the claims role, call, commit. Any failure rolls back, so no role or aborted state leaks. The shared `rpc` delegates to it via `FlowCtx.call`, so the rollback-only module still contains no commit. Owner-role fixture/lease statements stay explicit.
+    - **(2)** `endAll`, cleanup steps and the cleanup-start rollback now keep rollback failures.
+    - **(3)** `cleanupPlan(own, changes, { retainBatches, externalActiveSites })`:
+      - any retained batch keeps ALL the run's facts, daily rows, versions, mirror rows, generations and site pointers, and restores only the processor setting;
+      - journal rows received by a retained batch are kept;
+      - a site whose active batch is not the run's is never touched;
+      - even unretained metadata resets apply only while the site's active batch is the run's, or none.
+  - **Deliberate breaks** (134 focused tests; all 19 killed):
+    - qualified EXTRACT: 2 failed;
+    - no timing rows: 2; no occurrence rows: 2;
+    - save throwing through cleanup: 1; output failure not refusing the connection: 1;
+    - private tables ignored: 1; ledger not hashed: 1; epoch drift accepted: 1;
+    - block comments hiding COMMIT: 1;
+    - unexpected disconnect swallowed: 1; terminate without the tag: 1;
+    - service RPC without the role check: 1; committed RPCs not transactional: 1 (this one first survived a text-only check and was fixed with a behavioural begin/role/proof/call/commit test);
+    - rollback failure swallowed: 1;
+    - retained run still deleting facts: 1; external site reset: 1;
+    - commit before the ownership save: 1; fixture-prefix guard lost: 1;
+    - F9h removed: 1.
+  - **Surprises:**
+    - My first fixture expectations were wrong in two places, both caught by the shared rules: `rp-x1` with a blank order is an invalid verification, and the excluded hook line `rp-v2` is not a timing-stream line.
+    - The cleanup unit test's fake answered every site_state query, which made both sites look externally active; the fake was narrowed.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict tsc on the reporting-jobs and capture runners OK; 1062/1062 tests; build OK.
+  - **Next:** independent review of the fixes and the harness before any staging action. Then the rollback rehearsal, installation of the reviewed draft, the installed and committed interleavings, and the fresh restoration audits.
