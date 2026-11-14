@@ -333,7 +333,7 @@ $fn$;
 -- Server-side job metadata for one site (no source payloads, no secrets).
 CREATE FUNCTION public.get_reporting_job_status(p_site text)
 RETURNS TABLE (site text, processor_enabled boolean, read_mode text, capture_enabled boolean, capture_epoch bigint, source_epoch bigint,
-               active_generation_id uuid, active_batch_id uuid, active_batch_state text, lease_fence bigint, lease_expires_at timestamptz,
+               active_generation_id uuid, active_batch_id uuid, active_batch_state text, active_batch_kind text, lease_fence bigint, lease_expires_at timestamptz,
                heartbeat_at timestamptz, last_verified_cutoff timestamptz, pending_changes bigint, oldest_pending_captured_at timestamptz)
 LANGUAGE sql
 STABLE
@@ -343,6 +343,7 @@ AS $fn$
   SELECT s.site, s.processor_enabled, s.read_mode, c.capture_enabled, c.capture_epoch, s.source_epoch,
          s.active_generation_id, s.active_batch_id,
          (SELECT b.state FROM reporting_private.batches b WHERE b.batch_id = s.active_batch_id),
+         (SELECT b.kind FROM reporting_private.batches b WHERE b.batch_id = s.active_batch_id),
          s.lease_fence, s.lease_expires_at, s.heartbeat_at, s.last_verified_cutoff,
          (SELECT count(*) FROM reporting_private.site_pending_changes(p_site)),
          (SELECT min(ch.captured_at) FROM reporting_private.changes ch
@@ -768,7 +769,9 @@ $fn$;
 -- verified staged chunks stay for identical replay. Frozen input is never
 -- re-snapshotted; an invalid (drifted) batch is not revived; a live lease is busy.
 CREATE FUNCTION public.resume_reporting_batch(p_batch uuid, p_expected_fence bigint)
-RETURNS TABLE (batch_id uuid, lease_fence bigint, lease_expires_at timestamptz, state text, returned_work bigint)
+RETURNS TABLE (batch_id uuid, lease_fence bigint, lease_expires_at timestamptz, state text, returned_work bigint,
+               kind text, base_generation_id uuid, rule_version text, capture_epoch bigint, source_cutoff timestamptz,
+               rebuild_progress jsonb)
 LANGUAGE plpgsql
 VOLATILE
 SECURITY INVOKER
@@ -810,7 +813,15 @@ BEGIN
      WHERE w.batch_id = p_batch AND w.state = 'leased'
     RETURNING 1)
   SELECT count(*) INTO v_back FROM back;
-  RETURN QUERY SELECT p_batch, v_new, v_lease, b.state, v_back;
+  -- Everything a replacement worker with no memory needs to continue (T13B1-1):
+  -- identity plus saved rebuild progress (bounded metadata; no source payloads).
+  RETURN QUERY SELECT p_batch, v_new, v_lease, b.state, v_back, b.kind, b.base_generation_id, b.rule_version, b.capture_epoch, b.source_cutoff,
+    CASE WHEN b.kind = 'rebuild' THEN pg_catalog.jsonb_build_object(
+      'afterEventId', b.rebuild_cursor -> 'after',
+      'complete', coalesce((b.rebuild_cursor ->> 'complete')::boolean, false),
+      'pages', coalesce((b.rebuild_cursor ->> 'pages')::bigint, 0),
+      'rows', coalesce((b.rebuild_cursor ->> 'rows')::bigint, 0),
+      'bytes', coalesce((b.rebuild_cursor ->> 'bytes')::bigint, 0)) END;
 END
 $fn$;
 

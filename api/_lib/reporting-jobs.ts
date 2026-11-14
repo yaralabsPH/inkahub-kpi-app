@@ -111,6 +111,8 @@ export interface ReportingJobStatus {
   activeGenerationId: string | null;
   activeBatchId: string | null;
   activeBatchState: string | null;
+  /** Lets orchestration route recovery (refresh vs rebuild) explicitly. */
+  activeBatchKind: "refresh" | "rebuild" | null;
   leaseFence: number;
   leaseExpiresAtUtc: string | null;
   heartbeatAtUtc: string | null;
@@ -135,6 +137,12 @@ export async function getReportingJobStatus(client: RpcClient, site: ReportingSi
     activeGenerationId: strOrNull(r.active_generation_id, "active_generation_id"),
     activeBatchId: strOrNull(r.active_batch_id, "active_batch_id"),
     activeBatchState: strOrNull(r.active_batch_state, "active_batch_state"),
+    activeBatchKind: (() => {
+      const k = strOrNull(r.active_batch_kind, "active_batch_kind");
+      if (k !== null && k !== "refresh" && k !== "rebuild") throw new ReportingJobError(`unknown batch kind ${k}`);
+      if ((k === null) !== (r.active_batch_id === null)) throw new ReportingJobError("active batch kind and id disagree");
+      return k as BatchKind | null;
+    })(),
     leaseFence: num(r.lease_fence, "lease_fence"),
     leaseExpiresAtUtc: strOrNull(r.lease_expires_at, "lease_expires_at"),
     heartbeatAtUtc: strOrNull(r.heartbeat_at, "heartbeat_at"),
@@ -287,23 +295,106 @@ export async function renewReportingLease(client: RpcClient, batchId: string, fe
   return out;
 }
 
-export interface ResumedBatch extends LeaseState {
-  state: string;
-  returnedWork: number;
+/** Saved candidate-copy progress of a rebuild (bounded metadata; never source rows). */
+export interface RebuildProgress {
+  /** The next copy request's cursor (null = from the start). */
+  afterEventId: string | null;
+  complete: boolean;
+  pages: number;
+  rows: number;
+  bytes: number;
 }
 
-/** Expired-lease takeover of the SAME batch under a new, larger fence. */
+export type BatchKind = "refresh" | "rebuild";
+const BATCH_STATES = ["active", "frozen", "publishing"] as const;
+
+export interface ResumedBatch extends LeaseState {
+  state: (typeof BATCH_STATES)[number];
+  returnedWork: number;
+  kind: BatchKind;
+  baseGenerationId: string | null;
+  ruleVersion: string;
+  captureEpoch: number;
+  sourceCutoffUtc: string | null;
+  /** Rebuilds only (null for a refresh). */
+  rebuildProgress: RebuildProgress | null;
+}
+
+const PROGRESS_KEYS = ["afterEventId", "bytes", "complete", "pages", "rows"];
+
+/** Strict: exact keys, exact types, internally consistent; anything else is refused. */
+export function parseRebuildProgress(v: unknown): RebuildProgress {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) throw new ReportingJobError("rebuild_progress is not an object");
+  const o = v as Record<string, unknown>;
+  if (Object.keys(o).sort().join(",") !== PROGRESS_KEYS.join(",")) throw new ReportingJobError("rebuild_progress has unexpected keys");
+  const after = o.afterEventId;
+  if (after !== null && (typeof after !== "string" || after === "")) throw new ReportingJobError("rebuild_progress.afterEventId must be null or a non-empty string");
+  const p: RebuildProgress = {
+    afterEventId: after as string | null,
+    complete: bool(o.complete, "rebuild_progress.complete"),
+    pages: num(o.pages, "rebuild_progress.pages"),
+    rows: num(o.rows, "rebuild_progress.rows"),
+    bytes: num(o.bytes, "rebuild_progress.bytes"),
+  };
+  if (p.pages < 0 || p.rows < 0 || p.bytes < 0) throw new ReportingJobError("rebuild_progress counts must be non-negative");
+  if (p.pages === 0 && (p.afterEventId !== null || p.rows !== 0 || p.bytes !== 0 || p.complete)) throw new ReportingJobError("rebuild_progress is inconsistent: no pages copied");
+  if (p.rows > 0 && p.afterEventId === null) throw new ReportingJobError("rebuild_progress is inconsistent: rows copied without a cursor");
+  return p;
+}
+
+/** Expired-lease takeover of the SAME batch under a new, larger fence, with everything needed to continue. */
 export async function resumeReportingBatch(client: RpcClient, batchId: string, expectedFence: number): Promise<ResumedBatch> {
-  const [r] = await callRows(client, "resume_reporting_batch", { p_batch: batchArg(batchId), p_expected_fence: fenceArg(expectedFence) });
-  const out = {
+  const id = batchArg(batchId);
+  const [r] = await callRows(client, "resume_reporting_batch", { p_batch: id, p_expected_fence: fenceArg(expectedFence) });
+  const state = str(r.state, "state");
+  if (!(BATCH_STATES as readonly string[]).includes(state)) throw new ReportingJobError(`resumed batch is ${state}`);
+  const kind = str(r.kind, "kind");
+  if (kind !== "refresh" && kind !== "rebuild") throw new ReportingJobError(`unknown batch kind ${kind}`);
+  const out: ResumedBatch = {
     batchId: str(r.batch_id, "batch_id"),
     leaseFence: num(r.lease_fence, "lease_fence"),
     leaseExpiresAtUtc: str(r.lease_expires_at, "lease_expires_at"),
-    state: str(r.state, "state"),
+    state: state as ResumedBatch["state"],
     returnedWork: num(r.returned_work, "returned_work"),
+    kind,
+    baseGenerationId: strOrNull(r.base_generation_id, "base_generation_id"),
+    ruleVersion: str(r.rule_version, "rule_version"),
+    captureEpoch: num(r.capture_epoch, "capture_epoch"),
+    sourceCutoffUtc: strOrNull(r.source_cutoff, "source_cutoff"),
+    rebuildProgress: kind === "rebuild" ? parseRebuildProgress(r.rebuild_progress) : null,
   };
+  if (out.batchId !== id) throw new ReportingJobError("takeover returned another batch");
   if (out.leaseFence <= expectedFence) throw new ReportingJobError("takeover did not advance the fence");
+  if (kind === "refresh" && r.rebuild_progress !== null && r.rebuild_progress !== undefined) throw new ReportingJobError("a refresh has no rebuild progress");
+  if (kind === "rebuild" && out.state === "active" && out.sourceCutoffUtc !== null) throw new ReportingJobError("an active rebuild has no cutoff yet");
   return out;
+}
+
+/**
+ * Recover a rebuild after losing all process state: take over the expired
+ * lease, then continue copying from the RETURNED cursor (never from the
+ * start), or report that the copy was already complete and freeze is next.
+ * Needs only the batch id and fence from get_reporting_job_status; no
+ * private-table access.
+ */
+export async function recoverRebuildCopy(
+  client: RpcClient,
+  batchId: string,
+  expectedFence: number,
+  maxPages: number,
+): Promise<{ resumed: ResumedBatch; pagesCopied: number; progress: RebuildProgress; next: "copy" | "freeze" }> {
+  if (!Number.isSafeInteger(maxPages) || maxPages < 0) throw new ReportingJobError("maxPages must be a non-negative integer");
+  const resumed = await resumeReportingBatch(client, batchId, expectedFence);
+  if (resumed.kind !== "rebuild" || !resumed.rebuildProgress) throw new ReportingJobError(`batch ${batchId} is a ${resumed.kind}, not a rebuild`);
+  if (resumed.state !== "active") throw new ReportingJobError(`rebuild ${batchId} is already ${resumed.state}`);
+  let progress = resumed.rebuildProgress;
+  let pagesCopied = 0;
+  while (!progress.complete && pagesCopied < maxPages) {
+    const page = await copyReportingSourcePage(client, batchId, resumed.leaseFence, progress.afterEventId);
+    pagesCopied++;
+    progress = { afterEventId: page.nextAfterEventId, complete: page.complete, pages: page.pages, rows: page.totalRows, bytes: progress.bytes + page.bytesCopied };
+  }
+  return { resumed, pagesCopied, progress, next: progress.complete ? "freeze" : "copy" };
 }
 
 /** Explicit recovery only (Task 15's protected action): evidence and pending journal are kept. */

@@ -287,8 +287,9 @@ describe("B1 wrappers", () => {
   it("renew must keep the fence; resume must advance it", async () => {
     await expect(renewReportingLease(fake([{ batch_id: BATCH, lease_fence: 8, lease_expires_at: "t" }]).client, BATCH, 7)).rejects.toThrow(/changed the fence/);
     expect(await renewReportingLease(fake([{ batch_id: BATCH, lease_fence: 7, lease_expires_at: "t" }]).client, BATCH, 7)).toMatchObject({ leaseFence: 7 });
-    await expect(resumeReportingBatch(fake([{ batch_id: BATCH, lease_fence: 7, lease_expires_at: "t", state: "frozen", returned_work: 2 }]).client, BATCH, 7)).rejects.toThrow(/did not advance/);
-    expect(await resumeReportingBatch(fake([{ batch_id: BATCH, lease_fence: 8, lease_expires_at: "t", state: "frozen", returned_work: 2 }]).client, BATCH, 7)).toMatchObject({ leaseFence: 8, returnedWork: 2 });
+    const refresh = { batch_id: BATCH, lease_fence: 8, lease_expires_at: "t", state: "frozen", returned_work: 2, kind: "refresh", base_generation_id: "g1", rule_version: "item-counting-summary-v1", capture_epoch: 4, source_cutoff: "t0", rebuild_progress: null };
+    await expect(resumeReportingBatch(fake([{ ...refresh, lease_fence: 7 }]).client, BATCH, 7)).rejects.toThrow(/did not advance/);
+    expect(await resumeReportingBatch(fake([refresh]).client, BATCH, 7)).toMatchObject({ leaseFence: 8, returnedWork: 2, kind: "refresh", rebuildProgress: null });
   });
 
   it("freeze maps its counts", async () => {

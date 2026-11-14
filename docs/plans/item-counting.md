@@ -467,6 +467,25 @@ At `edb5ab124c47130e7aea28338d8e251d7041fab7`, independent read-only review pass
 - A lost freeze response can recover through persisted `frozen` status without resnapshotting; add that orchestration case in Task 15. It is not a B1 blocker.
 
 **Next:** Claude fixes T13B1-1 only, records failing/passing regression evidence, runs focused/common gates, commits/pushes and pauses for verification. B2 remains gated on that verification; 0038 stays unapplied.
+
+**Coder response to T13B1-1 (Claude, 2026-11-14; 0038 still an unapplied draft; 0037 byte-identical; no SQL run):**
+- **SQL:**
+  - `resume_reporting_batch` now also returns `kind`, `base_generation_id`, `rule_version`, `capture_epoch`, `source_cutoff` and `rebuild_progress`. The progress (rebuilds only; NULL for a refresh) is a jsonb `{afterEventId, complete, pages, rows, bytes}` derived from the saved `rebuild_cursor`. It excludes the saved `last` response, images and any source payload.
+  - `get_reporting_job_status` adds `active_batch_kind`.
+  - Fence checks, lease rules and candidate immutability are unchanged.
+- **Wrappers** (`api/_lib/reporting-jobs.ts`):
+  - `ResumedBatch` carries the typed identity and progress. `parseRebuildProgress` is strict: exact keys (so no extra payload), a null or non-empty cursor, non-negative safe-integer counts, and consistency (no pages ⇒ null cursor, zero counts, not complete; rows ⇒ a cursor).
+  - `resumeReportingBatch` also rejects another batch id, an unknown kind or state, a refresh carrying progress, and an active rebuild with a cutoff.
+  - `getReportingJobStatus` validates `activeBatchKind` and refuses a kind/id mismatch.
+  - New `recoverRebuildCopy(client, batchId, expectedFence, maxPages)` needs only the batch id and fence from status. It takes over, then continues copying from the RETURNED cursor, or returns `next: "freeze"` without any copy call when the saved copy is complete. It never restarts from null and never reads private tables.
+- **Tests** (new `tests/reporting/reportingRebuildRecovery.test.ts`, 21 tests, also in `typecheck:digest`). A stateful fake applies the B1 rules: keyset pages, the cursor/replay decision, fence and lease.
+  - Two pages copied, all process state lost, lease expired; then status → takeover → continuation. Copy cursors are exactly `[null, e00999, e01999]`, and all 2,500 candidate rows are written exactly once.
+  - After takeover the old fence is refused. After one page, a `null` request is an identical replay that copies nothing; after two pages it is a cursor mismatch.
+  - Completed-copy recovery with an exact multiple of 1,000 rows (empty final page) goes straight to freeze with no copy call. A takeover before any page starts from null.
+  - Ten malformed-progress cases, plus wrapper identity/kind/state/cutoff and status kind/id checks.
+  - SQL text for the new resume columns (no `last`, image or source access) and the status kind.
+- **Regressions proven:** reverting each part in turn fails its test. That covers 7 reverts: resume returns no progress; status without kind; recovery restarting from null; copying again after a complete copy; lenient keys; ignored consistency; unvalidated status kind.
+- Gate: `npx tsc -b`, `npm run typecheck:digest`, 942/942 tests, build OK. A lost freeze response remains Task 15's orchestration case, as noted.
 - No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
 
 ## Amendment implementation log
