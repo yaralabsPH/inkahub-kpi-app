@@ -5,7 +5,9 @@
 -- single-statement batch freeze and job status. Part B1: batch identity and
 -- drift checks, the resumable candidate rebuild (begin/copy/freeze) and lease
 -- renewal/takeover/abandon. Part B2a: work planning/sealing, bounded claims
--- and single/bulk chunk staging with exact hash/envelope/ownership checks.
+-- (serialized-response bound) and single/bulk chunk staging of FIVE result
+-- arrays (the fifth, source_issue_facts, is T11-4's selected-source warning
+-- family) with exact hash/envelope/structure/ownership/source-binding checks.
 -- Part B2b (atomic publication) is added to THIS draft at the next checkpoint.
 --
 -- Expand-only. 0034–0037 are not edited. Source table, source policies,
@@ -887,6 +889,37 @@ ALTER TABLE reporting_private.partition_work
 -- Production date computed by TypeScript (site zone, 04:00) at materialization.
 ALTER TABLE reporting_private.event_facts ADD COLUMN production_date date;
 
+-- T11-4: the fifth staged family. A malformed-identity source row (whitespace-
+-- only id; an empty id fails the read) keeps its RAW selectors, so it still
+-- selects the four evidence families, and carries the shared-TypeScript issue
+-- that is reported only when the row is selected. It adds no Items, Orders,
+-- timing or parent presence. Versioned exactly like the other result tables.
+CREATE TABLE reporting_private.source_issue_facts (
+  site             text        NOT NULL CHECK (site IN ('au', 'uk', 'us')),
+  audience_kind    text        NOT NULL CHECK (audience_kind IN ('site', 'self')),
+  audience_staff   uuid,
+  event_id         text        NOT NULL CHECK (event_id <> ''),
+  valid_from_seq   bigint      NOT NULL CHECK (valid_from_seq >= 1),
+  valid_to_seq     bigint,
+  event_type       text        NOT NULL CHECK (event_type <> ''),
+  created_at       timestamptz NOT NULL,
+  staff_id         uuid,
+  raw_order        text,
+  parent_event_id  text,
+  issue_kind       text        NOT NULL CHECK (issue_kind IN ('invalid_event', 'unclassified_sku', 'invalid_quantity', 'unresolved_parent', 'missing_completion_detail', 'ambiguous_repeat')),
+  issue_detail     text,
+  rule_version     text        NOT NULL CHECK (rule_version <> ''),
+  CHECK ((audience_kind = 'site') = (audience_staff IS NULL)),
+  CHECK (valid_to_seq IS NULL OR valid_to_seq > valid_from_seq),
+  CHECK (audience_kind = 'site' OR staff_id = audience_staff),
+  UNIQUE NULLS NOT DISTINCT (site, audience_kind, audience_staff, event_id, valid_from_seq)
+);
+CREATE INDEX source_issue_facts_current_time ON reporting_private.source_issue_facts (site, audience_kind, audience_staff, created_at, event_id) WHERE valid_to_seq IS NULL;
+CREATE INDEX source_issue_facts_validity ON reporting_private.source_issue_facts (site, audience_kind, audience_staff, valid_from_seq, valid_to_seq);
+CREATE INDEX source_issue_facts_raw_order ON reporting_private.source_issue_facts (site, audience_kind, audience_staff, raw_order);
+CREATE INDEX source_issue_facts_parent ON reporting_private.source_issue_facts (site, audience_kind, audience_staff, parent_event_id) WHERE parent_event_id IS NOT NULL;
+ALTER TABLE reporting_private.source_issue_facts ENABLE ROW LEVEL SECURITY;
+
 -- No work is added to a sealed batch, and a descriptor's identity never changes.
 CREATE FUNCTION reporting_private.partition_work_guard()
 RETURNS trigger
@@ -1006,6 +1039,7 @@ BEGIN
                WHEN pg_catalog.jsonb_typeof(e.v -> 'partitionKind') <> 'string' OR e.v ->> 'partitionKind' NOT IN ('order', 'event') THEN 'bad partitionKind'
                WHEN pg_catalog.jsonb_typeof(e.v -> 'partitionKey') <> 'string' OR e.v ->> 'partitionKey' = '' THEN 'bad partitionKey'
                WHEN e.v ->> 'partitionKind' = 'order' AND reporting_private.order_key(e.v ->> 'partitionKey') IS DISTINCT FROM e.v ->> 'partitionKey' THEN 'order partition key is not a trimmed order key'
+               WHEN pg_catalog.octet_length(pg_catalog.to_json(e.v ->> 'partitionKey')::text) > 1048576 - 512 THEN 'partitionKey too large for one claim response'
                WHEN pg_catalog.jsonb_typeof(e.v -> 'inputHash') <> 'string' OR e.v ->> 'inputHash' !~ '^[0-9a-f]{64}$' THEN 'bad inputHash'
              END AS problem
         FROM pg_catalog.jsonb_array_elements(p_items) WITH ORDINALITY AS e(v, ord)) x
@@ -1084,9 +1118,15 @@ BEGIN
 END
 $fn$;
 
--- Claim a bounded list (1..1000 descriptors, at most 1 MiB) of pending work
--- of a sealed frozen batch under this fence. work_id is returned as text so
--- JavaScript never rounds it.
+-- Claim a bounded list (1..1000 descriptors) of pending work of a sealed
+-- frozen batch under this fence. The bound is the SERIALIZED response
+-- (T13B2a-3): each returned row is measured as its json_build_object text —
+-- JSON-escaped values, quoted keys and " : "/", " separators, an upper bound
+-- of PostgREST's compact row JSON — plus 4 bytes of list separator, plus 2
+-- for the brackets; the claimed prefix stays within 1 MiB. Rows that do not
+-- fit stay pending for the next claim (never leased and not returned); a
+-- first row that cannot fit alone fails visibly (planning already refuses
+-- such keys). work_id is returned as text so JavaScript never rounds it.
 CREATE FUNCTION public.claim_reporting_work(p_batch uuid, p_fence bigint, p_limit integer DEFAULT 100)
 RETURNS TABLE (work_id text, audience_kind text, audience_staff uuid, partition_kind text, partition_key text, input_hash text,
                expected_chunk_count integer, staged_chunks integer)
@@ -1097,12 +1137,14 @@ SET search_path = ''
 AS $fn$
 #variable_conflict use_column
 DECLARE
-  b reporting_private.batches;
+  b        reporting_private.batches;
+  v_ids    bigint[];
+  v_picked integer;
+  v_first  bigint;
 BEGIN
   b := reporting_private.lock_batch(p_batch, p_fence, true);
   IF b.state <> 'frozen' OR b.sealed_at IS NULL THEN RAISE EXCEPTION 'reporting batch % is not a sealed frozen batch', p_batch; END IF;
   IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000 THEN RAISE EXCEPTION 'claim_reporting_work: limit must be 1..1000'; END IF;
-  RETURN QUERY
   WITH picked AS (
     SELECT w.work_id
       FROM reporting_private.partition_work w
@@ -1111,19 +1153,28 @@ BEGIN
      LIMIT p_limit
        FOR UPDATE SKIP LOCKED
   ), sized AS (
-    SELECT w.work_id, sum(pg_catalog.octet_length(w.partition_key) + 200) OVER (ORDER BY w.work_id ROWS UNBOUNDED PRECEDING) AS run
+    SELECT w.work_id,
+           2 + sum(4 + pg_catalog.octet_length(pg_catalog.json_build_object(
+                 'work_id', w.work_id::text, 'audience_kind', w.audience_kind, 'audience_staff', w.audience_staff,
+                 'partition_kind', w.partition_kind, 'partition_key', w.partition_key, 'input_hash', w.input_hash,
+                 'expected_chunk_count', w.expected_chunk_count,
+                 'staged_chunks', (SELECT count(*)::integer FROM reporting_private.partition_results r WHERE r.work_id = w.work_id))::text))
+               OVER (ORDER BY w.work_id ROWS UNBOUNDED PRECEDING) AS run
       FROM reporting_private.partition_work w JOIN picked p ON p.work_id = w.work_id
-  ), claimed AS (
-    UPDATE reporting_private.partition_work w
-       SET state = 'leased', lease_fence = p_fence
-      FROM sized s
-     WHERE w.work_id = s.work_id AND s.run <= 1048576
-    RETURNING w.*
   )
-  SELECT c.work_id::text, c.audience_kind, c.audience_staff, c.partition_kind, c.partition_key, c.input_hash, c.expected_chunk_count,
-         (SELECT count(*)::integer FROM reporting_private.partition_results r WHERE r.work_id = c.work_id)
-    FROM claimed c
-   ORDER BY c.work_id;
+  SELECT coalesce(array_agg(z.work_id ORDER BY z.work_id) FILTER (WHERE z.run <= 1048576), '{}'::bigint[]), count(*)::integer, min(z.work_id)
+    INTO v_ids, v_picked, v_first
+    FROM sized z;
+  IF v_picked > 0 AND pg_catalog.cardinality(v_ids) = 0 THEN
+    RAISE EXCEPTION 'claim_reporting_work: work % does not fit one 1 MiB claim response', v_first;
+  END IF;
+  UPDATE reporting_private.partition_work w SET state = 'leased', lease_fence = p_fence WHERE w.work_id = ANY (v_ids);
+  RETURN QUERY
+  SELECT w.work_id::text, w.audience_kind, w.audience_staff, w.partition_kind, w.partition_key, w.input_hash, w.expected_chunk_count,
+         (SELECT count(*)::integer FROM reporting_private.partition_results r WHERE r.work_id = w.work_id)
+    FROM reporting_private.partition_work w
+   WHERE w.work_id = ANY (v_ids)
+   ORDER BY w.work_id;
 END
 $fn$;
 
@@ -1201,20 +1252,22 @@ BEGIN
     RAISE EXCEPTION 'stage: work % is not claimed under fence %', p_partition, p_fence;
   END IF;
 
-  -- Rows: exactly the four arrays, at most 1,000 rows in all.
+  -- Rows: exactly the five arrays, at most 1,000 rows in all.
   BEGIN
     v_rows := v_text::jsonb;
   EXCEPTION WHEN invalid_text_representation THEN
     RAISE EXCEPTION 'stage: canonicalRows is not JSON';
   END;
   IF pg_catalog.jsonb_typeof(v_rows) <> 'object'
-     OR (SELECT string_agg(k, ',' ORDER BY k COLLATE "C") FROM pg_catalog.jsonb_object_keys(v_rows) AS k) IS DISTINCT FROM 'cancel_edges,event_facts,order_occurrences,timing_facts'
+     OR (SELECT string_agg(k, ',' ORDER BY k COLLATE "C") FROM pg_catalog.jsonb_object_keys(v_rows) AS k) IS DISTINCT FROM 'cancel_edges,event_facts,order_occurrences,source_issue_facts,timing_facts'
      OR pg_catalog.jsonb_typeof(v_rows -> 'event_facts') <> 'array' OR pg_catalog.jsonb_typeof(v_rows -> 'cancel_edges') <> 'array'
-     OR pg_catalog.jsonb_typeof(v_rows -> 'order_occurrences') <> 'array' OR pg_catalog.jsonb_typeof(v_rows -> 'timing_facts') <> 'array' THEN
-    RAISE EXCEPTION 'stage: canonicalRows must hold exactly the arrays event_facts, cancel_edges, order_occurrences, timing_facts';
+     OR pg_catalog.jsonb_typeof(v_rows -> 'order_occurrences') <> 'array' OR pg_catalog.jsonb_typeof(v_rows -> 'timing_facts') <> 'array'
+     OR pg_catalog.jsonb_typeof(v_rows -> 'source_issue_facts') <> 'array' THEN
+    RAISE EXCEPTION 'stage: canonicalRows must hold exactly the arrays event_facts, cancel_edges, order_occurrences, timing_facts, source_issue_facts';
   END IF;
   IF pg_catalog.jsonb_array_length(v_rows -> 'event_facts') + pg_catalog.jsonb_array_length(v_rows -> 'cancel_edges')
-     + pg_catalog.jsonb_array_length(v_rows -> 'order_occurrences') + pg_catalog.jsonb_array_length(v_rows -> 'timing_facts') > 1000 THEN
+     + pg_catalog.jsonb_array_length(v_rows -> 'order_occurrences') + pg_catalog.jsonb_array_length(v_rows -> 'timing_facts')
+     + pg_catalog.jsonb_array_length(v_rows -> 'source_issue_facts') > 1000 THEN
     RAISE EXCEPTION 'stage: more than 1000 rows in one chunk';
   END IF;
 
@@ -1241,7 +1294,93 @@ BEGIN
 END
 $fn$;
 
--- Row shape, trusted-metadata exclusion and ownership against the frozen view.
+-- Structural validation of one staged row (T13B2a-1): every required field,
+-- JSON type, enum, range and relational rule of its table, checked BEFORE a
+-- chunk is saved (a composite parse does not enforce NOT NULL/CHECK).
+-- Generated from the same column spec as resultRowProblem in
+-- api/_lib/reporting-stage.ts; messages are identical. Returns NULL or the first problem.
+CREATE FUNCTION reporting_private.staged_row_problem(p_table text, v jsonb)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT CASE p_table
+    WHEN 'event_facts' THEN CASE
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'event_id'), 'missing') <> 'string' OR (v ->> 'event_id') = '') THEN 'event_facts.event_id must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'event_type'), 'missing') <> 'string' OR (v ->> 'event_type') NOT IN ('line_verified', 'completed', 'dispatched', 'cancelled')) THEN 'event_facts.event_type must be one of line_verified, completed, dispatched, cancelled'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'created_at'), 'missing') <> 'string' OR (v ->> 'created_at') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+-][0-9]{2}(:?[0-9]{2})?)$') THEN 'event_facts.created_at must be an ISO-8601 timestamp'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'staff_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'staff_id'), 'missing') <> 'string' OR (v ->> 'staff_id') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') THEN 'event_facts.staff_id must be a lowercase uuid or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'department'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'department'), 'missing') <> 'string') THEN 'event_facts.department must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'raw_order'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'raw_order'), 'missing') <> 'string') THEN 'event_facts.raw_order must be a string or null'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'order_key'), 'missing') <> 'string') THEN 'event_facts.order_key must be a string'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'case_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'case_id'), 'missing') <> 'string') THEN 'event_facts.case_id must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'parent_event_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'parent_event_id'), 'missing') <> 'string') THEN 'event_facts.parent_event_id must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'sku'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'sku'), 'missing') <> 'string') THEN 'event_facts.sku must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'quantity'), 'missing') <> 'null' AND (CASE WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'quantity'), 'missing') <> 'number' OR (v ->> 'quantity') !~ '^-?[0-9]{1,10}$' THEN true ELSE (v ->> 'quantity')::bigint NOT BETWEEN -2147483648 AND 2147483647 END) THEN 'event_facts.quantity must be a 32-bit integer or null'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'role'), 'missing') <> 'string' OR (v ->> 'role') NOT IN ('verification', 'terminal', 'cancellation', 'invalid')) THEN 'event_facts.role must be one of verification, terminal, cancellation, invalid'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'work_type'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'work_type'), 'missing') <> 'string' OR (v ->> 'work_type') NOT IN ('a0_framed', 'framed', 'unframed', 'dispatch')) THEN 'event_facts.work_type must be one of a0_framed, framed, unframed, dispatch or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'invalid_detail'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'invalid_detail'), 'missing') <> 'string') THEN 'event_facts.invalid_detail must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'line_key'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'line_key'), 'missing') <> 'string') THEN 'event_facts.line_key must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'item_status'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'item_status'), 'missing') <> 'string' OR (v ->> 'item_status') NOT IN ('counted', 'excluded', 'unclassified')) THEN 'event_facts.item_status must be one of counted, excluded, unclassified or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'items'), 'missing') <> 'null' AND (CASE WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'items'), 'missing') <> 'number' OR (v ->> 'items') !~ '^[0-9]{1,16}$' THEN true ELSE (v ->> 'items')::bigint > 9007199254740991 END) THEN 'event_facts.items must be a non-negative safe integer or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'product_kind'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'product_kind'), 'missing') <> 'string' OR (v ->> 'product_kind') NOT IN ('eligible', 'excluded', 'unclassified')) THEN 'event_facts.product_kind must be one of eligible, excluded, unclassified or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'item_issue_kind'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'item_issue_kind'), 'missing') <> 'string' OR (v ->> 'item_issue_kind') NOT IN ('unclassified_sku', 'invalid_quantity')) THEN 'event_facts.item_issue_kind must be one of unclassified_sku, invalid_quantity or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'item_issue_detail'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'item_issue_detail'), 'missing') <> 'string') THEN 'event_facts.item_issue_detail must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'timing_stream'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'timing_stream'), 'missing') <> 'boolean') THEN 'event_facts.timing_stream must be a boolean or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'timing_weight'), 'missing') <> 'null' AND (CASE WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'timing_weight'), 'missing') <> 'number' THEN true ELSE (v -> 'timing_weight')::numeric < 0 END) THEN 'event_facts.timing_weight must be a non-negative number or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'production_date'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'production_date'), 'missing') <> 'string' OR (v ->> 'production_date') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') THEN 'event_facts.production_date must be a YYYY-MM-DD date or null'
+      WHEN (v ->> 'role' = 'verification') <> (pg_catalog.jsonb_typeof(v -> 'item_status') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'items') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'product_kind') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'line_key') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'timing_stream') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'timing_weight') <> 'null') THEN 'event_facts: role verification needs exactly item_status, items, product_kind, line_key, timing_stream and timing_weight'
+      WHEN (v ->> 'role' = 'invalid') <> (pg_catalog.jsonb_typeof(v -> 'invalid_detail') <> 'null') THEN 'event_facts: invalid_detail is required exactly for role invalid'
+    END
+    WHEN 'cancel_edges' THEN CASE
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'cancel_event_id'), 'missing') <> 'string' OR (v ->> 'cancel_event_id') = '') THEN 'cancel_edges.cancel_event_id must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'parent_event_id'), 'missing') <> 'string' OR (v ->> 'parent_event_id') = '') THEN 'cancel_edges.parent_event_id must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'is_self'), 'missing') <> 'boolean') THEN 'cancel_edges.is_self must be a boolean'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'parent_role'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'parent_role'), 'missing') <> 'string' OR (v ->> 'parent_role') NOT IN ('verification', 'terminal', 'cancellation', 'invalid')) THEN 'cancel_edges.parent_role must be one of verification, terminal, cancellation, invalid or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'parent_created_at'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'parent_created_at'), 'missing') <> 'string' OR (v ->> 'parent_created_at') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+-][0-9]{2}(:?[0-9]{2})?)$') THEN 'cancel_edges.parent_created_at must be an ISO-8601 timestamp or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'pair'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'pair'), 'missing') <> 'string' OR (v ->> 'pair') NOT IN ('valid', 'mismatch', 'case_differs')) THEN 'cancel_edges.pair must be one of valid, mismatch, case_differs or null'
+      WHEN (pg_catalog.jsonb_typeof(v -> 'parent_role') = 'null') <> (pg_catalog.jsonb_typeof(v -> 'parent_created_at') = 'null') THEN 'cancel_edges: parent_role and parent_created_at are both set or both null'
+      WHEN (pg_catalog.jsonb_typeof(v -> 'pair') <> 'null') <> coalesce(v ->> 'parent_role' IN ('verification', 'terminal'), false) THEN 'cancel_edges: pair is required exactly for a verification or terminal parent'
+    END
+    WHEN 'order_occurrences' THEN CASE
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'terminal_event_id'), 'missing') <> 'string' OR (v ->> 'terminal_event_id') = '') THEN 'order_occurrences.terminal_event_id must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'order_key'), 'missing') <> 'string' OR (v ->> 'order_key') = '') THEN 'order_occurrences.order_key must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'raw_order'), 'missing') <> 'string') THEN 'order_occurrences.raw_order must be a string'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'case_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'case_id'), 'missing') <> 'string') THEN 'order_occurrences.case_id must be a string or null'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'work_type'), 'missing') <> 'string' OR (v ->> 'work_type') NOT IN ('a0_framed', 'framed', 'unframed', 'dispatch')) THEN 'order_occurrences.work_type must be one of a0_framed, framed, unframed, dispatch'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'staff_id'), 'missing') <> 'string' OR (v ->> 'staff_id') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') THEN 'order_occurrences.staff_id must be a lowercase uuid'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'occurred_at'), 'missing') <> 'string' OR (v ->> 'occurred_at') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+-][0-9]{2}(:?[0-9]{2})?)$') THEN 'order_occurrences.occurred_at must be an ISO-8601 timestamp'
+    END
+    WHEN 'timing_facts' THEN CASE
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'event_id'), 'missing') <> 'string' OR (v ->> 'event_id') = '') THEN 'timing_facts.event_id must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'staff_id'), 'missing') <> 'string' OR (v ->> 'staff_id') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') THEN 'timing_facts.staff_id must be a lowercase uuid'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'work_type'), 'missing') <> 'string' OR (v ->> 'work_type') NOT IN ('a0_framed', 'framed', 'unframed', 'dispatch')) THEN 'timing_facts.work_type must be one of a0_framed, framed, unframed, dispatch'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'occurred_at'), 'missing') <> 'string' OR (v ->> 'occurred_at') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+-][0-9]{2}(:?[0-9]{2})?)$') THEN 'timing_facts.occurred_at must be an ISO-8601 timestamp'
+      WHEN (CASE WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'weight'), 'missing') <> 'number' THEN true ELSE (v -> 'weight')::numeric < 0 END) THEN 'timing_facts.weight must be a non-negative number'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'prev_all_event_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'prev_all_event_id'), 'missing') <> 'string' OR (v ->> 'prev_all_event_id') = '') THEN 'timing_facts.prev_all_event_id must be a non-empty string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'prev_same_type_event_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'prev_same_type_event_id'), 'missing') <> 'string' OR (v ->> 'prev_same_type_event_id') = '') THEN 'timing_facts.prev_same_type_event_id must be a non-empty string or null'
+    END
+    WHEN 'source_issue_facts' THEN CASE
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'event_id'), 'missing') <> 'string' OR (v ->> 'event_id') = '') THEN 'source_issue_facts.event_id must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'event_type'), 'missing') <> 'string' OR (v ->> 'event_type') = '') THEN 'source_issue_facts.event_type must be a non-empty string'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'created_at'), 'missing') <> 'string' OR (v ->> 'created_at') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+-][0-9]{2}(:?[0-9]{2})?)$') THEN 'source_issue_facts.created_at must be an ISO-8601 timestamp'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'staff_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'staff_id'), 'missing') <> 'string' OR (v ->> 'staff_id') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') THEN 'source_issue_facts.staff_id must be a lowercase uuid or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'raw_order'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'raw_order'), 'missing') <> 'string') THEN 'source_issue_facts.raw_order must be a string or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'parent_event_id'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'parent_event_id'), 'missing') <> 'string') THEN 'source_issue_facts.parent_event_id must be a string or null'
+      WHEN (coalesce(pg_catalog.jsonb_typeof(v -> 'issue_kind'), 'missing') <> 'string' OR (v ->> 'issue_kind') NOT IN ('invalid_event', 'unclassified_sku', 'invalid_quantity', 'unresolved_parent', 'missing_completion_detail', 'ambiguous_repeat')) THEN 'source_issue_facts.issue_kind must be one of invalid_event, unclassified_sku, invalid_quantity, unresolved_parent, missing_completion_detail, ambiguous_repeat'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'issue_detail'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'issue_detail'), 'missing') <> 'string') THEN 'source_issue_facts.issue_detail must be a string or null'
+    END
+    ELSE 'unknown result table ' || coalesce(p_table, '') END
+$fn$;
+
+-- Row shape, trusted-metadata exclusion, structural validity (staged_row_problem)
+-- and binding to the frozen view (T13B2a-2): every RAW source field a row
+-- carries must equal its primary frozen source image; derived fields (role,
+-- work type, items, pair, ...) stay TypeScript's. Ownership: the frozen
+-- image's owner partition and, for a self audience, its own rows. A parent or
+-- predecessor reference must agree with the frozen view as the audience sees it.
 -- Returns NULL when every row is valid, else the first problem.
 CREATE FUNCTION reporting_private.check_staged_rows(p_batch uuid, p_work reporting_private.partition_work, p_rows jsonb)
 RETURNS text
@@ -1254,51 +1393,102 @@ DECLARE
   b      record;
   r      record;
   img    jsonb;
+  ref    jsonb;
   own    record;
   v_keys text;
   v_id   text;
+  v_at   text;
+  v_bad  text;
+  v_ref  text;
+  v_vis  boolean;
+  v_pre  text;
 BEGIN
   SELECT x.site, x.source_cutoff INTO b FROM reporting_private.batches x WHERE x.batch_id = p_batch;
   FOR r IN
     SELECT t.tbl, e.v, e.ord
-      FROM (VALUES ('event_facts'), ('cancel_edges'), ('order_occurrences'), ('timing_facts')) AS t(tbl)
+      FROM (VALUES ('event_facts'), ('cancel_edges'), ('order_occurrences'), ('timing_facts'), ('source_issue_facts')) AS t(tbl)
       CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(p_rows -> t.tbl) WITH ORDINALITY AS e(v, ord)
   LOOP
-    IF pg_catalog.jsonb_typeof(r.v) <> 'object' THEN RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] is not an object'; END IF;
+    v_pre := r.tbl || '[' || r.ord::text || ']';
+    IF pg_catalog.jsonb_typeof(r.v) <> 'object' THEN RETURN v_pre || ' is not an object'; END IF;
     SELECT string_agg(k, ',' ORDER BY k COLLATE "C") INTO v_keys FROM pg_catalog.jsonb_object_keys(r.v) AS k;
     IF v_keys IS DISTINCT FROM (SELECT string_agg(c, ',' ORDER BY c COLLATE "C") FROM pg_catalog.unnest(pg_catalog.string_to_array(
          CASE r.tbl
            WHEN 'event_facts' THEN 'case_id,created_at,department,event_id,event_type,invalid_detail,item_issue_detail,item_issue_kind,item_status,items,line_key,order_key,parent_event_id,product_kind,production_date,quantity,raw_order,role,sku,staff_id,timing_stream,timing_weight,work_type'
            WHEN 'cancel_edges' THEN 'cancel_event_id,is_self,pair,parent_created_at,parent_event_id,parent_role'
            WHEN 'order_occurrences' THEN 'case_id,occurred_at,order_key,raw_order,staff_id,terminal_event_id,work_type'
-           ELSE 'event_id,occurred_at,prev_all_event_id,prev_same_type_event_id,staff_id,weight,work_type' END, ',')) AS c) THEN
-      RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] has unexpected keys (site, audience, partition, rule and validity are set by the server)';
+           WHEN 'timing_facts' THEN 'event_id,occurred_at,prev_all_event_id,prev_same_type_event_id,staff_id,weight,work_type'
+           ELSE 'created_at,event_id,event_type,issue_detail,issue_kind,parent_event_id,raw_order,staff_id' END, ',')) AS c) THEN
+      RETURN v_pre || ' has unexpected keys (site, audience, partition, rule and validity are set by the server)';
     END IF;
-    -- Typed parse (raises on a wrong type).
-    CASE r.tbl
-      WHEN 'event_facts' THEN PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.event_facts, r.v);
-      WHEN 'cancel_edges' THEN PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.cancel_edges, r.v);
-      WHEN 'order_occurrences' THEN PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.order_occurrences, r.v);
-      ELSE PERFORM pg_catalog.jsonb_populate_record(NULL::reporting_private.timing_facts, r.v);
-    END CASE;
+    -- Required fields, JSON types, enums, ranges and relational rules (T13B2a-1).
+    v_bad := reporting_private.staged_row_problem(r.tbl, r.v);
+    IF v_bad IS NOT NULL THEN RETURN v_pre || ': ' || v_bad; END IF;
+
     v_id := CASE r.tbl WHEN 'cancel_edges' THEN r.v ->> 'cancel_event_id' WHEN 'order_occurrences' THEN r.v ->> 'terminal_event_id' ELSE r.v ->> 'event_id' END;
-    IF v_id IS NULL OR v_id = '' THEN RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] has no source event id'; END IF;
     img := reporting_private.frozen_image(p_batch, v_id);
-    IF img IS NULL THEN RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] event ' || coalesce((v_id)::text, '') || ' is not in the frozen view'; END IF;
+    IF img IS NULL THEN RETURN v_pre || ' event ' || v_id || ' is not in the frozen view'; END IF;
     SELECT * INTO own FROM reporting_private.owner_partition(img);
     IF own.partition_kind <> p_work.partition_kind OR own.partition_key <> p_work.partition_key THEN
-      RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] event ' || coalesce((v_id)::text, '') || ' belongs to partition ' || coalesce((own.partition_kind)::text, '') || '/' || coalesce((own.partition_key)::text, '') || ', not ' || coalesce((p_work.partition_kind)::text, '') || '/' || coalesce((p_work.partition_key)::text, '');
+      RETURN v_pre || ' event ' || v_id || ' belongs to partition ' || own.partition_kind || '/' || own.partition_key || ', not ' || p_work.partition_kind || '/' || p_work.partition_key;
     END IF;
     IF p_work.audience_kind = 'self' AND (img ->> 'staff_id') IS DISTINCT FROM p_work.audience_staff::text THEN
-      RETURN coalesce((r.tbl)::text, '') || '[' || coalesce((r.ord)::text, '') || '] event ' || coalesce((v_id)::text, '') || ' is not the self audience''s own row';
+      RETURN v_pre || ' event ' || v_id || ' is not the self audience''s own row';
+    END IF;
+    -- A whitespace-only id is a source issue, never an ordinary fact (and vice versa).
+    IF (r.tbl = 'source_issue_facts') <> (coalesce(reporting_private.order_key(v_id), '') = '') THEN
+      RETURN v_pre || ' event ' || v_id || CASE WHEN r.tbl = 'source_issue_facts' THEN ' has a valid identity; it is not a source issue' ELSE ' has a malformed identity; it belongs in source_issue_facts' END;
+    END IF;
+    IF (img ->> 'created_at')::timestamptz > b.source_cutoff THEN RETURN v_pre || ' is after the batch cutoff'; END IF;
+
+    -- Raw fields bound to the primary frozen source (T13B2a-2).
+    v_at := CASE WHEN r.tbl IN ('order_occurrences', 'timing_facts') THEN r.v ->> 'occurred_at' ELSE NULL END;
+    IF r.tbl IN ('event_facts', 'source_issue_facts') THEN
+      IF (r.v ->> 'event_type') IS DISTINCT FROM (img ->> 'event_type') THEN RETURN v_pre || ' event_type differs from the frozen source'; END IF;
+      IF (r.v ->> 'created_at')::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz THEN RETURN v_pre || ' created_at differs from the frozen source'; END IF;
+      IF (r.v ->> 'staff_id') IS DISTINCT FROM (img ->> 'staff_id') THEN RETURN v_pre || ' staff_id differs from the frozen source'; END IF;
+      IF (r.v ->> 'raw_order') IS DISTINCT FROM (img ->> 'order_number') THEN RETURN v_pre || ' raw_order differs from the frozen source'; END IF;
+      IF (r.v ->> 'parent_event_id') IS DISTINCT FROM (img ->> 'parent_event_id') THEN RETURN v_pre || ' parent_event_id differs from the frozen source'; END IF;
     END IF;
     IF r.tbl = 'event_facts' THEN
-      IF (r.v ->> 'created_at')::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] created_at differs from the frozen source'; END IF;
-      IF (r.v ->> 'created_at')::timestamptz > b.source_cutoff THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] is after the batch cutoff'; END IF;
-      IF (r.v ->> 'raw_order') IS DISTINCT FROM (img ->> 'order_number') THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] raw_order differs from the frozen source'; END IF;
-      IF (r.v ->> 'order_key') IS DISTINCT FROM coalesce(reporting_private.order_key(r.v ->> 'raw_order'), '') THEN RETURN 'event_facts[' || coalesce((r.ord)::text, '') || '] order_key is not the trimmed raw order'; END IF;
+      IF (r.v ->> 'department') IS DISTINCT FROM (img ->> 'department') THEN RETURN v_pre || ' department differs from the frozen source'; END IF;
+      IF (r.v ->> 'case_id') IS DISTINCT FROM (img ->> 'cs_case_id') THEN RETURN v_pre || ' case_id differs from the frozen source'; END IF;
+      IF (r.v ->> 'sku') IS DISTINCT FROM (img ->> 'line_sku') THEN RETURN v_pre || ' sku differs from the frozen source'; END IF;
+      IF (r.v -> 'quantity') IS DISTINCT FROM coalesce(img -> 'line_quantity', 'null'::jsonb) THEN RETURN v_pre || ' quantity differs from the frozen source'; END IF;
+      IF (r.v ->> 'order_key') IS DISTINCT FROM coalesce(reporting_private.order_key(r.v ->> 'raw_order'), '') THEN RETURN v_pre || ' order_key is not the trimmed raw order'; END IF;
     ELSIF r.tbl = 'cancel_edges' THEN
-      IF (r.v ->> 'parent_event_id') IS DISTINCT FROM (img ->> 'parent_event_id') THEN RETURN 'cancel_edges[' || coalesce((r.ord)::text, '') || '] parent differs from the frozen cancellation'; END IF;
+      IF (img ->> 'event_type') IS DISTINCT FROM 'cancelled' THEN RETURN v_pre || ' event ' || v_id || ' is not a cancellation in the frozen source'; END IF;
+      IF (r.v ->> 'parent_event_id') IS DISTINCT FROM (img ->> 'parent_event_id') THEN RETURN v_pre || ' parent differs from the frozen cancellation'; END IF;
+      IF (r.v -> 'is_self') IS DISTINCT FROM pg_catalog.to_jsonb((img ->> 'parent_event_id') = v_id) THEN RETURN v_pre || ' is_self differs from the frozen cancellation'; END IF;
+      -- Parent existence as the reducer sees it: a nonblank, due, count-type event visible to the audience.
+      -- (An ignored `started` row or a malformed identity is NOT a parent, whatever the selection selected.)
+      v_ref := r.v ->> 'parent_event_id';
+      ref := CASE WHEN coalesce(reporting_private.order_key(v_ref), '') = '' THEN NULL ELSE reporting_private.frozen_image(p_batch, v_ref) END;
+      v_vis := ref IS NOT NULL AND (ref ->> 'event_type') IN ('line_verified', 'completed', 'dispatched', 'cancelled')
+               AND (ref ->> 'created_at')::timestamptz <= b.source_cutoff
+               AND (p_work.audience_kind = 'site' OR (ref ->> 'staff_id') IS NOT DISTINCT FROM p_work.audience_staff::text);
+      IF (pg_catalog.jsonb_typeof(r.v -> 'parent_role') <> 'null') <> v_vis THEN RETURN v_pre || ' parent existence differs from the frozen view'; END IF;
+      IF v_vis AND (r.v ->> 'parent_created_at')::timestamptz IS DISTINCT FROM (ref ->> 'created_at')::timestamptz THEN RETURN v_pre || ' parent_created_at differs from the frozen parent'; END IF;
+    ELSIF r.tbl = 'order_occurrences' THEN
+      IF (img ->> 'event_type') NOT IN ('completed', 'dispatched') THEN RETURN v_pre || ' event ' || v_id || ' is not a terminal in the frozen source'; END IF;
+      IF (r.v ->> 'raw_order') IS DISTINCT FROM (img ->> 'order_number') THEN RETURN v_pre || ' raw_order differs from the frozen source'; END IF;
+      IF (r.v ->> 'order_key') IS DISTINCT FROM reporting_private.order_key(r.v ->> 'raw_order') THEN RETURN v_pre || ' order_key is not the trimmed raw order'; END IF;
+      IF (r.v ->> 'case_id') IS DISTINCT FROM (img ->> 'cs_case_id') THEN RETURN v_pre || ' case_id differs from the frozen source'; END IF;
+      IF (r.v ->> 'staff_id') IS DISTINCT FROM (img ->> 'staff_id') THEN RETURN v_pre || ' staff_id differs from the frozen source'; END IF;
+      IF v_at::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz THEN RETURN v_pre || ' occurred_at differs from the frozen source'; END IF;
+    ELSIF r.tbl = 'timing_facts' THEN
+      IF (img ->> 'event_type') IS DISTINCT FROM 'line_verified' THEN RETURN v_pre || ' event ' || v_id || ' is not a verification in the frozen source'; END IF;
+      IF (r.v ->> 'staff_id') IS DISTINCT FROM (img ->> 'staff_id') THEN RETURN v_pre || ' staff_id differs from the frozen source'; END IF;
+      IF v_at::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz THEN RETURN v_pre || ' occurred_at differs from the frozen source'; END IF;
+      -- Predecessors: earlier (or same-instant) due verifications of the same worker, visible to the audience.
+      FOREACH v_ref IN ARRAY ARRAY[r.v ->> 'prev_all_event_id', r.v ->> 'prev_same_type_event_id'] LOOP
+        CONTINUE WHEN v_ref IS NULL;
+        ref := CASE WHEN coalesce(reporting_private.order_key(v_ref), '') = '' THEN NULL ELSE reporting_private.frozen_image(p_batch, v_ref) END;
+        IF ref IS NULL OR (ref ->> 'event_type') IS DISTINCT FROM 'line_verified' OR (ref ->> 'staff_id') IS DISTINCT FROM (img ->> 'staff_id')
+           OR (ref ->> 'created_at')::timestamptz > (img ->> 'created_at')::timestamptz OR v_ref = v_id THEN
+          RETURN v_pre || ' predecessor ' || v_ref || ' is not an earlier verification by the same worker in the frozen view';
+        END IF;
+      END LOOP;
     END IF;
   END LOOP;
   RETURN NULL;
@@ -1399,11 +1589,15 @@ REVOKE ALL ON FUNCTION reporting_private.owner_partition(jsonb) FROM PUBLIC, ano
 REVOKE ALL ON FUNCTION reporting_private.work_manifest(uuid) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION reporting_private.stage_one(uuid, bigint, text, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION reporting_private.check_staged_rows(uuid, reporting_private.partition_work, jsonb) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.staged_row_problem(text, jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION reporting_private.frozen_image(uuid, text) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.owner_partition(jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.work_manifest(uuid) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.stage_one(uuid, bigint, text, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.check_staged_rows(uuid, reporting_private.partition_work, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.staged_row_problem(text, jsonb) TO service_role;
+REVOKE ALL ON TABLE reporting_private.source_issue_facts FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE reporting_private.source_issue_facts TO service_role;
 REVOKE ALL ON FUNCTION public.plan_reporting_work(uuid, bigint, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.seal_reporting_work(uuid, bigint, integer, text) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.claim_reporting_work(uuid, bigint, integer) FROM PUBLIC, anon, authenticated;

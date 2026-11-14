@@ -15,20 +15,27 @@ import { canonicalJson, sha256Hex } from "../../src/lib/domain/productionReporti
 import { splitSqlStatements } from "../staging/sqlStatements";
 import {
   buildChunks,
+  claimPrefix,
   claimReportingWork,
+  claimRowBytes,
   compareUtf8,
   descriptorProblem,
   manifestLine,
   MAX_BULK_ENTRIES,
+  MAX_CLAIM_KEY_JSON_BYTES,
   packStageRequests,
   planReportingWork,
   reportingManifestHash,
+  RESULT_COLUMNS,
+  RESULT_TABLES,
+  resultRowProblem,
   sealReportingWork,
   sortDescriptors,
   stageReportingResult,
   stageReportingResults,
   type ChunkEnvelope,
   type ResultRows,
+  type ResultTable,
   type WorkDescriptor,
 } from "../../api/_lib/reporting-stage";
 import { ReportingJobError, type RpcClient } from "../../api/_lib/reporting-jobs";
@@ -48,6 +55,7 @@ describe("cross-language hash agreement", () => {
     cancel_edges: [],
     order_occurrences: [],
     timing_facts: [],
+    source_issue_facts: [{ event_id: "  ", event_type: "started", raw_order: null, staff_id: null, parent_event_id: " ", created_at: "2026-01-15T09:00:00Z", issue_kind: "invalid_event", issue_detail: "missing id or site" }],
   };
 
   it("chunkHash is SHA-256 of the canonical text's UTF-8 bytes — what SQL's convert_to(text, 'UTF8') hashes", () => {
@@ -114,16 +122,19 @@ describe("descriptors (same rules as plan_reporting_work)", () => {
 
 describe("chunks and bulk requests", () => {
   const row = (i: number, pad = 0) => ({ event_id: `e${i}`, note: "x".repeat(pad) });
-  const rows = (n: number, pad = 0): ResultRows => ({ event_facts: Array.from({ length: n }, (_, i) => row(i, pad)), cancel_edges: [], order_occurrences: [], timing_facts: [] });
+  const rows = (n: number, pad = 0): ResultRows => ({ event_facts: Array.from({ length: n }, (_, i) => row(i, pad)), cancel_edges: [], order_occurrences: [], timing_facts: [], source_issue_facts: [] });
 
-  it("an empty replacement is ONE chunk of four empty arrays", () => {
-    const c = buildChunks({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [] });
+  it("an empty replacement is ONE chunk of five empty arrays", () => {
+    const c = buildChunks({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [], source_issue_facts: [] });
     expect(c).toHaveLength(1);
-    expect(JSON.parse(c[0].canonicalRows)).toEqual({ cancel_edges: [], event_facts: [], order_occurrences: [], timing_facts: [] });
+    expect(JSON.parse(c[0].canonicalRows)).toEqual({ cancel_edges: [], event_facts: [], order_occurrences: [], source_issue_facts: [], timing_facts: [] });
     expect(c[0]).toMatchObject({ chunkNo: 0, chunkCount: 1 });
   });
 
-  it("at most 1,000 rows per chunk; contiguous numbering; one digest over the ordered chunk hashes", () => {
+  it("at most 1,000 rows per chunk (counted across all five arrays); contiguous numbering; one digest over the ordered chunk hashes", () => {
+    const mixed = buildChunks({ ...rows(600), source_issue_facts: Array.from({ length: 600 }, (_, i) => ({ event_id: " ".repeat(i + 1) })) });
+    expect(mixed.map((x) => Object.values(JSON.parse(x.canonicalRows) as Record<string, unknown[]>).reduce((n, a) => n + a.length, 0))).toEqual([1000, 200]);
+    expect(() => buildChunks({ ...rows(1), extra: [] } as unknown as ResultRows)).toThrow(/unknown result table extra/);
     const c = buildChunks(rows(2500));
     expect(c.map((x) => x.chunkNo)).toEqual([0, 1, 2]);
     expect(c.every((x) => x.chunkCount === 3 && x.resultDigest === c[0].resultDigest)).toBe(true);
@@ -156,14 +167,17 @@ describe("chunks and bulk requests", () => {
 // ---------------------------------------------------------------------------
 
 type Work = { id: string; batch: string; audienceKind: "site" | "self"; audienceStaff: string | null; partitionKind: "order" | "event"; partitionKey: string; state: "pending" | "leased" | "done"; fence: number | null; expCount: number | null; expDigest: string | null };
-type Img = { id: string; order_number: string | null; staff_id: string; created_at: string; parent_event_id?: string | null };
-const COLS: Record<string, string[]> = {
-  event_facts: ["case_id", "created_at", "department", "event_id", "event_type", "invalid_detail", "item_issue_detail", "item_issue_kind", "item_status", "items", "line_key", "order_key", "parent_event_id", "product_kind", "production_date", "quantity", "raw_order", "role", "sku", "staff_id", "timing_stream", "timing_weight", "work_type"],
-  cancel_edges: ["cancel_event_id", "is_self", "pair", "parent_created_at", "parent_event_id", "parent_role"],
-  order_occurrences: ["case_id", "occurred_at", "order_key", "raw_order", "staff_id", "terminal_event_id", "work_type"],
-  timing_facts: ["event_id", "occurred_at", "prev_all_event_id", "prev_same_type_event_id", "staff_id", "weight", "work_type"],
-};
+/** A frozen source image: to_jsonb(production_events row). */
+type Img = { id: string; event_type: string; order_number: string | null; staff_id: string | null; created_at: string; parent_event_id: string | null; department: string | null; line_sku: string | null; line_quantity: number | null; cs_case_id: string | null };
+const COLS: Record<ResultTable, string[]> = Object.fromEntries(RESULT_TABLES.map((t) => [t, RESULT_COLUMNS[t].map(([c]) => c)])) as Record<ResultTable, string[]>;
 const jsTrim = (s: string | null) => (s ?? "").trim();
+const COUNT_TYPES = ["line_verified", "completed", "dispatched", "cancelled"];
+/** Exact instant in microseconds (Date.parse drops them; timestamptz keeps them). */
+const at = (s: unknown): bigint => {
+  const t = String(s);
+  const frac = /\.(\d{1,6})/.exec(t)?.[1] ?? "";
+  return BigInt(Date.parse(t.replace(/\.\d+/, ""))) * 1000n + BigInt(frac.padEnd(6, "0"));
+};
 
 class StageRef {
   works = new Map<string, Work>();
@@ -179,21 +193,65 @@ class StageRef {
     const k = jsTrim(img.order_number);
     return k ? ["order", k] : ["event", img.id];
   }
+  /** Mirrors check_staged_rows, rule for rule and in the same order. */
   checkRows(w: Work, rows: Record<string, Array<Record<string, unknown>>>): void {
-    for (const t of Object.keys(COLS)) {
+    for (const t of RESULT_TABLES) {
       rows[t].forEach((r, i) => {
-        if (Object.keys(r).sort().join(",") !== [...COLS[t]].sort().join(",")) throw new Error(`${t}[${i + 1}] has unexpected keys`);
+        const pre = `${t}[${i + 1}]`;
+        if (Object.keys(r).sort().join(",") !== [...COLS[t]].sort().join(",")) throw new Error(`${pre} has unexpected keys`);
+        const bad = resultRowProblem(t, r);
+        if (bad) throw new Error(`${pre}: ${bad}`);
         const id = String(t === "cancel_edges" ? r.cancel_event_id : t === "order_occurrences" ? r.terminal_event_id : r.event_id);
         const img = this.frozen.get(id);
-        if (!img) throw new Error(`${t}[${i + 1}] event ${id} is not in the frozen view`);
+        if (!img) throw new Error(`${pre} event ${id} is not in the frozen view`);
         const [pk, key] = this.owner(img);
-        if (pk !== w.partitionKind || key !== w.partitionKey) throw new Error(`${t}[${i + 1}] event ${id} belongs to partition ${pk}/${key}`);
-        if (w.audienceKind === "self" && img.staff_id !== w.audienceStaff) throw new Error(`${t}[${i + 1}] event ${id} is not the self audience's own row`);
+        if (pk !== w.partitionKind || key !== w.partitionKey) throw new Error(`${pre} event ${id} belongs to partition ${pk}/${key}`);
+        if (w.audienceKind === "self" && img.staff_id !== w.audienceStaff) throw new Error(`${pre} event ${id} is not the self audience's own row`);
+        if ((t === "source_issue_facts") !== (jsTrim(id) === "")) throw new Error(`${pre} event ${id} ${t === "source_issue_facts" ? "has a valid identity" : "has a malformed identity"}`);
+        if (at(img.created_at) > at(this.cutoff)) throw new Error(`${pre} is after the batch cutoff`);
+        const same = (field: string, a: unknown, b: unknown) => {
+          if (a !== b) throw new Error(`${pre} ${field} differs from the frozen source`);
+        };
+        if (t === "event_facts" || t === "source_issue_facts") {
+          same("event_type", r.event_type, img.event_type);
+          if (at(r.created_at) !== at(img.created_at)) throw new Error(`${pre} created_at differs from the frozen source`);
+          same("staff_id", r.staff_id, img.staff_id);
+          same("raw_order", r.raw_order, img.order_number);
+          same("parent_event_id", r.parent_event_id, img.parent_event_id);
+        }
         if (t === "event_facts") {
-          if (r.created_at !== img.created_at) throw new Error(`event_facts[${i + 1}] created_at differs from the frozen source`);
-          if (String(r.created_at) > this.cutoff) throw new Error(`event_facts[${i + 1}] is after the batch cutoff`);
-          if (r.raw_order !== img.order_number) throw new Error(`event_facts[${i + 1}] raw_order differs`);
-          if (r.order_key !== jsTrim(r.raw_order as string | null)) throw new Error(`event_facts[${i + 1}] order_key is not the trimmed raw order`);
+          same("department", r.department, img.department);
+          same("case_id", r.case_id, img.cs_case_id);
+          same("sku", r.sku, img.line_sku);
+          same("quantity", r.quantity, img.line_quantity);
+          if (r.order_key !== jsTrim(r.raw_order as string | null)) throw new Error(`${pre} order_key is not the trimmed raw order`);
+        } else if (t === "cancel_edges") {
+          if (img.event_type !== "cancelled") throw new Error(`${pre} event ${id} is not a cancellation in the frozen source`);
+          if (r.parent_event_id !== img.parent_event_id) throw new Error(`${pre} parent differs from the frozen cancellation`);
+          if (r.is_self !== (img.parent_event_id === id)) throw new Error(`${pre} is_self differs from the frozen cancellation`);
+          const pid = String(r.parent_event_id);
+          const p = jsTrim(pid) === "" ? undefined : this.frozen.get(pid);
+          const visible = !!p && COUNT_TYPES.includes(p.event_type) && at(p.created_at) <= at(this.cutoff) && (w.audienceKind === "site" || p.staff_id === w.audienceStaff);
+          if ((r.parent_role !== null) !== visible) throw new Error(`${pre} parent existence differs from the frozen view`);
+          if (visible && at(r.parent_created_at) !== at(p!.created_at)) throw new Error(`${pre} parent_created_at differs from the frozen parent`);
+        } else if (t === "order_occurrences") {
+          if (img.event_type !== "completed" && img.event_type !== "dispatched") throw new Error(`${pre} event ${id} is not a terminal in the frozen source`);
+          same("raw_order", r.raw_order, img.order_number);
+          if (r.order_key !== jsTrim(r.raw_order as string)) throw new Error(`${pre} order_key is not the trimmed raw order`);
+          same("case_id", r.case_id, img.cs_case_id);
+          same("staff_id", r.staff_id, img.staff_id);
+          if (at(r.occurred_at) !== at(img.created_at)) throw new Error(`${pre} occurred_at differs from the frozen source`);
+        } else if (t === "timing_facts") {
+          if (img.event_type !== "line_verified") throw new Error(`${pre} event ${id} is not a verification in the frozen source`);
+          same("staff_id", r.staff_id, img.staff_id);
+          if (at(r.occurred_at) !== at(img.created_at)) throw new Error(`${pre} occurred_at differs from the frozen source`);
+          for (const ref of [r.prev_all_event_id, r.prev_same_type_event_id]) {
+            if (ref === null) continue;
+            const p = jsTrim(String(ref)) === "" ? undefined : this.frozen.get(String(ref));
+            if (!p || p.event_type !== "line_verified" || p.staff_id !== img.staff_id || at(p.created_at) > at(img.created_at) || ref === id) {
+              throw new Error(`${pre} predecessor ${String(ref)} is not an earlier verification by the same worker in the frozen view`);
+            }
+          }
         }
       });
     }
@@ -219,7 +277,7 @@ class StageRef {
     if (w.state === "done") throw new Error("work is complete");
     if (w.state !== "leased" || w.fence !== fence) throw new Error(`work ${partition} is not claimed under fence ${fence}`);
     const rows = JSON.parse(String(c.canonicalRows)) as Record<string, Array<Record<string, unknown>>>;
-    if (Object.keys(rows).sort().join(",") !== "cancel_edges,event_facts,order_occurrences,timing_facts") throw new Error("canonicalRows must hold exactly the four arrays");
+    if (Object.keys(rows).sort().join(",") !== "cancel_edges,event_facts,order_occurrences,source_issue_facts,timing_facts") throw new Error("canonicalRows must hold exactly the five arrays");
     if (Object.values(rows).reduce((n, a) => n + a.length, 0) > 1000) throw new Error("more than 1000 rows");
     this.checkRows(w, rows);
     saved.set(no, { hash: String(c.chunkHash) });
@@ -246,34 +304,90 @@ class StageRef {
   }
 }
 
-describe("staging rules (reference model of 0038)", () => {
-  const imgs = new Map<string, Img>([
-    ["v1", { id: "v1", order_number: "5001", staff_id: STAFF, created_at: "2026-01-15T09:00:00Z" }],
-    ["v2", { id: "v2", order_number: " 5001 ", staff_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", created_at: "2026-01-15T09:05:00Z" }],
-    ["c1", { id: "c1", order_number: "5001", staff_id: STAFF, created_at: "2026-01-15T09:10:00Z", parent_event_id: "v1" }],
-    ["x1", { id: "x1", order_number: "  ", staff_id: STAFF, created_at: "2026-01-15T09:20:00Z" }],
-    ["f1", { id: "f1", order_number: "5001", staff_id: STAFF, created_at: "2026-02-20T09:00:00Z" }],
-  ]);
-  const fact = (id: string, over: Record<string, unknown> = {}) => {
-    const img = imgs.get(id)!;
-    const base: Record<string, unknown> = Object.fromEntries(COLS.event_facts.map((k) => [k, null]));
-    return { ...base, event_id: id, created_at: img.created_at, raw_order: img.order_number, order_key: jsTrim(img.order_number), event_type: "line_verified", role: "verification", staff_id: img.staff_id, ...over };
+const BEN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const img = (id: string, p: Partial<Img>): [string, Img] => [
+  id,
+  { id, event_type: "line_verified", order_number: "5001", staff_id: STAFF, created_at: "2026-01-15T09:00:00Z", parent_event_id: null, department: "framed", line_sku: "INKA-KAN0566-A4-FB", line_quantity: 1, cs_case_id: null, ...p },
+];
+const imgs = new Map<string, Img>([
+  img("v0", { created_at: "2026-01-15T08:50:00Z" }),
+  img("v1", {}),
+  img("v2", { order_number: " 5001 ", staff_id: BEN, created_at: "2026-01-15T09:05:00Z" }),
+  img("c1", { event_type: "cancelled", created_at: "2026-01-15T09:10:00Z", parent_event_id: "v1" }),
+  img("c2", { event_type: "cancelled", created_at: "2026-01-15T09:12:00Z", parent_event_id: "st-1" }),
+  img("c3", { event_type: "cancelled", created_at: "2026-01-15T09:14:00Z", parent_event_id: "v2" }),
+  img("st-1", { event_type: "started", created_at: "2026-01-15T08:00:00Z", line_sku: null, line_quantity: null }),
+  img("t1", { event_type: "completed", created_at: "2026-01-15T09:30:00Z", cs_case_id: "case-1", line_sku: null, line_quantity: null }),
+  img("x1", { order_number: "  ", created_at: "2026-01-15T09:20:00Z" }),
+  img("   ", { event_type: "started", order_number: null, created_at: "2026-01-15T09:40:00Z", line_sku: null, line_quantity: null }),
+  img(" \t", { event_type: "completed", order_number: "5001", staff_id: BEN, created_at: "2026-01-15T09:41:00Z", line_sku: null, line_quantity: null }),
+  img("f1", { created_at: "2026-02-20T09:00:00Z" }),
+]);
+const I = (id: string) => imgs.get(id)!;
+const ROLE_OF: Record<string, string> = { line_verified: "verification", completed: "terminal", dispatched: "terminal", cancelled: "cancellation" };
+/** A structurally valid row bound to its frozen image (derived fields are plausible TypeScript output). */
+const fact = (id: string, over: Record<string, unknown> = {}) => {
+  const s = I(id);
+  const verification = s.event_type === "line_verified";
+  return {
+    event_id: id, event_type: s.event_type, created_at: s.created_at, staff_id: s.staff_id, department: s.department, raw_order: s.order_number,
+    order_key: jsTrim(s.order_number), case_id: s.cs_case_id, parent_event_id: s.parent_event_id, sku: s.line_sku, quantity: s.line_quantity,
+    role: ROLE_OF[s.event_type] ?? "invalid", work_type: "framed", invalid_detail: null,
+    line_key: verification ? "kan0566" : null, item_status: verification ? "counted" : null, items: verification ? 1 : null, product_kind: verification ? "eligible" : null,
+    item_issue_kind: null, item_issue_detail: null, timing_stream: verification ? true : null, timing_weight: verification ? 1 : null, production_date: "2026-01-15",
+    ...over,
   };
-  const edge = (id: string) => ({ cancel_event_id: id, parent_event_id: "v1", is_self: false, parent_role: "verification", parent_created_at: "2026-01-15T09:00:00Z", pair: "valid" });
-  const env = (rows: Partial<ResultRows>) => buildChunks({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [], ...rows } as ResultRows);
-  function setup() {
-    const db = new StageRef(imgs, "2026-02-10T00:00:00Z");
-    const add = (id: string, w: Partial<Work>) => db.works.set(id, { id, batch: BATCH, audienceKind: "site", audienceStaff: null, partitionKind: "order", partitionKey: "5001", state: "leased", fence: 7, expCount: null, expDigest: null, ...w });
-    add("1", {});
-    add("2", { partitionKind: "event", partitionKey: "x1" });
-    add("3", { audienceKind: "self", audienceStaff: STAFF });
-    add("4", { state: "pending", fence: null });
-    return db;
+};
+const edge = (id: string, audienceStaff: string | null = null, over: Record<string, unknown> = {}) => {
+  const s = I(id);
+  const p = imgs.get(String(s.parent_event_id));
+  const visible = !!p && COUNT_TYPES.includes(p.event_type) && (audienceStaff === null || p.staff_id === audienceStaff);
+  return {
+    cancel_event_id: id, parent_event_id: s.parent_event_id, is_self: s.parent_event_id === id,
+    parent_role: visible ? ROLE_OF[p!.event_type] : null, parent_created_at: visible ? p!.created_at : null,
+    pair: visible && ["verification", "terminal"].includes(ROLE_OF[p!.event_type]) ? "valid" : null, ...over,
+  };
+};
+const occ = (id: string, over: Record<string, unknown> = {}) => {
+  const s = I(id);
+  return { terminal_event_id: id, order_key: jsTrim(s.order_number), raw_order: s.order_number, case_id: s.cs_case_id, work_type: "framed", staff_id: s.staff_id, occurred_at: s.created_at, ...over };
+};
+const timing = (id: string, over: Record<string, unknown> = {}) => {
+  const s = I(id);
+  return { event_id: id, staff_id: s.staff_id, work_type: "framed", occurred_at: s.created_at, weight: 1, prev_all_event_id: null, prev_same_type_event_id: null, ...over };
+};
+const issue = (id: string, over: Record<string, unknown> = {}) => {
+  const s = I(id);
+  return { event_id: id, event_type: s.event_type, created_at: s.created_at, staff_id: s.staff_id, raw_order: s.order_number, parent_event_id: s.parent_event_id, issue_kind: "invalid_event", issue_detail: "missing id or site", ...over };
+};
+const env = (rows: Partial<ResultRows>) => buildChunks({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [], source_issue_facts: [], ...rows } as ResultRows);
+function setup() {
+  const db = new StageRef(imgs, "2026-02-10T00:00:00Z");
+  const add = (id: string, w: Partial<Work>) => db.works.set(id, { id, batch: BATCH, audienceKind: "site", audienceStaff: null, partitionKind: "order", partitionKey: "5001", state: "leased", fence: 7, expCount: null, expDigest: null, ...w });
+  add("1", {});
+  add("2", { partitionKind: "event", partitionKey: "x1" });
+  add("3", { audienceKind: "self", audienceStaff: STAFF });
+  add("4", { state: "pending", fence: null });
+  add("5", { partitionKind: "event", partitionKey: "   " });
+  add("6", { audienceKind: "self", audienceStaff: BEN });
+  return db;
+}
+/** Stage one chunk on a fresh model; returns the error message or "ok". */
+const tryStage = (work: string, rows: Partial<ResultRows>) => {
+  try {
+    const db = setup();
+    db.stage(7, work, env(rows)[0]);
+    expect(db.works.get(work)!.state).toBe("done");
+    return "ok";
+  } catch (e) {
+    return (e as Error).message;
   }
+};
 
+describe("staging rules (reference model of 0038)", () => {
   it("all chunks present with the declared digest complete the work; one missing chunk keeps it open", () => {
     const db = setup();
-    const chunks = buildChunks({ event_facts: Array.from({ length: 1200 }, () => fact("v1")), cancel_edges: [], order_occurrences: [], timing_facts: [] });
+    const chunks = env({ event_facts: Array.from({ length: 1200 }, () => fact("v1")) });
     expect(chunks).toHaveLength(2);
     expect(db.stage(7, "1", chunks[1])).toEqual({ stored: true, done: false });
     expect(db.works.get("1")!.state).toBe("leased");
@@ -291,7 +405,7 @@ describe("staging rules (reference model of 0038)", () => {
 
   it("a contradictory chunkCount or resultDigest for a work fails", () => {
     const db = setup();
-    const two = buildChunks({ event_facts: Array.from({ length: 1001 }, () => fact("v1")), cancel_edges: [], order_occurrences: [], timing_facts: [] });
+    const two = env({ event_facts: Array.from({ length: 1001 }, () => fact("v1")) });
     db.stage(7, "1", two[0]);
     const [single] = env({ event_facts: [fact("v1")] });
     // Chunk 0 of a ONE-chunk result for a work already saved as a TWO-chunk result.
@@ -309,34 +423,156 @@ describe("staging rules (reference model of 0038)", () => {
     expect(() => db.stage(7, "1", { ...c, chunkNo: 1 })).toThrow(/outside chunkCount/);
     expect(() => db.stage(7, "1", { ...c, extra: 1 })).toThrow(/unexpected keys/);
     expect(() => db.stage(7, "1.0", c)).toThrow(/positive decimal/);
+    const four = canonicalJson({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [] });
+    expect(() => setup().stage(7, "1", { ...c, canonicalRows: four, chunkHash: nodeSha(four), resultDigest: nodeSha(nodeSha(four)) })).toThrow(/exactly the five arrays/);
     expect(db.works.get("1")!.state).toBe("leased");
   });
 
-  it("ownership: rows must belong to the claimed partition (JS-trimmed order), be in the frozen view, and be the self audience's own rows", () => {
-    const db = setup();
-    // v2's order " 5001 " trims to 5001: same owner.
-    expect(db.stage(7, "1", env({ event_facts: [fact("v1"), fact("v2")], cancel_edges: [edge("c1")] })[0]).done).toBe(true);
-    expect(() => setup().stage(7, "2", env({ event_facts: [fact("v1")] })[0])).toThrow(/belongs to partition order\/5001/);
-    expect(setup().stage(7, "2", env({ event_facts: [fact("x1")] })[0]).done).toBe(true);
-    expect(() => setup().stage(7, "1", env({ event_facts: [fact("v1", { event_id: "zz" })] })[0])).toThrow(/not in the frozen view/);
-    expect(() => setup().stage(7, "3", env({ event_facts: [fact("v2")] })[0])).toThrow(/not the self audience's own row/);
+  it("every family together: valid rows of all five arrays complete a site work and a self work", () => {
+    expect(tryStage("1", { event_facts: [fact("v0"), fact("v1"), fact("v2"), fact("c1"), fact("t1")], cancel_edges: [edge("c1"), edge("c2"), edge("c3")], order_occurrences: [occ("t1")], timing_facts: [timing("v1", { prev_all_event_id: "v0", prev_same_type_event_id: "v0" })] })).toBe("ok");
+    expect(tryStage("5", { source_issue_facts: [issue("   ")] })).toBe("ok");
+    expect(tryStage("1", { source_issue_facts: [issue(" \t")] })).toBe("ok");
+    expect(tryStage("3", { event_facts: [fact("v1"), fact("c3")], cancel_edges: [edge("c3", STAFF)], timing_facts: [timing("v1", { prev_all_event_id: "v0" })] })).toBe("ok");
   });
 
-  it("payload attempts to set trusted metadata (site, audience, partition, rule, validity) are refused", () => {
-    for (const k of ["site", "audience_kind", "audience_staff", "partition_key", "rule_version", "valid_from_seq"]) {
-      expect(() => setup().stage(7, "1", env({ event_facts: [{ ...fact("v1"), [k]: "x" }] })[0]), k).toThrow(/unexpected keys/);
+  it("ownership: rows must belong to the claimed partition (JS-trimmed order), be in the frozen view, and be the self audience's own rows", () => {
+    expect(tryStage("1", { event_facts: [fact("v1"), fact("v2")], cancel_edges: [edge("c1")] })).toBe("ok");
+    expect(tryStage("2", { event_facts: [fact("v1")] })).toMatch(/belongs to partition order\/5001/);
+    expect(tryStage("2", { event_facts: [fact("x1")] })).toBe("ok");
+    expect(tryStage("1", { event_facts: [fact("v1", { event_id: "zz" })] })).toMatch(/not in the frozen view/);
+    expect(tryStage("3", { event_facts: [fact("v2")] })).toMatch(/not the self audience's own row/);
+    expect(tryStage("3", { source_issue_facts: [issue(" \t")] })).toMatch(/not the self audience's own row/);
+    expect(tryStage("6", { source_issue_facts: [issue(" \t")] })).toBe("ok");
+  });
+
+  it("payload attempts to set trusted metadata (site, audience, partition, rule, validity) are refused in every array", () => {
+    const rows: Record<ResultTable, Record<string, unknown>> = { event_facts: fact("v1"), cancel_edges: edge("c1"), order_occurrences: occ("t1"), timing_facts: timing("v1"), source_issue_facts: issue(" \t") };
+    for (const t of RESULT_TABLES) {
+      for (const k of ["site", "audience_kind", "audience_staff", "partition_key", "rule_version", "valid_from_seq"]) {
+        expect(tryStage("1", { [t]: [{ ...rows[t], [k]: "x" }] }), `${t}.${k}`).toMatch(/unexpected keys/);
+      }
     }
   });
 
-  it("frozen-source drift in a row (time, order, key) and rows after the cutoff are refused", () => {
-    expect(() => setup().stage(7, "1", env({ event_facts: [fact("v1", { created_at: "2026-01-15T09:00:01Z" })] })[0])).toThrow(/created_at differs/);
-    expect(() => setup().stage(7, "1", env({ event_facts: [fact("v1", { raw_order: "5002", order_key: "5002" })] })[0])).toThrow(/raw_order differs/);
-    expect(() => setup().stage(7, "1", env({ event_facts: [fact("v2", { order_key: " 5001 " })] })[0])).toThrow(/order_key is not the trimmed raw order/);
-    expect(() => setup().stage(7, "1", env({ event_facts: [fact("f1")] })[0])).toThrow(/after the batch cutoff/);
+  it("T13B2a-1: required, null, type, enum, range and relational problems are refused before a chunk is saved or a work completes", () => {
+    const cases: Array<[ResultTable, Record<string, unknown>, RegExp]> = [
+      ["event_facts", fact("v1", { role: null }), /event_facts\.role must be one of/],
+      ["event_facts", fact("v1", { event_type: "started" }), /event_facts\.event_type must be one of line_verified/],
+      ["event_facts", fact("v1", { created_at: null }), /event_facts\.created_at must be an ISO-8601 timestamp$/],
+      ["event_facts", fact("v1", { order_key: null }), /event_facts\.order_key must be a string$/],
+      ["event_facts", fact("v1", { quantity: "1" }), /event_facts\.quantity must be a 32-bit integer or null/],
+      ["event_facts", fact("v1", { quantity: 2 ** 31 }), /event_facts\.quantity must be a 32-bit integer or null/],
+      ["event_facts", fact("v1", { items: -1 }), /event_facts\.items must be a non-negative safe integer or null/],
+      ["event_facts", fact("v1", { items: 1.5 }), /event_facts\.items must be a non-negative safe integer or null/],
+      ["event_facts", fact("v1", { items: 2 ** 53 }), /event_facts\.items must be a non-negative safe integer or null/],
+      ["event_facts", fact("v1", { timing_weight: -0.5 }), /event_facts\.timing_weight must be a non-negative number or null/],
+      ["event_facts", fact("v1", { timing_stream: "true" }), /event_facts\.timing_stream must be a boolean or null/],
+      ["event_facts", fact("v1", { work_type: "paint" }), /event_facts\.work_type must be one of a0_framed/],
+      ["event_facts", fact("v1", { staff_id: STAFF.toUpperCase() }), /event_facts\.staff_id must be a lowercase uuid or null/],
+      ["event_facts", fact("v1", { production_date: "15/01/2026" }), /event_facts\.production_date must be a YYYY-MM-DD date or null/],
+      ["event_facts", fact("v1", { items: null }), /role verification needs exactly/],
+      ["event_facts", fact("v1", { role: "terminal" }), /role verification needs exactly/],
+      ["event_facts", fact("v1", { role: "invalid" }), /role verification needs exactly/],
+      ["event_facts", fact("t1", { role: "invalid" }), /invalid_detail is required exactly for role invalid/],
+      ["event_facts", fact("t1", { invalid_detail: "x" }), /invalid_detail is required exactly for role invalid/],
+      ["cancel_edges", edge("c1", null, { is_self: null }), /cancel_edges\.is_self must be a boolean$/],
+      ["cancel_edges", edge("c1", null, { parent_event_id: "" }), /cancel_edges\.parent_event_id must be a non-empty string$/],
+      ["cancel_edges", edge("c1", null, { parent_created_at: null }), /parent_role and parent_created_at are both set or both null/],
+      ["cancel_edges", edge("c1", null, { pair: null }), /pair is required exactly for a verification or terminal parent/],
+      ["cancel_edges", edge("c2", null, { pair: "valid" }), /pair is required exactly for a verification or terminal parent/],
+      ["cancel_edges", edge("c1", null, { pair: "maybe" }), /cancel_edges\.pair must be one of valid, mismatch, case_differs or null/],
+      ["order_occurrences", occ("t1", { staff_id: null }), /order_occurrences\.staff_id must be a lowercase uuid$/],
+      ["order_occurrences", occ("t1", { order_key: "" }), /order_occurrences\.order_key must be a non-empty string$/],
+      ["order_occurrences", occ("t1", { work_type: null }), /order_occurrences\.work_type must be one of/],
+      ["order_occurrences", occ("t1", { occurred_at: "yesterday" }), /order_occurrences\.occurred_at must be an ISO-8601 timestamp$/],
+      ["timing_facts", timing("v1", { weight: null }), /timing_facts\.weight must be a non-negative number$/],
+      ["timing_facts", timing("v1", { weight: -1 }), /timing_facts\.weight must be a non-negative number$/],
+      ["timing_facts", timing("v1", { prev_all_event_id: "" }), /timing_facts\.prev_all_event_id must be a non-empty string or null/],
+      ["source_issue_facts", issue(" \t", { issue_kind: null }), /source_issue_facts\.issue_kind must be one of invalid_event/],
+      ["source_issue_facts", issue(" \t", { issue_kind: "other" }), /source_issue_facts\.issue_kind must be one of invalid_event/],
+      ["source_issue_facts", issue(" \t", { event_type: null }), /source_issue_facts\.event_type must be a non-empty string$/],
+    ];
+    for (const [t, row, re] of cases) {
+      const db = setup();
+      const [c] = env({ [t]: [row] });
+      expect(() => db.stage(7, "1", c), `${t} ${JSON.stringify(row).slice(0, 80)}`).toThrow(re);
+      expect(db.results.size).toBe(0);
+      expect(db.works.get("1")!.state).toBe("leased");
+      expect(resultRowProblem(t, row)).toMatch(re);
+    }
+  });
+
+  it("T13B2a-2: wrong worker, time, order, case and parent identity are refused for site and self audiences; derived fields stay TypeScript's", () => {
+    for (const work of ["1", "3"]) {
+      const bad: Array<[Partial<ResultRows>, RegExp]> = [
+        [{ event_facts: [fact("v1", { staff_id: BEN })] }, /staff_id differs/],
+        [{ event_facts: [fact("v1", { created_at: "2026-01-15T09:00:00.000001Z" })] }, /created_at differs/],
+        [{ event_facts: [fact("v1", { raw_order: " 5001", order_key: "5001" })] }, /raw_order differs/],
+        [{ event_facts: [fact("v1", { order_key: "5002" })] }, /order_key is not the trimmed raw order/],
+        [{ event_facts: [fact("v1", { case_id: "case-9" })] }, /case_id differs/],
+        [{ event_facts: [fact("v1", { parent_event_id: "c1" })] }, /parent_event_id differs/],
+        [{ event_facts: [fact("v1", { sku: "INKA-AUX-HOOK" })] }, /sku differs/],
+        [{ event_facts: [fact("v1", { quantity: 2 })] }, /quantity differs/],
+        [{ event_facts: [fact("v1", { department: "unframed" })] }, /department differs/],
+        [{ event_facts: [fact("v1", { event_type: "completed", role: "terminal", line_key: null, item_status: null, items: null, product_kind: null, timing_stream: null, timing_weight: null })] }, /event_type differs/],
+        [{ order_occurrences: [occ("t1", { staff_id: BEN })] }, /staff_id differs/],
+        [{ order_occurrences: [occ("t1", { occurred_at: "2026-01-15T09:31:00Z" })] }, /occurred_at differs/],
+        [{ order_occurrences: [occ("t1", { raw_order: "5001 ", order_key: "5001" })] }, /raw_order differs/],
+        [{ order_occurrences: [occ("t1", { case_id: null })] }, /case_id differs/],
+        [{ order_occurrences: [occ("v1")] }, /is not a terminal in the frozen source/],
+        [{ timing_facts: [timing("v1", { staff_id: BEN })] }, /staff_id differs/],
+        [{ timing_facts: [timing("v1", { occurred_at: "2026-01-15T08:59:59Z" })] }, /occurred_at differs/],
+        [{ timing_facts: [timing("t1")] }, /is not a verification in the frozen source/],
+        [{ timing_facts: [timing("v1", { prev_all_event_id: "v2" })] }, /predecessor v2 is not an earlier verification by the same worker/],
+        [{ timing_facts: [timing("v0", { prev_same_type_event_id: "v1" })] }, /predecessor v1 is not an earlier/],
+        [{ timing_facts: [timing("v1", { prev_all_event_id: "t1" })] }, /predecessor t1 is not an earlier/],
+        [{ timing_facts: [timing("v1", { prev_all_event_id: "gone" })] }, /predecessor gone is not an earlier/],
+        [{ timing_facts: [timing("v1", { prev_all_event_id: "v1" })] }, /predecessor v1 is not an earlier/],
+        [{ cancel_edges: [edge("c1", null, { parent_event_id: "v0" })] }, /parent differs from the frozen cancellation/],
+        [{ cancel_edges: [edge("c1", null, { is_self: true })] }, /is_self differs/],
+        [{ cancel_edges: [edge("c1", null, { parent_created_at: "2026-01-15T08:00:00Z" })] }, /parent_created_at differs from the frozen parent/],
+        // An ignored valid-id `started` parent is NOT a parent (the reducer's "parent not found").
+        [{ cancel_edges: [edge("c2", null, { parent_role: "verification", parent_created_at: "2026-01-15T08:00:00Z", pair: "valid" })] }, /parent existence differs/],
+        [{ cancel_edges: [edge("v1", null, { parent_event_id: "v0" })] }, /is not a cancellation in the frozen source/],
+        [{ source_issue_facts: [issue("v1")] }, /has a valid identity/],
+        [{ event_facts: [fact("   ", { event_type: "started" })] }, /event_facts\.event_type must be one of/],
+      ];
+      for (const [rows, re] of bad) {
+        const msg = tryStage(work, rows);
+        expect(msg, `${work} ${JSON.stringify(rows).slice(0, 120)}`).toMatch(re);
+      }
+    }
+    expect(tryStage("1", { cancel_edges: [edge("c3")] })).toBe("ok"); // site sees Ben's parent
+    expect(tryStage("3", { cancel_edges: [edge("c3", STAFF)] })).toBe("ok"); // Anna's self view does not
+    expect(tryStage("3", { cancel_edges: [edge("c3")] })).toMatch(/parent existence differs/);
+    expect(tryStage("1", { cancel_edges: [edge("c3", STAFF)] })).toMatch(/parent existence differs/);
+    expect(tryStage("5", { event_facts: [fact("   ", { event_type: "started" })] })).toMatch(/event_type must be one of/);
+    expect(tryStage("5", { source_issue_facts: [issue("   ", { staff_id: BEN })] })).toMatch(/staff_id differs/);
+    expect(tryStage("5", { source_issue_facts: [issue("   ", { raw_order: "5002" })] })).toMatch(/raw_order differs/);
+    expect(tryStage("5", { source_issue_facts: [issue("   ", { created_at: "2026-01-15T09:40:01Z" })] })).toMatch(/created_at differs/);
+    expect(tryStage("5", { source_issue_facts: [issue("   ", { parent_event_id: "v1" })] })).toMatch(/parent_event_id differs/);
+    expect(tryStage("5", { source_issue_facts: [issue("   ", { event_type: "completed" })] })).toMatch(/event_type differs/);
+  });
+
+  it("a whitespace-id row is never an ordinary fact, and a valid-id row never a source issue", () => {
+    const ws = new Map(imgs);
+    ws.set("  ", { ...I("v1"), id: "  ", order_number: "5001" });
+    const db = new StageRef(ws, "2026-02-10T00:00:00Z");
+    db.works.set("1", { id: "1", batch: BATCH, audienceKind: "site", audienceStaff: null, partitionKind: "order", partitionKey: "5001", state: "leased", fence: 7, expCount: null, expDigest: null });
+    expect(() => db.stage(7, "1", env({ event_facts: [{ ...fact("v1"), event_id: "  " }] })[0])).toThrow(/has a malformed identity/);
+    expect(tryStage("1", { source_issue_facts: [issue("v1")] })).toMatch(/has a valid identity/);
+  });
+
+  it("frozen-source drift and rows after the cutoff are refused in every family", () => {
+    expect(tryStage("1", { event_facts: [fact("v1", { created_at: "2026-01-15T09:00:01Z" })] })).toMatch(/created_at differs/);
+    expect(tryStage("1", { event_facts: [fact("v1", { raw_order: "5002", order_key: "5002" })] })).toMatch(/raw_order differs/);
+    expect(tryStage("1", { event_facts: [fact("v2", { order_key: " 5001 " })] })).toMatch(/order_key is not the trimmed raw order/);
+    expect(tryStage("1", { event_facts: [fact("f1")] })).toMatch(/after the batch cutoff/);
+    expect(tryStage("1", { timing_facts: [timing("f1")] })).toMatch(/after the batch cutoff/);
   });
 
   it("unclaimed work, another fence, and completed work refuse new chunks", () => {
-    const [c] = env({ event_facts: [] });
+    const [c] = env({});
     expect(() => setup().stage(7, "4", c)).toThrow(/not claimed under fence 7/);
     expect(() => setup().stage(8, "1", c)).toThrow(/not claimed under fence 8/);
     expect(() => setup().stage(7, "9", c)).toThrow(/does not belong/);
@@ -345,9 +581,9 @@ describe("staging rules (reference model of 0038)", () => {
   it("bulk: one invalid entry rolls back the whole request; bulk and single-work staging end in the same state", () => {
     const good1 = env({ event_facts: [fact("v1")] })[0];
     const good2 = env({ event_facts: [fact("x1")] })[0];
-    const bad = { ...good1, chunkHash: H("0") };
+    const bad = env({ event_facts: [fact("v1", { role: null })] })[0];
     const db = setup();
-    expect(() => db.bulk(7, [{ partition: "1", chunk: good1 }, { partition: "2", chunk: good2 }, { partition: "3", chunk: bad }])).toThrow();
+    expect(() => db.bulk(7, [{ partition: "1", chunk: good1 }, { partition: "2", chunk: good2 }, { partition: "3", chunk: bad }])).toThrow(/role must be one of/);
     expect(db.results.size).toBe(0);
     expect([db.works.get("1")!.state, db.works.get("2")!.state]).toEqual(["leased", "leased"]);
     const bulk = setup();
@@ -358,6 +594,63 @@ describe("staging rules (reference model of 0038)", () => {
     expect([...bulk.works.values()]).toEqual([...single.works.values()]);
     expect([...bulk.results.entries()].map(([k, m]) => [k, [...m.entries()]])).toEqual([...single.results.entries()].map(([k, m]) => [k, [...m.entries()]]));
     expect(() => setup().bulk(7, Array.from({ length: 101 }, () => ({ partition: "1", chunk: good1 })))).toThrow(/at most 100/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claim size (T13B2a-3)
+// ---------------------------------------------------------------------------
+
+describe("T13B2a-3: the claim bound is the serialized response, escaping and framing included", () => {
+  /** PostgREST's compact row JSON, list-framed (what the caller actually receives). */
+  const compact = (ws: ReadonlyArray<Parameters<typeof claimRowBytes>[0]>) =>
+    Buffer.byteLength(JSON.stringify(ws.map((w) => ({ work_id: w.workId, audience_kind: w.audienceKind, audience_staff: w.audienceStaff, partition_kind: w.partitionKind, partition_key: w.partitionKey, input_hash: w.inputHash, expected_chunk_count: w.expectedChunkCount, staged_chunks: w.stagedChunks }))), "utf8");
+  // 1,000 unique keys: three digits plus 800 quotes each (the review's reproduction).
+  const pending = Array.from({ length: 1000 }, (_, i) => ({
+    workId: String(1000 + i), audienceKind: "site" as const, audienceStaff: null, partitionKind: "event" as const,
+    partitionKey: String(i).padStart(3, "0") + '"'.repeat(800), inputHash: H("a"), expectedChunkCount: null, stagedChunks: 0,
+  }));
+
+  it("reproduces the defect: the old octet_length(partition_key)+200 estimate accepts a response far over 1 MiB", () => {
+    const oldEstimate = pending.reduce((n, w) => n + Buffer.byteLength(w.partitionKey, "utf8") + 200, 0);
+    expect(oldEstimate).toBe(1_003_000);
+    expect(oldEstimate).toBeLessThanOrEqual(1024 * 1024);
+    expect(compact(pending)).toBeGreaterThan(1.5 * 1024 * 1024);
+    // Every one of these descriptors is individually valid and plannable.
+    for (const w of pending.slice(0, 3)) expect(descriptorProblem({ audienceKind: w.audienceKind, audienceStaff: w.audienceStaff, partitionKind: w.partitionKind, partitionKey: w.partitionKey, inputHash: w.inputHash })).toBeNull();
+  });
+
+  it("each claim is the longest work-id prefix within 1 MiB of serialized bytes, never truncated; repeated claims return every work (none stranded)", () => {
+    let rest = [...pending];
+    const seen: string[] = [];
+    let calls = 0;
+    while (rest.length) {
+      const got = claimPrefix(rest);
+      calls++;
+      expect(got.length).toBeGreaterThan(0);
+      expect(got).toEqual(rest.slice(0, got.length)); // a prefix, unaltered
+      expect(2 + got.reduce((n, w) => n + claimRowBytes(w), 0)).toBeLessThanOrEqual(1024 * 1024);
+      expect(compact(got)).toBeLessThanOrEqual(1024 * 1024);
+      if (got.length < rest.length) expect(2 + [...got, rest[got.length]].reduce((n, w) => n + claimRowBytes(w), 0)).toBeGreaterThan(1024 * 1024);
+      seen.push(...got.map((w) => w.workId));
+      rest = rest.slice(got.length);
+    }
+    expect(seen).toEqual(pending.map((w) => w.workId));
+    expect(calls).toBe(2);
+  });
+
+  it("the byte model is json_build_object text: escaped values, quoted keys, ' : ' and ', ' separators, plus the list separator", () => {
+    const w = { workId: "12", audienceKind: "self" as const, audienceStaff: STAFF, partitionKind: "order" as const, partitionKey: 'a"\\\u0001é', inputHash: H("b"), expectedChunkCount: 3, stagedChunks: 1 };
+    const text = `{"work_id" : "12", "audience_kind" : "self", "audience_staff" : "${STAFF}", "partition_kind" : "order", "partition_key" : "a\\"\\\\\\u0001é", "input_hash" : "${H("b")}", "expected_chunk_count" : 3, "staged_chunks" : 1}`;
+    expect(claimRowBytes(w)).toBe(4 + Buffer.byteLength(text, "utf8"));
+    expect(claimRowBytes(w)).toBeGreaterThan(compact([w]));
+  });
+
+  it("a descriptor that cannot fit one response is refused when planned, and fails visibly if ever claimed", () => {
+    const huge = "\u0001".repeat(180_000); // escapes to 1,080,000 bytes
+    expect(Buffer.byteLength(JSON.stringify(huge), "utf8")).toBeGreaterThan(MAX_CLAIM_KEY_JSON_BYTES);
+    expect(descriptorProblem({ audienceKind: "site", audienceStaff: null, partitionKind: "event", partitionKey: huge, inputHash: H("a") })).toMatch(/too large for one claim response/);
+    expect(() => claimPrefix([{ ...pending[0], partitionKey: huge }, pending[1]])).toThrow(/does not fit one 1 MiB claim response/);
   });
 });
 
@@ -380,6 +673,24 @@ describe("0038 B2a SQL", () => {
     expect(g).toMatch(/descriptor is immutable/);
   });
 
+  it("T11-4: the fifth family is a versioned, service-only private table with the raw selectors and the TypeScript issue", () => {
+    const t = codes.find((c) => c.startsWith("CREATE TABLE reporting_private.source_issue_facts"))!;
+    for (const col of ["site text NOT NULL CHECK (site IN ('au', 'uk', 'us'))", "audience_kind text NOT NULL", "audience_staff uuid,", "event_id text NOT NULL CHECK (event_id <> '')", "valid_from_seq bigint NOT NULL CHECK (valid_from_seq >= 1)", "valid_to_seq bigint,", "event_type text NOT NULL", "created_at timestamptz NOT NULL", "staff_id uuid,", "raw_order text,", "parent_event_id text,", "issue_kind text NOT NULL CHECK (issue_kind IN ('invalid_event', 'unclassified_sku', 'invalid_quantity', 'unresolved_parent', 'missing_completion_detail', 'ambiguous_repeat'))", "issue_detail text,", "rule_version text NOT NULL"]) {
+      expect(t, col).toContain(col);
+    }
+    expect(t).toMatch(/CHECK \(\(audience_kind = 'site'\) = \(audience_staff IS NULL\)\)/);
+    expect(t).toMatch(/CHECK \(valid_to_seq IS NULL OR valid_to_seq > valid_from_seq\)/);
+    expect(t).toMatch(/CHECK \(audience_kind = 'site' OR staff_id = audience_staff\)/);
+    expect(t).toMatch(/UNIQUE NULLS NOT DISTINCT \(site, audience_kind, audience_staff, event_id, valid_from_seq\)/);
+    expect(t).not.toMatch(/REFERENCES/);
+    expect(codes).toContain("ALTER TABLE reporting_private.source_issue_facts ENABLE ROW LEVEL SECURITY");
+    expect(codes).toContain("REVOKE ALL ON TABLE reporting_private.source_issue_facts FROM PUBLIC, anon, authenticated");
+    expect(codes).toContain("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE reporting_private.source_issue_facts TO service_role");
+    expect(codes.filter((c) => c.startsWith("CREATE INDEX source_issue_facts_"))).toHaveLength(4);
+    // 0037 stays byte-identical; the fifth table is new in 0038 only.
+    expect(readFileSync("supabase/migrations/0037_reporting_storage.sql", "utf8")).not.toMatch(/source_issue_facts/);
+  });
+
   it("plan: frozen unsealed batch under a live fence; ≤1,000 descriptors and 1 MiB; exact shape; conflicts fail; identical replay is a no-op", () => {
     const f = fn("public.plan_reporting_work");
     expect(f).toMatch(/b := reporting_private\.lock_batch\(p_batch, p_fence, true\);/);
@@ -389,6 +700,8 @@ describe("0038 B2a SQL", () => {
     expect(f).toMatch(/octet_length\(p_items::text\) > 1048576/);
     expect(f).toMatch(/IS DISTINCT FROM 'audienceKind,audienceStaff,inputHash,partitionKey,partitionKind'/);
     expect(f).toMatch(/reporting_private\.order_key\(e\.v ->> 'partitionKey'\) IS DISTINCT FROM e\.v ->> 'partitionKey' THEN 'order partition key is not a trimmed order key'/);
+    expect(f).toMatch(/WHEN pg_catalog\.octet_length\(pg_catalog\.to_json\(e\.v ->> 'partitionKey'\)::text\) > 1048576 - 512 THEN 'partitionKey too large for one claim response'/);
+    expect(MAX_CLAIM_KEY_JSON_BYTES).toBe(1048576 - 512);
     expect(f).toMatch(/AND j\.h <> i\.h/);
     expect(f).toMatch(/AND w\.input_hash <> i\.h/);
     expect(f).toMatch(/ON CONFLICT \(batch_id, audience_kind, audience_staff, partition_kind, partition_key\) DO NOTHING/);
@@ -408,18 +721,23 @@ describe("0038 B2a SQL", () => {
     expect(f).toMatch(/already sealed with a different manifest/);
   });
 
-  it("claim: sealed frozen batch; limit 1..1000; SKIP LOCKED; ≤1 MiB; work id as text", () => {
+  it("claim: sealed frozen batch; limit 1..1000; SKIP LOCKED; serialized-response bound (T13B2a-3); work id as text", () => {
     const f = fn("public.claim_reporting_work");
     expect(f).toMatch(/^CREATE FUNCTION public\.claim_reporting_work\(p_batch uuid, p_fence bigint, p_limit integer DEFAULT 100\) RETURNS TABLE \(work_id text,/);
     expect(f).toMatch(/IF b\.state <> 'frozen' OR b\.sealed_at IS NULL THEN RAISE EXCEPTION/);
     expect(f).toMatch(/IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000 THEN/);
     expect(f).toMatch(/FOR UPDATE SKIP LOCKED/);
-    expect(f).toMatch(/s\.run <= 1048576/);
-    expect(f).toMatch(/SET state = 'leased', lease_fence = p_fence/);
-    expect(f).toMatch(/SELECT c\.work_id::text,/);
+    expect(f).not.toMatch(/octet_length\(w\.partition_key\) \+ 200/);
+    // The SQL measures exactly the json_build_object text the TypeScript claimRowBytes models, in the returned column order.
+    expect(f).toMatch(/2 \+ sum\(4 \+ pg_catalog\.octet_length\(pg_catalog\.json_build_object\( 'work_id', w\.work_id::text, 'audience_kind', w\.audience_kind, 'audience_staff', w\.audience_staff, 'partition_kind', w\.partition_kind, 'partition_key', w\.partition_key, 'input_hash', w\.input_hash, 'expected_chunk_count', w\.expected_chunk_count, 'staged_chunks', \(SELECT count\(\*\)::integer FROM reporting_private\.partition_results r WHERE r\.work_id = w\.work_id\)\)::text\)\) OVER \(ORDER BY w\.work_id ROWS UNBOUNDED PRECEDING\) AS run/);
+    expect(f).toMatch(/FILTER \(WHERE z\.run <= 1048576\)/);
+    expect(f).toMatch(/IF v_picked > 0 AND pg_catalog\.cardinality\(v_ids\) = 0 THEN RAISE EXCEPTION 'claim_reporting_work: work % does not fit one 1 MiB claim response', v_first;/);
+    // Only the returned prefix is leased; the returned rows are exactly the leased ones.
+    expect(f).toMatch(/UPDATE reporting_private\.partition_work w SET state = 'leased', lease_fence = p_fence WHERE w\.work_id = ANY \(v_ids\);/);
+    expect(f).toMatch(/SELECT w\.work_id::text, .* FROM reporting_private\.partition_work w WHERE w\.work_id = ANY \(v_ids\) ORDER BY w\.work_id;/);
   });
 
-  it("stage: hash of the exact UTF-8 bytes BEFORE parsing; exact envelope and arrays; replay/conflict; claimed under the fence; ≤1,000 rows; completion digest", () => {
+  it("stage: hash of the exact UTF-8 bytes BEFORE parsing; exactly five arrays; replay/conflict; claimed under the fence; ≤1,000 rows across all five; completion digest", () => {
     const f = fn("reporting_private.stage_one");
     const hashAt = f.indexOf("pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(v_text, 'UTF8')), 'hex') <> v_hash");
     expect(hashAt).toBeGreaterThan(0);
@@ -427,32 +745,127 @@ describe("0038 B2a SQL", () => {
     expect(f).not.toMatch(/sha256\([^)]*::text/); // never hashes jsonb::text
     expect(f).toMatch(/p_partition !~ '\^\[1-9\]\[0-9\]\{0,18\}\$'/);
     expect(f).toMatch(/IS DISTINCT FROM 'canonicalRows,chunkCount,chunkHash,chunkNo,resultDigest'/);
-    expect(f).toMatch(/IS DISTINCT FROM 'cancel_edges,event_facts,order_occurrences,timing_facts'/);
+    expect(f).toMatch(/IS DISTINCT FROM 'cancel_edges,event_facts,order_occurrences,source_issue_facts,timing_facts'/);
+    expect([...RESULT_TABLES].sort().join(",")).toBe("cancel_edges,event_facts,order_occurrences,source_issue_facts,timing_facts");
+    for (const t of RESULT_TABLES) {
+      expect(f).toContain(`pg_catalog.jsonb_typeof(v_rows -> '${t}') <> 'array'`);
+      expect(f).toContain(`pg_catalog.jsonb_array_length(v_rows -> '${t}')`);
+    }
     expect(f).toMatch(/octet_length\(p_chunk::text\) > 1048576/);
     expect(f).toMatch(/> 1000 THEN RAISE EXCEPTION 'stage: more than 1000 rows in one chunk'/);
     expect(f).toMatch(/IF v_prev = v_hash THEN RETURN QUERY SELECT p_partition, v_no, false, w\.state = 'done';/);
     expect(f).toMatch(/was already saved with different content/);
     expect(f).toMatch(/IF w\.state <> 'leased' OR w\.lease_fence IS DISTINCT FROM p_fence THEN/);
+    // Rows are fully validated before the chunk is saved, and the chunk before the work completes.
+    expect(f.indexOf("v_bad := reporting_private.check_staged_rows(p_batch, w, v_rows);")).toBeLessThan(f.indexOf("INSERT INTO reporting_private.partition_results"));
+    expect(f.indexOf("INSERT INTO reporting_private.partition_results")).toBeLessThan(f.indexOf("SET state = 'done'"));
     expect(f).toMatch(/string_agg\(r\.chunk_hash, E'\\n' ORDER BY r\.chunk_no\)/);
     expect(f).toMatch(/IF v_all <> v_dig THEN RAISE EXCEPTION/);
     expect(f).toMatch(/SET state = 'done', chunk_count = v_count, result_digest = v_dig, completed_at = now\(\)/);
   });
 
-  it("rows: exact keys per table (no trusted metadata), typed parse, frozen-view ownership, self rows, source consistency, cutoff", () => {
+  it("T13B2a-1: staged_row_problem checks every column of every array, with the TypeScript validator's messages, in the same order", () => {
+    const f = fn("reporting_private.staged_row_problem");
+    expect(f).toMatch(/^CREATE FUNCTION reporting_private\.staged_row_problem\(p_table text, v jsonb\) RETURNS text LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = ''/);
+    for (const t of RESULT_TABLES) {
+      const from = f.slice(f.indexOf(`WHEN '${t}' THEN CASE`));
+      const body = from.slice(0, from.indexOf(" END ")); // this table's block only
+      const sqlMsgs = [...body.matchAll(/THEN '([^']+)'/g)].map((m) => m[1]);
+      // TypeScript's message for each column, obtained by making ONLY that column wrong (an object is never valid).
+      const sample = { id: "x", str: "s", uuid: STAFF, ts: "2026-01-15T09:00:00Z", date: "2026-01-15", int4: 1, int53: 1, num: 1, bool: true } as Record<string, unknown>;
+      const base = Object.fromEntries(RESULT_COLUMNS[t].map(([k, kind, , values]) => [k, kind === "enum" ? values![0] : sample[kind]]));
+      const tsMsgs = RESULT_COLUMNS[t].map(([c]) => resultRowProblem(t, { ...base, [c]: {} }));
+      expect(new Set(tsMsgs).size, t).toBe(tsMsgs.length);
+      expect(sqlMsgs.slice(0, tsMsgs.length), t).toEqual(tsMsgs);
+      for (const [c, kind, nullable] of RESULT_COLUMNS[t]) {
+        const numeric = ["int4", "int53", "num"].includes(kind);
+        const shape = `${numeric ? "CASE WHEN " : ""}coalesce(pg_catalog.jsonb_typeof(v -> '${c}'), 'missing') <> '${kind === "bool" ? "boolean" : numeric ? "number" : "string"}'`;
+        expect(body, `${t}.${c}`).toContain(nullable ? `coalesce(pg_catalog.jsonb_typeof(v -> '${c}'), 'missing') <> 'null' AND (${shape}` : `WHEN (${shape}`);
+      }
+    }
+    // Relational rules, also in TypeScript.
+    expect(f).toContain("THEN 'event_facts: role verification needs exactly item_status, items, product_kind, line_key, timing_stream and timing_weight'");
+    expect(f).toContain("THEN 'event_facts: invalid_detail is required exactly for role invalid'");
+    expect(f).toContain("THEN 'cancel_edges: parent_role and parent_created_at are both set or both null'");
+    expect(f).toContain("THEN 'cancel_edges: pair is required exactly for a verification or terminal parent'");
+    // Numeric casts only after the shape is known (CASE fixes evaluation order).
+    expect(f).toMatch(/CASE WHEN coalesce\(pg_catalog\.jsonb_typeof\(v -> 'quantity'\), 'missing'\) <> 'number' OR \(v ->> 'quantity'\) !~ '\^-\?\[0-9\]\{1,10\}\$' THEN true ELSE \(v ->> 'quantity'\)::bigint NOT BETWEEN -2147483648 AND 2147483647 END/);
+    expect(f).toMatch(/ELSE \(v ->> 'items'\)::bigint > 9007199254740991 END/);
+  });
+
+  it("rows: exact keys per array (no trusted metadata), structural check BEFORE any cast or lookup, frozen-view ownership, self rows, identity family, cutoff", () => {
     const f = fn("reporting_private.check_staged_rows");
+    expect(f).not.toMatch(/jsonb_populate_record/);
     expect(f).toMatch(/has unexpected keys \(site, audience, partition, rule and validity are set by the server\)/);
-    for (const t of ["event_facts", "cancel_edges", "order_occurrences", "timing_facts"]) expect(f).toContain(`jsonb_populate_record(NULL::reporting_private.${t}, r.v)`);
-    expect(f).toMatch(/img := reporting_private\.frozen_image\(p_batch, v_id\);/);
+    expect(f).toMatch(/FROM \(VALUES \('event_facts'\), \('cancel_edges'\), \('order_occurrences'\), \('timing_facts'\), \('source_issue_facts'\)\) AS t\(tbl\)/);
+    for (const t of RESULT_TABLES) {
+      const keys = t === "source_issue_facts" ? f.match(/ELSE '([^']+)' END, ','\)\)/)?.[1] : f.match(new RegExp(`WHEN '${t}' THEN '([^']+)'`))?.[1];
+      expect(keys?.split(","), t).toEqual([...COLS[t]].sort());
+      for (const k of ["site", "audience_kind", "audience_staff", "valid_from_seq", "valid_to_seq", "rule_version", "partition_kind", "partition_key"]) expect(keys?.split(","), `${t}.${k}`).not.toContain(k);
+    }
+    const structural = f.indexOf("v_bad := reporting_private.staged_row_problem(r.tbl, r.v);");
+    expect(structural).toBeGreaterThan(0);
+    expect(structural).toBeLessThan(f.indexOf("img := reporting_private.frozen_image(p_batch, v_id);"));
+    expect(structural).toBeLessThan(f.indexOf("::timestamptz"));
     expect(f).toMatch(/own\.partition_kind <> p_work\.partition_kind OR own\.partition_key <> p_work\.partition_key/);
     expect(f).toMatch(/p_work\.audience_kind = 'self' AND \(img ->> 'staff_id'\) IS DISTINCT FROM p_work\.audience_staff::text/);
-    expect(f).toMatch(/> b\.source_cutoff THEN RETURN/);
-    for (const k of ["site", "audience_kind", "audience_staff", "valid_from_seq", "valid_to_seq", "rule_version", "partition_kind", "partition_key"]) {
-      expect(f.match(/WHEN 'event_facts' THEN '([^']+)'/)?.[1].split(",")).not.toContain(k);
-    }
+    expect(f).toMatch(/IF \(r\.tbl = 'source_issue_facts'\) <> \(coalesce\(reporting_private\.order_key\(v_id\), ''\) = ''\) THEN/);
+    expect(f).toMatch(/IF \(img ->> 'created_at'\)::timestamptz > b\.source_cutoff THEN RETURN v_pre \|\| ' is after the batch cutoff'; END IF;/);
     const fi = fn("reporting_private.frozen_image");
     expect(fi).toMatch(/IF b\.kind = 'rebuild' THEN SELECT sc\.image INTO img FROM reporting_private\.source_candidate sc/);
     expect(fi).toMatch(/FROM reporting_private\.batch_events be .* IF FOUND THEN RETURN img; END IF; SELECT s\.image INTO img FROM reporting_private\.source_current s/);
     expect(fn("reporting_private.owner_partition")).toMatch(/coalesce\(reporting_private\.order_key\(p_image ->> 'order_number'\), ''\) <> '' THEN 'order' ELSE 'event'/);
+  });
+
+  it("T13B2a-2: every raw field of every array is bound to its primary frozen source; parents and predecessors to the frozen view as the audience sees it", () => {
+    const f = fn("reporting_private.check_staged_rows");
+    const bound: Array<[string, string]> = [
+      ["(r.v ->> 'event_type') IS DISTINCT FROM (img ->> 'event_type')", "event_type"],
+      ["(r.v ->> 'created_at')::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz", "created_at"],
+      ["(r.v ->> 'staff_id') IS DISTINCT FROM (img ->> 'staff_id')", "staff_id"],
+      ["(r.v ->> 'raw_order') IS DISTINCT FROM (img ->> 'order_number')", "raw_order"],
+      ["(r.v ->> 'parent_event_id') IS DISTINCT FROM (img ->> 'parent_event_id')", "parent_event_id"],
+      ["(r.v ->> 'department') IS DISTINCT FROM (img ->> 'department')", "department"],
+      ["(r.v ->> 'case_id') IS DISTINCT FROM (img ->> 'cs_case_id')", "case_id"],
+      ["(r.v ->> 'sku') IS DISTINCT FROM (img ->> 'line_sku')", "sku"],
+      ["(r.v -> 'quantity') IS DISTINCT FROM coalesce(img -> 'line_quantity', 'null'::jsonb)", "quantity"],
+      ["v_at::timestamptz IS DISTINCT FROM (img ->> 'created_at')::timestamptz", "occurred_at"],
+    ];
+    const between = (a: string, b: string) => {
+      const i = f.indexOf(a);
+      expect(i, a).toBeGreaterThan(0);
+      return f.slice(i, f.indexOf(b, i + a.length));
+    };
+    // Each array's own branch binds its own raw fields (a line in another branch does not count).
+    const branches: Array<[string, string, string[]]> = [
+      ["IF r.tbl IN ('event_facts', 'source_issue_facts') THEN", "END IF; IF r.tbl = 'event_facts' THEN", ["event_type", "created_at", "staff_id", "raw_order", "parent_event_id"]],
+      ["IF r.tbl = 'event_facts' THEN", "ELSIF r.tbl = 'cancel_edges' THEN", ["department", "case_id", "sku", "quantity"]],
+      ["ELSIF r.tbl = 'order_occurrences' THEN", "ELSIF r.tbl = 'timing_facts' THEN", ["raw_order", "case_id", "staff_id", "occurred_at"]],
+      ["ELSIF r.tbl = 'timing_facts' THEN", "END LOOP; END IF; END LOOP;", ["staff_id", "occurred_at"]],
+    ];
+    for (const [a, b, fields] of branches) {
+      const br = between(a, b);
+      for (const field of fields) {
+        const [cond] = bound.find(([, x]) => x === field)!;
+        expect(br, `${a} ${field}`).toContain(`IF ${cond} THEN RETURN v_pre || ' ${field} differs from the frozen source'`);
+      }
+    }
+    expect(between("IF r.tbl = 'event_facts' THEN", "ELSIF r.tbl = 'cancel_edges' THEN")).toContain("order_key is not the trimmed raw order");
+    expect(between("ELSIF r.tbl = 'order_occurrences' THEN", "ELSIF r.tbl = 'timing_facts' THEN")).toContain("order_key is not the trimmed raw order");
+    expect(f).toContain("IF r.tbl IN ('event_facts', 'source_issue_facts') THEN");
+    expect(f).toContain("(img ->> 'event_type') IS DISTINCT FROM 'cancelled'");
+    expect(f).toContain("(img ->> 'event_type') NOT IN ('completed', 'dispatched')");
+    expect(f).toContain("(img ->> 'event_type') IS DISTINCT FROM 'line_verified'");
+    expect(f).toContain("(r.v -> 'is_self') IS DISTINCT FROM pg_catalog.to_jsonb((img ->> 'parent_event_id') = v_id)");
+    expect(f).toMatch(/v_vis := ref IS NOT NULL AND \(ref ->> 'event_type'\) IN \('line_verified', 'completed', 'dispatched', 'cancelled'\) AND \(ref ->> 'created_at'\)::timestamptz <= b\.source_cutoff AND \(p_work\.audience_kind = 'site' OR \(ref ->> 'staff_id'\) IS NOT DISTINCT FROM p_work\.audience_staff::text\);/);
+    expect(f).toContain("IF (pg_catalog.jsonb_typeof(r.v -> 'parent_role') <> 'null') <> v_vis THEN RETURN v_pre || ' parent existence differs from the frozen view'");
+    expect(f).toContain("IF v_vis AND (r.v ->> 'parent_created_at')::timestamptz IS DISTINCT FROM (ref ->> 'created_at')::timestamptz THEN");
+    expect(f).toMatch(/FOREACH v_ref IN ARRAY ARRAY\[r\.v ->> 'prev_all_event_id', r\.v ->> 'prev_same_type_event_id'\] LOOP/);
+    expect(f).toContain("(ref ->> 'staff_id') IS DISTINCT FROM (img ->> 'staff_id') OR (ref ->> 'created_at')::timestamptz > (img ->> 'created_at')::timestamptz OR v_ref = v_id");
+    // No second counting implementation: derived fields are never recomputed in SQL.
+    for (const derived of ["'items'", "'item_status'", "'product_kind'", "'line_key'", "'timing_weight'", "'work_type'", "'role'", "'pair'", "'weight'"]) {
+      expect(f, derived).not.toContain(`r.v ->> ${derived}`);
+    }
   });
 
   it("bulk: ≤100 entries and 1 MiB; exact {partition, chunk}; one function body, no exception handler, so any failure rolls back every entry", () => {
@@ -463,10 +876,11 @@ describe("0038 B2a SQL", () => {
     expect(f).toMatch(/RETURN QUERY SELECT \* FROM reporting_private\.stage_one\(p_batch, p_fence, e\.v ->> 'partition', e\.v -> 'chunk'\);/);
     expect(f).not.toMatch(/EXCEPTION WHEN/);
     expect(fn("public.stage_reporting_result")).toMatch(/RETURN QUERY SELECT \* FROM reporting_private\.stage_one\(p_batch, p_fence, p_partition, p_chunk\);/);
+    expect(fn("reporting_private.check_staged_rows")).not.toMatch(/EXCEPTION WHEN/);
   });
 
   it("every B2a function: invoker, empty search path, no dynamic SQL; RPCs service-only", () => {
-    for (const n of ["public.plan_reporting_work", "public.seal_reporting_work", "public.claim_reporting_work", "public.stage_reporting_result", "public.stage_reporting_results", "reporting_private.stage_one", "reporting_private.check_staged_rows", "reporting_private.frozen_image", "reporting_private.owner_partition", "reporting_private.work_manifest", "reporting_private.partition_work_guard"]) {
+    for (const n of ["public.plan_reporting_work", "public.seal_reporting_work", "public.claim_reporting_work", "public.stage_reporting_result", "public.stage_reporting_results", "reporting_private.stage_one", "reporting_private.check_staged_rows", "reporting_private.staged_row_problem", "reporting_private.frozen_image", "reporting_private.owner_partition", "reporting_private.work_manifest", "reporting_private.partition_work_guard"]) {
       const f = fn(n);
       expect(f, n).toMatch(/SECURITY INVOKER SET search_path = ''/);
       expect(f, n).not.toMatch(/\bEXECUTE\b|\bformat\b/i);
@@ -475,6 +889,8 @@ describe("0038 B2a SQL", () => {
       expect(codes).toContain(`REVOKE ALL ON FUNCTION ${sig} FROM PUBLIC, anon, authenticated`);
       expect(codes).toContain(`GRANT EXECUTE ON FUNCTION ${sig} TO service_role`);
     }
+    expect(codes).toContain("REVOKE ALL ON FUNCTION reporting_private.staged_row_problem(text, jsonb) FROM PUBLIC, anon, authenticated");
+    expect(codes).toContain("GRANT EXECUTE ON FUNCTION reporting_private.staged_row_problem(text, jsonb) TO service_role");
     expect(codes).toContain("REVOKE ALL ON FUNCTION reporting_private.partition_work_guard() FROM PUBLIC, anon, authenticated, service_role");
   });
 });
@@ -516,8 +932,17 @@ describe("B2a wrappers", () => {
     await expect(claimReportingWork(fake([]).client, BATCH, 7, 1001)).rejects.toThrow(/limit/);
   });
 
+  it("T13B2a-3: claim refuses a response over 1 MiB and accepts the bounded prefix of the escaping-heavy case", async () => {
+    const mk = (i: number) => ({ work_id: String(1000 + i), audience_kind: "site", audience_staff: null, partition_kind: "event", partition_key: String(i).padStart(3, "0") + '"'.repeat(800), input_hash: H("a"), expected_chunk_count: null, staged_chunks: 0 });
+    const all = Array.from({ length: 1000 }, (_, i) => mk(i));
+    await expect(claimReportingWork(fake(all).client, BATCH, 7, 1000)).rejects.toThrow(/claim response over 1 MiB/);
+    const prefix = claimPrefix(all.map((r) => ({ workId: r.work_id, audienceKind: "site" as const, audienceStaff: null, partitionKind: "event" as const, partitionKey: r.partition_key, inputHash: r.input_hash, expectedChunkCount: null, stagedChunks: 0 })));
+    const got = await claimReportingWork(fake(all.slice(0, prefix.length)).client, BATCH, 7, 1000);
+    expect(got.map((w) => w.workId)).toEqual(prefix.map((w) => w.workId));
+  });
+
   it("stage validates the work id; bulk enforces 1..100 entries and the result count; database errors keep their code", async () => {
-    const [c] = buildChunks({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [] });
+    const [c] = buildChunks({ event_facts: [], cancel_edges: [], order_occurrences: [], timing_facts: [], source_issue_facts: [] });
     await expect(stageReportingResult(fake([]).client, BATCH, 7, { partition: "0", chunk: c })).rejects.toThrow(/positive decimal/);
     await expect(stageReportingResults(fake([]).client, BATCH, 7, [])).rejects.toThrow(/1\.\.100/);
     await expect(stageReportingResults(fake([{ work_id: "1", chunk_no: 0, stored: true, done: true }]).client, BATCH, 7, [{ partition: "1", chunk: c }, { partition: "2", chunk: c }])).rejects.toThrow(/different number/);

@@ -1359,3 +1359,56 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - source issues give parent presence: 0 — an equivalent mutant, since source-issue ids are always whitespace-only (empty throws, site must match) and blank parents are never looked up.
   - Gate: `npx tsc -b` OK; `npm run typecheck:digest` OK; 992/992 tests; build OK.
   - The fifth SQL family (0038 `source_issue_facts`, five-array envelope) lands in the next commit with T13B2a-1..3.
+- 2026-11-15: **fifth staged family plus T13B2a-1..3.** This is the second of the two overnight commits. 0038 is still an unapplied draft; 0034–0037 are byte-identical (0037 SHA-256 531BB2C5…); no SQL was run. Task 13 stays open and B2b is not started.
+  - **Fifth family.** New private table `reporting_private.source_issue_facts`:
+    - versioned like the other result tables, with RLS and service-only grants;
+    - raw id, type, instant, staff, raw order and raw parent, plus the TypeScript issue kind and detail;
+    - 4 indexes and no FK.
+
+    The stage envelope is now exactly five arrays (`stage_one`, `RESULT_TABLES`, `buildChunks`), and the 1,000-row cap counts all five. The staging catalog expects the new table and `staged_row_problem`.
+  - **T13B2a-1 (structure).** The `jsonb_populate_record` parse is gone. `reporting_private.staged_row_problem(table, row)` checks every column of all five arrays before any cast, lookup or save:
+    - required versus null;
+    - JSON type;
+    - lowercase uuid and ISO timestamp/date shapes;
+    - enums;
+    - int4, safe-int and non-negative ranges, with numeric casts only inside a CASE once the shape is known;
+    - the relational rules (verification fields, `invalid_detail`, `parent_role`/`parent_created_at`, `pair`).
+
+    It is generated from the same column spec as the TypeScript `resultRowProblem`, with identical messages. A test makes each column wrong in turn in TypeScript and requires the same SQL message, in the same order, within that table's block.
+  - **T13B2a-2 (binding).** Each array's raw fields must equal its primary frozen image:
+    - **event/source-issue:** type, instant, staff, raw order, parent;
+    - **event:** department, case, sku, quantity, and order key = trimmed raw order;
+    - **occurrences:** terminal type, raw order/key, case, staff, instant;
+    - **timing:** verification type, staff, instant;
+    - **edges:** cancellation type, parent, `is_self`;
+    - every family is held to the cutoff;
+    - a whitespace-only id may appear only as a source issue, and a valid id never as one.
+
+    Parent existence is derived from the frozen view as the audience sees it: a nonblank, due, count-type event, and for a self audience, that worker's own. A valid-id `started` parent therefore never has a parent role, and `parent_created_at` must match. Each predecessor id must be an earlier or same-instant due verification by the same worker. Derived fields (role, work type, items, pair, weight) are not recomputed in SQL.
+
+    Tests use a reference model with full frozen images. They cover wrong worker/time/order/case/sku/quantity/department/type/parent and predecessor problems for the site and self audiences, plus parent visibility (Ben's parent is visible to the site, invisible to Anna's self view).
+  - **T13B2a-3 (claim bytes).**
+    - **Claim.** `claim_reporting_work` measures each returned row as its `json_build_object` text (escaped values, quoted keys, `" : "`/`", "` separators — an upper bound on PostgREST's compact row JSON), plus 4 bytes of list separator, plus 2 for the brackets. Only the 1 MiB prefix is leased and returned; the rest stays pending. A first row that cannot fit alone raises a visible error.
+    - **Planning.** `plan_reporting_work`/`descriptorProblem` refuse any key whose escaped JSON exceeds 1 MiB − 512.
+    - **Wrapper.** It also refuses a response over 1 MiB.
+    - **Byte model.** TypeScript `claimRowBytes`/`claimPrefix` model the same bound.
+    - **Reproduction.** For the review's case (1,000 keys of 3 digits plus 800 quotes), the old estimate is 1,003,000 bytes, while the compact response is over 1.5 MiB. The new bound claims two prefixes covering all 1,000 works, each compact response ≤ 1 MiB, with nothing truncated or stranded.
+  - **Surprise.** The old reference model compared times with `Date.parse`, which drops microseconds. It now compares exact microseconds, as `timestamptz` does.
+  - **Deliberate breaks** (stage suite, 52 tests; every mutant killed):
+    - removing the structural call: 1 failed;
+    - making `order_occurrences.staff_id` nullable in SQL: 1;
+    - dropping the occurrences staff binding: 1. Both of these first survived, because the SQL-text checks searched the whole function body; the tests now scope each assertion to its table's block;
+    - parent visibility ignoring the audience: 1;
+    - dropping the source-issue identity check: 1;
+    - the old claim estimate: 1;
+    - silently skipping an oversized first descriptor: 1;
+    - a four-array envelope: 1;
+    - an SQL message drifting from TypeScript: 1;
+    - the TypeScript validator ignoring NOT NULL: 2;
+    - dropping the verification relation: 1;
+    - the old TypeScript claim estimate: 3;
+    - no wrapper response cap: 1;
+    - accepting unclaimable keys: 1;
+    - four TypeScript tables: 20.
+  - **Not done:** runtime SQL proof of these rules (staging), which belongs to the final reviewed migration rehearsal and the B2b harness, as the plan says. The SQL is verified only by its text and by the reference model.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; 1004/1004 tests; build OK. 0038 SHA-256 is fd3ea601bcb23f4b….
