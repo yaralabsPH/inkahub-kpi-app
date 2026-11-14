@@ -116,6 +116,14 @@ These are separate from Must-fix code/harness findings. Pending CJ steps are not
 
 ## Coder response
 
-(Coder fills this in after fixing, linking regression evidence and identifying any CJ-approved plan amendment.)
+Claude, 2026-11-14. Fixes in `5cb28a8` (M1–M5, S1–S3, N1), `83a3fd4` and `76f74d2` (M6 code), `bdcca17` (M6 staging evidence). Details are in the plan's Implementation logs.
+
+- **M1:** new `src/lib/domain/productionInstant.ts` (`instantMicros`, exact bigint microseconds). The reducer orders, qualifies, validates cancellations (`parent.us > c.us`) and compares scope on that key; milliseconds are kept only for display/durations. Tests cover the excluded-only completion at `10:00:00.000100Z`, a sub-millisecond cancellation before its parent and genuinely equal instants; mutation back to `Date.parse` fails them.
+- **M2:** the selected-person tile's denominator now comes from that person's own staff-days (`staffDays` follows the person/work-type scope); the leaderboard stays all-visible. Two-worker test: A's rate stays 1.
+- **M3:** digest `readAll` pages by actual progress with an exact count, rejects non-array/null data, gaps and failed later pages; staff names get a unique tie-breaker. Tests with a 500-row cap and later-page failures for all three readers assert no XLSX/email.
+- **M4:** new `src/lib/repository/supabase/orderLookup.ts` (`loadOrderLookup`, count-aware, returns `complete`); `orderLookupCounts` returns null unless complete; `OrderLookupCard` binds results to user | site | order with a sequence guard and clears on identity change. Tests cover deferred responses across site/account switches and an order over the server cap.
+- **M5:** Welcome's coverage spans its whole displayed range, the digest warns for today and the comparison day (`coverage_issues_yesterday`), Reports' coverage comes from the everyone summary. Historical-only and other-person-only gaps are tested.
+- **M6:** CJ-approved plan amendment ("Task 4 M6 amendment", 2026-11-13, then Task 10 of the 2026-11-14 amendment). `--policy-parity=cases` collects the four cases in one rolled-back REPEATABLE READ transaction with the exact pre-0036 policies restored in a nested savepoint and a fresh restoration check; `checkParityArtifact` certifies only that collection, and the old two-arrangement artifact now fails (tested). Staging run on `76f74d2`: four cases identical, restoration passed; all three fresh `item-counting-gate-v2.3` manager phases passed against the same parity hash (`608b3e12afac…`), final `STATUS: COMPLETE`.
+- **S1:** focus first bumps the date tick, then refreshes; Welcome projects only when `snapshotCovers(snapshot, range)`. **S2:** compact status shows production day, timezone and cutoff; the email always prints the cutoff. **S3:** alternate modes no longer rewrite the performance report. **N1:** plan status prose reconciled.
 
 STATUS: COMPLETE
