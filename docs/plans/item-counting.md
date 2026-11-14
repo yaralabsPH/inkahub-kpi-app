@@ -1331,3 +1331,31 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - SQL text for every rule; wrappers.
   - Gate: `npx tsc -b`, `npm run typecheck:digest`, 982/982 tests, build OK.
   - **Not done (stopped at the usage limit):** a deliberate-break run for B2a was not performed this time. B2b (publication and runtime runner) is not started; Task 13 is open.
+- 2026-11-15 — T11-4 fix (selected-source warnings; first of two overnight commits). Task 13 stays open.
+  - Projector: a whitespace-only-id row is now a `SourceIssueFact` (raw id, type, instant, staff, raw order, raw parent, shared-TS issue) in `PartitionResult.sourceIssues`, which replaces partition-wide `globalIssues`. An empty id or an unreadable time throws, as the transport/loader does. The self audience filters before capture. Rows after the cutoff go to `futureEventIds`, never to issues.
+  - Reference: `selectFactFamilies` runs the four-family rules over the union of facts and source issues and returns the two separately. Only selected source issues are reported (global, whatever the display filter). They never give parent presence. Counting rules are unchanged. `evidenceIdentityIssue` was extracted from `prepareProductionEvidence` with no behavior change.
+  - Tests: 10 new companion regressions:
+    - Jan 5 whitespace row vs Jan 12 range;
+    - a future or later malformed row;
+    - malformed terminal → prior context;
+    - malformed cancellation → parent;
+    - malformed `started` parent warns;
+    - valid `started` parent is "parent not found";
+    - narrower range/staff/work-type filters;
+    - self visibility;
+    - empty id / bad time throw;
+    - hash sensitivity.
+
+    `randomHistory` now adds unique whitespace ids and whitespace parents to the randomized reducer-parity sweep.
+  - Surprise: the reducer skips a whitespace `parent_event_id` before parent lookup (`productionCounts.ts:359`), so such a cancellation gets no "parent not found". The test asserts only the selected identity warning; counting rules were not touched.
+  - Deliberate breaks (projection suite of 70 tests):
+    - all source issues in every range (the bug): 4 failed;
+    - no selectors from source issues: 3;
+    - future malformed rows captured: 1;
+    - self filter after capture: 18;
+    - hash omits source issues: 1;
+    - malformed rows dropped: 9;
+    - empty id accepted: 1;
+    - source issues give parent presence: 0 — an equivalent mutant, since source-issue ids are always whitespace-only (empty throws, site must match) and blank parents are never looked up.
+  - Gate: `npx tsc -b` OK; `npm run typecheck:digest` OK; 992/992 tests; build OK.
+  - The fifth SQL family (0038 `source_issue_facts`, five-array envelope) lands in the next commit with T13B2a-1..3.

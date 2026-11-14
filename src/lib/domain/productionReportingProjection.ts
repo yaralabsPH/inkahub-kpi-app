@@ -23,6 +23,7 @@ import { countProductionItems } from "./productionItems.js";
 import {
   cancellationPairOutcome,
   classifyEvidenceEvent,
+  evidenceIdentityIssue,
   evidenceOrderKey,
   exactInstant,
   isCountEvidenceType,
@@ -61,6 +62,7 @@ import {
   type FrozenPartitionInput,
   type ItemFact,
   type PartitionResult,
+  type SourceIssueFact,
 } from "./productionReporting";
 
 // ---------------------------------------------------------------------------
@@ -93,18 +95,34 @@ export function projectReportingPartition(input: FrozenPartitionInput): Partitio
   const audience = input.audience;
   if (audience.kind === "self" && !nonBlank(audience.staffId)) throw new RangeError("self audience needs a staff id");
 
-  const globalIssues: CoverageIssue[] = [];
+  const sourceIssues: SourceIssueFact[] = [];
   const futureEventIds: string[] = [];
-  // Self audience: only that worker's saved rows, BEFORE any correction/qualification preparation.
+  // Self audience: only that worker's saved rows, BEFORE any correction/qualification preparation
+  // (and before any source-issue selection: another worker's malformed row is never visible to it).
   const rows = audience.kind === "self" ? input.events.filter((e) => e.staff_id === audience.staffId) : input.events;
 
   const unique = new Map<string, ProductionEvidenceEvent>();
   for (const raw of rows) {
-    if (!nonBlank(raw.id) || !nonBlank(raw.location)) {
-      globalIssues.push({ kind: "invalid_event", eventId: String(raw.id ?? ""), location: String(raw.location ?? ""), detail: "missing id or site" });
+    // As the evidence transport: an empty id or an unreadable time fails the whole read.
+    if (typeof raw.id !== "string" || raw.id === "") throw new RangeError(`A source row at ${String(raw.location)} has no id`);
+    if (raw.location !== input.site) throw new RangeError(`Event ${raw.id} belongs to ${raw.location}, not partition site ${input.site}`);
+    const t = exactInstant(raw.created_at);
+    if (t === null || !Number.isFinite(typeof raw.created_at === "string" ? Date.parse(raw.created_at) : Number.NaN)) {
+      throw new RangeError(`Event ${raw.id} at ${raw.location} has an unreadable time`);
+    }
+    const identity = evidenceIdentityIssue(raw);
+    if (t > cutoffUs) {
+      if (identity || isCountEvidenceType(raw.event_type)) futureEventIds.push(raw.id);
+      continue; // not due yet: neither a fact nor a warning
+    }
+    if (identity) {
+      // Kept with its RAW selectors: it still selects evidence, then warns only when selected.
+      sourceIssues.push({
+        site: raw.location, id: raw.id, eventType: raw.event_type, us: t.toString(), createdAt: raw.created_at,
+        staffId: raw.staff_id, rawOrder: raw.order_number, parentId: raw.parent_event_id, issue: identity,
+      });
       continue;
     }
-    if (raw.location !== input.site) throw new RangeError(`Event ${raw.id} belongs to ${raw.location}, not partition site ${input.site}`);
     const prior = unique.get(raw.id);
     if (prior) {
       if (!samePayload(prior, raw)) throw new ProductionEvidenceError("conflicting_event", `Event ${raw.id} at ${raw.location} was read with two different payloads`);
@@ -116,16 +134,8 @@ export function projectReportingPartition(input: FrozenPartitionInput): Partitio
   const facts: EventFact[] = [];
   for (const raw of unique.values()) {
     if (!isCountEvidenceType(raw.event_type)) continue;
-    const t = exactInstant(raw.created_at);
-    const ms = typeof raw.created_at === "string" ? Date.parse(raw.created_at) : Number.NaN;
-    if (t === null || !Number.isFinite(ms)) {
-      globalIssues.push({ kind: "invalid_event", eventId: raw.id, location: raw.location, detail: "invalid time" });
-      continue;
-    }
-    if (t > cutoffUs) {
-      futureEventIds.push(raw.id);
-      continue;
-    }
+    const t = exactInstant(raw.created_at) as bigint;
+    const ms = Date.parse(raw.created_at);
     const cls = classifyEvidenceEvent(raw);
     const isVerification = cls.role === "verification";
     facts.push({
@@ -205,7 +215,12 @@ export function projectReportingPartition(input: FrozenPartitionInput): Partitio
   }
 
   futureEventIds.sort();
-  const body: Omit<PartitionResult, "hash"> = { site: input.site, audience, ruleVersion: input.ruleVersion, sourceCutoffUtc: input.sourceCutoffUtc, facts, edges, globalIssues, futureEventIds };
+  sourceIssues.sort((a, b) => {
+    const x = BigInt(a.us);
+    const y = BigInt(b.us);
+    return x < y ? -1 : x > y ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : canonicalJson(a) < canonicalJson(b) ? -1 : 1;
+  });
+  const body: Omit<PartitionResult, "hash"> = { site: input.site, audience, ruleVersion: input.ruleVersion, sourceCutoffUtc: input.sourceCutoffUtc, facts, edges, sourceIssues, futureEventIds };
   return { ...body, hash: partitionHash(body) };
 }
 
@@ -230,25 +245,34 @@ function instant(text: string, what: string): bigint {
   return t;
 }
 
-/** Window rows, qualification verifications, cancelled parents and later cancellations. */
-export function selectFactFamilies(result: PartitionResult, selection: UtcWindow): EventFact[] {
+/**
+ * Window rows, qualification verifications, cancelled parents and later
+ * cancellations — over the UNION of ordinary facts and source-issue rows, as
+ * v2 selects by raw selectors before the reducer rejects an identity. A
+ * malformed window terminal can select prior context, a malformed cancellation
+ * can seed its parent, and a malformed row of any type can be selected as a
+ * parent. Source issues are returned separately: they warn, nothing more.
+ */
+export function selectFactFamilies(result: PartitionResult, selection: UtcWindow): { facts: EventFact[]; sourceIssues: SourceIssueFact[] } {
   const S = instant(selection.startUtc, "selection start");
   const E = instant(selection.endUtcExclusive, "selection end");
   if (S >= E) throw new RangeError("selection is empty");
-  const win = result.facts.filter((f) => us(f) >= S && us(f) < E);
-  const terminalOrders = new Set(
-    win.filter((w) => (w.eventType === "completed" || w.eventType === "dispatched") && w.rawOrder !== null && btrim(w.rawOrder) !== "").map((w) => w.rawOrder as string),
-  );
+  type Row = { id: string; eventType: string; t: bigint; rawOrder: string | null; parentId: string | null };
+  const rowOf = (x: EventFact | SourceIssueFact): Row => ({ id: x.id, eventType: x.eventType, t: BigInt(x.us), rawOrder: x.rawOrder, parentId: x.parentId });
+  const all: Row[] = [...result.facts.map(rowOf), ...result.sourceIssues.map(rowOf)];
+  const RELEVANT = new Set(["line_verified", "completed", "dispatched", "cancelled"]);
+  const win = all.filter((r) => RELEVANT.has(r.eventType) && r.t >= S && r.t < E);
+  const terminalOrders = new Set(win.filter((w) => (w.eventType === "completed" || w.eventType === "dispatched") && w.rawOrder !== null && btrim(w.rawOrder) !== "").map((w) => w.rawOrder as string));
   const parentIds = new Set(win.filter((w) => w.eventType === "cancelled" && w.parentId !== null && w.parentId !== "").map((w) => w.parentId as string));
   const winTargets = new Set(win.filter((w) => w.eventType === "line_verified" || w.eventType === "completed" || w.eventType === "dispatched").map((w) => w.id));
-  const out = new Map<string, EventFact>();
-  for (const f of win) out.set(f.id, f);
-  for (const f of result.facts) {
-    const t = us(f);
-    if (t < S && ((f.eventType === "line_verified" && f.rawOrder !== null && terminalOrders.has(f.rawOrder)) || parentIds.has(f.id))) out.set(f.id, f);
-    else if (t >= E && f.eventType === "cancelled" && f.parentId !== null && winTargets.has(f.parentId)) out.set(f.id, f);
-  }
-  return [...out.values()].sort(cmpFact);
+  const picked = (r: Row) =>
+    (RELEVANT.has(r.eventType) && r.t >= S && r.t < E) ||
+    (r.t < S && ((r.eventType === "line_verified" && r.rawOrder !== null && terminalOrders.has(r.rawOrder)) || parentIds.has(r.id))) ||
+    (r.t >= E && r.eventType === "cancelled" && r.parentId !== null && winTargets.has(r.parentId));
+  return {
+    facts: result.facts.filter((f) => picked(rowOf(f))).sort(cmpFact),
+    sourceIssues: result.sourceIssues.filter((x) => picked(rowOf(x))),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -269,10 +293,14 @@ interface SelectionEvidence {
   qualification: Map<string, Qualification>;
   anchoredIssues: Anchored<CoverageIssue>[];
   anchoredNotes: Anchored<CoverageNoteKind>[];
+  /** Selected source-identity warnings: reported for the whole selection, whatever the display filter. */
+  selectedSourceIssues: CoverageIssue[];
 }
 
 function evaluateSelection(result: PartitionResult, selection: UtcWindow): SelectionEvidence {
-  const selected = selectFactFamilies(result, selection);
+  const picked = selectFactFamilies(result, selection);
+  const selected = picked.facts;
+  // Source issues never provide parent presence (the reducer skips them before indexing).
   const present = new Map(selected.map((f) => [f.id, f]));
   const edges = new Map(result.edges.map((e) => [e.cancelId, e]));
   const anchoredIssues: Anchored<CoverageIssue>[] = [];
@@ -346,7 +374,7 @@ function evaluateSelection(result: PartitionResult, selection: UtcWindow): Selec
     for (const v of list) issue(v, v.workType, "ambiguous_repeat", `${list.length} verifications of the same line`);
   }
 
-  return { verifications, terminals, effective, reversed: reversedT, qualification, anchoredIssues, anchoredNotes };
+  return { verifications, terminals, effective, reversed: reversedT, qualification, anchoredIssues, anchoredNotes, selectedSourceIssues: picked.sourceIssues.map((x) => x.issue) };
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +483,7 @@ export function referenceSummary(result: PartitionResult, q: ReferenceQuery): Co
     seen.add(k);
     issues.push(i);
   };
-  for (const i of result.globalIssues) addIssue(i);
+  for (const i of ev.selectedSourceIssues) addIssue(i);
   for (const a of ev.anchoredIssues) if (inScope(a.f, a.workType)) addIssue(a.value);
   issues.sort((a, b) => {
     const ka = `${a.kind}\u0000${a.location}\u0000${a.eventId}\u0000${a.detail ?? ""}`;

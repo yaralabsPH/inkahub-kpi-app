@@ -40,21 +40,26 @@ import {
   projectReportingPartition,
   referenceSummary,
   referenceTimingLines,
+  selectFactFamilies,
 } from "../productionReportingProjection";
 import {
   ANNA,
   at,
   BEN,
   cancel,
+  CARL,
   CASE_R,
   complete,
   CUTOFF,
   day,
   days,
+  ev,
   fourFamilySnapshot,
   history,
   OTHER_SITE,
   randomHistory,
+  resetIds,
+  selectFourFamilies,
   SITE,
   verify,
 } from "../../../../tests/fixtures/reporting-history";
@@ -434,3 +439,138 @@ describe("DTO mapping and request validation", () => {
 // Keep the dispatch fixture import used (dispatch rows are part of history()).
 void complete;
 void cancel;
+
+describe("T11-4: source-identity issues are a selectable fifth family, never partition-wide", () => {
+  const MISSING_ID = "missing id or site";
+  const idIssues = (s: { coverage: { issues: Array<{ kind: string; detail?: string; eventId: string }> } }) =>
+    s.coverage.issues.filter((i) => i.kind === "invalid_event" && i.detail === MISSING_ID).map((i) => i.eventId);
+  const ids = (xs: Array<{ id: string }>) => xs.map((x) => x.id);
+
+  function jan12Order(): ProductionEvidenceEvent[] {
+    return [verify({ order_number: "6001", created_at: at(12, "09:00") }), complete({ order_number: "6001", created_at: at(12, "09:10") })];
+  }
+
+  it("a whitespace-ID Jan 5 verification does not mark a Jan 12 range incomplete (it warns on Jan 5 only)", () => {
+    resetIds();
+    const src = [verify({ id: "  ", order_number: "6000", created_at: at(5, "09:00") }), ...jan12Order()];
+    const jan12 = actual(src, day(12), { range: day(12) });
+    expect(idIssues(jan12)).toEqual([]);
+    expect(jan12.coverage.incomplete).toBe(false);
+    expect(jan12.normal).toMatchObject({ items: 1, orders: 1 });
+    expect(idIssues(actual(src, day(5), { range: day(5) }))).toEqual(["  "]);
+    expect(project(src).sourceIssues.map((x) => [x.id, x.eventType, x.rawOrder])).toEqual([["  ", "line_verified", "6000"]]);
+    for (const w of [day(5), day(12), days(5, 12)]) expectParity(src, w, { range: w });
+  });
+
+  it("a future malformed row (after the source cutoff) never contaminates the current range; a later in-cutoff one only its own day", () => {
+    resetIds();
+    const future = verify({ id: " ", order_number: "6001", created_at: "2026-02-11T09:00:00.000000Z" });
+    const later = complete({ id: "   ", order_number: "6009", created_at: at(20, "09:00") });
+    const src = [...jan12Order(), future, later];
+    const r = project(src);
+    expect(r.futureEventIds).toEqual([" "]);
+    expect(r.sourceIssues.map((x) => x.id)).toEqual(["   "]);
+    expect(idIssues(actual(src, day(12), { range: day(12) }))).toEqual([]);
+    expect(actual(src, day(12), { range: day(12) }).coverage.incomplete).toBe(false);
+    expect(idIssues(actual(src, day(20), { range: day(20) }))).toEqual(["   "]);
+    for (const w of [day(12), day(20), days(12, 20)]) expectParity(src, w, { range: w });
+  });
+
+  it("a malformed window terminal selects prior verification context by its RAW order", () => {
+    resetIds();
+    const prior = verify({ order_number: "6002", created_at: at(11, "09:00") });
+    const src = [prior, complete({ id: "    ", order_number: "6002", created_at: at(12, "09:00") })];
+    const picked = selectFactFamilies(project(src), day(12));
+    expect(ids(picked.facts)).toEqual([prior.id]);
+    expect(ids(picked.sourceIssues)).toEqual(["    "]);
+    expect(ids(selectFourFamilies(src, SITE, day(12), CUTOFF)).sort()).toEqual(["    ", prior.id].sort());
+    expect(idIssues(actual(src, day(12), { range: day(12) }))).toEqual(["    "]);
+    expectParity(src, day(12), { range: day(12) });
+  });
+
+  it("a malformed cancellation seeds its parent into the selection", () => {
+    resetIds();
+    const parent = verify({ order_number: "6003", created_at: at(11, "09:00") });
+    const src = [parent, cancel(parent, { id: "     ", created_at: at(12, "09:00") })];
+    const picked = selectFactFamilies(project(src), day(12));
+    expect(ids(picked.facts)).toEqual([parent.id]);
+    expect(ids(picked.sourceIssues)).toEqual(["     "]);
+    expectParity(src, day(12), { range: day(12) });
+  });
+
+  it("a malformed `started` row selected as a cancellation's parent keeps the global warning", () => {
+    resetIds();
+    const started = ev({ id: "      ", event_type: "started", order_number: "6004", created_at: at(11, "09:00") });
+    const v = verify({ order_number: "6004", created_at: at(12, "08:00") });
+    const c = cancel(v, { parent_event_id: "      ", created_at: at(12, "09:00") });
+    const src = [started, v, c];
+    const s = actual(src, day(12), { range: day(12) });
+    expect(idIssues(s)).toEqual(["      "]);
+    expect(ids(selectFactFamilies(project(src), day(12)).sourceIssues)).toEqual(["      "]);
+    expect(idIssues(actual(src, day(13), { range: day(13) }))).toEqual([]);
+    expect(idIssues(actual(src, day(11), { range: day(11) }))).toEqual([]); // `started` is not a window type
+    for (const w of [day(11), day(12), day(13)]) expectParity(src, w, { range: w });
+  });
+
+  it("a valid-ID `started` parent is ignored by preparation: its cancellation still reports 'parent not found', with no identity warning", () => {
+    resetIds();
+    const started = ev({ id: "st-1", event_type: "started", order_number: "6005", created_at: at(11, "09:00") });
+    const v = verify({ order_number: "6005", created_at: at(12, "08:00") });
+    const c = cancel(v, { parent_event_id: "st-1", created_at: at(12, "09:00") });
+    const src = [started, v, c];
+    const r = project(src);
+    expect(r.sourceIssues).toEqual([]);
+    expect(r.facts.some((f) => f.id === "st-1")).toBe(false);
+    const s = actual(src, day(12), { range: day(12) });
+    expect(idIssues(s)).toEqual([]);
+    expect(s.coverage.issues.some((i) => i.eventId === c.id && i.detail === "parent not found")).toBe(true);
+    expectParity(src, day(12), { range: day(12) });
+  });
+
+  it("a selected source issue survives narrower display range, staff and work-type filters", () => {
+    resetIds();
+    const src = [...jan12Order(), verify({ id: "  ", order_number: "6006", staff_id: CARL, created_at: at(12, "15:00") })];
+    const narrow: UtcWindow = { startUtc: at(12, "08:00"), endUtcExclusive: at(12, "10:00") };
+    for (const scope of [{ range: narrow }, { range: day(12), staffIds: [BEN] }, { range: day(12), workTypes: ["unframed" as WorkType] }, { range: narrow, staffIds: [ANNA], workTypes: ["framed" as WorkType] }]) {
+      const s = actual(src, day(12), scope);
+      expect(idIssues(s), JSON.stringify(scope)).toEqual(["  "]);
+      expect(s.coverage.incomplete).toBe(true);
+      expectParity(src, day(12), scope);
+    }
+  });
+
+  it("self visibility filters source rows before selection: another worker's malformed row never reaches Anna", () => {
+    resetIds();
+    const prior = verify({ order_number: "6007", created_at: at(11, "09:00") });
+    const src = [prior, complete({ id: "  ", order_number: "6007", staff_id: BEN, created_at: at(12, "09:00") }), ...jan12Order()];
+    const anna = project(src, { kind: "self", staffId: ANNA });
+    expect(anna.sourceIssues).toEqual([]);
+    expect(ids(selectFactFamilies(anna, day(12)).facts)).not.toContain(prior.id);
+    expect(idIssues(actual(src, day(12), { range: day(12) }, { kind: "self", staffId: ANNA }))).toEqual([]);
+    expect(idIssues(actual(src, day(12), { range: day(12) }, { kind: "self", staffId: BEN }))).toEqual(["  "]);
+    for (const audience of [{ kind: "site" } as const, { kind: "self", staffId: ANNA } as const, { kind: "self", staffId: BEN } as const]) {
+      expectParity(src, day(12), { range: day(12) }, audience);
+    }
+  });
+
+  it("an empty id or an unreadable time fails the partition (as the transport/loader), never an all-history warning", () => {
+    resetIds();
+    expect(() => project([verify({ id: "", created_at: at(12, "09:00") })])).toThrow(RangeError);
+    expect(() => project([verify({ id: "  ", created_at: "2026-01-12 nonsense" })])).toThrow(RangeError);
+    expect(() => project([verify({ created_at: "2026-01-12T09:00:00Z+junk" })])).toThrow(RangeError);
+  });
+
+  it("source issues are in the canonical hash: adding one, or changing its raw selectors, changes it", () => {
+    resetIds();
+    const base = jan12Order();
+    const malformed = verify({ id: "  ", order_number: "6008", created_at: at(5, "09:00") });
+    const a = project(base);
+    const b = project([...base, malformed]);
+    const c = project([...base, { ...malformed, order_number: "6009" }]);
+    const d = project([...base, { ...malformed, parent_event_id: "x" }]);
+    expect(new Set([a.hash, b.hash, c.hash, d.hash]).size).toBe(4);
+    expect(project([malformed, ...base]).hash).toBe(b.hash);
+    const { hash, ...rest } = b;
+    expect(partitionHash(rest)).toBe(hash);
+  });
+});

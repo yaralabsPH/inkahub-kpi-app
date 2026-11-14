@@ -171,6 +171,15 @@ export function nonBlank(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
 }
 
+/**
+ * A saved row whose identity cannot be used (blank id or site), reported for
+ * ANY event type before relevance or time are considered (shared rule).
+ */
+export function evidenceIdentityIssue(raw: Pick<ProductionEvidenceEvent, "id" | "location">): CoverageIssue | null {
+  if (nonBlank(raw.id) && nonBlank(raw.location)) return null;
+  return { kind: "invalid_event", eventId: String(raw.id ?? ""), location: String(raw.location ?? ""), detail: "missing id or site" };
+}
+
 /** Trimmed order number used for grouping ("" when blank). */
 export function evidenceOrderKey(orderNumber: unknown): string {
   return typeof orderNumber === "string" ? orderNumber.trim() : "";
@@ -287,8 +296,9 @@ export function prepareProductionEvidence(snapshot: ProductionSnapshot): Prepare
   // 1. Deduplicate repeated retrieval of the same (location, id).
   const unique = new Map<string, ProductionEvidenceEvent>();
   for (const raw of snapshot.events) {
-    if (!nonBlank(raw.id) || !nonBlank(raw.location)) {
-      globalIssues.push({ kind: "invalid_event", eventId: String(raw.id ?? ""), location: String(raw.location ?? ""), detail: "missing id or site" });
+    const identity = evidenceIdentityIssue(raw);
+    if (identity) {
+      globalIssues.push(identity);
       continue;
     }
     const key = eventKey(raw.location, raw.id);

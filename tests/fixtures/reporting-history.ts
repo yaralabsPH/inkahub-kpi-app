@@ -238,8 +238,12 @@ export function randomHistory(seed: number, n = 400): ProductionEvidenceEvent[] 
     const r = rnd();
     const type = r < 0.5 ? "line_verified" : r < 0.65 ? "completed" : r < 0.72 ? "dispatched" : r < 0.9 ? "cancelled" : "started";
     const parent = type === "cancelled" && out.length ? pick(out) : null;
+    // T11-4: a few whitespace-only ids (accepted by the transport, permitted by 0012), unique per row,
+    // and cancellations pointing at one: they select evidence and warn only when selected.
+    const blankId = rnd() < 0.04;
+    const blankParent = type === "cancelled" && rnd() < 0.05;
     out.push({
-      id: `r${seed}-${i}`,
+      id: blankId ? " ".repeat(1 + i) : `r${seed}-${i}`,
       location: rnd() < 0.85 ? SITE : OTHER_SITE,
       staff_id: pick(staff),
       department: type === "dispatched" && rnd() < 0.8 ? "dispatch" : parent && rnd() < 0.8 ? parent.department : pick(deps),
@@ -248,7 +252,7 @@ export function randomHistory(seed: number, n = 400): ProductionEvidenceEvent[] 
       line_quantity: rnd() < 0.9 ? 1 + Math.floor(rnd() * 3) : rnd() < 0.5 ? "two" : -1,
       event_type: type,
       created_at: t,
-      parent_event_id: parent ? (rnd() < 0.9 ? parent.id : "missing-id") : null,
+      parent_event_id: blankParent ? " ".repeat(1 + Math.floor(rnd() * i + 1)) : parent ? (rnd() < 0.9 ? parent.id : "missing-id") : null,
       cs_case_id: parent && rnd() < 0.7 ? parent.cs_case_id : pick(cases),
     });
   }

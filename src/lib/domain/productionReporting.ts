@@ -419,6 +419,23 @@ export interface CancelEdgeFact {
   pair: CancellationPairOutcome | null;
 }
 
+/** A source row whose identity the shared rules reject (fifth fact family). */
+export interface SourceIssueFact {
+  site: string;
+  /** The raw saved id, untrimmed (e.g. "  "). */
+  id: string;
+  eventType: string;
+  /** Exact instant, epoch microseconds as a decimal string. */
+  us: string;
+  createdAt: string;
+  staffId: string | null;
+  /** Raw selectors used by the four-family selection. */
+  rawOrder: string | null;
+  parentId: string | null;
+  /** From the shared TypeScript classifier (evidenceIdentityIssue). */
+  issue: CoverageIssue;
+}
+
 export interface FrozenPartitionInput {
   site: string;
   audience: ReportingAudience;
@@ -436,8 +453,13 @@ export interface PartitionResult {
   sourceCutoffUtc: string;
   facts: EventFact[];
   edges: CancelEdgeFact[];
-  /** Rows that cannot be placed in time (always reported, never counted). */
-  globalIssues: CoverageIssue[];
+  /**
+   * Saved rows with an unusable identity (e.g. a whitespace-only id), of any
+   * event type, at or before the cutoff. They still SELECT evidence (v2's four
+   * families use their raw selectors) but contribute no Items, Orders, timing
+   * or parent presence; a range reports one only when its selection picks it.
+   */
+  sourceIssues: SourceIssueFact[];
   /** Source events after the cutoff: kept out of facts until due. */
   futureEventIds: string[];
   /** SHA-256 of the canonical JSON of everything above. */
