@@ -43,9 +43,24 @@ export const REPORTING_TABLES = [
 ] as const;
 export const REPORTING_FUNCTIONS = [CAPTURE_FUNCTION, "control_guard", "generations_guard"] as const;
 /** Added by 0038 (Task 13 Part A): internal helpers the server may execute. */
-export const REPORTING_FUNCTIONS_0038 = ["acknowledge_received_changes", "site_pending_changes"] as const;
+/** Internal helpers added by 0038 that the server may execute (Part A + B1). */
+export const REPORTING_FUNCTIONS_0038 = ["acknowledge_received_changes", "batch_drift", "lock_batch", "order_key", "site_pending_changes"] as const;
+/** Trigger functions added by 0038: nobody executes them directly. */
+export const REPORTING_TRIGGER_FUNCTIONS_0038 = ["source_candidate_guard"] as const;
+/** Tables added by 0038 (B1). */
+export const REPORTING_TABLES_0038 = ["source_candidate"] as const;
 /** Service-only public RPCs added by 0038 (Task 13 Part A). */
-export const PUBLIC_RPCS_0038 = ["begin_reporting_batch", "get_reporting_job_status", "set_reporting_capture"] as const;
+export const PUBLIC_RPCS_0038 = [
+  "abandon_reporting_batch",
+  "begin_reporting_batch",
+  "begin_reporting_rebuild",
+  "copy_reporting_source_page",
+  "freeze_reporting_rebuild",
+  "get_reporting_job_status",
+  "renew_reporting_lease",
+  "resume_reporting_batch",
+  "set_reporting_capture",
+] as const;
 const ROLES = ["anon", "authenticated", "service_role", CAPTURE_ROLE] as const;
 const CLIENT_ROLES = ["anon", "authenticated", "authenticator", "service_role"];
 
@@ -136,7 +151,12 @@ export function expectedTablePrivs(role: string, table: string): string {
 
 /** 0038 is installed when ANY of its objects is present; then ALL of them must be exactly as designed. */
 export function catalogLevel(c: ReportingCatalog): "0037" | "0038" {
-  const any = (c.policies ?? []).some((x) => x.p === "control_capture_lock") || (c.publicRpcs ?? []).length > 0 || (c.functions ?? []).some((f) => (REPORTING_FUNCTIONS_0038 as readonly string[]).includes(f.f)) || (c.controlColumnUpdate ?? []).length > 0;
+  const any =
+    (c.policies ?? []).some((x) => x.p === "control_capture_lock") ||
+    (c.publicRpcs ?? []).length > 0 ||
+    (c.functions ?? []).some((f) => [...REPORTING_FUNCTIONS_0038, ...REPORTING_TRIGGER_FUNCTIONS_0038].includes(f.f as never)) ||
+    (c.tables ?? []).some((t) => (REPORTING_TABLES_0038 as readonly string[]).includes(t.t)) ||
+    (c.controlColumnUpdate ?? []).length > 0;
   return any ? "0038" : "0037";
 }
 
@@ -144,15 +164,17 @@ export function catalogLevel(c: ReportingCatalog): "0037" | "0038" {
 export function checkCatalog(c: ReportingCatalog): string[] {
   const p: string[] = [];
   if (c.schema !== REPORTING_SCHEMA) return [`schema ${REPORTING_SCHEMA} is not installed`];
+  const level0038 = catalogLevel(c) === "0038";
   const tables = (c.tables ?? []).map((t) => t.t);
-  if (tables.join(",") !== [...REPORTING_TABLES].join(",")) p.push(`tables are [${tables.join(", ")}], expected [${REPORTING_TABLES.join(", ")}]`);
+  const wantTables = [...REPORTING_TABLES, ...(level0038 ? REPORTING_TABLES_0038 : [])].sort();
+  if (tables.join(",") !== wantTables.join(",")) p.push(`tables are [${tables.join(", ")}], expected [${wantTables.join(", ")}]`);
   for (const t of c.tables ?? []) {
     if (!t.rls) p.push(`RLS is off on ${t.t}`);
     if (t.owner === CAPTURE_ROLE) p.push(`${CAPTURE_ROLE} owns table ${t.t}`);
   }
   const level = catalogLevel(c);
   const fns = c.functions ?? [];
-  const wantFns = [...REPORTING_FUNCTIONS, ...(level === "0038" ? REPORTING_FUNCTIONS_0038 : [])].sort();
+  const wantFns = [...REPORTING_FUNCTIONS, ...(level === "0038" ? [...REPORTING_FUNCTIONS_0038, ...REPORTING_TRIGGER_FUNCTIONS_0038] : [])].sort();
   if (fns.map((f) => f.f).join(",") !== wantFns.join(",")) p.push(`functions are [${fns.map((f) => f.f).join(", ")}], expected [${wantFns.join(", ")}] for ${level}`);
   for (const f of fns) {
     const cfg = (f.config ?? []).join(";");

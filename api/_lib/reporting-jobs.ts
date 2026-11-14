@@ -179,6 +179,205 @@ export function pendingForSite(site: ReportingSite, journal: readonly JournalRow
     .sort((a, b) => a - b);
 }
 
+// ---------------------------------------------------------------------------
+// Part B1: candidate rebuild, lease renewal/takeover/abandon
+// ---------------------------------------------------------------------------
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function batchArg(batchId: unknown): string {
+  if (typeof batchId !== "string" || !UUID.test(batchId)) throw new ReportingJobError("batchId must be a uuid");
+  return batchId;
+}
+function fenceArg(fence: unknown): number {
+  if (typeof fence !== "number" || !Number.isSafeInteger(fence) || fence < 1) throw new ReportingJobError("fence must be a positive safe integer");
+  return fence;
+}
+
+export interface RebuildBatch {
+  batchId: string;
+  leaseFence: number;
+  baseGenerationId: string | null;
+  captureEpoch: number;
+  ruleVersion: string;
+  state: string;
+  leaseExpiresAtUtc: string;
+}
+
+export async function beginReportingRebuild(client: RpcClient, site: ReportingSite): Promise<RebuildBatch> {
+  if (!isReportingSite(site)) throw new ReportingJobError(`unsupported site ${String(site)}`);
+  const [r] = await callRows(client, "begin_reporting_rebuild", { p_site: site });
+  return {
+    batchId: str(r.batch_id, "batch_id"),
+    leaseFence: num(r.lease_fence, "lease_fence"),
+    baseGenerationId: strOrNull(r.base_generation_id, "base_generation_id"),
+    captureEpoch: num(r.capture_epoch, "capture_epoch"),
+    ruleVersion: str(r.rule_version, "rule_version"),
+    state: str(r.state, "state"),
+    leaseExpiresAtUtc: str(r.lease_expires_at, "lease_expires_at"),
+  };
+}
+
+export interface CopiedPage {
+  rowsCopied: number;
+  bytesCopied: number;
+  afterEventId: string | null;
+  /** Pass this as the next request's cursor. */
+  nextAfterEventId: string | null;
+  pageChecksum: string;
+  complete: boolean;
+  pages: number;
+  totalRows: number;
+  /** True when this was an identical replay of the last saved request (nothing copied). */
+  replay: boolean;
+}
+
+/** The database reads and writes the page itself; callers pass only the cursor. */
+export async function copyReportingSourcePage(client: RpcClient, batchId: string, fence: number, afterEventId: string | null): Promise<CopiedPage> {
+  if (afterEventId !== null && (typeof afterEventId !== "string" || afterEventId === "")) throw new ReportingJobError("afterEventId must be null or a non-empty string");
+  const [r] = await callRows(client, "copy_reporting_source_page", { p_batch: batchArg(batchId), p_fence: fenceArg(fence), p_after_event_id: afterEventId });
+  const checksum = str(r.page_checksum, "page_checksum");
+  if (!/^[0-9a-f]{64}$/.test(checksum)) throw new ReportingJobError("page_checksum is not a SHA-256 hex digest");
+  return {
+    rowsCopied: num(r.rows_copied, "rows_copied"),
+    bytesCopied: num(r.bytes_copied, "bytes_copied"),
+    afterEventId: strOrNull(r.after_event_id, "after_event_id"),
+    nextAfterEventId: strOrNull(r.next_after_event_id, "next_after_event_id"),
+    pageChecksum: checksum,
+    complete: bool(r.complete, "complete"),
+    pages: num(r.pages, "pages"),
+    totalRows: num(r.total_rows, "total_rows"),
+    replay: bool(r.replay, "replay"),
+  };
+}
+
+export interface FrozenRebuild {
+  batchId: string;
+  sourceCutoffUtc: string;
+  changeCount: number;
+  eventCount: number;
+  upserted: number;
+  deleted: number;
+  candidateRows: number;
+}
+
+export async function freezeReportingRebuild(client: RpcClient, batchId: string, fence: number): Promise<FrozenRebuild> {
+  const [r] = await callRows(client, "freeze_reporting_rebuild", { p_batch: batchArg(batchId), p_fence: fenceArg(fence) });
+  return {
+    batchId: str(r.batch_id, "batch_id"),
+    sourceCutoffUtc: str(r.source_cutoff, "source_cutoff"),
+    changeCount: num(r.change_count, "change_count"),
+    eventCount: num(r.event_count, "event_count"),
+    upserted: num(r.upserted, "upserted"),
+    deleted: num(r.deleted, "deleted"),
+    candidateRows: num(r.candidate_rows, "candidate_rows"),
+  };
+}
+
+export interface LeaseState {
+  batchId: string;
+  leaseFence: number;
+  leaseExpiresAtUtc: string;
+}
+
+/** 30-second heartbeat: extends the current lease; the fence never changes here. */
+export async function renewReportingLease(client: RpcClient, batchId: string, fence: number): Promise<LeaseState> {
+  const [r] = await callRows(client, "renew_reporting_lease", { p_batch: batchArg(batchId), p_fence: fenceArg(fence) });
+  const out = { batchId: str(r.batch_id, "batch_id"), leaseFence: num(r.lease_fence, "lease_fence"), leaseExpiresAtUtc: str(r.lease_expires_at, "lease_expires_at") };
+  if (out.leaseFence !== fence) throw new ReportingJobError("lease renewal changed the fence");
+  return out;
+}
+
+export interface ResumedBatch extends LeaseState {
+  state: string;
+  returnedWork: number;
+}
+
+/** Expired-lease takeover of the SAME batch under a new, larger fence. */
+export async function resumeReportingBatch(client: RpcClient, batchId: string, expectedFence: number): Promise<ResumedBatch> {
+  const [r] = await callRows(client, "resume_reporting_batch", { p_batch: batchArg(batchId), p_expected_fence: fenceArg(expectedFence) });
+  const out = {
+    batchId: str(r.batch_id, "batch_id"),
+    leaseFence: num(r.lease_fence, "lease_fence"),
+    leaseExpiresAtUtc: str(r.lease_expires_at, "lease_expires_at"),
+    state: str(r.state, "state"),
+    returnedWork: num(r.returned_work, "returned_work"),
+  };
+  if (out.leaseFence <= expectedFence) throw new ReportingJobError("takeover did not advance the fence");
+  return out;
+}
+
+/** Explicit recovery only (Task 15's protected action): evidence and pending journal are kept. */
+export async function abandonReportingBatch(client: RpcClient, batchId: string, fence: number, reason: string): Promise<{ batchId: string; state: string; failureKind: string }> {
+  if (typeof reason !== "string" || !reason.trim() || reason.length > 180) throw new ReportingJobError("reason must be 1..180 characters");
+  const [r] = await callRows(client, "abandon_reporting_batch", { p_batch: batchArg(batchId), p_fence: fenceArg(fence), p_reason: reason });
+  return { batchId: str(r.batch_id, "batch_id"), state: str(r.state, "state"), failureKind: str(r.failure_kind, "failure_kind") };
+}
+
+// Pure references of the B1 SQL rules (they state the staging expectations).
+
+export const COPY_PAGE_ROWS = 1000;
+export const COPY_PAGE_BYTES = 1024 * 1024;
+
+/**
+ * copy_reporting_source_page's selection over rows already ordered by event id
+ * and filtered to id > after: at most 1,000 rows, a running byte total of at
+ * most 1 MiB (a byte-capped page ends at its actual last row), complete only
+ * after a true end-of-source read, and a single oversized first row fails.
+ */
+export function selectSourcePage(rows: ReadonlyArray<{ id: string; bytes: number }>, maxRows = COPY_PAGE_ROWS, maxBytes = COPY_PAGE_BYTES): { kept: string[]; bytes: number; complete: boolean } {
+  const fetched = rows.slice(0, maxRows);
+  const kept: string[] = [];
+  let run = 0;
+  for (const r of fetched) {
+    if (run + r.bytes > maxBytes) break;
+    run += r.bytes;
+    kept.push(r.id);
+  }
+  if (fetched.length > 0 && kept.length === 0) throw new ReportingJobError(`source row ${fetched[0].id} is ${fetched[0].bytes} bytes, over the page limit`);
+  return { kept, bytes: run, complete: fetched.length < maxRows && kept.length === fetched.length };
+}
+
+export interface CopyCursor {
+  after: string | null;
+  complete: boolean;
+  last?: { after: string | null };
+}
+
+/**
+ * next = copy the next page; replay = return the saved response; otherwise
+ * refuse. A final EMPTY page leaves the cursor unchanged, so its retry is a
+ * replay because the copy is complete.
+ */
+export function copyCursorDecision(cursor: CopyCursor, requestedAfter: string | null): "next" | "replay" | "complete" | "mismatch" {
+  if (cursor.last && cursor.last.after === requestedAfter && (cursor.after !== requestedAfter || cursor.complete)) return "replay";
+  if (cursor.complete) return "complete";
+  return cursor.after === requestedAfter ? "next" : "mismatch";
+}
+
+export interface DriftInput {
+  batch: { kind: "refresh" | "rebuild"; captureEpoch: number; ruleVersion: string; baseGenerationId: string | null; site: string; batchId: string };
+  control: { captureEpoch: number; ruleVersion: string; captureEnabled: boolean };
+  site: { activeBatchId: string | null; activeGenerationId: string | null };
+  base: { site: string; state: string; complete: boolean; ruleVersion: string; captureEpoch: number } | null;
+}
+
+/** batch_drift(): why a batch may no longer be used (null = valid). */
+export function batchDrift(i: DriftInput): string | null {
+  const { batch: b, control: c, site: s, base: g } = i;
+  if (!c.captureEnabled) return "capture is disabled";
+  if (b.captureEpoch !== c.captureEpoch) return "capture epoch changed";
+  if (b.ruleVersion !== c.ruleVersion) return "rule version changed";
+  if (s.activeBatchId !== b.batchId) return "not the site's active batch";
+  if (b.baseGenerationId !== s.activeGenerationId) return "published base changed";
+  if (b.baseGenerationId !== null) {
+    if (!g || g.site !== b.site || g.state !== "published" || !g.complete) return "base is not a complete published generation of this site";
+    if (b.kind === "refresh" && (g.ruleVersion !== c.ruleVersion || g.captureEpoch !== c.captureEpoch)) return "refresh base is not at the current rule and capture epoch";
+  } else if (b.kind === "refresh") {
+    return "refresh has no published base";
+  }
+  return null;
+}
+
 /** acknowledge_received_changes(site): ids that become globally acknowledged now (every supported side has a receipt). */
 export function acknowledgeable(site: ReportingSite, journal: readonly JournalRow[], batches: readonly BatchRow[]): number[] {
   return journal

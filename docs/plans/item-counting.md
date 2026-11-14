@@ -428,6 +428,38 @@ At `edb5ab124c47130e7aea28338d8e251d7041fab7`, independent read-only review pass
 - Gate: `npx tsc -b`, `npm run typecheck:digest`, 897/897 tests, build OK; strict `tsc --noEmit` clean on both runners.
 
 **Focused planner closure (2026-11-14):** T13A-1–3 are verified closed at `001218df9128186bec26256c490fdf6dc2b1a24a`. The independent reviewer reran 119 focused tests successfully and found no remaining scoped issue. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43610633888/job/132494707990), completed 15:32:37 UTC. This clears code review for Part A, not database execution or Task 13 completion. Claude may now implement **Part B1 only**, following the approved contract and bounded transport clarification; run the common gate, commit/push and pause. No SQL application before the full reviewed 0038 draft.
+
+**Part B1 coder record (Claude, 2026-11-14; 0038 still an unapplied draft; 0037 byte-identical; no SQL run):**
+- **Identity:**
+  - `reporting_private.batch_drift(batch)` returns why a batch is no longer usable (NULL = valid): capture off, epoch or rule changed, not the site's active batch, base pointer changed, or base not a complete published generation of this site. A refresh base must also be at the current rule and epoch; a rebuild may replace an older rule/epoch base, but its own captured rule/epoch must match control.
+  - `reporting_private.lock_batch(batch, fence, live)` takes the control `FOR SHARE` lock, then the site row, then the batch row. It requires drift NULL, the exact fence on both batch and site, and, when `live`, an unexpired lease. Every B1 mutation uses it.
+- **Refresh `begin_reporting_batch` (Part A, revised):**
+  - Validates the REAL base generation: site, published, complete, rule and epoch, plus `source_epoch`.
+  - An active batch with drift is marked `failed` (`invalidated: …`) and never returned as usable. A valid live batch raises `busy`. A valid expired batch is returned `reused` so its owner can resume it.
+  - Known limit: if the same call then raises for a missing/invalid base, PostgreSQL rolls back the invalidation too. The drifted batch stays unusable (every mutation refuses it), and `begin_reporting_rebuild` or `abandon_reporting_batch` clears it.
+- **Rebuild:**
+  - New private `source_candidate` (keyed batch/site/event; RLS on; service-only DML), with the same image/index fields as `source_current`. The guard trigger allows writes only while its batch is an ACTIVE rebuild, and deletes only after the batch is published/failed/abandoned, so the candidate is immutable after freeze.
+  - `begin_reporting_rebuild(site)` requires capture and processor enabled. A drifted active batch is invalidated; a valid live one is busy; a valid expired one must be resumed or abandoned, never replaced. The base must be the unchanged complete published base (or none). It records rule/epoch from control, fence +1, a 360 s lease, and the cursor.
+  - `copy_reporting_source_page(batch, fence, after)` owns the read and the write; there is no image parameter. Keyset `id > after ORDER BY id LIMIT 1000`, no OFFSET, a 1 MiB running-byte cap, and an oversized single row raises. It is complete only on a true end-of-source read, i.e. fewer than 1,000 rows fetched and none byte-capped. The page checksum is SHA-256. The request must be at the persisted cursor, or it is an identical replay of the last saved request.
+  - **Planner note fixed:** a final EMPTY page (empty site, or an exact multiple of 1,000 rows) leaves the cursor unchanged, so the replay condition also accepts a completed copy. Its lost-response retry now replays instead of raising "already complete".
+  - `freeze_reporting_rebuild(batch, fence)` requires a complete copy. ONE `WITH` statement inserts membership (`site_pending_changes`) and final images/tombstones into `batch_events`, upserts images into the candidate and deletes tombstones. Then the batch is `frozen` with its cutoff.
+- **Lease:**
+  - `renew_reporting_lease` extends a live lease to 360 s with the fence unchanged.
+  - `resume_reporting_batch(batch, expected_fence)` works only for a valid batch at that fence with an EXPIRED lease (otherwise busy; a drifted batch must be abandoned). It sets fence +1 on site and batch and returns leased work to pending. Staged chunks, frozen inputs and the candidate are untouched.
+  - `abandon_reporting_batch(batch, fence, reason)` requires a non-empty reason and the current fence, and refuses a live valid batch. It sets `abandoned` plus the reason and clears the site pointer, keeping evidence and the pending journal. An unfrozen batch records the abandonment time as its cutoff only to satisfy 0037's state check.
+- **`reporting_private.order_key(text)` (planner note):** it now trims EXACTLY the characters JavaScript's `String.prototype.trim` removes (tab, LF, VT, FF, CR, space, NBSP, U+1680, U+2000–U+200A, U+2028/9, U+202F, U+205F, U+3000, BOM). A test decodes the SQL set and proves it equal to JavaScript over every BMP code point, and that it matches `evidenceOrderKey` on sample keys. An indexed order-key lookup therefore finds every row the shared key groups together. Counting semantics are unchanged.
+- **Other changes:**
+  - ACLs: the six public calls and three helpers are service-only; the guard trigger is executable by nobody.
+  - Runner catalog expectations now include the B1 table, helpers, trigger function and RPCs, with all of 0038 required when any of it is present.
+  - `api/_lib/reporting-jobs.ts` adds typed wrappers (argument validation before calling; checks that renew keeps the fence and resume advances it) and pure references `selectSourcePage`, `copyCursorDecision`, `batchDrift`.
+  - The new `tests/reporting/reportingRebuild.test.ts` (30 tests) is added to `typecheck:digest`.
+- **Tests:**
+  - SQL text for every rule above.
+  - Pure models: a full page that is not complete; a byte-capped page that is not complete; true end of source; oversize; cursor decisions including both empty-final-page replays; refresh rejected on an older-rule base vs a legitimate rule-change rebuild; toggle/epoch/base/active/site drift.
+  - Wrapper validation.
+- **Mutations:** 16 B1 breaks plus 4 for the planner-note fixes are each caught.
+- Gate: `npx tsc -b`, `npm run typecheck:digest`, 924/924 tests, build OK; strict `tsc --noEmit` clean on both runners.
+- **Not in B1:** planning/sealing, chunks/staging, publication, `source_versions`, `production_date` and ownership columns (all B2). Staging rehearsal of the complete draft is the planner's step after B2.
 - No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
 
 ## Amendment implementation log

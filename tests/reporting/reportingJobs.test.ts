@@ -42,12 +42,16 @@ describe("0038 migration text (Part A)", () => {
 
   it("does not touch source tables, source policies, client roles or timeouts", () => {
     for (const c of codes) {
-      expect(c).not.toMatch(/^(DROP|TRUNCATE|DELETE|ALTER TABLE|ALTER ROLE|ALTER DEFAULT)/i);
+      expect(c).not.toMatch(/^(DROP|TRUNCATE|DELETE|ALTER ROLE|ALTER DEFAULT)/i);
+      if (/^ALTER TABLE/i.test(c)) expect(c).toMatch(/^ALTER TABLE reporting_private\.\w+ ENABLE ROW LEVEL SECURITY$/);
       expect(c).not.toMatch(/ON public\.(?!production_events\b)\w+ /);
       expect(c).not.toMatch(/statement_timeout|idle_in_transaction/i);
     }
     for (const g of codes.filter((c) => /^GRANT /.test(c))) expect(g).not.toMatch(/\b(anon|authenticated|PUBLIC)\b/);
-    expect(codes.filter((c) => /production_events/.test(c) && !/^CREATE OR REPLACE FUNCTION reporting_private\.capture_production_event_change/.test(c) && !/^CREATE FUNCTION public\.begin_reporting_batch/.test(c))).toEqual([]);
+    // Only these read the source table, and none of them writes it.
+    const readers = codes.filter((c) => /production_events/.test(c) && !/^CREATE OR REPLACE FUNCTION reporting_private\.capture_production_event_change/.test(c));
+    expect(readers.map((c) => /^CREATE FUNCTION (public\.\w+)/.exec(c)?.[1])).toEqual(["public.begin_reporting_batch", "public.copy_reporting_source_page", "public.freeze_reporting_rebuild"]);
+    for (const c of readers) expect(c).not.toMatch(/(INSERT INTO|UPDATE|DELETE FROM) public\.production_events/);
   });
 
   it("activation fence: the capture function reads control FOR SHARE (not FOR KEY SHARE) before checking enabled", () => {
@@ -265,15 +269,18 @@ import {
   REPORTING_FUNCTIONS,
   REPORTING_FUNCTIONS_0038,
   REPORTING_TABLES,
+  REPORTING_TABLES_0038,
+  REPORTING_TRIGGER_FUNCTIONS_0038,
   type ReportingCatalog,
 } from "../staging/reportingCapture";
 
 function catalog0038(): ReportingCatalog {
   const roles = ["anon", "authenticated", "service_role", CAPTURE_ROLE];
-  const fns = [...REPORTING_FUNCTIONS, ...REPORTING_FUNCTIONS_0038].sort();
+  const fns = [...REPORTING_FUNCTIONS, ...REPORTING_FUNCTIONS_0038, ...REPORTING_TRIGGER_FUNCTIONS_0038].sort();
+  const tables = [...REPORTING_TABLES, ...REPORTING_TABLES_0038].sort();
   return {
     schema: "reporting_private",
-    tables: REPORTING_TABLES.map((t) => ({ t, rls: true, owner: "postgres" })),
+    tables: tables.map((t) => ({ t, rls: true, owner: "postgres" })),
     functions: fns.map((f) => ({ f, owner: f === "capture_production_event_change" ? CAPTURE_ROLE : "postgres", secdef: f === "capture_production_event_change", config: ['search_path=""'], dynamic: false })),
     policies: [
       { t: "changes", p: "changes_capture_insert", cmd: "INSERT", roles: [CAPTURE_ROLE], permissive: "PERMISSIVE" },
@@ -285,7 +292,7 @@ function catalog0038(): ReportingCatalog {
     members: [{ member: "postgres", inherit: false }],
     triggers: [{ n: CAPTURE_TRIGGER, def: "CREATE TRIGGER production_events_reporting_capture AFTER INSERT OR DELETE OR UPDATE ON public.production_events FOR EACH ROW EXECUTE FUNCTION reporting_private.capture_production_event_change()" }],
     schemaPrivs: roles.map((role) => ({ role, usage: role === "service_role" || role === CAPTURE_ROLE, create: false })),
-    tablePrivs: roles.flatMap((role) => REPORTING_TABLES.map((t) => ({ role, t, privs: expectedTablePrivs(role, t) }))),
+    tablePrivs: roles.flatMap((role) => tables.map((t) => ({ role, t, privs: expectedTablePrivs(role, t) }))),
     functionExec: ["anon", "authenticated", "service_role"].flatMap((role) => fns.map((f) => ({ role, f, x: role === "service_role" && (REPORTING_FUNCTIONS_0038 as readonly string[]).includes(f) }))),
     publicAcl: [{ o: "schema", public: false }],
     exposed: "pgrst.db_schemas=public,graphql_public",
