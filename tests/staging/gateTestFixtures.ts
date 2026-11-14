@@ -81,6 +81,11 @@ export const postPolicies = () => [...writes(), pol("production_events_read", "S
 export const policyCatalogRows = (rows: PolicyRow[] = postPolicies()) =>
   rows.map((r) => ({ policy_catalog: "production_events", ...r, roles: `{${r.roles.join(",")}}` }));
 
+/** The non-policy catalog fingerprints (helpers, RLS flags, grants, role configs, v1/v2, user_locations policies). */
+export const CATALOG_OTHER: Record<string, string> = Object.freeze({
+  helpers: "h", rls_flags: "production_events=true/false", table_grants: "g", role_configs: "c", evidence_functions: "f", user_locations_policies: "u",
+}) as Record<string, string>;
+
 function snap(mode: "before" | "after", arrangement: "standard" | "owner-kiosk-without-uk"): ParitySnapshot {
   const policies = mode === "before" ? prePolicies() : postPolicies();
   const roles: ParitySnapshot["roles"] = {};
@@ -91,7 +96,7 @@ function snap(mode: "before" | "after", arrangement: "standard" | "owner-kiosk-w
     const readers = Object.fromEntries(READER_PROBES.flatMap((pr) => ["au", "uk", "us", "staging"].map((st) => [`${pr}:${st}`, visible[st]])));
     roles[role] = { profileRole: role === "no-subject" ? null : role, memberships: [...sites, "staging"].join(","), claimsBytes: 630, visible, readers, errors: [] };
   }
-  return { mode, arrangement, capturedAt: "t", revision: "r", catalog: { policies, policyHash: policyHash(policies).hash, other: { helpers: "h" } }, fixture: { au: "1:x" }, roles };
+  return { mode, arrangement, capturedAt: "t", revision: "r", catalog: { policies, policyHash: policyHash(policies).hash, other: { ...CATALOG_OTHER } }, fixture: { au: "1:x" }, roles };
 }
 
 /** The pre-M6 history only (two arrangements): must NOT certify parity any more. */
@@ -102,32 +107,51 @@ export function legacyParityArtifact(): ParityArtifact {
   };
 }
 
+const SITES = ["au", "uk", "us", "staging"] as const;
+export const subjectOf = (role: string) => String(sessionClaims(role).sub);
+
 /** One case side whose row sets satisfy every coverage rule for that case. */
 export function caseSide(kase: ParityCase, which: "before" | "after"): CaseSide {
   const policies = which === "before" ? prePolicies() : postPolicies();
   const want = caseMemberships(kase);
+  const bytes = claimsSources();
   const roles: CaseSide["roles"] = {};
   for (const role of CASE_SPECS[kase].roles) {
-    const member = role === "no-subject" ? [] : want[role as keyof typeof want];
+    const member: string[] = role === "no-subject" ? [] : want[role as keyof typeof want];
     const visible: Record<string, string[]> = {};
-    for (const st of ["au", "uk", "us", "staging"]) visible[st] = member.includes(st) && st !== "staging" ? [`${st}|${role}-1`] : [];
-    const readers = Object.fromEntries(READER_PROBES.flatMap((pr) => ["au", "uk", "us", "staging"].map((st) => [`${pr}:${st}`, visible[st]])));
-    roles[role] = { profileRole: role === "no-subject" ? null : role, memberships: member.join(","), claimsBytes: 630, visible, readers, errors: [] };
+    const foreign: Record<string, number> = {};
+    for (const st of SITES) {
+      const own = member.includes(st) ? [`${st}|${role}-1`] : [];
+      const others = member.includes(st) && role !== "staff" ? [`${st}|other-1`] : [];
+      visible[st] = [...own, ...others].sort();
+      foreign[st] = others.length;
+    }
+    const readers = Object.fromEntries(READER_PROBES.flatMap((pr) => SITES.map((st) => [`${pr}:${st}`, visible[st].map((k) => JSON.stringify({ k }))])));
+    roles[role] = {
+      profileRole: role === "no-subject" ? null : role, memberships: member.join(","), claimsBytes: role === "no-subject" ? 60 : bytes[role].bytes, visible, readers, errors: [],
+      subject: role === "no-subject" ? null : subjectOf(role), env: { user: "authenticated", rowSecurity: "on", timeoutMs: 8000, bypass: false }, foreign,
+    };
   }
-  return { policies, policyHash: policyHash(policies).hash, other: { helpers: "h" }, roles, staffForeignRows: CASE_SPECS[kase].roles.includes("staff") ? 0 : null };
+  return { policies, policyHash: policyHash(policies).hash, other: { ...CATALOG_OTHER }, roles, staffForeignRows: CASE_SPECS[kase].roles.includes("staff") ? 0 : null };
 }
 
 /** A passing four-case collection under the post-0036 policies. */
 export function caseCollection(): CaseCollection {
-  const fixture = { au: "5:a", uk: "5:b", us: "5:c" };
+  const fixture = { au: "5:a", staging: "2:s", uk: "5:b", us: "5:c" };
+  const users = Object.fromEntries(["owner", "manager", "staff", "kiosk", "cs"].map((u) => [u, subjectOf(u)]));
+  const standard = () => Object.fromEntries(Object.entries(STANDARD_MEMBERSHIPS).map(([k, v]) => [k, [...v]]));
   const coll: CaseCollection = {
-    collectionId: "c1", capturedAt: "t", revision: "r", method: CASE_METHOD, cutoff: "2026-11-12T00:00:00.000Z", bounds: ["-infinity", "infinity"],
-    fixture, fixtureHash: fixtureHash(fixture), baselinePolicyHash: policyHash(prePolicies()).hash, installedPolicyHash: policyHash(postPolicies()).hash,
-    startMemberships: Object.fromEntries(Object.entries(STANDARD_MEMBERSHIPS).map(([k, v]) => [k, [...v]])),
-    staffOtherWorkerRows: { au: 3 },
-    cases: PARITY_CASES.map((k) => ({ case: k, memberships: caseMemberships(k), before: caseSide(k, "before"), after: caseSide(k, "after") })),
+    collectionId: "c1", capturedAt: "t", finishedAt: "t2", revision: "r", method: CASE_METHOD, cutoff: "2026-11-12T00:00:00.000Z",
+    bounds: ["-infinity", "2026-09-01T00:00:00.000Z", "2026-10-01T00:00:00.000Z", "infinity"],
+    fixture, fixtureHash: fixtureHash(fixture), baselinePolicyHash: policyHash(prePolicies()).hash,
+    baseline: { policyHash: policyHash(prePolicies()).hash, other: { ...CATALOG_OTHER }, revision: "r", capturedAt: "t" },
+    installedPolicyHash: policyHash(postPolicies()).hash, installedOther: { ...CATALOG_OTHER },
+    users, claimsBytes: Object.fromEntries(Object.entries(claimsSources()).map(([r, c]) => [r, c.bytes])),
+    startMemberships: standard(),
+    staffOtherWorkerRows: { au: 3, staging: 1 },
+    cases: PARITY_CASES.map((k) => ({ case: k, collectionId: "c1", fixtureHash: fixtureHash(fixture), memberships: caseMemberships(k), before: caseSide(k, "before"), after: caseSide(k, "after") })),
     comparisons: [],
-    restoration: { checkedAt: "t", passed: true, problems: [] },
+    restoration: { checkedAt: "t", passed: true, problems: [], memberships: standard(), catalog: { policyHash: policyHash(postPolicies()).hash, other: { ...CATALOG_OTHER } }, fixtureHash: fixtureHash(fixture) },
     problems: [],
   };
   coll.comparisons = coll.cases.map((e) => compareCase(coll, e));

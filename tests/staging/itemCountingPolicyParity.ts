@@ -8,7 +8,7 @@
  * shapes, booleans and synthetic row identities.
  */
 import { createHash } from "node:crypto";
-import { caseCollectionHash, checkCaseCollection, type CaseCollection } from "./itemCountingParityCases";
+import { caseCollectionHash, checkCaseCollection, type BaselineCatalog, type CaseCollection } from "./itemCountingParityCases";
 
 /** One pg_policies row for public.production_events. */
 export interface PolicyRow {
@@ -192,15 +192,25 @@ export interface RoleSnapshot {
   claimsBytes: number | null;
   /** Sorted "location|id" keys visible as `authenticated` with RLS on, per site. */
   visible: Record<string, string[]>;
-  /** Sorted ids returned by each direct app reader's filters, per "reader:site" (see READER_PROBES). */
+  /**
+   * Per "reader:site" (see READER_PROBES): history snapshots hold sorted ids;
+   * four-case snapshots hold each returned row (the reader's own columns, as
+   * JSON text) in the reader's own order and limit.
+   */
   readers?: Record<string, string[]>;
   errors: string[];
+  /** Four-case only: the session's subject (synthetic test user id), null for the no-subject session. */
+  subject?: string | null;
+  /** Four-case only: the verified read environment after the role switch. */
+  env?: { user: string; rowSecurity: string; timeoutMs: number | null; bypass: boolean | null };
+  /** Four-case only: visible rows per site not saved by the session's own subject. */
+  foreign?: Record<string, number>;
 }
 
-/** Direct app readers of production_events, replayed with their own filters at the fixed cutoff. */
+/** Direct app readers of production_events, replayed with their own columns, filters, order and limit at the fixed cutoff. */
 export const READER_PROBES = [
   "currently-clocked-in", "daily-timesheet", "labour-hours-today", "live-order-completions", "package-history",
-  "recent-activity", "production-verified-lines", "production-counters", "reports-event-stream", "reports-order-search", "welcome-team",
+  "recent-activity", "production-verified-lines", "production-clock-state", "reports-export-extras", "reports-order-search", "production-order-events",
 ] as const;
 
 export interface CatalogSnapshot {
@@ -326,9 +336,20 @@ export function compareSnapshots(before: ParitySnapshot, after: ParitySnapshot, 
   return { arrangement: after.arrangement, comparedAt, beforeHash: before.catalog.policyHash, afterHash: after.catalog.policyHash, problems, counts };
 }
 
+/** The original pre-0036 baseline catalog (latest standard before snapshot), or null. */
+export function baselineCatalog(art: ParityArtifact | null): BaselineCatalog | null {
+  const s = [...(art?.snapshots ?? [])].reverse().find((x) => x.mode === "before" && x.arrangement === "standard");
+  return s ? { policyHash: s.catalog.policyHash, other: s.catalog.other, revision: s.revision, capturedAt: s.capturedAt } : null;
+}
+
 /** The original pre-0036 baseline policy hash (latest standard before snapshot), or null. */
 export function baselinePolicyHash(art: ParityArtifact | null): string | null {
-  return [...(art?.snapshots ?? [])].reverse().find((x) => x.mode === "before" && x.arrangement === "standard")?.catalog.policyHash ?? null;
+  return baselineCatalog(art)?.policyHash ?? null;
+}
+
+/** The retained post-0036 policy hash (passing standard history comparison), or null. */
+export function retainedInstalledHash(art: ParityArtifact | null): string | null {
+  return (art?.comparisons ?? []).find((c) => c.arrangement === "standard" && c.problems.length === 0)?.afterHash ?? null;
 }
 
 /**
@@ -338,7 +359,7 @@ export function baselinePolicyHash(art: ParityArtifact | null): string | null {
  */
 export function checkParityArtifact(art: ParityArtifact | null, currentPolicyHash: string | null): string[] {
   if (!art) return ["policy parity has not been run (run --policy-parity=cases)"];
-  return checkCaseCollection(art.cases ?? null, currentPolicyHash, baselinePolicyHash(art));
+  return checkCaseCollection(art.cases ?? null, currentPolicyHash, baselineCatalog(art));
 }
 
 /** Stable hash of the accepted parity evidence, recorded with each manager phase. */

@@ -3,6 +3,7 @@ import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshC
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
+import { createOrderLookupSession, type OrderLookupView } from "@/lib/repository/supabase/orderLookupSession";
 import { useAppStore } from "@/lib/state/appStore";
 import { Card, CardHeader, CardTitle, CardBody } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -982,51 +983,35 @@ function OrderLookupCard({
   staffLookup: Map<string, StaffLookup>;
 }) {
   const [input, setInput] = useState("");
-  const [searched, setSearched] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const auth = useAuth();
 
   // A result belongs to the user, site and order it was read for, under one
   // cutoff. Changing user or site clears it, and a late response for an
   // older search is discarded, so a count never appears under another site.
+  // The lifecycle lives in createOrderLookupSession (tested with deferred responses).
   const scopeKey = `${auth.user?.id ?? "anon"}|${location}`;
-  const [lookup, setLookup] = useState<{
-    key: string; location: string; order: string; asOfUtc: string; events: OrderEvent[]; complete: boolean;
-  } | null>(null);
-  const searchSeq = useRef(0);
-  useEffect(() => {
-    searchSeq.current++;
-    setSearched(null);
-    setLookup(null);
-    setError(null);
-    setLoading(false);
-  }, [scopeKey]);
-
-  const runSearch = useCallback(async () => {
-    const normalized = normalizeOrderNumber(input);
-    if (!normalized) {
-      setError("Enter an order number first.");
-      return;
-    }
-    const mine = ++searchSeq.current;
-    const asOfUtc = new Date().toISOString();
-    setError(null);
-    setLoading(true);
-    setSearched(normalized);
-    try {
-      const res = await loadOrderLookup<OrderEvent>(supabase, { location, orderNumber: normalized, asOfUtc });
-      if (mine !== searchSeq.current) return;
-      setLookup({ key: `${scopeKey}|${normalized}`, location, order: normalized, asOfUtc, events: res.events, complete: res.complete });
-    } catch (e) {
-      if (mine !== searchSeq.current) return;
-      setError((e as Error).message);
-      setLookup(null);
-    } finally {
-      if (mine === searchSeq.current) setLoading(false);
-    }
-  }, [supabase, location, input, scopeKey]);
-  const events = lookup && searched && lookup.key === `${scopeKey}|${searched}` ? lookup.events : null;
+  const supabaseRef = useRef(supabase);
+  supabaseRef.current = supabase;
+  const [view, setView] = useState<OrderLookupView<OrderEvent> | null>(null);
+  const session = useMemo(
+    () =>
+      createOrderLookupSession<OrderEvent>({
+        load: (req) => loadOrderLookup<OrderEvent>(supabaseRef.current, req),
+        normalize: normalizeOrderNumber,
+        now: () => new Date().toISOString(),
+        onChange: setView,
+        scopeKey,
+        location,
+      }),
+    // Created once; scope changes go through setScope below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  useEffect(() => session.setScope(scopeKey, location), [session, scopeKey, location]);
+  const current = view ?? session.view();
+  const { searched, loading, error, lookup, events } = current;
+  const setError = useCallback((message: string | null) => session.setError(message), [session]);
+  const runSearch = useCallback(() => session.search(input), [session, input]);
 
   // Per-event Remove action. Owner-only. Deletes the production_events
   // row + any matching ledger rows (parent_event_id) so the audit
@@ -1066,11 +1051,7 @@ function OrderLookupCard({
 
   const reset = () => {
     setInput("");
-    searchSeq.current++;
-    setSearched(null);
-    setLookup(null);
-    setError(null);
-    setLoading(false);
+    session.reset();
   };
 
   // Departments that touched this order (set of unique department values from

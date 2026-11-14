@@ -410,9 +410,16 @@ describe("digest refuses to report from incomplete or unauthorized reads", () =>
       ["a body without rows and without an error", "ledger", () => ({ data: null, error: null, count: 700 })],
       ["a count that changes between pages", "ledger", () => ({ data: [], error: null, count: 701 })],
       ["an empty page before the count is reached", "production_events", () => ({ data: [], error: null, count: 1201 })],
+      // Review r2 R2-6: later-page failures of the clock and staff-name readers too.
+      ["a clock read error on the second page", "production_events", () => ({ data: null, error: { message: "clock page 2 failed" }, count: null })],
+      ["a clock page without rows and without an error", "production_events", () => ({ data: null, error: null, count: 1201 })],
+      ["a staff-name read error on the second page", "staff_barcodes", () => ({ data: null, error: { message: "names page 2 failed" }, count: null })],
+      ["a staff-name page without rows and without an error", "staff_barcodes", () => ({ data: null, error: null, count: 600 })],
+      ["a staff-name count that changes between pages", "staff_barcodes", () => ({ data: [], error: null, count: 601 })],
     ];
     for (const [label, table, page] of broken) {
       it(`fails before any workbook or email on ${label}`, async () => {
+        h.state.tables.staff_barcodes = Array.from({ length: 600 }, (_, i) => ({ user_id: A, display_name: "Ana", barcode: `b${String(i).padStart(4, "0")}`, location: "uk" }));
         h.state.tables.products = [{ id: "p-a0d", code: "A0-Double", location: "uk" }];
         h.state.tables.ledger = Array.from({ length: 700 }, (_, i) => ({ id: `l-${String(i).padStart(4, "0")}`, location: "uk", product_id: "p-a0d", delta: -1, ts: "2026-01-15T12:00:00.000Z" }));
         const clocks: Row[] = [];

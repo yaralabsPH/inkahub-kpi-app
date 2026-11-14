@@ -66,9 +66,26 @@ npm run staging:item-counting -- --policy-parity=cases
 **Required state before running:** standard memberships exactly —
 owner and kiosk on `au, staging, uk, us`; manager, staff and cs on
 `au, staging`. No fixture or membership administration may run at the same
-time. The original `--policy-parity=before` standard snapshot must still be in
-`staging-results-item-counting.policy-parity.json`: its pre-0036 policy hash
-is the authority the restore must reproduce.
+time. The original `--policy-parity=before` standard snapshot and the passing
+`--policy-parity=after` standard comparison must still be in
+`staging-results-item-counting.policy-parity.json`: the first is the pre-0036
+policy and catalog authority (helpers, grants, RLS flags, role settings,
+v1/v2, membership policies), the second the retained post-0036 hash. A missing
+authority stops the run before any database work.
+
+**Self/other-worker probes at `staging` (CJ-approved, once):** every member
+site needs positive rows, including `staging`, which the volume fixture does
+not populate. Two synthetic `started` events (one by the staff test user, one
+by the kiosk test user, dated 2026-11-11, before the cutoff, no stock or
+ledger effect) are added there with the guarded staging SQL helper and kept.
+They prove staff sees only its own row there and the site-wide roles see
+another worker's row. AU/UK/US rows, scope and cutoff are untouched.
+
+**Run lifecycle:** the new attempt is written to the artifact as *pending*
+before settings, sign-in or the connection are used, so a failure, Ctrl+C or
+kill can never leave an older success in place. The report is rewritten after
+every step and every 10 s, always ending FAILED until the run finishes. Every
+final failure (claims, coverage, checker) is stored in the collection itself.
 
 What it does, all on ONE connection in ONE `REPEATABLE READ` transaction that
 always ends in `ROLLBACK` (also on errors, timeouts and Ctrl+C):
@@ -87,11 +104,15 @@ always ends in `ROLLBACK` (also on errors, timeouts and Ctrl+C):
    | `owner-denied-uk` | remove owner `uk` | owner |
    | `kiosk-denied-uk` | remove kiosk `uk` | kiosk |
 
-3. Reads each identity's complete per-site rows and the 11 direct-reader
-   replays under installed 0036, then, under a nested savepoint, restores the
-   exact pre-0036 SELECT policy text (the plan's Policy rollback body, no
-   BEGIN/COMMIT) and reads again. Every read is `authenticated`, RLS on,
-   bypass-RLS off, real session claims and the catalog 8 s limit. The nested
+3. Reads each identity's complete per-site rows (month by month, up to the
+   fixed cutoff) and the 11 direct-reader replays under installed 0036, then,
+   under a nested savepoint, restores the exact pre-0036 SELECT policy text
+   (the plan's Policy rollback body, no BEGIN/COMMIT) and reads again. Each
+   replay uses the app reader's own columns, filters, order and limit, closed
+   at the cutoff (with `id` as the last tie-breaker), and keeps every returned
+   row as JSON in order, so changed fields or order fail, not only changed ids.
+   Every read is `authenticated`, RLS on, bypass-RLS off, real session claims
+   and exactly 8,000 ms statement_timeout, recorded per read. The nested
    savepoint and then the case savepoint are rolled back, and memberships are
    re-checked before the next case.
 4. After `ROLLBACK`, a fresh statement re-reads the five users' memberships,

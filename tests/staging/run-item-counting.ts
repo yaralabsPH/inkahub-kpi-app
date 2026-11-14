@@ -62,13 +62,15 @@ import { runGate, type GateIO } from "./itemCountingGate";
 import { buildReport, type GateState } from "./itemCountingReport";
 import { claimsSetting } from "./generate-query-evidence";
 import { signInClaims, SESSION_ROLES, type SessionRole } from "./stagingSessions";
-import { collectCaseParity, collectParitySnapshot } from "./policyParityRun";
-import { casesModeArgProblems, caseParityMarkdown, caseParityProblems } from "./itemCountingParityCases";
+import { randomUUID } from "node:crypto";
+import { collectParitySnapshot } from "./policyParityRun";
+import { casesModeArgProblems } from "./itemCountingParityCases";
+import { runCasesMode } from "./caseParityMode";
 import { collectWriteCompat } from "./writeCompatRun";
 import { checkSet, compareSets, STEPS } from "./writeCompat";
 import {
   ARRANGEMENTS,
-  baselinePolicyHash,
+
   checkSnapshot,
   compareSnapshots,
   redactSecrets,
@@ -306,6 +308,7 @@ async function runSqlFile(client: pg.Client, file: string, notices: string[]): P
 }
 
 async function main(): Promise<number> {
+  if (PARITY_ARG === "cases") return runCaseParity();
   let settings: Settings | null = null;
   try {
     settings = readSettings();
@@ -326,8 +329,7 @@ async function main(): Promise<number> {
     state.claimsSources = sessions.sources;
     for (const [role, c] of Object.entries(sessions.sources)) console.log(`  ${role}: real session claims ${c.bytes} bytes${c.problems.length ? ` · ${c.problems[0]}` : ""}`);
 
-    if (PARITY_ARG === "cases") return await runCaseParity(dbConfig);
-    if (PARITY_ARG) return await runParity(dbConfig, PARITY_ARG);
+    if (PARITY_ARG === "before" || PARITY_ARG === "after") return await runParity(dbConfig, PARITY_ARG);
     if (WRITE_COMPAT) return await runWriteCompat(dbConfig);
 
     const io: GateIO = {
@@ -470,37 +472,54 @@ function writeParity(art: ParityArtifact): void {
  * The new collection replaces any earlier one in the artifact, even when it
  * failed, so a failed run can never fall back to an older success.
  */
-async function runCaseParity(dbConfig: pg.ClientConfig): Promise<number> {
-  const art: ParityArtifact = readParity() ?? { snapshots: [], comparisons: [] };
-  const lines: string[] = [];
-  const log = (l: string) => {
-    console.log(`  ${l}`);
-    lines.push(l);
-  };
+async function runCaseParity(): Promise<number> {
   console.log("\nPolicy parity · four cases (one transaction, rolled back; pre-0036 restored in a nested savepoint)");
-  const retained = art.comparisons.find((c) => c.arrangement === "standard" && c.problems.length === 0)?.afterHash ?? null;
-  const extra: string[] = [];
-  const client = new pg.Client(dbConfig);
-  client.on("error", (e) => console.error(`  database connection error: ${redactSecrets(e.message)}`));
-  let coll: Awaited<ReturnType<typeof collectCaseParity>> | null = null;
-  try {
-    await client.connect();
-    coll = await collectCaseParity(client, {
-      revision: state.revision, claimsText, baselinePolicyHash: baselinePolicyHash(art), expectedInstalledHash: retained, log, signal: CASES_ABORT.signal,
-    });
-    art.cases = coll;
-    writeParity(art);
-  } catch (e) {
-    extra.push(redactSecrets(e instanceof Error ? e.message : String(e)));
-  } finally {
-    await client.end().catch(() => {});
-  }
-  const problems = [...extra, ...caseParityProblems(baselinePolicyHash(art), coll, state.claimsSources)].map(redactSecrets);
-  const { markdown, status } = caseParityMarkdown({ coll, problems, lines, claimsSources: state.claimsSources, revision: state.revision, project: STAGING_REF, finishedAt: new Date().toISOString() });
-  writeFileSync(PARITY_REPORT, markdown, "utf8");
+  // The new attempt is marked pending in the artifact BEFORE settings, sign-in or connection can fail.
+  let settings: Settings | null = null;
+  const loadSettings = () => {
+    if (!settings) {
+      settings = readSettings();
+      assertStagingSupabaseUrl(settings.STAGING_SUPABASE_URL);
+    }
+    return settings;
+  };
+  const { code, status } = await runCasesMode({
+    readArtifact: readParity,
+    writeArtifact: writeParity,
+    writeReport: (md) => {
+      const tmp = `${PARITY_REPORT}.tmp`;
+      writeFileSync(tmp, md, "utf8");
+      renameSync(tmp, PARITY_REPORT);
+    },
+    async signIn() {
+      const s = loadSettings();
+      const logins = Object.fromEntries(SESSION_ROLES.map((r) => {
+        const up = r.toUpperCase() as Uppercase<SessionRole>;
+        return [r, { email: s[`STAGING_${up}_EMAIL`], password: s[`STAGING_${up}_PASSWORD`] }];
+      })) as Record<SessionRole, { email: string; password: string }>;
+      const sessions = await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins);
+      for (const [role, c] of Object.entries(sessions.sources)) console.log(`  ${role}: real session claims ${c.bytes} bytes${c.problems.length ? ` · ${c.problems[0]}` : ""}`);
+      return sessions;
+    },
+    async connect() {
+      const client = new pg.Client(stagingDbConfig(loadSettings().STAGING_DB_URL));
+      // A dropped connection becomes the failing query's error (reported), not an unhandled crash.
+      client.on("error", (e) => console.error(`  database connection error: ${redactSecrets(e.message)}`));
+      await client.connect();
+      return client;
+    },
+    revision: state.revision,
+    project: STAGING_REF,
+    now: () => new Date().toISOString(),
+    newId: () => randomUUID(),
+    log: (l) => console.log(`  ${l}`),
+    signal: CASES_ABORT.signal,
+    heartbeatMs: 10_000,
+    redact: redactSecrets,
+  });
   console.log(`\nWrote ${PARITY_REPORT}`);
   console.log(status);
-  return problems.length ? 1 : 0;
+  return code;
 }
 
 /** `--write-compat`: app write paths, digest and anon checks with 0036 and restored pre-0036 policies, all rolled back. */

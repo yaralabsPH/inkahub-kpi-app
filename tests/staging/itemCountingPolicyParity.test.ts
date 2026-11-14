@@ -180,10 +180,10 @@ describe("before/after parity", () => {
   it("fails when a direct reader's replay differs or is missing", () => {
     const a = snap("after");
     a.roles.kiosk!.readers!["currently-clocked-in:au"] = ["au|a1", "au|zz"];
-    delete a.roles.cs!.readers!["welcome-team:au"];
+    delete a.roles.cs!.readers!["production-order-events:au"];
     const p = compareSnapshots(snap("before"), a, "now").problems;
     expect(p.some((x) => x.startsWith("kiosk reader currently-clocked-in:au:"))).toBe(true);
-    expect(p).toContain("after/standard: cs reader welcome-team at au was not replayed");
+    expect(p).toContain("after/standard: cs reader production-order-events at au was not replayed");
   });
 
   it("fails on a missing role/site, a wrong arrangement, a leak without membership or a no-subject session seeing rows", () => {
@@ -235,9 +235,9 @@ describe("four-case in-transaction parity (review r1 M6)", () => {
     const art = parityArtifact();
     art.cases!.cases[0].after.roles.manager!.visible.au = ["au|other-1"];
     const r = parityArtifact();
-    r.cases!.cases[0].after.roles.kiosk!.readers!["welcome-team:uk"] = ["uk|zz"];
+    r.cases!.cases[0].after.roles.kiosk!.readers!["production-order-events:uk"] = ["uk|zz"];
     expect(checkParityArtifact(art, post).some((x) => x.includes("manager at au: 1 rows only under pre-0036"))).toBe(true);
-    expect(checkParityArtifact(r, post).some((x) => x.includes("kiosk reader welcome-team:uk"))).toBe(true);
+    expect(checkParityArtifact(r, post).some((x) => x.includes("kiosk reader production-order-events:uk"))).toBe(true);
   });
 
   it("requires exact memberships including staging", () => {
@@ -259,11 +259,11 @@ describe("four-case in-transaction parity (review r1 M6)", () => {
     leak.cases!.cases[2].before.roles.owner!.visible.uk = ["uk|x"];
     expect(checkParityArtifact(leak, post).some((x) => x.includes("owner saw 1 uk rows without uk membership"))).toBe(true);
     const staff = parityArtifact();
-    staff.cases!.cases[0].after.staffForeignRows = 2;
-    expect(checkParityArtifact(staff, post).some((x) => x.includes("staff saw 2 rows saved by other workers"))).toBe(true);
+    staff.cases!.cases[0].after.roles.staff!.foreign!.au = 2;
+    expect(checkParityArtifact(staff, post).some((x) => x.includes("staff saw 2 rows saved by other workers at au"))).toBe(true);
     const proof = parityArtifact();
     proof.cases!.staffOtherWorkerRows = {};
-    expect(checkParityArtifact(proof, post).some((x) => x.includes("exclusion is not proven"))).toBe(true);
+    expect(checkParityArtifact(proof, post).some((x) => x.includes("exclusion there is not proven"))).toBe(true);
   });
 
   it("rejects a mixed fixture/baseline, the wrong restored hash and different installed policies", () => {
