@@ -7,6 +7,9 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  CC_JOURNAL_SQL,
+  concurrencyProbe,
+  openGuardedClient,
   CAPTURE_STEPS,
   CAPTURE_TRIGGER,
   captureMarkdown,
@@ -25,6 +28,7 @@ import {
 } from "../staging/reportingCapture";
 
 const RUNNER = readFileSync("tests/staging/reporting-capture.ts", "utf8");
+const PURE = readFileSync("tests/staging/reportingCapture.ts", "utf8");
 const STAGING_URL = `postgresql://postgres.${STAGING_PROJECT_REF}:pw@aws-0-region.pooler.supabase.com:5432/postgres`;
 
 const TARGET = stagingTarget(STAGING_URL);
@@ -89,7 +93,7 @@ describe("T12-2: immutable staging target at every query", () => {
 
   it("the runner creates database clients only through the guarded opener", () => {
     expect(RUNNER.match(/new pg\.Client\(/g)).toHaveLength(1);
-    expect(RUNNER).toMatch(/guardClient\(new pg\.Client\(/);
+    expect(RUNNER).toMatch(/return openGuardedClient\(\(\) => new pg\.Client\(/);
     expect(RUNNER).not.toMatch(/\bpg\.Pool\b/);
     expect(RUNNER).toMatch(/const open = \(\) => openGuarded\(/);
   });
@@ -99,7 +103,9 @@ describe("T12-3: the runner never overrides a database timeout", () => {
   it("no statement/idle timeout override; only the concurrency probe's transaction-local lock_timeout; settings recorded", () => {
     expect(RUNNER).not.toMatch(/statement_timeout\s*:/);
     expect(RUNNER).not.toMatch(/set (local |session )?(statement_timeout|idle_in_transaction_session_timeout)/i);
-    expect(RUNNER.match(/set local lock_timeout/g)?.length).toBe(2);
+    expect(RUNNER).not.toMatch(/set (local |session )?lock_timeout|lock_timeout\s*:/i);
+    expect(PURE).not.toMatch(/statement_timeout\s*[:=]|set (local |session )?(statement_timeout|idle_in_transaction_session_timeout)/i);
+    expect(PURE.match(/set local lock_timeout = '3s'/g)?.length).toBe(2);
     expect(RUNNER).toMatch(/current_setting\('statement_timeout'\)/);
   });
 });
@@ -231,5 +237,152 @@ describe("T12-5: supported-site journal with stock deduction, and event-ID chang
     expect(checkSteps(doubleDeduct).join()).toMatch(/k04/);
     const leftover = goodSteps().map((r) => (r.id === "k07" ? { ...r, result: "2:2:1" } : r));
     expect(checkSteps(leftover).join()).toMatch(/k07/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Focused runner integration fixes (planner checkpoint at a029bd2)
+// ---------------------------------------------------------------------------
+
+/** A pg-like client: connect/query/end, connection params, scripted failures and rows. */
+class PgFake {
+  sent: string[] = [];
+  connected = false;
+  ended = false;
+  role = "postgres";
+  host = TARGET.host;
+  user = TARGET.user;
+  constructor(private opts: { connectFails?: boolean; endFails?: boolean; failOn?: (sql: string, role: string) => Error | undefined; rows?: (sql: string) => Array<Record<string, unknown>> } = {}) {}
+  async connect() {
+    if (this.opts.connectFails) throw Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    this.connected = true;
+  }
+  async query(sql: string) {
+    this.sent.push(sql);
+    if (sql === "reset role") this.role = "postgres";
+    const m = /^set local role (\w+)$/.exec(sql);
+    if (m) this.role = m[1];
+    const e = this.opts.failOn?.(sql, this.role);
+    if (e) throw e;
+    return { rows: this.opts.rows?.(sql) ?? [] };
+  }
+  async end() {
+    this.ended = true;
+    if (this.opts.endFails) throw new Error("socket already closed");
+  }
+}
+
+describe("openGuardedClient: a client that fails to connect or fails the marker is always closed", () => {
+  const markerFails = async () => {
+    throw new Error("Refusing to run: this database is not the staging project (no staging location/test users).");
+  };
+
+  it("marker failure after connect: the client is ended, the original error is rethrown", async () => {
+    const c = new PgFake();
+    await expect(openGuardedClient(() => c, TARGET, markerFails)).rejects.toThrow(/not the staging project/);
+    expect(c.connected).toBe(true);
+    expect(c.ended).toBe(true);
+  });
+
+  it("connect failure: the client is ended; the original error and its code survive", async () => {
+    const c = new PgFake({ connectFails: true });
+    const err = await openGuardedClient(() => c, TARGET, async () => {}).catch((e) => e);
+    expect(err.message).toBe("connect ECONNREFUSED");
+    expect(err.code).toBe("ECONNREFUSED");
+    expect(c.ended).toBe(true);
+  });
+
+  it("a cleanup failure is kept as evidence next to the original error", async () => {
+    const c = new PgFake({ endFails: true });
+    await expect(openGuardedClient(() => c, TARGET, markerFails)).rejects.toThrow(/not the staging project.*; cleanup failed: disconnect: socket already closed/);
+  });
+
+  it("success returns the connected, guarded client (not ended); a wrong target never connects", async () => {
+    const c = new PgFake();
+    const g = await openGuardedClient(() => c, TARGET, async () => {});
+    expect(c.connected && !c.ended).toBe(true);
+    c.host = "db.other.supabase.co";
+    await expect(g.query("select 1")).rejects.toThrow(/not connected to the staging target/);
+    const wrong = new PgFake();
+    wrong.host = "db.lkboboagiikvozvbcpvg.supabase.co";
+    await expect(openGuardedClient(() => wrong, TARGET, async () => {})).rejects.toThrow(/not connected to the staging target/);
+    expect(wrong.connected).toBe(false);
+  });
+
+  it("in the run lifecycle: a marker failure on the first connection ends it and the run fails, with the audit still attempted", async () => {
+    const clients: PgFake[] = [];
+    let calls = 0;
+    const report = newCaptureReport("check", "rev", "t0");
+    await runCaptureLifecycle(report, {
+      open: () => openGuardedClient(() => (clients[clients.length] = new PgFake()), TARGET, async () => {
+        if (calls++ === 0) await markerFails();
+      }),
+      body: async () => {},
+      audit: async () => [],
+      save: () => {},
+      now: () => "t1",
+      redact: (x) => x,
+    });
+    expect(clients).toHaveLength(2);
+    expect(clients[0].ended).toBe(true);
+    expect(clients[1].ended).toBe(true);
+    expect(captureStatus(report)).toMatch(/^STATUS: FAILED – Refusing to run: this database is not the staging project/);
+  });
+});
+
+describe("concurrencyProbe: the second connection resets its role before reading the private journal", () => {
+  const enabledBefore: StateSnapshot = {
+    catalog: {
+      schema: "reporting_private", tables: [], functions: [], policies: [], role: null, memberOf: [], members: [], triggers: [], schemaPrivs: [], tablePrivs: [],
+      functionExec: [], publicAcl: [], exposed: "", siteState: [], control: { capture_epoch: 2, capture_enabled: true, rule_version: "item-counting-summary-v1" },
+    },
+    roleExists: true,
+    triggers: CAPTURE_TRIGGER,
+    fixtures: "",
+  };
+  const become = async (c: PgFake, actor: string) => {
+    await c.query("reset role");
+    await c.query(`set local role ${actor === "staff" ? "authenticated" : actor}`);
+  };
+  // The journal is private: any read of it as `authenticated` is denied, as on staging.
+  const denyJournalAsClient = (sql: string, role: string) => (sql === CC_JOURNAL_SQL && role !== "postgres" ? Object.assign(new Error("permission denied for schema reporting_private"), { code: "42501" }) : undefined);
+
+  it("success: insert as staff, RESET ROLE, then read the journal; sees exactly its own row; rolled back", async () => {
+    const a = new PgFake();
+    const b = new PgFake({ failOn: denyJournalAsClient, rows: (sql) => (sql === CC_JOURNAL_SQL ? [{ n: 1 }] : []) });
+    const report = newCaptureReport("concurrency", "rev", "t0");
+    await concurrencyProbe(a, async () => b, enabledBefore, report, { staff: "s" }, {}, become as never);
+    const insert = b.sent.findIndex((x) => x.includes("'rc-cc-b'"));
+    const reset = b.sent.lastIndexOf("reset role");
+    const read = b.sent.indexOf(CC_JOURNAL_SQL);
+    expect(insert).toBeGreaterThan(0);
+    expect(reset).toBeGreaterThan(insert);
+    expect(read).toBeGreaterThan(reset);
+    expect(b.sent.at(-1)).toBe("rollback");
+    expect(b.ended).toBe(true);
+    expect(report.concurrency).toMatchObject({ captureEnabledCommitted: true, secondError: null, journalRowsSeenBySecond: 1 });
+    expect(report.concurrencyProblems).toEqual([]);
+  });
+
+  it("a failed second insert leaves the transaction aborted: no role reset or journal read, only ROLLBACK", async () => {
+    const a = new PgFake();
+    const b = new PgFake({ failOn: (sql) => (sql.includes("'rc-cc-b'") ? Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" }) : undefined) });
+    const report = newCaptureReport("concurrency", "rev", "t0");
+    await concurrencyProbe(a, async () => b, enabledBefore, report, { staff: "s" }, {}, become as never);
+    const insert = b.sent.findIndex((x) => x.includes("'rc-cc-b'"));
+    expect(b.sent.slice(insert + 1)).toEqual(["rollback"]);
+    expect(report.concurrency?.secondError).toBe("error 55P03");
+    expect(report.concurrency?.journalRowsSeenBySecond).toBeNull();
+    expect(report.concurrencyProblems.join()).toMatch(/55P03/);
+    expect(b.ended).toBe(true);
+  });
+
+  it("a journal read that still fails is an error, never a silent -1", async () => {
+    const a = new PgFake();
+    const b = new PgFake({ failOn: (sql) => (sql === CC_JOURNAL_SQL ? Object.assign(new Error("permission denied"), { code: "42501" }) : undefined) });
+    const report = newCaptureReport("concurrency", "rev", "t0");
+    await expect(concurrencyProbe(a, async () => b, enabledBefore, report, { staff: "s" }, {}, become as never)).rejects.toThrow(/permission denied/);
+    expect(b.sent.at(-1)).toBe("rollback");
+    expect(b.ended).toBe(true);
   });
 });

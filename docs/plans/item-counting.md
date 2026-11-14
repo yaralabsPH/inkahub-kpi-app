@@ -444,6 +444,17 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
   - **Regressions proven:** reverting each fix in turn fails its tests. That covers 10 reverts: old privilege order; per-query guard removed; unguarded runner client; timeout back; no audit after failure; status ignoring restoration; fixed output name; cleanup failure swallowed; stock group removed; ID-change steps removed.
   - Gate: `npx tsc -b`, `npm run typecheck:digest`, 836/836 tests, build OK; the staging files and new tests also pass strict `tsc --noEmit`.
   - The activation-boundary issue is left for the planner, as instructed.
+- 2026-11-14 (Claude, recording the planner's focused fix review at `a029bd2` and the two runner integration fixes; no scope change, no SQL run):
+  - **Planner feedback:**
+    - 58/58 tests passed and exact-head CI was SUCCESS (14:50:26Z). Migration order, target guard, no timeout override, retained reports, and the stock and ID scenarios are verified.
+    - Two runner integration defects remained. (1) `openGuarded` could throw on the marker check after connecting, before returning the client, so the lifecycle could not end it and a failed run could hang. (2) In the concurrency probe, the second connection read the private journal while still `staff`, giving 42501 and a silent `seen = -1`.
+  - **Fix 1:** new `openGuardedClient(make, target, marker, redact)` in `tests/staging/reportingCapture.ts` creates and guards the client, connects, and runs the marker. On a connect or marker failure it ends the client, then rethrows the original error with its message and code kept, plus `; cleanup failed: disconnect: …` when `end()` itself fails. A wrong target throws before any connect. `openGuarded` in the runner now only builds the pg config and calls it.
+  - **Fix 2:** the probe moved to `concurrencyProbe(...)` in the same module, with `become` injected and the runner calling it. Only after a SUCCESSFUL second insert does it `reset role` and then read the journal. A failed insert leaves the transaction aborted, so only ROLLBACK follows. A journal read that still fails is an error, not a silent -1. The second connection is always rolled back and ended.
+  - **Tests** (`tests/reporting/reportingCaptureRunner.test.ts`, 8 new; a pg-like fake records each statement and its effective role, and denies the journal to client roles as staging does):
+    - opener: marker failure ends the client; connect failure ends it and keeps the code; a cleanup failure is appended as evidence; success is returned not ended; a wrong target never connects; in the lifecycle, a first-connection marker failure ends that client and fails the run while the audit still runs on a second, ended client;
+    - probe: success order is insert → `reset role` → journal read → rollback, seeing exactly 1 row; a failed insert gives only `rollback`; a failing read raises.
+  - **Regressions proven:** each fix reverted in turn fails its tests (opener not ending the client; runner bypassing the shared opener; no role reset; reading after a failed insert).
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 844/844 tests, build OK; strict `tsc --noEmit` on the runner, module and tests is clean.
 
 ---
 

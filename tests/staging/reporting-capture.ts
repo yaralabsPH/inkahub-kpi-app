@@ -39,10 +39,10 @@ import {
   captureMarkdown,
   captureStatus,
   checkCatalog,
-  checkConcurrency,
   checkSteps,
   compareSnapshots,
-  guardClient,
+  concurrencyProbe,
+  openGuardedClient,
   newCaptureReport,
   overheadSummary,
   parseCaptureMode,
@@ -80,10 +80,8 @@ function readSettings(): Record<string, string> {
 async function openGuarded(raw: string, target: StagingTarget): Promise<pg.Client> {
   const url = new URL(raw);
   for (const k of [...url.searchParams.keys()]) if (k.startsWith("ssl")) url.searchParams.delete(k);
-  const client = guardClient(new pg.Client({ connectionString: url.toString(), ssl: { rejectUnauthorized: false }, application_name: "reporting-capture-staging-check" }), target);
-  await client.connect();
-  await markerCheck(client);
-  return client;
+  // Connect/marker failures end the allocated client before rethrowing (no hang).
+  return openGuardedClient(() => new pg.Client({ connectionString: url.toString(), ssl: { rejectUnauthorized: false }, application_name: "reporting-capture-staging-check" }), target, markerCheck, redactSecrets);
 }
 
 /** Staging marker: only the staging project has the `staging` location and its test users. */
@@ -205,45 +203,6 @@ async function checksBody(a: pg.Client, mode: CaptureMode, report: CaptureReport
   await a.query("rollback");
 }
 
-async function concurrencyBody(a: pg.Client, open: () => Promise<pg.Client>, before: StateSnapshot, report: CaptureReport, ids: { staff: string }, claims: Record<string, string>): Promise<void> {
-  if (!before.catalog) throw new Error("0037 is not installed; concurrency needs it installed and capture enabled");
-  report.catalog = before.catalog;
-  report.catalogProblems = checkCatalog(before.catalog);
-  const b = await open();
-  try {
-    await a.query("begin");
-    await b.query("begin");
-    await a.query("set local lock_timeout = '3s'");
-    await b.query("set local lock_timeout = '3s'");
-    await become(a, "staff", claims);
-    const ins = (id: string) =>
-      `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, cs_case_id, parent_event_id)
-       values ('au', '${id}', $1::uuid, 'framed', 'RC-CC', 'INKA-KAN0566-A4-FB', 1, 'line_verified', 'rc-station', 'concurrency', '2026-11-11T04:00:00Z', null, null)`;
-    const tA = performance.now();
-    await a.query(ins("rc-cc-a"), [ids.staff]);
-    await become(b, "staff", claims);
-    const tB = performance.now();
-    let secondError: string | null = null;
-    let secondMs: number | null = null;
-    try {
-      await b.query(ins("rc-cc-b"), [ids.staff]);
-      secondMs = Math.round(performance.now() - tB);
-    } catch (e) {
-      secondError = errText(e);
-    }
-    const seen = secondError ? null : Number((await b.query("select count(*)::int as n from reporting_private.changes where new_event_id in ('rc-cc-a', 'rc-cc-b')").catch(() => ({ rows: [{ n: -1 }] }))).rows[0].n);
-    report.concurrency = { captureEnabledCommitted: !!before.catalog.control?.capture_enabled, firstHeldMs: Math.round(performance.now() - tA), secondMs, secondError, journalRowsSeenBySecond: seen };
-    report.concurrencyProblems = checkConcurrency(report.concurrency);
-    if (before.catalog.control?.capture_enabled && !secondError && seen !== 1) report.concurrencyProblems.push(`second transaction sees ${seen} journal rows, expected exactly its own 1`);
-  } finally {
-    try {
-      await b.query("rollback");
-    } finally {
-      await b.end().catch(() => {});
-    }
-  }
-}
-
 async function main(): Promise<number> {
   const { mode, problems } = parseCaptureMode(process.argv.slice(2));
   if (!mode) {
@@ -302,7 +261,7 @@ async function main(): Promise<number> {
       before = await snapshot(a);
       if (mode === "rehearse-migration" && before.catalog) throw new Error("0037 is already installed; use --check");
       if (mode === "check" && !before.catalog) throw new Error("0037 is not installed; use --rehearse-migration");
-      if (mode === "concurrency") await concurrencyBody(a, open, before, report, ids, claims);
+      if (mode === "concurrency") await concurrencyProbe(a, open, before, report, ids, claims, become, () => performance.now(), errText);
       else await checksBody(a, mode, report, ids, claims, save, log);
     },
     audit: async (fresh) => {

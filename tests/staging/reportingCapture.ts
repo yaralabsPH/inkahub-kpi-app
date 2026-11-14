@@ -443,6 +443,118 @@ export function guardClient<T extends { query: (...args: never[]) => unknown }>(
 }
 
 // ---------------------------------------------------------------------------
+// Opener: a client that fails to connect or fails the marker is always closed
+// ---------------------------------------------------------------------------
+
+export interface OpenableClient {
+  query(sql: string, params?: unknown[]): Promise<unknown>;
+  connect(): Promise<unknown>;
+  end(): Promise<void>;
+}
+
+/**
+ * Create, guard, connect and marker-check one client. On a connect or marker
+ * failure the allocated client is ended before the error is rethrown (so a
+ * failed run cannot hang on an open socket); the original error is kept and a
+ * cleanup failure is appended as evidence. A wrong target throws before any
+ * connection is attempted.
+ */
+export async function openGuardedClient<C extends OpenableClient>(make: () => C, target: StagingTarget, marker: (client: C) => Promise<void>, redact: (s: string) => string = (s) => s): Promise<C> {
+  const client = guardClient(make(), target);
+  try {
+    await client.connect();
+    await marker(client);
+    return client;
+  } catch (e) {
+    let cleanup = "";
+    try {
+      await client.end();
+    } catch (ce) {
+      cleanup = `; cleanup failed: disconnect: ${redact(ce instanceof Error ? ce.message : String(ce))}`;
+    }
+    const err = new Error(`${redact(e instanceof Error ? e.message : String(e))}${cleanup}`, { cause: e });
+    const code = (e as { code?: unknown }).code;
+    if (code !== undefined) Object.assign(err, { code });
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency probe (two connections), with the role reset before inspection
+// ---------------------------------------------------------------------------
+
+export interface RowsClient {
+  query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
+  end(): Promise<void>;
+}
+
+export type BecomeFn<C> = (client: C, actor: CaptureActor, claims: Record<string, string>) => Promise<void>;
+
+const CC_INSERT = (id: string) =>
+  `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, cs_case_id, parent_event_id)
+   values ('au', '${id}', $1::uuid, 'framed', 'RC-CC', 'INKA-KAN0566-A4-FB', 1, 'line_verified', 'rc-station', 'concurrency', '2026-11-11T04:00:00Z', null, null)`;
+export const CC_JOURNAL_SQL = "select count(*)::int as n from reporting_private.changes where new_event_id in ('rc-cc-a', 'rc-cc-b')";
+
+/**
+ * First connection saves as staff and stays open; the second saves as staff
+ * with a 3 s lock wait. Only after a SUCCESSFUL second save does the second
+ * connection reset its role and inspect the private journal (staff cannot read
+ * it). A failed second save leaves its transaction aborted: no further query
+ * but ROLLBACK. Both connections' transactions are rolled back by the caller
+ * (first) and here (second).
+ */
+export async function concurrencyProbe<C extends RowsClient>(
+  a: C,
+  open: () => Promise<C>,
+  before: StateSnapshot,
+  report: CaptureReport,
+  ids: { staff: string },
+  claims: Record<string, string>,
+  become: BecomeFn<C>,
+  clock: () => number = () => performance.now(),
+  errText: (e: unknown) => string = (e) => `error ${(e as { code?: string }).code ?? (e instanceof Error ? e.message : String(e))}`,
+): Promise<void> {
+  if (!before.catalog) throw new Error("0037 is not installed; concurrency needs it installed and capture enabled");
+  report.catalog = before.catalog;
+  report.catalogProblems = checkCatalog(before.catalog);
+  const b = await open();
+  try {
+    await a.query("begin");
+    await b.query("begin");
+    await a.query("set local lock_timeout = '3s'");
+    await b.query("set local lock_timeout = '3s'");
+    await become(a, "staff", claims);
+    const tA = clock();
+    await a.query(CC_INSERT("rc-cc-a"), [ids.staff]);
+    await become(b, "staff", claims);
+    const tB = clock();
+    let secondError: string | null = null;
+    let secondMs: number | null = null;
+    try {
+      await b.query(CC_INSERT("rc-cc-b"), [ids.staff]);
+      secondMs = Math.round(clock() - tB);
+    } catch (e) {
+      secondError = errText(e);
+    }
+    let seen: number | null = null;
+    if (!secondError) {
+      await b.query("reset role"); // the private journal is not readable as staff
+      seen = Number((await b.query(CC_JOURNAL_SQL)).rows[0]?.n);
+    }
+    const enabled = !!before.catalog.control?.capture_enabled;
+    report.concurrency = { captureEnabledCommitted: enabled, firstHeldMs: Math.round(clock() - tA), secondMs, secondError, journalRowsSeenBySecond: seen };
+    report.concurrencyProblems = checkConcurrency(report.concurrency);
+    if (enabled && !secondError && seen !== 1) report.concurrencyProblems.push(`second transaction sees ${seen} journal rows, expected exactly its own 1`);
+  } finally {
+    try {
+      await b.query("rollback");
+    } finally {
+      await b.end().catch(() => {});
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Restoration audit: state before vs a fresh read after cleanup (review T12-4)
 // ---------------------------------------------------------------------------
 
