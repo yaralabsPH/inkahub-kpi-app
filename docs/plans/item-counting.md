@@ -253,6 +253,17 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
     - variance that stays with zero temp spill, pointing to CPU or instance throttling rather than spill;
     - stable times once spill is gone, pointing to temp I/O.
     - It does not change any setting, policy, timeout or target. A persistent `work_mem` change would be a separate CJ decision, not part of this diagnostic.
+  - **Diagnostic result (2026-11-14 13:27Z, `staging-results-item-counting-timeout-diag-1.md`):**
+    - **Ruled out as the main cause:**
+      - Temp spill: removing it saved only about 0.1 s (1.69 s → 1.54–1.62 s).
+      - Generic-plan switching and JIT: neither occurred.
+      - Plan changes: the plan shape was identical in all nine runs.
+      - Concurrent clients: there were none.
+    - **Observed:** the first execution on a fresh database connection took 5.1 s, three times the steady 1.7 s, with the same plan and work. It used 680 more shared-buffer hits; disk reads were not captured.
+    - **Likely mechanism (hypothesis, not proven):** the API timeouts hit runs 1 or 2 of a phase, when PostgREST likely serves from newly opened or long-idle connections after the minutes-long SQL gate. A first-call cost of about 5 s plus normal variance can reach the 8 s limit. This diagnostic cannot say whether that cost is per-connection warm-up (catalog/RLS/function caches) or uncached data pages.
+    - **Implication:** the same first-call cost can occur in production for real users after idle periods, independent of the benchmark.
+    - **Not justified by this evidence:** a `work_mem` change. It is out of scope anyway.
+    - **Decision needed:** this result strengthens the proposal below. Long three-month raw reads are inherently near the limit on a cold connection; steady-state reads have about 6 s of margin. A further diagnostic (separating connection warm-up from data-page cache) would need another CJ approval and is optional.
   - **Proposed Task 10 amendment (PROPOSAL for Astra/CJ; not approved, not applied; Tasks 11–20 stay blocked until a decision is recorded):**
     - Keep in Task 10 unchanged: four-case parity and restoration, real-session claims, positive coverage, no persistent membership change, the SQL gate's correctness checks (48 EXPLAINs and 36 full-body runs must complete under 8 s), follow-up M6 review and green CI, and the entitlement record.
     - Move long-range acceptance: the AU three-month 10 s target through the raw v2 browser path would no longer gate Task 10. It would become a Task 19 gate on the approved pre-aggregated read path, which already requires one-day ≤2 s and three-month ≤10 s with 20 concurrent readers, cold/median/slowest recorded, and no discarding of failures.
@@ -273,6 +284,13 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
 - 2026-11-14 (Astra on staging at `29e255f`, CJ-approved rerun): four-case parity **COMPLETE**, all four cases identical with restoration passed (collection `90d3da63…`, parity hash `26330a48…`). Manager denied-before recorded with its expected pending status (AU 3 months busy medians: owner 5,278 ms, manager 5,410 ms). **All-sites FAILED:** manager "AU 3 months (busy)" run 2 hit the 8 s statement timeout. Run 1 took 13,327 ms, run 3 took 6,255 ms, and the earlier passing all-sites run at `76f74d2` had a 5,240 ms median. Owner all-sites passed (median 4,609 ms). Astra stopped and restored standard memberships (`DELETE 2`); denied-after did not run. No retry, timeout change or target change. Reports `staging-results-item-counting-v23r3-*.md`. **Needs CJ:** decide on the all-sites manager timeout.
 - 2026-11-14 (Astra on staging at `e4291e5`, CJ-approved "Rerun all-sites"): all-sites **passed** (AU 3 months busy medians: manager 4,772 ms, owner 6,536 ms; same parity hash `26330a48…`). **Denied-after FAILED:** owner "AU 3 months (busy)" run 1 hit the 8 s statement timeout; run 2 took 9,567 ms and run 3 took 4,548 ms (manager median 5,110 ms). Memberships restored (`DELETE 2`). Two of four v2.3r3 phase runs have now timed out on the same 3-month AU load, once as manager and once as owner. The owner's access never changes between phases, so this is not tied to the manager's membership. Server read time for the identical load ranged from 2.4 s to over 11.9 s. Reports `staging-results-item-counting-v23r3b-*.md`. Not retried. **Needs CJ:** decide whether to investigate the timeouts before any further rerun.
 - 2026-11-14 (Claude, read-only timeout diagnostic on CJ's instruction via Codex; staging `ybrzhrgfrnvtcwymjdrq` only, target checked before each SQL; nothing changed): **Correction:** the previous entry's "server read time 2.4 s to over 11.9 s" is wrong. That figure is `headersMs` (request start to response headers), which includes API, network and database time, not database execution alone. The AU three-month load is one `load_production_evidence_v2` call (118,244 rows, about 14.7 MB), not paged reads. Findings and next step are under Open questions ("Task 10 performance gate — intermittent v2 statement timeout").
+- 2026-11-14 (Astra ran the CJ-approved bounded diagnostic once, `STATUS: COMPLETE`; Claude verified the report): ran at 13:27Z on staging; one fresh connection; one transaction, rolled back; owner real claims (510 bytes), `authenticated`, RLS on, 8,000 ms; prepared PostgREST-shape AU three-month v2 call; no other active client backends; one-off scratchpad script, not in the repo. Results:
+  - Run 1 took 5,096 ms of database execution.
+  - Runs 2–6 took 1,701–1,838 ms elapsed (EXPLAIN 1,686 ms) at the server `work_mem` of 2,184 kB, with the same temp spill (read 9,319 / written 5,626 blocks).
+  - With transaction-local `work_mem` 64MB: 1,540–1,618 ms and zero temp blocks.
+  - Same plan shape in all runs; custom plan (no switch to a generic plan); no JIT. Body 15,440,322 bytes every run.
+  - After ROLLBACK, `work_mem` was 2,184 kB again and the user was back to `postgres`.
+  - Report: `staging-results-item-counting-timeout-diag-1.md`. Interpretation under Open questions.
 
 ---
 
