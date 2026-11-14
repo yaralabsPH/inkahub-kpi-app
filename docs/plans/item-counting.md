@@ -460,6 +460,13 @@ At `edb5ab124c47130e7aea28338d8e251d7041fab7`, independent read-only review pass
 - **Mutations:** 16 B1 breaks plus 4 for the planner-note fixes are each caught.
 - Gate: `npx tsc -b`, `npm run typecheck:digest`, 924/924 tests, build OK; strict `tsc --noEmit` clean on both runners.
 - **Not in B1:** planning/sealing, chunks/staging, publication, `source_versions`, `production_date` and ownership columns (all B2). Staging rehearsal of the complete draft is the planner's step after B2.
+
+**Part B1 planner review — changes required (2026-11-14):** independent review at `07345b67d822c9b515b5f4f2e5aaeb0ff092c62c` passed 146 focused tests and the digest/API type-check. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43611818098/job/132498302911), completed 15:45:55 UTC. Empty-final-page replay and Unicode-trim regressions are verified; no SQL was executed. One P2 must be fixed before B2:
+
+- **T13B1-1 — persisted cursor is unavailable to the replacement worker.** `resume_reporting_batch` returns fence/state but no saved rebuild cursor; status also omits it. Copy two pages, lose all process memory, expire the lease and take over: the new worker cannot discover the next cursor, and `copy(..., null)` fails because null is neither current progress nor the last request. Extend the takeover result with bounded typed metadata: batch kind, base generation, rule, epoch, source cutoff and `rebuild_progress` (`afterEventId`, `complete`, `pages`, `rows`, `bytes`; null for refresh). Derive it from saved state, expose and validate it in the wrapper, and never return source payloads or auth tokens. Include active batch kind in status so orchestration can route recovery explicitly. A resumed rebuild continues from returned progress or proceeds to freeze if copying was already complete; it must not restart copying or require private-table access. Add a regression simulating at least two pages, lost process state and lease takeover, plus completed-copy recovery and malformed progress rejection. Keep fence checks and immutability unchanged.
+- A lost freeze response can recover through persisted `frozen` status without resnapshotting; add that orchestration case in Task 15. It is not a B1 blocker.
+
+**Next:** Claude fixes T13B1-1 only, records failing/passing regression evidence, runs focused/common gates, commits/pushes and pauses for verification. B2 remains gated on that verification; 0038 stays unapplied.
 - No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
 
 ## Amendment implementation log
