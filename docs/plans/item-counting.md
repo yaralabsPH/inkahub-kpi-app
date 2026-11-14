@@ -373,6 +373,18 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
   - **T11-3, P2 — malformed optional detail selectors accepted** (`productionReporting.ts:284`): the validator accepts `staffId: {unexpected:true}`, `orderNumber: []` and `cursor: 42`. Validate provided types and blank policy consistently with the summary contract. Later server code still owns cursor decoding/scope/authorization. Add rejection tests; this is a validation gap, not evidence of an access leak.
   - Reducer extraction, selected-context classification and pre-classification self filtering passed inspection. No source-rule redesign is requested. Deferred review subjects remain Tasks 12–20: SQL/materializer/auth integration, real-role/scale/freshness/capture evidence, browser behavior and release. No production or deployment inspection occurred.
   - **Next:** Claude fixes only these Task 11 findings, records failing/passing regressions, runs the common gate, commits/pushes and pauses for focused verification before Task 12. The design clarification and narrow internal capture-role policies above are approved implementation details within the existing spec. No new package, timeout increase, smaller acceptance fixture, production action or SQL application is part of this handoff.
+- 2026-11-14 (Claude, Task 11 review fixes; checkbox left open for the planner's focused verification):
+  - **T11-1:** `referenceTimingLines` now walks the selection's own effective timing stream (selected evidence, millisecond range, work type, stream SKU, per worker), exactly as `frameTimingLines` does on the snapshot. It no longer uses the stored full-history predecessor. `TimingFact.prevAll/prevSameType` are documented as index hints that a range read must not trust on their own.
+    - Regression: the exact reproduction (predecessor `10:00:00.000100Z`, selection start `10:00:00.000500Z`, next frame `10:10Z`) gives 0 minutes on both sides.
+    - Companion case: the same-millisecond predecessor IS selected context (a qualification-family line), so both sides give 10 minutes.
+  - **T11-2:** `SummaryResult` now extends a new `ReportScalars`: `activeStaff`, `staffDays`, `avgOrdersPerStaffDay`, and `skuBoard` capped at `SKU_BOARD_MAX = 20`.
+    - Explicit mapping `toReportScalars(view)` rejects a non-integer or negative count, a non-finite or negative average, and more than 20 board rows. `dispatchedOrders` stays derived from `byWorkType`.
+    - Test: maps `buildProductionReportView` exactly for everyone and for a selected person, and checks the 20-row bound and each rejection.
+  - **T11-3:** `validateDetailRequest` rejects any provided `staffId`/`orderNumber`/`cursor` that is not a non-blank string, the same policy as `validateSummaryRequest` (now a shared `optionalText`). Cursor decoding, scope and authorization stay with later server code.
+    - Test: rejects `{unexpected:true}`, `[]`, `42`, `""`, `"  "`, `null`, `7` and a string `limit`; accepts valid strings.
+  - **Regressions proven:** reverting each fix in turn fails exactly its own test (T11-1, two T11-2 reverts, T11-3), with the other 59 passing.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 778/778 tests, build OK.
+  - Raw-order whitespace qualification semantics are unchanged, as the planner directed.
 
 ---
 

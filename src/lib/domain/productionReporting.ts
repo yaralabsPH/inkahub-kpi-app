@@ -20,7 +20,7 @@ import type {
 } from "./productionCounts";
 import { WORK_TYPES } from "./productionCounts";
 import type { FrameTimingTotals } from "./productionFrameTiming";
-import type { ReportPersonRow } from "./productionReportView";
+import type { ProductionReportView, ReportPersonRow, ReportSkuRow } from "./productionReportView";
 import type { ProductionWelcomeView, WelcomeCounts, WelcomeDepartment, WelcomeMostImproved } from "./productionWelcomeView";
 import { isProductionDate, isReportSite, type ReportSite } from "./productionPeriods";
 
@@ -135,7 +135,25 @@ export interface PublishedWelcomeView {
   coverage: CoverageCounts;
 }
 
-export interface SummaryResult {
+/** Slowest frame variants (current Reports board); at most SKU_BOARD_MAX rows. */
+export type ReportSkuDto = ReportSkuRow;
+export const SKU_BOARD_MAX = 20;
+
+/**
+ * Whole-scope Reports values that a paginated people list cannot recover
+ * (review T11-2). `dispatchedOrders` stays derived from `byWorkType.dispatch`.
+ */
+export interface ReportScalars {
+  /** People with credited Items or Orders in the tile scope. */
+  activeStaff: number;
+  /** Staff-days behind the tile average: everyone's, or the selected person's. */
+  staffDays: number;
+  avgOrdersPerStaffDay: number;
+  /** Top SKU_BOARD_MAX slowest variants, already ordered. */
+  skuBoard: ReportSkuDto[];
+}
+
+export interface SummaryResult extends ReportScalars {
   meta: PublishedMeta;
   totals: CountTotals;
   byWorkType: WorkTypeTotals[];
@@ -235,6 +253,27 @@ export function toCoverageCounts(c: ProductionCoverage): CoverageCounts {
   return { issueCounts: { ...c.issueCounts }, notes: { ...c.notes }, visibility: c.visibility, incomplete: c.incomplete, issueRows: c.issues.length };
 }
 
+function finiteNonNegative(n: number, what: string): number {
+  if (!Number.isFinite(n) || n < 0) throw new RangeError(`${what} is not a finite non-negative number`);
+  return n;
+}
+
+/** The whole-scope Reports values, mapped explicitly from the current view. */
+export function toReportScalars(v: Pick<ProductionReportView, "activeStaff" | "staffDays" | "avgOrdersPerStaffDay" | "skuBoard">): ReportScalars {
+  if (v.skuBoard.length > SKU_BOARD_MAX) throw new RangeError(`skuBoard has ${v.skuBoard.length} rows; at most ${SKU_BOARD_MAX}`);
+  return {
+    activeStaff: safeCount(v.activeStaff, "activeStaff"),
+    staffDays: safeCount(v.staffDays, "staffDays"),
+    avgOrdersPerStaffDay: finiteNonNegative(v.avgOrdersPerStaffDay, "avgOrdersPerStaffDay"),
+    skuBoard: v.skuBoard.map((r) => ({
+      sku: r.sku,
+      weight: finiteNonNegative(r.weight, "skuBoard weight"),
+      durationMin: finiteNonNegative(r.durationMin, "skuBoard durationMin"),
+      avgMin: finiteNonNegative(r.avgMin, "skuBoard avgMin"),
+    })),
+  };
+}
+
 export function toCoverageDetail(i: CoverageIssue): CoverageDetailDto {
   return { kind: i.kind, eventId: i.eventId, location: i.location, detail: i.detail ?? null };
 }
@@ -271,22 +310,35 @@ function checkRange(firstDate: unknown, lastDate: unknown): void {
   if (firstDate > lastDate) throw new ReportingRequestError("firstDate is after lastDate");
 }
 
+/** An optional text selector: absent, or a non-blank string. Anything else is rejected (no coercion). */
+function optionalText(value: unknown, name: string): void {
+  if (value === undefined) return;
+  if (typeof value !== "string" || !value.trim()) throw new ReportingRequestError(`invalid ${name}`);
+}
+
 export function validateSummaryRequest(r: SummaryRequest): SummaryRequest {
   if (!isReportSite(r.site)) throw new ReportingRequestError("unsupported site");
   checkRange(r.firstDate, r.lastDate);
   if (r.view !== "reports" && r.view !== "welcome") throw new ReportingRequestError("unsupported view");
   if (r.workType !== undefined && !isWork(r.workType)) throw new ReportingRequestError("unsupported work type");
-  if (r.staffId !== undefined && (typeof r.staffId !== "string" || !r.staffId.trim())) throw new ReportingRequestError("invalid staffId");
-  if (r.generationId !== undefined && (typeof r.generationId !== "string" || !r.generationId.trim())) throw new ReportingRequestError("invalid generationId");
+  optionalText(r.staffId, "staffId");
+  optionalText(r.generationId, "generationId");
   return r;
 }
 
+/**
+ * Shape validation only. Later server code still decodes the opaque cursor,
+ * checks it against site/audience/filter/generation, and authorizes.
+ */
 export function validateDetailRequest(r: DetailRequest): DetailRequest & { limit: number } {
   if (!isReportSite(r.site)) throw new ReportingRequestError("unsupported site");
   if (typeof r.generationId !== "string" || !r.generationId.trim()) throw new ReportingRequestError("generationId is required");
   if (!(DETAIL_KINDS as readonly string[]).includes(r.kind)) throw new ReportingRequestError("unsupported detail kind");
   checkRange(r.firstDate, r.lastDate);
   if (r.workType !== undefined && !isWork(r.workType)) throw new ReportingRequestError("unsupported work type");
+  optionalText(r.staffId, "staffId");
+  optionalText(r.orderNumber, "orderNumber");
+  optionalText(r.cursor, "cursor");
   const limit = r.limit ?? DETAIL_PAGE_DEFAULT;
   if (!Number.isInteger(limit) || limit < 1 || limit > DETAIL_PAGE_MAX) throw new ReportingRequestError(`limit must be 1..${DETAIL_PAGE_MAX}`);
   return { ...r, limit };
@@ -312,9 +364,13 @@ export interface TimingFact {
   stream: boolean;
   /** Frame units (0 for UN/legacy lines). */
   weight: number;
-  /** Previous effective stream line of the same worker (all work types), full history at the cutoff. */
+  /**
+   * Previous effective stream line of the same worker (all work types), full
+   * history at the cutoff. An index hint only: a range read must take its
+   * predecessor from that range's selected effective stream (review T11-1).
+   */
   prevAll: { id: string; ms: number } | null;
-  /** Previous effective stream line of the same worker and work type. */
+  /** Previous effective stream line of the same worker and work type (same caveat). */
   prevSameType: { id: string; ms: number } | null;
 }
 

@@ -499,9 +499,15 @@ export function referenceSummary(result: PartitionResult, q: ReferenceQuery): Co
 
 /**
  * Timing lines for one range and a SUPPORTED work-type selection (one work
- * type, or all). The first included observation has zero gap when its stored
- * predecessor is outside the range. Other combinations are rejected, never
- * approximated.
+ * type, or all). Other combinations are rejected, never approximated.
+ *
+ * The predecessor is the previous line of the same worker in THIS selection's
+ * effective timing stream (selected evidence, range by millisecond, work type,
+ * stream SKU), as the existing timing does. A stored full-history predecessor
+ * is not enough: one saved microseconds before the selection start shares its
+ * millisecond but is not selected evidence (review T11-1), and a selected
+ * context line may be effective here but not in full history. The first
+ * included observation therefore has zero gap when its predecessor is outside.
  */
 export function referenceTimingLines(result: PartitionResult, q: { selection: UtcWindow; scope: ProductionScope }): FrameTimingLine[] {
   const types = q.scope.workTypes;
@@ -512,17 +518,19 @@ export function referenceTimingLines(result: PartitionResult, q: { selection: Ut
   const endMs = Date.parse(q.scope.range.endUtcExclusive);
   const staff = q.scope.staffIds ? new Set(q.scope.staffIds) : null;
   const out: FrameTimingLine[] = [];
+  const prevByWorker = new Map<string, number>();
   for (const v of ev.verifications) {
     if (!ev.effective.has(v.id)) continue;
     if (v.ms < startMs || v.ms >= endMs) continue;
     if (!allTypes && v.workType !== types![0]) continue;
     const t = v.timing!;
     if (!t.stream) continue;
-    const prev = allTypes ? t.prevAll : t.prevSameType;
-    const prevMs = prev && prev.ms >= startMs ? prev.ms : undefined;
+    const worker = v.staffId as string;
+    const prevMs = prevByWorker.get(worker);
     const gapMin = prevMs === undefined ? 0 : (v.ms - prevMs) / 60_000;
     const timed = prevMs !== undefined && gapMin > 0 && gapMin <= FRAME_GAP_CAP_MIN && t.weight > 0;
-    if (staff && !staff.has(v.staffId as string)) continue;
+    prevByWorker.set(worker, v.ms);
+    if (staff && !staff.has(worker)) continue;
     out.push({
       eventId: v.id,
       staffId: v.staffId as string,

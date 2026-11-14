@@ -19,13 +19,17 @@ import {
   type WorkType,
 } from "../productionCounts";
 import { frameTimingLines } from "../productionFrameTiming";
+import { productionRange } from "../productionPeriods";
+import { buildProductionReportView } from "../productionReportView";
 import {
   canonicalJson,
   partitionHash,
   REPORTING_RULE_VERSION,
   sha256Hex,
+  SKU_BOARD_MAX,
   toCountTotals,
   toCoverageCounts,
+  toReportScalars,
   validateDetailRequest,
   validateSummaryRequest,
   type FrozenPartitionInput,
@@ -237,6 +241,27 @@ describe("range semantics, with explicit expected values", () => {
     expect(wide.find((l) => l.eventId === first.eventId)!.durationMin).toBe(20);
   });
 
+  it("T11-1: a predecessor saved microseconds before the selection start (same millisecond) is not in the stream", () => {
+    const p = verify({ id: "t11-p", order_number: "5200", created_at: "2026-01-14T10:00:00.000100Z" });
+    const n = verify({ id: "t11-n", order_number: "5201", created_at: at(14, "10:10") });
+    const sel = { startUtc: "2026-01-14T10:00:00.000500Z", endUtcExclusive: day(14).endUtcExclusive };
+    const scope: ProductionScope = { range: sel };
+    const want = frameTimingLines(prepareProductionEvidence(fourFamilySnapshot([p, n], sel)), scope);
+    expect(want.map((l) => [l.eventId, l.durationMin])).toEqual([["t11-n", 0]]);
+    expect(referenceTimingLines(project([p, n]), { selection: sel, scope })).toEqual(want);
+  });
+
+  it("T11-1: the same-millisecond predecessor IS in the stream when it is selected context evidence", () => {
+    const p = verify({ id: "t11-q", order_number: "5201", created_at: "2026-01-14T10:00:00.000100Z" });
+    const n = verify({ id: "t11-m", order_number: "5201", created_at: at(14, "10:10") });
+    const c = complete({ order_number: "5201", created_at: at(14, "10:20") });
+    const sel = { startUtc: "2026-01-14T10:00:00.000500Z", endUtcExclusive: day(14).endUtcExclusive };
+    const scope: ProductionScope = { range: sel };
+    const want = frameTimingLines(prepareProductionEvidence(fourFamilySnapshot([p, n, c], sel)), scope);
+    expect(want.map((l) => [l.eventId, l.durationMin])).toEqual([["t11-q", 0], ["t11-m", 10]]);
+    expect(referenceTimingLines(project([p, n, c]), { selection: sel, scope })).toEqual(want);
+  });
+
   it("Items overflow is null (never a coerced number) and marks coverage incomplete", () => {
     const big = Number.MAX_SAFE_INTEGER - 5;
     const src = [verify({ order_number: "9001", line_quantity: big, created_at: at(12, "09:00") }), verify({ order_number: "9002", line_quantity: big, created_at: at(12, "09:01") })];
@@ -360,6 +385,38 @@ describe("DTO mapping and request validation", () => {
     const s = expected(history(), day(12), { range: day(12) });
     const c = toCoverageCounts(s.coverage);
     expect(c).toEqual({ issueCounts: s.coverage.issueCounts, notes: s.coverage.notes, visibility: s.coverage.visibility, incomplete: s.coverage.incomplete, issueRows: s.coverage.issues.length });
+  });
+
+  it("T11-2: whole-scope Reports values (activeStaff, staffDays, average, top-20 slowest variants) map exactly", () => {
+    const range = productionRange("uk", "2026-01-12", "2026-01-15");
+    const evidence = prepareProductionEvidence(fourFamilySnapshot(history(), { startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive }));
+    for (const staffId of [null, ANNA]) {
+      const view = buildProductionReportView(evidence, { range, staffId });
+      const s = toReportScalars(view);
+      expect(s).toEqual({ activeStaff: view.activeStaff, staffDays: view.staffDays, avgOrdersPerStaffDay: view.avgOrdersPerStaffDay, skuBoard: view.skuBoard });
+      expect(s.activeStaff).toBeGreaterThan(0);
+      expect(s.staffDays).toBeGreaterThan(0);
+      expect(s.skuBoard.length).toBeGreaterThan(0);
+    }
+    const all = buildProductionReportView(evidence, { range });
+    expect(toReportScalars(all).activeStaff).toBe(3);
+    const row = { sku: "A4-FB", weight: 1, durationMin: 2, avgMin: 2 };
+    expect(toReportScalars({ ...all, skuBoard: Array.from({ length: SKU_BOARD_MAX }, () => row) }).skuBoard).toHaveLength(SKU_BOARD_MAX);
+    expect(() => toReportScalars({ ...all, skuBoard: Array.from({ length: SKU_BOARD_MAX + 1 }, () => row) })).toThrow(RangeError);
+    expect(() => toReportScalars({ ...all, avgOrdersPerStaffDay: Number.NaN })).toThrow(RangeError);
+    expect(() => toReportScalars({ ...all, staffDays: 1.5 })).toThrow(RangeError);
+  });
+
+  it("T11-3: malformed optional detail and summary selectors are rejected, valid ones accepted", () => {
+    const base = { site: "uk" as const, generationId: "g1", kind: "orders" as const, firstDate: "2026-01-01", lastDate: "2026-01-01" };
+    for (const bad of [{ staffId: { unexpected: true } }, { orderNumber: [] }, { cursor: 42 }, { cursor: "" }, { cursor: "  " }, { staffId: "" }, { orderNumber: null }, { staffId: 7 }]) {
+      expect(() => validateDetailRequest({ ...base, ...(bad as object) } as never), JSON.stringify(bad)).toThrow(/invalid/);
+    }
+    expect(validateDetailRequest({ ...base, staffId: ANNA, orderNumber: "5001", cursor: "opaque" })).toMatchObject({ staffId: ANNA, orderNumber: "5001", cursor: "opaque", limit: 200 });
+    for (const bad of [{ staffId: [] }, { generationId: 3 }, { staffId: " " }]) {
+      expect(() => validateSummaryRequest({ site: "uk", firstDate: "2026-01-01", lastDate: "2026-01-02", view: "reports", ...(bad as object) } as never)).toThrow(/invalid/);
+    }
+    expect(() => validateDetailRequest({ ...base, limit: "10" as never })).toThrow();
   });
 
   it("summary and detail requests are validated with explicit bounds", () => {
