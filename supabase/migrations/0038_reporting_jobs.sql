@@ -1296,7 +1296,9 @@ $fn$;
 
 -- Structural validation of one staged row (T13B2a-1): every required field,
 -- JSON type, enum, range and relational rule of its table, checked BEFORE a
--- chunk is saved (a composite parse does not enforce NOT NULL/CHECK).
+-- chunk is saved (a composite parse does not enforce NOT NULL/CHECK). A date
+-- must be a real proleptic-Gregorian day in years 0001-9999 (month, day, leap
+-- year), checked arithmetically and then by make_date, so none fails at publish.
 -- Generated from the same column spec as resultRowProblem in
 -- api/_lib/reporting-stage.ts; messages are identical. Returns NULL or the first problem.
 CREATE FUNCTION reporting_private.staged_row_problem(p_table text, v jsonb)
@@ -1330,7 +1332,7 @@ AS $fn$
       WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'item_issue_detail'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'item_issue_detail'), 'missing') <> 'string') THEN 'event_facts.item_issue_detail must be a string or null'
       WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'timing_stream'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'timing_stream'), 'missing') <> 'boolean') THEN 'event_facts.timing_stream must be a boolean or null'
       WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'timing_weight'), 'missing') <> 'null' AND (CASE WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'timing_weight'), 'missing') <> 'number' THEN true ELSE (v -> 'timing_weight')::numeric < 0 END) THEN 'event_facts.timing_weight must be a non-negative number or null'
-      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'production_date'), 'missing') <> 'null' AND (coalesce(pg_catalog.jsonb_typeof(v -> 'production_date'), 'missing') <> 'string' OR (v ->> 'production_date') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') THEN 'event_facts.production_date must be a YYYY-MM-DD date or null'
+      WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'production_date'), 'missing') <> 'null' AND (CASE WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'production_date'), 'missing') <> 'string' OR (v ->> 'production_date') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN true WHEN pg_catalog.substr((v ->> 'production_date'), 1, 4)::integer < 1 OR pg_catalog.substr((v ->> 'production_date'), 6, 2)::integer NOT BETWEEN 1 AND 12 OR pg_catalog.substr((v ->> 'production_date'), 9, 2)::integer < 1 OR pg_catalog.substr((v ->> 'production_date'), 9, 2)::integer > CASE WHEN pg_catalog.substr((v ->> 'production_date'), 6, 2)::integer = 2 THEN CASE WHEN (pg_catalog.substr((v ->> 'production_date'), 1, 4)::integer % 4 = 0 AND pg_catalog.substr((v ->> 'production_date'), 1, 4)::integer % 100 <> 0) OR pg_catalog.substr((v ->> 'production_date'), 1, 4)::integer % 400 = 0 THEN 29 ELSE 28 END WHEN pg_catalog.substr((v ->> 'production_date'), 6, 2)::integer IN (4, 6, 9, 11) THEN 30 ELSE 31 END THEN true ELSE pg_catalog.make_date(pg_catalog.substr((v ->> 'production_date'), 1, 4)::integer, pg_catalog.substr((v ->> 'production_date'), 6, 2)::integer, pg_catalog.substr((v ->> 'production_date'), 9, 2)::integer) IS NULL END) THEN 'event_facts.production_date must be a YYYY-MM-DD date or null'
       WHEN (v ->> 'role' = 'verification') <> (pg_catalog.jsonb_typeof(v -> 'item_status') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'items') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'product_kind') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'line_key') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'timing_stream') <> 'null' AND pg_catalog.jsonb_typeof(v -> 'timing_weight') <> 'null') THEN 'event_facts: role verification needs exactly item_status, items, product_kind, line_key, timing_stream and timing_weight'
       WHEN (v ->> 'role' = 'invalid') <> (pg_catalog.jsonb_typeof(v -> 'invalid_detail') <> 'null') THEN 'event_facts: invalid_detail is required exactly for role invalid'
     END

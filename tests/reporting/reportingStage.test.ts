@@ -20,6 +20,7 @@ import {
   claimRowBytes,
   compareUtf8,
   descriptorProblem,
+  isCalendarDate,
   manifestLine,
   MAX_BULK_ENTRIES,
   MAX_CLAIM_KEY_JSON_BYTES,
@@ -502,6 +503,27 @@ describe("staging rules (reference model of 0038)", () => {
     }
   });
 
+  it("T13B2a-1 residual: production_date must be a real calendar day (month, day, leap year, years 0001-9999) before the chunk is saved", () => {
+    const bad = ["2026-02-30", "2026-99-99", "2026-00-10", "2026-13-01", "2026-01-00", "2026-01-32", "2026-04-31", "2026-06-31", "2026-09-31", "2026-11-31", "2026-02-29", "1900-02-29", "2100-02-29", "2023-02-29", "0000-01-01", "0000-02-29", "10000-01-01", "2026-1-15"];
+    const good = ["2024-02-29", "2000-02-29", "2400-02-29", "1600-02-29", "2026-02-28", "2026-01-31", "2026-03-31", "2026-04-30", "2026-12-31", "0001-01-01", "9999-12-31", "2026-01-15"];
+    for (const v of bad) {
+      expect(isCalendarDate(v), v).toBe(false);
+      const row = fact("v1", { production_date: v });
+      expect(resultRowProblem("event_facts", row), v).toBe("event_facts.production_date must be a YYYY-MM-DD date or null");
+      const db = setup();
+      expect(() => db.stage(7, "1", env({ event_facts: [row] })[0]), v).toThrow(/production_date must be a YYYY-MM-DD date or null/);
+      expect(db.results.size, v).toBe(0);
+      expect(db.works.get("1")!.state, v).toBe("leased");
+    }
+    for (const v of good) {
+      expect(isCalendarDate(v), v).toBe(true);
+      expect(resultRowProblem("event_facts", fact("v1", { production_date: v })), v).toBeNull();
+      expect(tryStage("1", { event_facts: [fact("v1", { production_date: v })] }), v).toBe("ok");
+    }
+    // Nullability is unchanged.
+    expect(tryStage("1", { event_facts: [fact("v1", { production_date: null })] })).toBe("ok");
+  });
+
   it("T13B2a-2: wrong worker, time, order, case and parent identity are refused for site and self audiences; derived fields stay TypeScript's", () => {
     for (const work of ["1", "3"]) {
       const bad: Array<[Partial<ResultRows>, RegExp]> = [
@@ -769,7 +791,8 @@ describe("0038 B2a SQL", () => {
     expect(f).toMatch(/^CREATE FUNCTION reporting_private\.staged_row_problem\(p_table text, v jsonb\) RETURNS text LANGUAGE sql IMMUTABLE SECURITY INVOKER SET search_path = ''/);
     for (const t of RESULT_TABLES) {
       const from = f.slice(f.indexOf(`WHEN '${t}' THEN CASE`));
-      const body = from.slice(0, from.indexOf(" END ")); // this table's block only
+      const next = RESULT_TABLES.map((x) => from.indexOf(`WHEN '${x}' THEN CASE`)).filter((i) => i > 0);
+      const body = from.slice(0, Math.min(...next, from.indexOf("ELSE 'unknown result table"))); // this table's block only
       const sqlMsgs = [...body.matchAll(/THEN '([^']+)'/g)].map((m) => m[1]);
       // TypeScript's message for each column, obtained by making ONLY that column wrong (an object is never valid).
       const sample = { id: "x", str: "s", uuid: STAFF, ts: "2026-01-15T09:00:00Z", date: "2026-01-15", int4: 1, int53: 1, num: 1, bool: true } as Record<string, unknown>;
@@ -779,7 +802,7 @@ describe("0038 B2a SQL", () => {
       expect(sqlMsgs.slice(0, tsMsgs.length), t).toEqual(tsMsgs);
       for (const [c, kind, nullable] of RESULT_COLUMNS[t]) {
         const numeric = ["int4", "int53", "num"].includes(kind);
-        const shape = `${numeric ? "CASE WHEN " : ""}coalesce(pg_catalog.jsonb_typeof(v -> '${c}'), 'missing') <> '${kind === "bool" ? "boolean" : numeric ? "number" : "string"}'`;
+        const shape = `${numeric || kind === "date" ? "CASE WHEN " : ""}coalesce(pg_catalog.jsonb_typeof(v -> '${c}'), 'missing') <> '${kind === "bool" ? "boolean" : numeric ? "number" : "string"}'`;
         expect(body, `${t}.${c}`).toContain(nullable ? `coalesce(pg_catalog.jsonb_typeof(v -> '${c}'), 'missing') <> 'null' AND (${shape}` : `WHEN (${shape}`);
       }
     }
@@ -791,6 +814,19 @@ describe("0038 B2a SQL", () => {
     // Numeric casts only after the shape is known (CASE fixes evaluation order).
     expect(f).toMatch(/CASE WHEN coalesce\(pg_catalog\.jsonb_typeof\(v -> 'quantity'\), 'missing'\) <> 'number' OR \(v ->> 'quantity'\) !~ '\^-\?\[0-9\]\{1,10\}\$' THEN true ELSE \(v ->> 'quantity'\)::bigint NOT BETWEEN -2147483648 AND 2147483647 END/);
     expect(f).toMatch(/ELSE \(v ->> 'items'\)::bigint > 9007199254740991 END/);
+    // T13B2a-1 residual: production_date is a real calendar day; the native make_date only runs once the arithmetic proved it valid.
+    const pd = f.slice(f.indexOf("WHEN coalesce(pg_catalog.jsonb_typeof(v -> 'production_date')"), f.indexOf("THEN 'event_facts.production_date must be"));
+    const Y = "pg_catalog.substr((v ->> 'production_date'), 1, 4)::integer";
+    const M = "pg_catalog.substr((v ->> 'production_date'), 6, 2)::integer";
+    const D = "pg_catalog.substr((v ->> 'production_date'), 9, 2)::integer";
+    for (const part of [
+      "<> 'null' AND (CASE WHEN",
+      "!~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN true",
+      `WHEN ${Y} < 1 OR ${M} NOT BETWEEN 1 AND 12 OR ${D} < 1`,
+      `OR ${D} > CASE WHEN ${M} = 2 THEN CASE WHEN (${Y} % 4 = 0 AND ${Y} % 100 <> 0) OR ${Y} % 400 = 0 THEN 29 ELSE 28 END WHEN ${M} IN (4, 6, 9, 11) THEN 30 ELSE 31 END THEN true`,
+      `ELSE pg_catalog.make_date(${Y}, ${M}, ${D}) IS NULL END)`,
+    ]) expect(pd, part).toContain(part);
+    expect(pd.indexOf("% 400 = 0")).toBeLessThan(pd.indexOf("make_date"));
   });
 
   it("rows: exact keys per array (no trusted metadata), structural check BEFORE any cast or lookup, frozen-view ownership, self rows, identity family, cutoff", () => {

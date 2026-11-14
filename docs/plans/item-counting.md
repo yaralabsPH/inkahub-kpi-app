@@ -1418,3 +1418,26 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - four TypeScript tables: 20.
   - **Not done:** runtime SQL proof of these rules (staging), which belongs to the final reviewed migration rehearsal and the B2b harness, as the plan says. The SQL is verified only by its text and by the reference model.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; 1004/1004 tests; build OK. 0038 SHA-256 is fd3ea601bcb23f4b….
+- 2026-11-15: **T13B2a-1 residual (calendar validation of `production_date`).** Only this residual was fixed; no SQL was run and no migration was applied. 0037 is unchanged (531BB2C5…); the 0038 draft's SHA-256 is now aeba062d….
+  - **SQL.** `staged_row_problem` keeps the same message. After the shape regex it checks, in order:
+    - year ≥ 1;
+    - month 1–12;
+    - day ≥ 1 and within the month (30-day months; February 28/29 by the 4/100/400 leap rule).
+
+    It then confirms with a native `make_date`, which runs only once the arithmetic has passed, so an invalid date never raises mid-check and never reaches the chunk store or publication. Null is still accepted. The site/04:00 production-date semantics are unchanged; SQL does not compute dates.
+  - **TypeScript.** `isCalendarDate` (used by `resultRowProblem`) applies the same rules plus a native UTC `Date` round trip.
+  - **Tests.** The new tests cover:
+    - rejected: 2026-02-30, 2026-99-99, month 00/13, day 00/32, 31st of April/June/September/November, 2026/2023/1900/2100-02-29, year 0000, 5-digit years, unpadded months;
+    - accepted: 2024/2000/2400/1600-02-29, month ends, 0001-01-01 and 9999-12-31.
+
+    A rejected row leaves no stored chunk and the work stays leased. The SQL-text checks scope the date rule to its own block. Surprise: the date CASE contains an inner `END`, which first truncated the message-parity block; that test now bounds each block by the next table header.
+  - **Deliberate breaks** (stage suite, 53 tests). Killed:
+    - regex-only TypeScript (the finding): 1 failed;
+    - regex-only SQL: 1;
+    - Julian leap rule in SQL: 1;
+    - no SQL `make_date`: 1;
+    - unchecked 30-day months in SQL: 1;
+    - year 0000 allowed in TypeScript: 1.
+
+    In TypeScript, weakening the leap rule, the 30/31-day months or the month bound alone survives. These are equivalent, because the native `Date` round trip independently rejects those days. Removing the round trip alone also survives, because the arithmetic covers it. With both layers broken, each combination fails (Julian leap, every year leap, 31-day months, month 13: 1 failed each).
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; 1005/1005 tests; build OK.

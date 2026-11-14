@@ -173,13 +173,28 @@ const KIND_TEXT: Record<Exclude<ColumnKind, "enum">, string> = {
   id: "a non-empty string", str: "a string", uuid: "a lowercase uuid", ts: "an ISO-8601 timestamp", date: "a YYYY-MM-DD date",
   int4: "a 32-bit integer", int53: "a non-negative safe integer", num: "a non-negative number", bool: "a boolean",
 };
+/**
+ * A real calendar day (proleptic Gregorian, years 0001-9999, as PostgreSQL
+ * date accepts for this shape): month 1-12, day within the month, leap years
+ * by the 4/100/400 rule, confirmed by a native UTC Date round trip.
+ */
+export function isCalendarDate(s: string): boolean {
+  if (!DATE_RE.test(s)) return false;
+  const [y, m, d] = [Number(s.slice(0, 4)), Number(s.slice(5, 7)), Number(s.slice(8, 10))];
+  if (y < 1 || m < 1 || m > 12 || d < 1) return false;
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  if (d > (m === 2 ? (leap ? 29 : 28) : [4, 6, 9, 11].includes(m) ? 30 : 31)) return false;
+  const dt = new Date(0);
+  dt.setUTCFullYear(y, m - 1, d);
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
 function valueOk(v: unknown, kind: ColumnKind, values?: readonly string[]): boolean {
   switch (kind) {
     case "id": return typeof v === "string" && v !== "";
     case "str": return typeof v === "string";
     case "uuid": return typeof v === "string" && UUID_RE.test(v);
     case "ts": return typeof v === "string" && TS_RE.test(v);
-    case "date": return typeof v === "string" && DATE_RE.test(v);
+    case "date": return typeof v === "string" && isCalendarDate(v);
     case "enum": return typeof v === "string" && (values ?? []).includes(v);
     case "bool": return typeof v === "boolean";
     case "int4": return typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
