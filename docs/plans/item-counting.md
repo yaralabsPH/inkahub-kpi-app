@@ -626,6 +626,12 @@ Claude owns this bounded residual repair before root runs `--fence`:
 
 These are runner/test-only corrections, not counting-rule or migration changes. Run focused regression/sensitivity checks and the common gate, append exact evidence, commit/push and pause. No SQL/staging modes, app/API edits, Task 14, production action or acceptance relaxation. Root stays read-only while Claude edits. Task 13 remains unchecked; installed staging retains capture off, processors off and legacy reads from the last verified checkpoint.
 
+### B2b recovery-runner clearance — 2026-11-15
+
+Root reviewed clean pushed `08b62dba94c51f8ab3c3cb133f44ebdf0cc9cd66`; [CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43662573862/job/132654894224), completed 01:20:46 UTC. Independent stop/cleanup/I1 review passed 158 focused tests; extracted F2 integration review passed 83. All three residuals above are closed: ordinary-toggle disconnect errors propagate and stop further scenarios, I1 needs the wait AND successful second begin, and actual F2 orchestration settles sessions/queries and receipt states in dependency order while retaining first/secondary failures. Coder common gate passed 1,117 tests, type-checks and build; 12 new and 19 retained deliberate breaks were caught. 0037/0038 hashes are unchanged.
+
+Root owns the next staging execution under the existing authorization: run `--fence` against `ybrzhrgfrnvtcwymjdrq` with the per-SQL target guard, unchanged limits, immutable output, exact transition receipts and fresh full-state restoration audit. Stop dependent work on failure; no unchanged retries. On success, continue the remaining explicitly bracketed rollback interleavings and reviewed committed harness. Claude remains paused while root runs these gates. Task 13 stays unchecked until runtime evidence is complete; no Task 14 or production action is authorized here.
+
 ## Amendment implementation log
 
 - 2026-11-14 (Codex, CJ's overnight delegation): CJ authorized autonomous coordination and routine decisions while asleep. Claude remains the coder; Codex handles planner decisions/review. One writer at a time, commit before handoff. Authorized feature work and necessary staging validation target only `ybrzhrgfrnvtcwymjdrq`, checked before every SQL run; additive staging schema application requires planner review first. Production/other-account access, merges, deployment, purchases, secret disclosure, destructive source cleanup and weakened acceptance/security limits remain excluded.
