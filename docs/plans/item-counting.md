@@ -632,6 +632,12 @@ Root reviewed clean pushed `08b62dba94c51f8ab3c3cb133f44ebdf0cc9cd66`; [CI passe
 
 Root owns the next staging execution under the existing authorization: run `--fence` against `ybrzhrgfrnvtcwymjdrq` with the per-SQL target guard, unchanged limits, immutable output, exact transition receipts and fresh full-state restoration audit. Stop dependent work on failure; no unchanged retries. On success, continue the remaining explicitly bracketed rollback interleavings and reviewed committed harness. Claude remains paused while root runs these gates. Task 13 stays unchecked until runtime evidence is complete; no Task 14 or production action is authorized here.
 
+### B2b installed fence result — 2026-11-15
+
+Root ran `npm run staging:reporting-jobs -- --fence` at `791049a`, staging target `ybrzhrgfrnvtcwymjdrq` checked before launch and every SQL. Artifact `staging-results-reporting-fence-20261115T012742155Z-3b9eee4b.md` is **COMPLETE**, with fresh full-state restoration verified. All F1–F6 passed: compatible source writers (88 ms), activation and queued-writer waits, old-snapshot serialization refusal (40001), exact epoch changes/journal attribution, default 3 s and stricter 1 s lock refusals (55P03; 3,084/1,084 ms) with unchanged control, and capture-role mutation denial (42501). Capture returned to disabled; only the explicitly receipted epoch/timestamp transitions were allowed. Existing limits and 0037/0038 stayed unchanged. No production action.
+
+Task 13 remains open for rollback interleavings with explicitly recorded temporary operator setup/restoration, followed by the reviewed committed interleavings and their fresh audits. Claude's current repair handoff is complete and accepted; Claude remains paused while root owns those runtime gates. Do not restart the completed repairs or start Task 14 from this result alone.
+
 ## Amendment implementation log
 
 - 2026-11-14 (Codex, CJ's overnight delegation): CJ authorized autonomous coordination and routine decisions while asleep. Claude remains the coder; Codex handles planner decisions/review. One writer at a time, commit before handoff. Authorized feature work and necessary staging validation target only `ybrzhrgfrnvtcwymjdrq`, checked before every SQL run; additive staging schema application requires planner review first. Production/other-account access, merges, deployment, purchases, secret disclosure, destructive source cleanup and weakened acceptance/security limits remain excluded.
