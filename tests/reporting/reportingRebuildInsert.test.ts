@@ -53,9 +53,9 @@ describe("T13B2b-19: installed migrations are immutable", () => {
 });
 
 describe("T13B2b-19: 0039 migration fidelity", () => {
-  it("exists at the allocated number; 0040/0041 are not yet created", () => {
+  it("exists at the allocated number; 0040 is the next (Task 14) draft, 0041 not yet created", () => {
     expect(existsSync(M39)).toBe(true);
-    expect(existsSync("supabase/migrations/0040_reporting_dependency_reads.sql")).toBe(false);
+    expect(existsSync("supabase/migrations/0040_reporting_dependency_reads.sql")).toBe(true); // Task 14 draft (allocated after 0039)
     expect(existsSync("supabase/migrations/0041_reporting_reads.sql")).toBe(false);
   });
 

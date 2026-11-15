@@ -284,6 +284,30 @@ New scanner/offline sessions, source scan deduplication, canvas eligibility, his
 
 ## Open questions and execution gates
 
+- **Task 14 coder design notes and open questions (2026-11-15, for planner review; not decided by Claude):**
+  - **Decided within the contract:**
+    - **Audiences per owner:** site, plus every staff id of the owner's frozen members, plus every staff id of BASE images of changed keys whose base owner is this owner. A self audience can only own rows for its own member events (self input is filtered to that worker before projection), so previously published self rows of an owner come only from its old members. This yields the required empty replacements (moves, staff reassignment, deletion) without reading published fact tables.
+    - **Owner input:**
+      - members;
+      - their parents;
+      - their inverse children;
+      - for each worker of a member stream line: an exact predecessor walk from the worker's LATEST member line down past a site-effective line of all types and of each member work type found below the EARLIEST member line;
+      - every consumed candidate's own cancellations.
+      Ties at the stop instant are read whole. Self audiences need no separate walk: site-effective implies self-effective, so the site walk is a superset.
+    - **Refresh closure:**
+      - old and new owners (also invalid-identity and due future keys);
+      - owners of parents (old and new parent ids);
+      - owners of frozen inverse children of every changed id;
+      - owners of every stream line from each changed/affected stream position (changed lines old and new, and parents of changed cancellations) up to and including the first site-effective line of all types and of that line's type.
+    - **Reads are exact and page-size independent.** What a walk consumes depends only on the frozen view; a short (byte-capped) page is never treated as the end. Input hashes are therefore deterministic for a frozen view.
+  - **Open question 1 (fan-out):** an order whose member lines span a long time (e.g. rework months later) brings that worker's whole intervening stream into its input. Likewise, a predecessor/successor walk for a rarely used work type may scan far. Both are bounded only by the 50,000-event `partition_too_large` failure, never truncated.
+    - Options: (a) accept, and measure in Task 19 on the five-year fixture; (b) for refresh only, seed predecessors from the published base's `timing_facts` stream index instead of walking source; (c) a reviewed amendment that bounds per-type look-back.
+    - Claude has implemented (a) only.
+  - **Open question 2 (request count):** members are read for up to 100 owners per call, but parents, children and stream pages are per owner (several RPC round trips per owner). A million-order rebuild therefore needs several million bounded calls.
+    - Options: (a) accept and measure in Task 19; (b) a later reviewed amendment adding multi-owner parent/child/stream reads.
+    - The 0040 functions already accept up to 1,000 ids per call, so (b) is a TypeScript change.
+  - **Open question 3 (read locking):** every 0040 read takes the existing `lock_batch` (control share + site row FOR UPDATE, fence/lease/drift checks) for the duration of one call. This serializes reads with other site metadata transitions, matching every other batch RPC.
+    - Planner to confirm that per-call validation is preferred over a cheaper unlocked fence check.
 - **Hosting entitlement and budget not observed:** Task 10 records whether existing Vercel supports the defined schedule/runtime and the measured worker/backfill costs. If it does not, CJ chooses an explicitly costed amendment; do not provision/upgrade by assumption. This does not prevent preparing/reviewing the plan.
 - **Existing M6 collection still pending:** complete Task 10 exactly as the preserved contract; the old COMPLETE report cannot clear it. Maintain original manager memberships on completion.
 - **Implementation discoveries:** if exact range/coverage parity, frozen-source capture/publication under current timeout, pathological dependency fan-out, side-card bounds or five-year resource budgets cannot meet this plan, stop the affected task and record measured evidence plus one bounded proposed change. Do not move counting rules, widen permissions, reduce fixtures or silently relax limits.
@@ -2234,3 +2258,58 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The T13B2b-22 set was re-run: 7/7 unchanged entries caught, and 6 entries retargeted to the rewritten watch, 5 caught. The sixth (a rethrow injected after recording, inside the listener's own try) is an equivalent mutant: its catch absorbs it after the failure is already recorded.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1263/1263 tests (36 files); build OK.
   - **Next:** root review. Only after clearance, root takes a fresh full baseline and runs the corrected rollback I0–I5 once against staging. The staging gate remains FAILED; Task 13 stays unchecked.
+- 2026-11-15 — Task 14 offline implementation (Claude). No SQL, no staging mode, nothing applied, no production, no Task 15+ work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 `05d7eff1…` are byte-identical. New draft 0040 SHA-256 is `4e39243e2ee6526f656eb1b462156d6bc9eabf17cac78fcb2d873cd4498968b2` (LF, unapplied). The Task 14 checkbox stays unchecked pending planner review and 0040 staging evidence.
+  - **Failing first:** `tests/reporting/reportingMaterialize.test.ts` was written before the module and failed to load (missing `api/_lib/production-reporting-materialize`).
+  - **`api/_lib/production-reporting-materialize.ts` (new):**
+    - The production owner mapping `rowsByOwner`/`ownerRows`, moved out of the test fixture, which now re-exports it.
+    - `ownerOfEvent`: trimmed nonblank order, else event id, as SQL `owner_partition`.
+    - `materializePartition`: the shared projector with a self audience filtered BEFORE projection.
+    - The `FrozenReader` contract and `memoryFrozenReader`.
+    - `buildOwnerInput`:
+      - members, parents, inverse children;
+      - an exact predecessor walk per member worker, from the latest member line down past a site-effective line of all types and of each member type below the EARLIEST member line;
+      - consumed candidates' cancellations;
+      - ties kept whole.
+    - `affectedOwners`, the refresh closure:
+      - old and new owners (invalid-identity and due future keys included);
+      - parent owners;
+      - inverse-children owners;
+      - stream successors up to the first site-effective line of all types and of the line's type.
+    - `materializeOwners` (streaming) and `materializeBatch`:
+      - work descriptors whose input hash is SHA-256 of the canonical `FrozenPartitionInput`;
+      - owner rows for the site and for self audiences of current members plus base-image staff of changed keys (empty replacements for moves, restaffing and deletion);
+      - `PartitionTooLargeError` (`partition_too_large`) above 50,000 input events, with no work returned;
+      - stats: owners, works, max and total input, requests.
+  - **`api/_lib/production-reporting-reader.ts` (new):** `rpcFrozenReader` over the 0040 RPCs.
+    - Every read pages until an EMPTY page; a byte-capped short page is never treated as the end.
+    - A member overflow is proven with cap+1 rows, then that owner is skipped.
+    - `byIds` re-requests only the ids after a capped response.
+    - Images are reduced to the 11 evidence fields after site and id binding; keyset order and worker are checked.
+  - **`supabase/migrations/0040_reporting_dependency_reads.sql` (draft):**
+    - `frozen_read_batch`: the existing `lock_batch` plus a FROZEN state check.
+    - Six service-only SECURITY INVOKER, empty-search_path read RPCs: `read_reporting_changed_keys`, `list_reporting_owners`, `read_reporting_owner_members`, `read_reporting_events_by_id`, `read_reporting_children`, `read_reporting_staff_stream`. Each pages ≤1,000 rows and ≤1 MiB with bytewise keysets, fails visibly on an oversized image, and uses no OFFSET.
+    - Refresh reads overlay the base mirror with frozen batch images; rebuild reads the frozen candidate. No data writes and no live-source read.
+    - Four reporting-only indexes: worker stream keysets on `source_current` and `source_candidate`, and bytewise owner keysets on the candidate.
+  - **Bugs found during the work and fixed:**
+    - A walk treated a short page as end-of-stream (wrong with byte-capped SQL pages).
+    - Walks consumed whole pages, which made input hashes depend on page size. They now consume event by event, and an RPC-versus-memory parity test at page caps 1, 2 and 5 proves determinism.
+  - **Tests:**
+    - `tests/reporting/reportingMaterialize.test.ts` (28):
+      - owner mapping and the self filter;
+      - every named plan regression, each with exact full-history oracle parity and complete enumeration: years-old late correction keeps its original day/person; a site move empties the old site and self owners; a hidden worker cancellation stays hidden; a later parent resolves only authorized context; deleting a middle line repairs its successor in another order; rework/null case identities stay distinct; repeated materialization is byte-identical (chunk hashes); a 50,001-row partition fails as `partition_too_large`;
+      - closure, input and descriptor-hash tests;
+      - exact one-row-page walks (same-type predecessor beyond an other-type line, cancelled nearest candidate, below-earliest stop, same-type successor, ties, a non-BMP bytewise/UTF-16 tie, exact input set);
+      - daily-group mapping parity against the existing reducer for the site and each self audience across 04:00 and cancellations;
+      - five randomized histories, each with exact oracle parity at default, 1-row and 2-row pages.
+    - `tests/reporting/reportingDependencyReads.test.ts` (12):
+      - the RPC reader equals the memory reader exactly at caps 1, 2 and 5 for refresh and rebuild;
+      - overflow skip, `byIds` re-request, image binding/reduction and visible errors;
+      - the 0040 text contract (service-only, invoker, frozen-batch locks first, read-only, bounded, bytewise keysets, overlay vs candidate).
+    - Existing allocation tests updated for 0040; `typecheck:digest` includes the new modules and tests.
+  - **Fan-out/memory record:** 300-line fixture, 10 new lines, orders spread over five hours: owners=10, works=40, maxInput=156, totalInput=1,560, requests=96, heap delta ≈28 MiB (GC-dependent). The refresh read only affected owners and their bounded dependencies, not the site history.
+  - **Mutations:** 20/22 deliberate breaks caught across the closure, walks, reader paging and image reduction. The 2 survivors are equivalent in this design:
+    - member inverse children are also fetched by the predecessor walk;
+    - parent owners are also reached by the successor walk.
+    - Earlier rounds found and closed real gaps: per-type need, cancelled candidates, below-earliest stop, whole-page consumption, tie wholeness.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1303/1303 tests (38 files); build OK.
+  - **Next:** planner review of the design notes and open questions below. 0040 needs an independently reviewed rollback rehearsal before any installation.
