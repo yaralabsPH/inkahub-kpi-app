@@ -42,7 +42,7 @@ import type { LifecycleReport } from "./reportingCapture";
 
 export const MIGRATION_0038 = "supabase/migrations/0038_reporting_jobs.sql";
 export type Site = "au" | "uk" | "us";
-export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings";
+export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings" | "explain-source-versions";
 export interface Db {
   query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>;
 }
@@ -53,15 +53,20 @@ export interface Db {
 
 export function parsePublicationArgs(argv: readonly string[]): { mode: PublicationMode | null; sites: [Site, Site] | null; maxPages: number; problems: string[] } {
   const problems: string[] = [];
-  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings"].includes(a));
-  const sitesArg = argv.find((a) => a.startsWith("--sites="));
+  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings", "--explain-source-versions"].includes(a));
+  const explain = modes.length === 1 && modes[0] === "--explain-source-versions";
+  // The plan diagnostic takes ONE site (--site=X); every other mode takes two (--sites=A,B).
+  const sitesArg = explain ? undefined : argv.find((a) => a.startsWith("--sites="));
+  const siteArg = explain ? argv.find((a) => a.startsWith("--site=")) : undefined;
   const pagesArg = argv.find((a) => a.startsWith("--max-pages="));
-  const unknown = argv.filter((a) => a.startsWith("--") && !modes.includes(a) && a !== sitesArg && a !== pagesArg);
-  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings");
+  const unknown = argv.filter((a) => a.startsWith("--") && !modes.includes(a) && a !== sitesArg && a !== siteArg && a !== pagesArg);
+  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings, --explain-source-versions");
   if (unknown.length) problems.push(`unknown flags: ${unknown.join(" ")}`);
-  const sites = sitesArg?.slice("--sites=".length).split(",") ?? [];
-  const okSites = sites.length === 2 && sites.every((s) => s === "au" || s === "uk" || s === "us") && sites[0] !== sites[1];
-  if (!okSites) problems.push("--sites=A,B must name two different supported sites (au, uk, us)");
+  const supported = (s: string) => s === "au" || s === "uk" || s === "us";
+  const one = siteArg?.slice("--site=".length) ?? "";
+  const sites = explain ? (supported(one) ? [one, one] : []) : (sitesArg?.slice("--sites=".length).split(",") ?? []);
+  const okSites = explain ? sites.length === 2 : sites.length === 2 && sites.every(supported) && sites[0] !== sites[1];
+  if (!okSites) problems.push(explain ? "--site=X must name one supported site (au, uk, us)" : "--sites=A,B must name two different supported sites (au, uk, us)");
   const maxPages = pagesArg ? Number(pagesArg.slice("--max-pages=".length)) : 200;
   if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 5000) problems.push("--max-pages must be an integer 1..5000");
   return { mode: problems.length ? null : (modes[0].slice(2) as PublicationMode), sites: okSites ? (sites as [Site, Site]) : null, maxPages, problems };
@@ -157,10 +162,12 @@ export interface PublicationReport extends LifecycleReport {
   cleanup: string[];
   /** Committed harness only: exactly what this run owns (recorded before its first commit). */
   ownership: Record<string, unknown> | null;
+  /** --explain-source-versions only: the plan, environment and parameter identities (no source payloads). */
+  diagnostic: Record<string, unknown> | null;
 }
 
 export function newPublicationReport(mode: PublicationMode, sites: [Site, Site], revision: string, startedAt: string, draftSha256: string): PublicationReport {
-  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
+  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
 }
 
 /** One STATUS line: COMPLETE only with every observation as expected, no error/cleanup failure and a verified restoration. */
@@ -194,6 +201,7 @@ export function publicationMarkdown(r: PublicationReport): string {
     ...(r.errors.length ? ["## Errors", ...r.errors.map((p) => `- ${p}`), ""] : []),
     ...(r.cleanup.length ? ["## Cleanup failures", ...r.cleanup.map((p) => `- ${p}`), ""] : []),
     ...(r.ownership ? ["## Cleanup ownership (recorded before the first commit)", "```json", JSON.stringify(r.ownership, null, 2), "```", ""] : []),
+    ...(r.diagnostic ? ["## Plan diagnostic (source_versions INSERT; plan only, rolled back)", "", `- ${String(r.diagnostic.label)}`, "", "```json", JSON.stringify(r.diagnostic, null, 2), "```", ""] : []),
     ...(r.restorationProblems.length ? ["## Restoration problems", ...r.restorationProblems.map((p) => `- ${p}`), ""] : []),
     publicationStatus(r),
   ];

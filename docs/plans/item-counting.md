@@ -1895,3 +1895,43 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The previous 19/19 set was re-run and all were caught (M15/M18 retargeted to their new locations).
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1117/1117 tests (33 files); build OK.
   - **Next:** root review. `--fence`, `--interleavings` and `--committed-interleavings` have still not run. Task 13 stays unchecked.
+- 2026-11-15 — I4 plan-only diagnostic PREPARED, NOT RUN. No SQL, no staging mode, no app/API/migration change, no fix selected, no Task 14 work. 0037 `531bb2c5…` and 0038 `14a808ea…714b1d` are installed, immutable and byte-identical:
+  - **Mode:** `npm run staging:reporting-jobs -- --explain-source-versions --site=uk [--max-pages=N]` (default 200, the same bound I4 used). It takes exactly one supported `--site`; `--sites` is refused. It is wired into the existing guarded `publicationMain`: target-checked guarded client before every SQL; installed-0038 check; report written before connecting; `fullState` baseline taken FIRST; existing `runCaptureLifecycle` (main rolled back and closed); fresh auditor comparing `fullState` with `ROLLBACK_ONLY` (zero allowed changes; generated sequence gaps stay excluded as before).
+  - **Code:** new `tests/staging/reportingPlanDiagnostic.ts` (`runPlanDiagnostic`). `reportingPublication.ts`: the mode, one-site argument parsing, a `diagnostic` report field and a markdown section. `reporting-jobs.ts`: the branch and usage line. `package.json`: `typecheck:digest` now includes the new test.
+  - **Run sequence:** ONE transaction, always ending in ROLLBACK (also after a failure; a rollback failure is kept beside the first error). It stops at the first failure through the shared `step()` helper:
+    - P0: capture and the site's processor enabled INSIDE the transaction.
+    - P1–P3: the reviewed `begin_reporting_rebuild`, `copyAll` and `freeze_reporting_rebuild`.
+    - P4: candidate row count must equal the site's `production_events` count (the original I4 workload; current source_versions count recorded).
+    - P5: role, settings, relation heap/index/TOAST sizes, `pg_stat_all_tables`/`pg_stat_all_indexes` counters and vacuum/analyze timestamps, `reltuples`/`relpages` for `source_candidate`, `source_versions`, `source_current` and `batches`.
+    - P6: as service_role (asserted via `current_user`), `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON)` WITHOUT ANALYZE of the exact rebuild INSERT. It requires a JSON plan.
+    - The diagnostic (full plan, environment, SQL and parameter identities: site, placeholder seq 1, batch id; no source payloads) is persisted before the final rollback.
+  - **Statement fidelity:** `SOURCE_VERSIONS_INSERT_SQL` is the 0038 rebuild-branch INSERT (lines 1943–1947) with `b.site`/`v_seq`/`p_batch` bound as `$1::text`/`$2::bigint`/`$3::uuid`. A test proves the text is identical to the migration after that substitution. `v_seq` appears only in the SELECT list, so the placeholder cannot change the plan.
+  - **Labelled limits:** this is a CURRENT STANDALONE plan with bound values. It is NOT the cached PL/pgSQL plan that timed out, and the uncommitted candidate rows are invisible to the table statistics. Only this statement is planned; the preceding UPDATE is not.
+  - **Allow-list guard:** every statement goes through `diagnosticDb`, an exact allow-list (begin, rollback, become's role and request-claims statements, the four reviewed RPCs, the UK processor update, the measurement SELECTs and the one EXPLAIN). Anything else is refused BEFORE sending: publish, commit/end, seal/claim/stage, VACUUM, ANALYZE, EXPLAIN ANALYZE, any timeout/planner `SET`/`set_config`, DDL, source writes, the bare INSERT.
+  - **Tests:** `tests/reporting/reportingPlanDiagnostic.test.ts`, 34:
+    - statement fidelity and EXPLAIN options;
+    - 15 forbidden statements refused unsent, plus an allow-list audit;
+    - a full run: order; measurements before EXPLAIN; exact params; service_role; full plan emitted; no payload; never publish/commit; one final rollback;
+    - stop-and-rollback for a copy failure, a workload mismatch, missing relation stats, an EXPLAIN failure and an EXPLAIN without a plan (no EXPLAIN sent after an earlier failure);
+    - emit and record persistence failures;
+    - a rollback failure kept beside the first error;
+    - the actual `runCaptureLifecycle` for success, prepare failure, EXPLAIN failure and an unexpected change (main rolled back and closed, fresh auditor, ROLLBACK_ONLY catching a same-count change);
+    - argument parsing and runner wiring (baseline before branch, `return`, ROLLBACK_ONLY audit).
+  - **Mutations:** 15/15 deliberate breaks caught:
+    - publish allowed;
+    - EXPLAIN ANALYZE;
+    - no rollback on failure;
+    - commit instead of rollback;
+    - workload check removed;
+    - EXPLAIN not as service_role;
+    - relation check removed;
+    - statement drifted from 0038;
+    - not persisted;
+    - guard bypassed;
+    - plan check removed;
+    - runner branch falling through;
+    - `--sites` accepted (this one first SURVIVED; a combined-flag regression was added and it is now caught);
+    - a rollback error replacing the first;
+    - plan markdown dropped.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1150/1150 tests (34 files); build OK.
+  - **Next:** root review, then root runs the diagnostic once. I5 and the committed harness still have not run. Task 13 stays unchecked.
