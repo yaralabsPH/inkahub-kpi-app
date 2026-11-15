@@ -1908,7 +1908,7 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - **Statement fidelity:** `SOURCE_VERSIONS_INSERT_SQL` is the 0038 rebuild-branch INSERT (lines 1943–1947) with `b.site`/`v_seq`/`p_batch` bound as `$1::text`/`$2::bigint`/`$3::uuid`. A test proves the text is identical to the migration after that substitution. `v_seq` appears only in the SELECT list, so the placeholder cannot change the plan.
   - **Labelled limits:** this is a CURRENT STANDALONE plan with bound values. It is NOT the cached PL/pgSQL plan that timed out, and the uncommitted candidate rows are invisible to the table statistics. Only this statement is planned; the preceding UPDATE is not.
   - **Allow-list guard:** every statement goes through `diagnosticDb`, an exact allow-list (begin, rollback, become's role and request-claims statements, the four reviewed RPCs, the UK processor update, the measurement SELECTs and the one EXPLAIN). Anything else is refused BEFORE sending: publish, commit/end, seal/claim/stage, VACUUM, ANALYZE, EXPLAIN ANALYZE, any timeout/planner `SET`/`set_config`, DDL, source writes, the bare INSERT.
-  - **Tests:** `tests/reporting/reportingPlanDiagnostic.test.ts`, 34:
+  - **Tests:** `tests/reporting/reportingPlanDiagnostic.test.ts`, 33:
     - statement fidelity and EXPLAIN options;
     - 15 forbidden statements refused unsent, plus an allow-list audit;
     - a full run: order; measurements before EXPLAIN; exact params; service_role; full plan emitted; no payload; never publish/commit; one final rollback;
