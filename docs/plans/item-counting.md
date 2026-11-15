@@ -2357,3 +2357,47 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Earlier rounds found and closed real gaps: per-type need, cancelled candidates, below-earliest stop, whole-page consumption, tie wholeness.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1303/1303 tests (38 files); build OK.
   - **Next:** planner review of the design notes and open questions below. 0040 needs an independently reviewed rollback rehearsal before any installation.
+- 2026-11-15 — Task 14 repairs T14R1–R4, OFFLINE (Claude). No SQL, no staging mode, nothing applied, no Task 15+ work, no limit or timeout change. 0037 `531bb2c5…`, 0038 `14a808ea…`, 0039 `05d7eff1…` and the 0040 draft `4e39243e…` are byte-identical. New append-only draft `0041_reporting_dependency_read_bounds.sql` has SHA-256 `dfa49d597cc37cef92314a4d2dcaf79d195949741fc0534fc57345c12f419646` (LF, unapplied). Task 16 is now 0042. Task 14 stays unchecked.
+  - **Failing first:** before the repair, 11 of the new materializer regressions failed: six R1 closure cases, the R2 boundary case and four R3 budget cases. The ASCII-tie R1 case already passed. R4's tests were written alongside 0041; removing 0041, or the reader's response check, reproduces their failure (mutations R4a and R4e below).
+  - **T14R1 (`walkSuccessors`):** the anchor keeps its full identity. Every consumed stream line is affected (ties at the anchor's instant included), but only a site-effective line STRICTLY AFTER the anchor in the projector's (instant, UTF-16 id) order can satisfy the stop. Bytewise SQL keyset traversal and whole boundary ties are kept. Old and new positions (worker/time changes) are separate anchors.
+  - **T14R2 (`buildOwnerInput`):** member earliest/latest boundaries and the below-earliest test use the new exported `projectorOrder`. Transport order stays bytewise.
+  - **T14R3 (budgets while reading):**
+    - New `DependencyBudget`: distinct consumed source/dependency ids per owner input or per successor seed. The first id past 50,000 throws `partition_too_large` at once, attributed to the owner or seed owner.
+    - `FrozenReader.children` is now a lazy stream, so the RPC reader requests the next page only when consumed.
+    - Member children are charged one by one.
+    - Each consumed stream candidate reads ONLY its own cancellations, incrementally. Unconsumed lookahead on a fetched page is never charged, read or hashed.
+    - `materializeOwners` reads one owner at a time (the 100-owner member prefetch is removed).
+    - The in-memory test reader is now indexed (per worker sorted with binary search, by parent, by owner), so 50,000-row tests are fast.
+  - **T14R4:**
+    - 0041 replaces all six read functions: same signatures and headers, the same frozen overlay/candidate queries for the five image reads, `frozen_read_batch` first, invoker security, empty search path, no grant changes. Each now has COMPLETE response accounting: 2 bytes of brackets plus, per returned row, `octet_length(jsonb_build_object(<every returned column>)::text) + 1`. jsonb text is never smaller than compact JSON.
+    - A row that alone cannot fit raises; otherwise the page ends short. The 1,000-row cap is kept. `list_reporting_owners` is now a byte-counted loop over one ordered union.
+    - `rpcFrozenReader` rejects any response whose compact JSON exceeds 1 MiB, never slicing it.
+  - **Tests:**
+    - `reportingMaterialize.test.ts` 28 → 41:
+      - R1: middle insertion, cancellation removal, A→B reassignment, timestamp move, ASCII tie, non-BMP tie, same-type successor behind an inserted other-type line — each with exact site/self oracle parity at caps 1, 2 and 200, and identical descriptors across caps;
+      - R2: the exact U+1F600/U+FFFD regression with any-type and same-type predecessors, parity and page-independent hashes;
+      - R3, instrumented: a 50,100-line successor walk stops with `partition_too_large` attributed to its seed, reading ≤ limit + one page of stream rows and no cancellations; 60,000 inverse children stop after exactly 50,000 child rows; a 60,000-cancellation candidate beyond the stop is never read and does not change the input; exactly 50,000 consumed succeeds at caps 1 and 200 with lookahead present; 60 owners × 900 events (54,000 total) stay valid with one owner per member read and 54,000 member rows.
+    - `reportingDependencyReads.test.ts` 12 → 21:
+      - the accounting model is never below compact JSON;
+      - 1,000 owners with 1,200-byte keys page short and continue exactly (0040 would have returned >1 MiB);
+      - multibyte, escaped and non-BMP images near the boundary across members, children, byIds and stream, every response ≤ 1 MiB;
+      - a single oversized row fails; an oversized response is rejected;
+      - effective-definition checks: 0040 hash pinned, six replacements with identical headers and queries, exact column lists, brackets, single-row raise, short-page exit, no image-only accounting, no grants/DDL/DML.
+    - Allocation tests updated for 0041 and 0042.
+  - **Mutations:** 13/13 targeted breaks caught:
+    - strict-after-anchor removed;
+    - bytewise member boundaries;
+    - bytewise below-earliest;
+    - member children read whole before charging;
+    - walk events not charged;
+    - 100-owner prefetch;
+    - lookahead charged (this one first SURVIVED; the exactly-50,000 boundary test was added and it is now caught);
+    - lookahead cancellations read;
+    - reader accepting an oversized response;
+    - image-only accounting in one read;
+    - owner list without accounting;
+    - brackets not counted;
+    - 0041 removed.
+  - **Cost record (planner answer 2):** on the 300-line fan-out fixture: owners=10, works=40, maxInput=156, totalInput=1,560, requests=1,704 (was 96), heap delta ≈54 MiB (GC-dependent). The request rise is the per-candidate incremental cancellation reads that T14R3 requires; batching them must keep equivalent bounded consumption and is a Task 15/19 measurement item, not done here.
+  - **Remaining limitations:** request count and the real wire-size/plan behaviour need PostgreSQL evidence in the reviewed 0040+0041 rollback rehearsal. Task 15 still owns durable cross-invocation enumeration.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1324/1324 tests (38 files); build OK.

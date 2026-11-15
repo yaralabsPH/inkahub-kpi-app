@@ -44,6 +44,11 @@ export function imageToEvent(image: unknown, site: string, expectedId?: string):
   };
 }
 
+/** The complete response bound of every 0040/0041 read (1 MiB of serialized JSON). */
+export const MAX_RESPONSE_BYTES = 1024 * 1024;
+/** UTF-8 size of the compact JSON a response is carried as (the conservative SQL accounting is never below this). */
+export const responseBytes = (data: unknown): number => new TextEncoder().encode(JSON.stringify(data)).length;
+
 export interface FrozenBatchRef { batchId: string; fence: number; site: string; cutoff: string; kind: "refresh" | "rebuild" }
 
 export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenReader {
@@ -56,6 +61,9 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenR
     if (error) throw new ReportingJobError(`${fn}: ${error.message}`, error.code ?? null);
     if (!Array.isArray(data)) throw new ReportingJobError(`${fn} returned no rows array`);
     if (data.length > 1000) throw new ReportingJobError(`${fn} returned more than 1,000 rows`);
+    // T14R4: the WHOLE response (array, rows, field names, ids and images) must fit 1 MiB; an oversized one is rejected, never sliced.
+    const bytes = responseBytes(data);
+    if (bytes > MAX_RESPONSE_BYTES) throw new ReportingJobError(`${fn} returned ${bytes} bytes; a response must be at most ${MAX_RESPONSE_BYTES}`);
     return data as Array<Record<string, unknown>>;
   };
   return {
@@ -142,8 +150,8 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenR
       }
       return out;
     },
-    async children(parentIds) {
-      const out: Ev[] = [];
+    async *children(parentIds) {
+      // Lazy: the next page is requested only when the consumer asks for more (a budget overflow stops reading at once).
       const ids = [...new Set(parentIds)].sort(compareUtf8);
       for (let g = 0; g < ids.length; g += 1000) {
         const group = ids.slice(g, g + 1000);
@@ -157,13 +165,13 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenR
             const id = str(r.event_id, "event_id");
             const e = imageToEvent(r.image, ref.site, id);
             if (e.parent_event_id !== parent || !group.includes(parent)) throw new ReportingJobError("read_reporting_children returned a row for another parent");
-            out.push(e);
+            if (afterParent !== null && (compareUtf8(parent, afterParent) < 0 || (parent === afterParent && compareUtf8(id, afterId!) <= 0))) throw new ReportingJobError("read_reporting_children is not in keyset order");
             afterParent = parent;
             afterId = id;
+            yield e;
           }
         }
       }
-      return out;
     },
     async stream(staff, direction, from: StreamPosition, limit) {
       if (!UUID.test(staff)) throw new ReportingJobError("staff must be a uuid");

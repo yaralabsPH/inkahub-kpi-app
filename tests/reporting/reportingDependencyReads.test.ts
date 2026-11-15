@@ -11,7 +11,7 @@ import { compareStream, diffFrozenViews, materializeBatch, memoryFrozenReader, M
 import { imageToEvent, rpcFrozenReader } from "../../api/_lib/production-reporting-reader";
 import { compareUtf8 } from "../../api/_lib/reporting-stage";
 import type { RpcClient } from "../../api/_lib/reporting-jobs";
-import { canonicalJson } from "../../src/lib/domain/productionReporting";
+import { canonicalJson, sha256Hex } from "../../src/lib/domain/productionReporting";
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
 import { migrationBody } from "../staging/reportingPublication";
 
@@ -30,6 +30,8 @@ function ev(id: string, type: string, order: string | null, staff: string, at: s
 }
 /** The image as to_jsonb(production_events): the evidence fields plus raw-export fields the projector never reads. */
 const image = (e: Ev) => ({ ...e, note: "raw export only", station_id: "st-1" });
+const complete = (id: string, order: string, staff: string, at: string) => ev(id, "completed", order, staff, at);
+const cancel = (id: string, parent: string, order: string | null, staff: string, at: string) => ev(id, "cancelled", order, staff, at, { parent_event_id: parent });
 
 /** A fake of the 0040 RPCs over one frozen view; `cap` rows per page, keyset exactly as the SQL. */
 function fakeRpc(o: { view: Ev[]; changed: ChangedKey[]; kind: "refresh" | "rebuild"; cap: number }) {
@@ -209,7 +211,7 @@ describe("Task 14: 0040 draft migration contract", () => {
 
   it("is the allocated next number, one transaction, with every statement parseable", () => {
     expect(existsSync(M0040)).toBe(true);
-    expect(existsSync("supabase/migrations/0041_reporting_reads.sql")).toBe(false);
+    expect(existsSync("supabase/migrations/0042_reporting_reads.sql")).toBe(false); // Task 16 is now 0042
     expect(code.trim().startsWith("BEGIN;")).toBe(true);
     expect(code.trim().endsWith("COMMIT;")).toBe(true);
     const body = migrationBody(sql);
@@ -261,5 +263,167 @@ describe("Task 14: 0040 draft migration contract", () => {
     }
     expect(fnBody("read_reporting_changed_keys")).toContain("LEFT JOIN reporting_private.source_current sc ON sc.site = b.site AND sc.event_id = be.event_id");
     expect(fnBody("read_reporting_owner_members")).toContain("reporting_private.owner_partition(be.image)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T14R4: complete response bounds (0041 replaces the six 0040 reads)
+// ---------------------------------------------------------------------------
+
+const M0041 = "supabase/migrations/0041_reporting_dependency_read_bounds.sql";
+const MiB = 1024 * 1024;
+const utf8 = (s: string) => new TextEncoder().encode(s).length;
+/** jsonb's text form: ", " between members and ": " after keys (never smaller than compact JSON). */
+function jsonbText(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(jsonbText).join(", ")}]`;
+  return `{${Object.entries(v as Record<string, unknown>).map(([k, x]) => `${JSON.stringify(k)}: ${jsonbText(x)}`).join(", ")}}`;
+}
+/** The 0041 accounting, as SQL computes it: brackets + per row (whole object as jsonb text + 1 separator). */
+function bytePage<T extends Record<string, unknown>>(rows: readonly T[], limit = 1000): { rows: T[]; error: string | null } {
+  let bytes = 2;
+  const out: T[] = [];
+  for (const r of rows.slice(0, limit)) {
+    const size = utf8(jsonbText(r)) + 1;
+    if (bytes + size > MiB) {
+      if (out.length === 0) return { rows: [], error: "one response row is larger than 1 MiB" };
+      break;
+    }
+    bytes += size;
+    out.push(r);
+  }
+  return { rows: out, error: null };
+}
+
+/** A byte-accurate fake of the 0041 reads (no row cap other than 1,000): every response is what the SQL would return. */
+function byteFake(view: Ev[], kind: "refresh" | "rebuild", imageOf: (e: Ev) => Record<string, unknown>) {
+  const sizes: number[] = [];
+  const base = fakeRpc({ view, changed: [], kind, cap: 1000 });
+  const client: RpcClient = {
+    rpc: async (fn, args) => {
+      const r = await base.client.rpc(fn, args);
+      if (r.error) return r;
+      // Rebuild the full page with the big images, then apply the 0041 byte accounting.
+      const full = await base.client.rpc(fn, { ...args, p_limit: 1000 });
+      const rows = (full.data as Array<Record<string, unknown>>).map((row) => ("image" in row && row.image ? { ...row, image: imageOf(view.find((e) => e.id === row.event_id)!) } : row));
+      const page = bytePage(rows, (args.p_limit as number | undefined) ?? 1000);
+      if (page.error) return { data: null, error: { message: page.error } };
+      sizes.push(utf8(JSON.stringify(page.rows)));
+      return { data: page.rows, error: null };
+    },
+  };
+  return { client, sizes, calls: base.calls };
+}
+
+describe("T14R4: complete response bounds", () => {
+  it("the SQL accounting (jsonb text) is never below the compact wire JSON, for escaped, multibyte and non-BMP text", () => {
+    for (const s of ['"quoted"\\back\\slash', "é".repeat(500), "\u{1F600}�\u0001\n\t", "x"]) {
+      const row = { event_id: s, image: { id: s, note: s, nested: { a: [s, 1, null] } } };
+      expect(utf8(jsonbText(row))).toBeGreaterThanOrEqual(utf8(JSON.stringify(row)));
+    }
+  });
+
+  it("1,000 owners with 1,200-byte keys page within 1 MiB of COMPLETE response and continue exactly", async () => {
+    const view: Ev[] = [];
+    for (let i = 0; i < 1000; i++) view.push(ev(`e${i}`, "note_added", `ORD-${String(i).padStart(4, "0")}-${"k".repeat(1190)}`, A, "2026-11-15T08:00:00Z"));
+    const f = byteFake(view, "rebuild", image);
+    const owners: Owner[] = [];
+    for await (const o of rpcFrozenReader(f.client, ref("rebuild")).owners()) owners.push(o);
+    expect(owners).toHaveLength(1000);
+    expect(owners.map((o) => o.partitionKey)).toEqual([...owners.map((o) => o.partitionKey)].sort(compareUtf8));
+    expect(f.sizes.length).toBeGreaterThan(1); // the first page was byte-capped short
+    for (const s of f.sizes) expect(s).toBeLessThanOrEqual(MiB);
+    // 0040's row-only limit would have returned one 1,000-owner page of 1,246,001+ bytes:
+    expect(utf8(JSON.stringify(owners.map((o) => ({ partition_kind: o.partitionKind, partition_key: o.partitionKey }))))).toBeGreaterThan(MiB);
+  });
+
+  it("long ids and multibyte/escaped images near the boundary: members, children, byIds and stream pages stay complete and ≤ 1 MiB", async () => {
+    const big = (e: Ev) => ({ ...image(e), note: `"é\\\u{1F600}`.repeat(11_000) }); // ~110 KB of multibyte/escaped text per row
+    const view: Ev[] = [complete("t", "RP-1", A, "2026-11-15T08:00:00Z")];
+    for (let i = 0; i < 25; i++) view.push(cancel(`${"c".repeat(400)}${String(i).padStart(2, "0")}`, "t", "RP-1", A, `2026-11-15T08:${String(10 + i).padStart(2, "0")}:00Z`));
+    const f = byteFake(view, "rebuild", big);
+    const reader = rpcFrozenReader(f.client, ref("rebuild"));
+    const m = await reader.members([{ partitionKind: "order", partitionKey: "RP-1" }], 50_000);
+    expect(m.get(ownerKey({ partitionKind: "order", partitionKey: "RP-1" }))!).toHaveLength(26);
+    const kids: string[] = [];
+    for await (const k of reader.children(["t"])) kids.push(k.id);
+    expect(kids).toHaveLength(25);
+    expect((await reader.byIds(view.map((e) => e.id))).size).toBe(26);
+    const page = await reader.stream(A, "after", { createdAt: "2026-11-15T07:00:00Z", id: "" }, 1000);
+    expect(page.length).toBeGreaterThan(0);
+    expect(page.length).toBeLessThan(26); // byte-capped short page
+    for (const s of f.sizes) expect(s).toBeLessThanOrEqual(MiB);
+    expect(f.sizes.some((s) => s > MiB - 130_000)).toBe(true); // pages really ran up to the boundary
+  });
+
+  it("a single row that cannot fit fails visibly; an oversized response is rejected by the reader, never sliced", async () => {
+    const huge = (e: Ev) => ({ ...image(e), note: "x".repeat(MiB) });
+    const f = byteFake([complete("t", "RP-1", A, "2026-11-15T08:00:00Z")], "rebuild", huge);
+    await expect(rpcFrozenReader(f.client, ref("rebuild")).byIds(["t"])).rejects.toThrow(/one response row is larger than 1 MiB/);
+    const rows = Array.from({ length: 3 }, (_, i) => ({ event_id: `e${i}`, image: { ...image(complete(`e${i}`, "RP", A, "2026-11-15T08:00:00Z")), note: "y".repeat(400_000) } }));
+    const sloppy: RpcClient = { rpc: async () => ({ data: rows, error: null }) };
+    await expect(rpcFrozenReader(sloppy, ref("rebuild")).byIds(["e0", "e1", "e2"])).rejects.toThrow(/returned \d+ bytes; a response must be at most 1048576/);
+  });
+});
+
+describe("T14R4: the effective 0040+0041 definitions", () => {
+  const read = (p: string) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+  const c40 = read(M0040);
+  const c41 = read(M0041);
+  const code41 = c41.split("\n").filter((l) => !l.trimStart().startsWith("--")).join("\n");
+  const fns = ["read_reporting_changed_keys", "list_reporting_owners", "read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream"];
+  const def = (text: string, name: string, replace: boolean) => {
+    const i = text.indexOf(`CREATE ${replace ? "OR REPLACE " : ""}FUNCTION public.${name}(`);
+    expect(i, name).toBeGreaterThanOrEqual(0);
+    return text.slice(i, text.indexOf("$fn$;", i));
+  };
+  const header = (d: string) => d.slice(d.indexOf("public."), d.indexOf("AS $fn$"));
+  const query = (d: string) => d.slice(d.indexOf("FOR r IN"), d.indexOf("  LOOP"));
+
+  it("0037-0040 are byte-identical; 0041 is allocated next, Task 16 is 0042 (not created)", () => {
+    expect(sha256Hex(read(M0040))).toBe("4e39243e2ee6526f656eb1b462156d6bc9eabf17cac78fcb2d873cd4498968b2");
+    expect(existsSync(M0041)).toBe(true);
+    expect(existsSync("supabase/migrations/0042_reporting_reads.sql")).toBe(false);
+    expect(code41.trim().startsWith("BEGIN;")).toBe(true);
+    expect(code41.trim().endsWith("COMMIT;")).toBe(true);
+    expect(migrationBody(c41)).toHaveLength(6);
+  });
+
+  it("every one of the six is replaced with the SAME signature, security, search path and frozen-batch validation", () => {
+    for (const f of fns) {
+      const d40 = def(c40, f, false);
+      const d41 = def(c41, f, true);
+      expect(header(d41), f).toBe(header(d40)); // args, RETURNS TABLE, language, volatility, SECURITY INVOKER, SET search_path = ''
+      expect(d41, f).toMatch(/BEGIN\n  b := reporting_private\.frozen_read_batch\(p_batch, p_fence\);/);
+    }
+    expect(code41).not.toMatch(/\b(GRANT|REVOKE|DROP|ALTER|INSERT|UPDATE|DELETE|TRUNCATE|MERGE|OFFSET)\b|SECURITY DEFINER|statement_timeout|set_config/);
+  });
+
+  it("the five image reads keep their exact frozen overlay/candidate queries; only the accounting changes", () => {
+    for (const f of fns.filter((x) => x !== "list_reporting_owners")) expect(query(def(c41, f, true)), f).toBe(query(def(c40, f, false)));
+  });
+
+  it("every read accounts for the COMPLETE row object of every returned column, the brackets, and a single oversized row", () => {
+    const cols: Record<string, string[]> = {
+      read_reporting_changed_keys: ["event_id", "before_image", "after_image"],
+      list_reporting_owners: ["partition_kind", "partition_key"],
+      read_reporting_owner_members: ["owner_index", "event_id", "image"],
+      read_reporting_events_by_id: ["event_id", "image"],
+      read_reporting_children: ["parent_event_id", "event_id", "image"],
+      read_reporting_staff_stream: ["event_id", "image"],
+    };
+    for (const f of fns) {
+      const d = def(c41, f, true);
+      const m = d.match(/v_size := pg_catalog\.octet_length\(pg_catalog\.jsonb_build_object\(([^)]*)\)::text\) \+ 1;/);
+      expect(m, f).not.toBeNull();
+      expect([...m![1].matchAll(/'(\w+)'/g)].map((x) => x[1]), f).toEqual(cols[f]);
+      expect(d, f).toContain("v_bytes bigint := 2; -- the response array's brackets");
+      expect(d, f).toMatch(/IF v_bytes \+ v_size > 1048576 THEN\n\s+IF v_rows = 0 THEN RAISE EXCEPTION 'one response row/);
+      expect(d, f).toContain("EXIT; -- a short page");
+      expect(d, f).toContain("v_rows := v_rows + 1;");
+      expect(d, f).not.toMatch(/octet_length\(r\.(image|before_image|after_image)::text\)/); // no image-only accounting left
+      if (f !== "read_reporting_events_by_id") expect(d, f).toContain("IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000 THEN RAISE EXCEPTION");
+    }
+    expect(def(c41, "list_reporting_owners", true)).toContain("ORDER BY x.kind COLLATE \"C\", x.key COLLATE \"C\"");
   });
 });

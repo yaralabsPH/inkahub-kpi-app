@@ -33,7 +33,7 @@ describe("0038 migration text (Part A)", () => {
   it("is the next number, one transaction, and 0037 stays exactly as installed on staging", () => {
     const names = readdirSync("supabase/migrations").filter((n) => /^\d{4}_/.test(n)).sort();
     // 0038 followed 0037; T13B2b-19 allocates 0039 next (plan: Task 14 = 0040, Task 16 = 0041).
-    expect(names.slice(-4)).toEqual(["0037_reporting_storage.sql", "0038_reporting_jobs.sql", "0039_reporting_rebuild_insert.sql", "0040_reporting_dependency_reads.sql"]); // Task 14 draft 0040
+    expect(names.slice(-5)).toEqual(["0037_reporting_storage.sql", "0038_reporting_jobs.sql", "0039_reporting_rebuild_insert.sql", "0040_reporting_dependency_reads.sql", "0041_reporting_dependency_read_bounds.sql"]); // Task 14 drafts 0040/0041
     expect(codes[0]).toBe("BEGIN");
     expect(codes.at(-1)).toBe("COMMIT");
     // The installed 0037 bytes (Task 12 staging evidence: SHA-256 531BB2C5…) are unchanged.

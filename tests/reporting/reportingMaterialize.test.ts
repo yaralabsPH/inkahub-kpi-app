@@ -22,6 +22,7 @@ import {
   ownerRows,
   PartitionTooLargeError,
   rowsByOwner,
+  type FrozenReader,
   type Owner,
 } from "../../api/_lib/production-reporting-materialize";
 import { buildChunks, resultRowProblem, RESULT_TABLES, type ResultRows } from "../../api/_lib/reporting-stage";
@@ -366,6 +367,164 @@ describe("Task 14: daily-group mapping parity (the five arrays carry exactly wha
     }
     expect(reducerDaily(SITE, events, CUT, null)).toContain(`2026-11-14|${A}|framed|false|1|1`);
   });
+});
+
+// ---------------------------------------------------------------------------
+// T14R1: successor closure — only a line strictly AFTER the anchor (projector order) may stop the walk
+// ---------------------------------------------------------------------------
+
+describe("T14R1: the successor closure is complete", () => {
+  const UN = { department: "unframed", line_sku: "INKA-KAN0566-A4-UN" } as const;
+  const cases: Array<[string, Ev[], Ev[]]> = [
+    ["an isolated middle insertion", [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")],
+      [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("new", "RP-X", A, "2026-11-15T08:10:00Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")]],
+    ["a removed cancellation of the middle line", [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("mid", "RP-M", A, "2026-11-15T08:10:00Z"), cancel("cx", "mid", null, B, "2026-11-15T08:15:00Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")],
+      [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("mid", "RP-M", A, "2026-11-15T08:10:00Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")]],
+    ["a middle line reassigned A -> B (B's later successor)", [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("mid", "RP-M", A, "2026-11-15T08:10:00Z"), verify("bnext", "RP-B", B, "2026-11-15T08:20:00Z"), verify("anext", "RP-A", A, "2026-11-15T08:30:00Z")],
+      [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("mid", "RP-M", B, "2026-11-15T08:10:00Z"), verify("bnext", "RP-B", B, "2026-11-15T08:20:00Z"), verify("anext", "RP-A", A, "2026-11-15T08:30:00Z")]],
+    ["a timestamp move past the next line", [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("mid", "RP-M", A, "2026-11-15T08:10:00Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z"), verify("last", "RP-L", A, "2026-11-15T08:40:00Z")],
+      [verify("prev", "RP-P", A, "2026-11-15T08:00:00Z"), verify("mid", "RP-M", A, "2026-11-15T08:30:00Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z"), verify("last", "RP-L", A, "2026-11-15T08:40:00Z")]],
+    ["a same-instant ASCII tie after the anchor", [verify("b", "RP-B", A, "2026-11-15T08:10:00.000001Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")],
+      [verify("a", "RP-A", A, "2026-11-15T08:10:00.000001Z"), verify("b", "RP-B", A, "2026-11-15T08:10:00.000001Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")]],
+    ["a same-instant non-BMP tie (bytewise after, UTF-16 before the anchor)", [verify("\u{1F600}", "RP-E", A, "2026-11-15T08:10:00.000001Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")],
+      [verify("\u{1F600}", "RP-E", A, "2026-11-15T08:10:00.000001Z"), verify("�", "RP-F", A, "2026-11-15T08:10:00.000001Z"), verify("next", "RP-N", A, "2026-11-15T08:20:00Z")]],
+    ["a same-type successor behind an inserted other-type line", [verify("f0", "RP-0", A, "2026-11-15T08:00:00Z"), verify("f2", "RP-2", A, "2026-11-15T08:30:00Z")],
+      [verify("f0", "RP-0", A, "2026-11-15T08:00:00Z"), verify("u1", "RP-1", A, "2026-11-15T08:10:00Z", UN), verify("f2", "RP-2", A, "2026-11-15T08:30:00Z")]],
+  ];
+  for (const [name, before, after] of cases) {
+    it(`${name}: complete enumeration and exact site/self parity at page caps 1, 2 and 200`, async () => {
+      const hashes = new Set<string>();
+      for (const maxPage of [1, 2, 200]) {
+        const r = await refreshParity(before, after, { maxPage });
+        expect(r.problems, `maxPage ${maxPage}`).toEqual([]);
+        hashes.add(canonicalJson(r.out.works.map((w) => w.desc)));
+      }
+      expect(hashes.size).toBe(1); // page-size independent
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// T14R2: member boundaries in the projector's order (UTF-16), transport stays bytewise
+// ---------------------------------------------------------------------------
+
+describe("T14R2: member boundaries use the projector's order", () => {
+  it("members U+1F600 and U+FFFD at the same instant: the earliest is U+1F600; both predecessor kinds are found below it", async () => {
+    const events = [
+      verify("pf", "RP-0", A, "2026-11-15T07:40:00Z"), // same-type (framed) predecessor
+      verify("pu", "RP-U", A, "2026-11-15T08:00:00Z", { department: "unframed", line_sku: "INKA-KAN0566-A4-UN" }), // any-type predecessor
+      verify("\u{1F600}", "RP-1", A, "2026-11-15T08:10:00.000001Z"),
+      verify("�", "RP-1", A, "2026-11-15T08:10:00.000001Z"),
+    ];
+    const sigs = new Set<string>();
+    for (const maxPage of [1, 2, 200]) {
+      const out = await materializeBatch(memoryFrozenReader({ site: SITE, cutoff: CUT, kind: "rebuild", view: events, changed: [], maxPage }));
+      for (const aud of audiencesOf(events)) {
+        for (const [k, rows] of oracle(events, aud)) {
+          const w = out.works.find((x) => `${x.desc.audienceKind}|${x.desc.audienceStaff ?? ""}|${ownerKey(x.desc)}` === `${aud.kind}|${aud.kind === "self" ? aud.staffId : ""}|${k}`);
+          expect(rowsJson(w?.rows), `${audKey(aud)} ${k} maxPage ${maxPage}`).toBe(rowsJson(rows));
+        }
+      }
+      const rp1 = out.works.find((w) => w.desc.audienceKind === "site" && w.desc.partitionKey === "RP-1")!;
+      expect(rp1.rows.timing_facts).toMatchObject([
+        { event_id: "\u{1F600}", prev_all_event_id: "pu", prev_same_type_event_id: "pf" },
+        { event_id: "�", prev_all_event_id: "\u{1F600}", prev_same_type_event_id: "\u{1F600}" },
+      ]);
+      sigs.add(canonicalJson(out.works.map((w) => w.desc)));
+    }
+    expect(sigs.size).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T14R3: budgets are enforced WHILE reading
+// ---------------------------------------------------------------------------
+
+/** Wrap a reader to count requests and rows actually handed to the materializer. */
+function counted(r: FrozenReader) {
+  const c = { stream: 0, streamRows: 0, children: 0, childRows: 0, members: 0, memberRows: 0 };
+  const w: FrozenReader = {
+    ...r,
+    site: r.site, cutoff: r.cutoff, kind: r.kind,
+    changedKeys: () => r.changedKeys(),
+    owners: () => r.owners(),
+    members: async (o, cap) => { c.members++; const m = await r.members(o, cap); for (const v of m.values()) c.memberRows += v.length; return m; },
+    byIds: (ids) => r.byIds(ids),
+    children: async function* (ids) { c.children++; for await (const k of r.children(ids)) { c.childRows++; yield k; } },
+    stream: async (s, d, f, l) => { c.stream++; const p = await r.stream(s, d, f, l); c.streamRows += p.length; return p; },
+    requests: () => r.requests(),
+  };
+  return { reader: w, c };
+}
+
+describe("T14R3: the 50,000 dependency budget is enforced while reading", () => {
+  const LIMIT = MAX_PARTITION_EVENTS;
+  const minute = (i: number) => new Date(Date.parse("2026-11-01T00:00:00Z") + i * 1000).toISOString().replace("Z", "000Z");
+
+  it("a successor walk that would consume more than 50,000 distinct events fails visibly, attributed to its seed, and stops reading promptly", async () => {
+    const view: Ev[] = [verify("seed", "RP-SEED", A, minute(0))];
+    for (let i = 1; i <= LIMIT + 100; i++) view.push(verify(`u${String(i).padStart(6, "0")}`, `RP-U${i}`, A, minute(i), { department: "unframed", line_sku: "INKA-KAN0566-A4-UN" }));
+    const changed = [{ id: "seed", before: null, after: view[0] }];
+    for (const maxPage of [200, 37]) {
+      const { reader, c } = counted(memoryFrozenReader({ site: SITE, cutoff: CUT, kind: "refresh", view, changed, maxPage }));
+      const err = await affectedOwners(reader).then(() => null, (e: unknown) => e);
+      expect(err, `maxPage ${maxPage}`).toBeInstanceOf(PartitionTooLargeError);
+      expect((err as PartitionTooLargeError).owner).toEqual({ partitionKind: "order", partitionKey: "RP-SEED" });
+      expect((err as PartitionTooLargeError).size).toBe(LIMIT + 1);
+      expect(c.streamRows, `maxPage ${maxPage}`).toBeLessThanOrEqual(LIMIT + maxPage); // at most one page of lookahead past the proof
+      expect(c.childRows).toBe(0);
+    }
+  }, 120_000);
+
+  it("a member with 60,000 inverse children stops at the first event proving overflow (50,001 consumed), not after reading all", async () => {
+    const view: Ev[] = [complete("t", "RP-1", A, minute(0))];
+    for (let i = 1; i <= 60_000; i++) view.push(cancel(`c${String(i).padStart(6, "0")}`, "t", null, B, minute(i)));
+    const { reader, c } = counted(memoryFrozenReader({ site: SITE, cutoff: CUT, kind: "rebuild", view, changed: [] }));
+    const err = await buildOwnerInput(reader, { partitionKind: "order", partitionKey: "RP-1" }).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(PartitionTooLargeError);
+    expect((err as PartitionTooLargeError).size).toBe(LIMIT + 1);
+    expect(c.childRows).toBe(LIMIT); // 1 member + 50,000 children = 50,001 distinct: proven, nothing more consumed
+  }, 120_000);
+
+  it("a large unused candidate beyond the stopping point is never read: its 60,000 cancellations do not count or change the hash", async () => {
+    const base = [verify("p0", "RP-0", A, minute(100)), verify("v", "RP-1", A, minute(200))];
+    const beyond = verify("old", "RP-OLD", A, minute(50)); // beyond p0: never consumed
+    const view: Ev[] = [...base, beyond];
+    for (let i = 1; i <= 60_000; i++) view.push(cancel(`k${String(i).padStart(6, "0")}`, "old", null, B, minute(60)));
+    const hashes = new Set<string>();
+    for (const maxPage of [1, 3, 200]) {
+      const { reader, c } = counted(memoryFrozenReader({ site: SITE, cutoff: CUT, kind: "rebuild", view, changed: [], maxPage }));
+      const input = await buildOwnerInput(reader, { partitionKind: "order", partitionKey: "RP-1" });
+      expect(input.events.map((e) => e.id)).toEqual(["p0", "v"]);
+      expect(c.childRows, `maxPage ${maxPage}`).toBe(0);
+      hashes.add(canonicalJson(input.events));
+    }
+    expect(hashes.size).toBe(1);
+  }, 120_000);
+
+  it("exactly 50,000 consumed events succeed at every page size: unconsumed lookahead beyond the stop is never charged", async () => {
+    const view: Ev[] = [];
+    for (let i = 0; i < 300; i++) view.push(ev(`old${String(i).padStart(3, "0")}`, "note_added", "RP-OLD", A, minute(i))); // lookahead only
+    view.push(verify("p0", "RP-0", A, minute(1000))); // the effective predecessor: the stop
+    for (let i = 0; i < LIMIT - 2; i++) view.push(ev(`n${String(i).padStart(6, "0")}`, "note_added", "RP-N", A, minute(2000 + i)));
+    view.push(verify("v", "RP-1", A, minute(2000 + LIMIT)));
+    for (const maxPage of [1, 200]) {
+      const input = await buildOwnerInput(memoryFrozenReader({ site: SITE, cutoff: CUT, kind: "rebuild", view, changed: [], maxPage }), { partitionKind: "order", partitionKey: "RP-1" });
+      expect(input.events, `maxPage ${maxPage}`).toHaveLength(LIMIT); // v + 49,998 notes + p0
+    }
+  }, 180_000);
+
+  it("owners are read one at a time (no 100-owner prefetch), and a batch whose total exceeds 50,000 events across owners stays valid", async () => {
+    const view: Ev[] = [];
+    for (let o = 0; o < 60; o++) for (let i = 0; i < 900; i++) view.push(ev(`n${o}-${i}`, "note_added", `RP-${o}`, A, minute(o * 1000 + i)));
+    const { reader, c } = counted(memoryFrozenReader({ site: SITE, cutoff: CUT, kind: "rebuild", view, changed: [] }));
+    const out = await materializeBatch(reader);
+    expect(out.stats.owners).toBe(60);
+    expect(out.stats.totalInput).toBe(54_000);
+    expect(c.members).toBe(60); // one owner per members read
+    expect(c.memberRows).toBe(54_000); // never another owner's members
+    expect(out.stats.peakInput).toBeLessThanOrEqual(900);
+  }, 120_000);
 });
 
 describe("Task 14: randomized source/derived parity (oracle over the complete history)", () => {

@@ -156,8 +156,8 @@ export interface FrozenReader {
   /** Members of each owner; at most `cap` per owner are returned (cap+1 proves an overflow). */
   members(owners: readonly Owner[], cap: number): Promise<Map<string, Ev[]>>;
   byIds(ids: readonly string[]): Promise<Map<string, Ev>>;
-  /** Frozen events whose parent_event_id is one of `parentIds`. */
-  children(parentIds: readonly string[]): Promise<Ev[]>;
+  /** Frozen events whose parent_event_id is one of `parentIds`, streamed lazily (a consumer that stops reads no more pages). */
+  children(parentIds: readonly string[]): AsyncIterable<Ev>;
   /** One page of a worker's events strictly before/after `from` (ordered away from it). */
   stream(staff: string, direction: "before" | "after", from: StreamPosition, limit: number): Promise<Ev[]>;
   requests(): number;
@@ -192,11 +192,24 @@ export function diffFrozenViews(before: readonly Ev[], after: readonly Ev[], pre
   return out.sort((p, q) => compareUtf8(p.id, q.id));
 }
 
-/** An in-memory frozen view with the same bounded contract as the 0040 RPCs (`maxPage` shortens stream pages, as a byte cap can). */
+/** An in-memory frozen view with the same bounded contract as the 0040/0041 RPCs (`maxPage` shortens stream pages, as a byte cap can). Indexed, so 50,000-row tests stay fast. */
 export function memoryFrozenReader(o: { site: string; cutoff: string; kind: "refresh" | "rebuild"; view: readonly Ev[]; changed: readonly ChangedKey[]; maxPage?: number }): FrozenReader {
   let n = 0;
   const view = [...o.view];
   const byId = new Map(view.map((e) => [e.id, e]));
+  const byOwner = new Map<string, Ev[]>();
+  const byParent = new Map<string, Ev[]>();
+  const byStaff = new Map<string, Array<{ e: Ev; us: bigint }>>();
+  for (const e of view) {
+    const k = ownerKey(ownerOfEvent(e));
+    (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(e);
+    if (e.parent_event_id !== null) (byParent.get(e.parent_event_id) ?? byParent.set(e.parent_event_id, []).get(e.parent_event_id)!).push(e);
+    if (e.staff_id) (byStaff.get(e.staff_id) ?? byStaff.set(e.staff_id, []).get(e.staff_id)!).push({ e, us: micros(e) });
+  }
+  const cmp = (a: { us: bigint; id: string }, b: { us: bigint; id: string }) => (a.us < b.us ? -1 : a.us > b.us ? 1 : compareUtf8(a.id, b.id));
+  for (const list of byStaff.values()) list.sort((x, y) => cmp({ us: x.us, id: x.e.id }, { us: y.us, id: y.e.id }));
+  for (const list of byParent.values()) list.sort((x, y) => compareUtf8(x.id, y.id));
+  for (const list of byOwner.values()) list.sort((x, y) => compareUtf8(x.id, y.id));
   return {
     site: o.site, cutoff: o.cutoff, kind: o.kind,
     async *changedKeys() {
@@ -213,29 +226,34 @@ export function memoryFrozenReader(o: { site: string; cutoff: string; kind: "ref
     },
     async members(owners, cap) {
       n++;
-      const want = new Set(owners.map(ownerKey));
-      const out = new Map<string, Ev[]>(owners.map((x) => [ownerKey(x), []]));
-      for (const e of view) {
-        const k = ownerKey(ownerOfEvent(e));
-        if (want.has(k) && out.get(k)!.length <= cap) out.get(k)!.push(e);
-      }
-      return out;
+      return new Map(owners.map((x) => [ownerKey(x), (byOwner.get(ownerKey(x)) ?? []).slice(0, cap + 1)]));
     },
     async byIds(ids) {
       n++;
       return new Map(ids.filter((id) => byId.has(id)).map((id) => [id, byId.get(id)!]));
     },
-    async children(parentIds) {
+    async *children(parentIds) {
       n++;
-      const p = new Set(parentIds);
-      return view.filter((e) => e.parent_event_id !== null && p.has(e.parent_event_id));
+      for (const p of [...new Set(parentIds)].sort(compareUtf8)) yield* byParent.get(p) ?? [];
     },
     async stream(staff, direction, from, limit) {
       n++;
-      const rows = view.filter((e) => e.staff_id === staff && (direction === "before" ? compareStream(e, { created_at: from.createdAt, id: from.id }) < 0 : compareStream(e, { created_at: from.createdAt, id: from.id }) > 0));
-      rows.sort(compareStream);
-      if (direction === "before") rows.reverse();
-      return rows.slice(0, Math.min(limit, o.maxPage ?? limit));
+      const list = byStaff.get(staff) ?? [];
+      const at = { us: micros({ created_at: from.createdAt, id: from.id }), id: from.id };
+      // first index strictly after `at`
+      let lo = 0;
+      let hi = list.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (cmp({ us: list[mid].us, id: list[mid].e.id }, at) <= 0) lo = mid + 1;
+        else hi = mid;
+      }
+      const size = Math.min(limit, o.maxPage ?? limit);
+      if (direction === "after") return list.slice(lo, lo + size).map((x) => x.e);
+      // strictly before: indexes < first index >= at
+      let j = lo;
+      while (j > 0 && cmp({ us: list[j - 1].us, id: list[j - 1].e.id }, at) >= 0) j--;
+      return list.slice(Math.max(0, j - size), j).reverse().map((x) => x.e);
     },
     requests: () => n,
   };
@@ -246,6 +264,12 @@ export function memoryFrozenReader(o: { site: string; cutoff: string; kind: "ref
 // ---------------------------------------------------------------------------
 
 interface StreamLine { ev: Ev; us: bigint; workType: string | null }
+
+/** The shared projector's logical order: exact instant, then the id in UTF-16 code-unit order (JS `<`). */
+export function projectorOrder(a: { us: bigint; id: string }, b: { us: bigint; id: string }): number {
+  return a.us < b.us ? -1 : a.us > b.us ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+const lineOrder = (l: StreamLine) => ({ us: l.us, id: l.ev.id });
 
 /** A due, well-identified stream verification of a worker (the projector's timing-stream candidates). */
 function streamLine(e: Ev, cutoffUs: bigint): StreamLine | null {
@@ -265,13 +289,45 @@ function siteEffective(reader: FrozenReader, l: StreamLine, kids: readonly Ev[])
 }
 
 /**
+ * T14R3: the dependency budget of ONE owner input or ONE successor seed: a
+ * count of DISTINCT consumed source/dependency event ids. The first id beyond
+ * MAX_PARTITION_EVENTS throws partition_too_large at once (nothing more is read
+ * for that owner/seed; nothing is truncated).
+ */
+export class DependencyBudget {
+  private readonly ids = new Set<string>();
+  constructor(readonly owner: Owner) {}
+  take(e: Pick<Ev, "id">): boolean {
+    if (this.ids.has(e.id)) return false;
+    this.ids.add(e.id);
+    if (this.ids.size > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError(this.owner, this.ids.size);
+    return true;
+  }
+  get size(): number {
+    return this.ids.size;
+  }
+}
+
+/** Read the cancellations of ONE consumed line incrementally, charging each to the budget as it arrives. */
+async function consumeChildren(reader: FrozenReader, id: string, budget: DependencyBudget, onKid: (k: Ev) => void): Promise<Ev[]> {
+  const kids: Ev[] = [];
+  for await (const k of reader.children([id])) {
+    budget.take(k);
+    onKid(k);
+    kids.push(k);
+  }
+  return kids;
+}
+
+/**
  * The exact stream walk. A worker's events are CONSUMED one at a time in
- * stream order from `from` (exclusive). Each consumed stream candidate brings
- * its own cancellations and is judged site-effective; `onLine` says whether
- * the walk is now satisfied. Once satisfied, the walk finishes that line's
- * instant (ties are kept whole) and stops. What is consumed depends only on
- * the frozen view, never on page sizes (a short, byte-capped page is not the
- * end; only an empty page is).
+ * bytewise transport order from `from` (exclusive). Each consumed event is
+ * charged to the budget; each consumed stream candidate reads its OWN
+ * cancellations incrementally (unconsumed candidates on a fetched page are
+ * lookahead only: never charged, never read, never in the input) and is judged
+ * site-effective. `onLine` says whether the walk is now satisfied; once
+ * satisfied the walk finishes that line's instant (ties are kept whole) and
+ * stops. Only an empty page ends the stream.
  */
 async function exactWalk(
   reader: FrozenReader,
@@ -279,32 +335,24 @@ async function exactWalk(
   from: StreamPosition,
   direction: "before" | "after",
   cutoffUs: bigint,
+  budget: DependencyBudget,
   onEvent: (e: Ev) => void,
-  onLine: (l: StreamLine, effective: boolean, kids: readonly Ev[]) => boolean,
+  onLine: (l: StreamLine, effective: boolean) => boolean,
 ): Promise<void> {
   let stopAt: bigint | null = null;
   let cursor = from;
   for (;;) {
     const page = await reader.stream(staff, direction, cursor, STREAM_PAGE);
     if (!page.length) return;
-    // Cancellations of every candidate on the page in one bounded read; only consumed candidates' join the input.
-    const candidates = page.map((e) => streamLine(e, cutoffUs)).filter((l): l is StreamLine => l !== null);
-    const kidsOf = new Map<string, Ev[]>();
-    if (candidates.length) {
-      for (const k of await reader.children(candidates.map((l) => l.ev.id))) {
-        const list = kidsOf.get(k.parent_event_id!) ?? [];
-        list.push(k);
-        kidsOf.set(k.parent_event_id!, list);
-      }
-    }
     for (const e of page) {
       const us = micros(e);
       if (stopAt !== null && (direction === "before" ? us < stopAt : us > stopAt)) return;
+      budget.take(e);
       onEvent(e);
       const l = streamLine(e, cutoffUs);
       if (!l) continue;
-      const kids = kidsOf.get(e.id) ?? [];
-      if (onLine(l, siteEffective(reader, l, kids), kids) && stopAt === null) stopAt = l.us;
+      const kids = await consumeChildren(reader, e.id, budget, onEvent);
+      if (onLine(l, siteEffective(reader, l, kids)) && stopAt === null) stopAt = l.us;
     }
     const last = page[page.length - 1];
     cursor = { createdAt: last.created_at, id: last.id };
@@ -312,16 +360,19 @@ async function exactWalk(
 }
 
 /**
- * Timing successors of a changed position: every stream line of the worker
- * after it, up to and including the first site-effective line of all types and
- * of each type in `types` (ties kept whole). Their prev pointers may change.
+ * T14R1: timing successors of an ANCHOR (a changed/affected stream line, by
+ * its full identity). Every consumed stream line is affected (ties at the
+ * anchor's instant included), but only a site-effective line STRICTLY AFTER
+ * the anchor in the projector's order can satisfy the stop — the anchor itself
+ * and earlier ties never do. Stops after an effective line of all types and of
+ * each type in `types`. Budgeted per seed.
  */
-async function walkSuccessors(reader: FrozenReader, staff: string, from: StreamPosition, types: ReadonlySet<string>, cutoffUs: bigint): Promise<StreamLine[]> {
+async function walkSuccessors(reader: FrozenReader, anchor: StreamLine, types: ReadonlySet<string>, cutoffUs: bigint, budget: DependencyBudget): Promise<StreamLine[]> {
   const need = new Set<string>(["*", ...types]);
   const lines: StreamLine[] = [];
-  await exactWalk(reader, staff, from, "after", cutoffUs, () => undefined, (l, effective) => {
+  await exactWalk(reader, anchor.ev.staff_id!, { createdAt: isoOfMicros(anchor.us), id: "" }, "after", cutoffUs, budget, () => undefined, (l, effective) => {
     lines.push(l);
-    if (effective) {
+    if (effective && projectorOrder(lineOrder(l), lineOrder(anchor)) > 0) {
       need.delete("*");
       if (l.workType !== null) need.delete(l.workType);
     }
@@ -343,63 +394,45 @@ export interface OwnerInput {
 
 export async function buildOwnerInput(reader: FrozenReader, owner: Owner, membersIn?: Ev[]): Promise<OwnerInput> {
   const members = membersIn ?? (await reader.members([owner], MAX_PARTITION_EVENTS)).get(ownerKey(owner)) ?? [];
-  if (members.length > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError(owner, members.length);
+  const budget = new DependencyBudget(owner);
+  const context = new Map<string, Ev>();
+  const keep = (e: Ev) => {
+    budget.take(e);
+    context.set(e.id, e);
+  };
+  for (const e of members) keep(e); // a members read of cap+1 proves the overflow here
   const cutoffUs = exactInstant(reader.cutoff);
   if (cutoffUs === null) throw new RangeError("the frozen cutoff is not an exact instant");
-  const context = new Map<string, Ev>(members.map((e) => [e.id, e]));
-  const budget = () => {
-    if (context.size > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError(owner, context.size);
-  };
   // Parents of members (a cancellation's edge needs its parent's role/time/sides).
-  const parentIds = [...new Set(members.map((e) => e.parent_event_id).filter((p): p is string => !!p && !context.has(p)))];
-  for (let i = 0; i < parentIds.length; i += 500) for (const [id, e] of await reader.byIds(parentIds.slice(i, i + 500))) context.set(id, e);
-  budget();
-  // Inverse children of members (they decide a member's effectiveness).
-  const ids = members.map((e) => e.id);
-  for (let i = 0; i < ids.length; i += 500) for (const k of await reader.children(ids.slice(i, i + 500))) context.set(k.id, k);
-  budget();
-  // Stream predecessors: per worker, from the worker's LATEST member line down past an effective
-  // predecessor (all types and each member type) below its EARLIEST member line.
+  const parentIds = [...new Set(members.map((e) => e.parent_event_id).filter((p): p is string => !!p && !context.has(p)))].sort(compareUtf8);
+  for (let i = 0; i < parentIds.length; i += 500) for (const e of (await reader.byIds(parentIds.slice(i, i + 500))).values()) keep(e);
+  // Inverse children of members, incrementally and budgeted (they decide a member's effectiveness).
+  for (const m of [...members].sort((x, y) => compareUtf8(x.id, y.id))) for await (const k of reader.children([m.id])) keep(k);
+  // Stream predecessors: per worker, from the worker's LATEST member line down past an effective predecessor
+  // (all types and each member type) below its EARLIEST member line — boundaries in the PROJECTOR's order (T14R2).
   const byWorker = new Map<string, StreamLine[]>();
   for (const e of members) {
     const l = streamLine(e, cutoffUs);
     if (!l) continue;
-    const list = byWorker.get(e.staff_id!) ?? [];
-    list.push(l);
-    byWorker.set(e.staff_id!, list);
+    (byWorker.get(e.staff_id!) ?? byWorker.set(e.staff_id!, []).get(e.staff_id!)!).push(l);
   }
   for (const [staff, lines] of [...byWorker.entries()].sort((x, y) => compareUtf8(x[0], y[0]))) {
-    lines.sort((x, y) => compareStream(x.ev, y.ev));
-    const latest = lines[lines.length - 1];
+    lines.sort((x, y) => projectorOrder(lineOrder(x), lineOrder(y)));
+    const earliest = lines[0];
+    const latestUs = lines[lines.length - 1].us;
     const types = new Set(lines.map((l) => l.workType).filter((t): t is string => t !== null));
+    const need = new Set<string>(["*", ...types]);
     // Start just after the latest member's microsecond so every tie at that instant is read too.
-    await walkBelow(reader, staff, latest.us + 1n, lines[0], types, context, budget, cutoffUs);
+    await exactWalk(reader, staff, { createdAt: isoOfMicros(latestUs + 1n), id: "" }, "before", cutoffUs, budget, (e) => void context.set(e.id, e), (l, effective) => {
+      if (effective && projectorOrder(lineOrder(l), lineOrder(earliest)) < 0) {
+        need.delete("*");
+        if (l.workType !== null) need.delete(l.workType);
+      }
+      return need.size === 0;
+    });
   }
   const events = [...context.values()].sort((x, y) => compareUtf8(x.id, y.id));
   return { owner, members: [...members].sort((x, y) => compareUtf8(x.id, y.id)), events };
-}
-
-/**
- * Stream predecessors: walk a worker's events down from (startUs, "") — every
- * consumed event and every consumed candidate's cancellations join the input —
- * until a site-effective line of all types and of each member type has been
- * found BELOW the earliest member line (ties kept whole).
- */
-async function walkBelow(reader: FrozenReader, staff: string, startUs: bigint, earliest: StreamLine, types: ReadonlySet<string>, context: Map<string, Ev>, budget: () => void, cutoffUs: bigint): Promise<void> {
-  const need = new Set<string>(["*", ...types]);
-  const below = (l: StreamLine) => l.us < earliest.us || (l.us === earliest.us && l.ev.id < earliest.ev.id);
-  await exactWalk(reader, staff, { createdAt: isoOfMicros(startUs), id: "" }, "before", cutoffUs, (e) => {
-    context.set(e.id, e);
-    budget();
-  }, (l, effective, kids) => {
-    for (const k of kids) context.set(k.id, k);
-    budget();
-    if (effective && below(l)) {
-      need.delete("*");
-      if (l.workType !== null) need.delete(l.workType);
-    }
-    return need.size === 0;
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +454,7 @@ export async function affectedOwners(reader: FrozenReader): Promise<Affected> {
   const add = (o: Owner) => owners.set(ownerKey(o), o);
   const changedIds: string[] = [];
   const parentIds = new Set<string>();
-  const walks: StreamLine[] = [];
+  const anchors: StreamLine[] = [];
   for await (const k of reader.changedKeys()) {
     changedIds.push(k.id);
     for (const img of [k.before, k.after]) {
@@ -429,31 +462,28 @@ export async function affectedOwners(reader: FrozenReader): Promise<Affected> {
       add(ownerOfEvent(img)); // old and new owners (also invalid-identity and due future keys)
       if (img.parent_event_id) parentIds.add(img.parent_event_id);
       const l = streamLine(img, cutoffUs);
-      if (l) walks.push(l);
+      if (l) anchors.push(l); // the old position (old worker/time) and the new one
     }
     if (k.before?.staff_id) {
       const key = ownerKey(ownerOfEvent(k.before));
-      const set = oldStaff.get(key) ?? new Set<string>();
-      set.add(k.before.staff_id);
-      oldStaff.set(key, set);
+      (oldStaff.get(key) ?? oldStaff.set(key, new Set<string>()).get(key)!).add(k.before.staff_id);
     }
   }
   // Parents (their effectiveness/edges change) and their timing successors.
-  const parents = [...parentIds];
+  const parents = [...parentIds].sort(compareUtf8);
   for (let i = 0; i < parents.length; i += 500) {
     for (const p of (await reader.byIds(parents.slice(i, i + 500))).values()) {
       add(ownerOfEvent(p));
       const l = streamLine(p, cutoffUs);
-      if (l) walks.push(l);
+      if (l) anchors.push(l);
     }
   }
-  // Inverse children of every changed key (their edge reads this parent).
-  for (let i = 0; i < changedIds.length; i += 500) for (const c of await reader.children(changedIds.slice(i, i + 500))) add(ownerOfEvent(c));
-  // Timing successors: from each changed/affected stream position forward, every stream line up to the first
-  // effective one of all types and of the line's type (ties kept whole).
-  for (const w of walks) {
-    const types = new Set<string>(w.workType ? [w.workType] : []);
-    const lines = await walkSuccessors(reader, w.ev.staff_id!, { createdAt: isoOfMicros(w.us), id: "" }, types, cutoffUs);
+  // Inverse children of every changed key (their edge reads this parent): owners only, nothing retained.
+  for (const id of changedIds) for await (const c of reader.children([id])) add(ownerOfEvent(c));
+  // Timing successors, each seed with its own dependency budget (attributed to the seed's owner).
+  for (const a of anchors) {
+    const types = new Set<string>(a.workType ? [a.workType] : []);
+    const lines = await walkSuccessors(reader, a, types, cutoffUs, new DependencyBudget(ownerOfEvent(a.ev)));
     for (const l of lines) add(ownerOfEvent(l.ev));
   }
   return { owners: [...owners.values()].sort((x, y) => compareUtf8(ownerKey(x), ownerKey(y))), oldStaff };
@@ -464,38 +494,33 @@ export async function affectedOwners(reader: FrozenReader): Promise<Affected> {
 // ---------------------------------------------------------------------------
 
 export interface MaterializedWork { desc: WorkDescriptor; rows: ResultRows; inputRows: number }
-export interface MaterializeStats { owners: number; works: number; maxInput: number; totalInput: number; requests: number }
+export interface MaterializeStats { owners: number; works: number; maxInput: number; totalInput: number; requests: number; peakInput: number }
 
 function partitionInput(reader: FrozenReader, audience: ReportingAudience, events: readonly Ev[]): FrozenPartitionInput {
   const visible = audience.kind === "self" ? events.filter((e) => e.staff_id === audience.staffId) : events;
   return { site: reader.site, audience, ruleVersion: REPORTING_RULE_VERSION, sourceCutoffUtc: reader.cutoff, events: visible };
 }
 
-/** Materialize the given owners; `onWork` receives each audience's descriptor and owner rows (streaming, bounded memory). */
+/** Materialize the given owners ONE AT A TIME (no multi-owner prefetch); `onWork` streams each audience's descriptor and owner rows. */
 export async function materializeOwners(reader: FrozenReader, owners: readonly Owner[], oldStaff: ReadonlyMap<string, ReadonlySet<string>>, onWork: (w: MaterializedWork) => void | Promise<void>, stats: MaterializeStats): Promise<void> {
-  for (let i = 0; i < owners.length; i += 100) {
-    const group = owners.slice(i, i + 100);
-    const members = await reader.members(group, MAX_PARTITION_EVENTS);
-    for (const owner of group) {
-      const own = members.get(ownerKey(owner)) ?? [];
-      if (own.length > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError(owner, own.length);
-      const input = await buildOwnerInput(reader, owner, own);
-      stats.owners++;
-      stats.maxInput = Math.max(stats.maxInput, input.events.length);
-      stats.totalInput += input.events.length;
-      const staff = new Set<string>(input.members.map((e) => e.staff_id).filter((s): s is string => !!s));
-      for (const s of oldStaff.get(ownerKey(owner)) ?? []) staff.add(s);
-      const audiences: ReportingAudience[] = [{ kind: "site" }, ...[...staff].sort(compareUtf8).map((staffId) => ({ kind: "self" as const, staffId }))];
-      for (const audience of audiences) {
-        const pin = partitionInput(reader, audience, input.events);
-        const result = projectReportingPartition(pin);
-        await onWork({
-          desc: { audienceKind: audience.kind, audienceStaff: audience.kind === "self" ? audience.staffId : null, partitionKind: owner.partitionKind, partitionKey: owner.partitionKey, inputHash: sha256Hex(canonicalJson(pin)) },
-          rows: ownerRows(result, owner),
-          inputRows: pin.events.length,
-        });
-        stats.works++;
-      }
+  for (const owner of owners) {
+    const input = await buildOwnerInput(reader, owner);
+    stats.owners++;
+    stats.maxInput = Math.max(stats.maxInput, input.events.length);
+    stats.peakInput = Math.max(stats.peakInput, input.events.length);
+    stats.totalInput += input.events.length;
+    const staff = new Set<string>(input.members.map((e) => e.staff_id).filter((s): s is string => !!s));
+    for (const s of oldStaff.get(ownerKey(owner)) ?? []) staff.add(s);
+    const audiences: ReportingAudience[] = [{ kind: "site" }, ...[...staff].sort(compareUtf8).map((staffId) => ({ kind: "self" as const, staffId }))];
+    for (const audience of audiences) {
+      const pin = partitionInput(reader, audience, input.events);
+      const result = projectReportingPartition(pin);
+      await onWork({
+        desc: { audienceKind: audience.kind, audienceStaff: audience.kind === "self" ? audience.staffId : null, partitionKind: owner.partitionKind, partitionKey: owner.partitionKey, inputHash: sha256Hex(canonicalJson(pin)) },
+        rows: ownerRows(result, owner),
+        inputRows: pin.events.length,
+      });
+      stats.works++;
     }
   }
   stats.requests = reader.requests();
@@ -503,7 +528,7 @@ export async function materializeOwners(reader: FrozenReader, owners: readonly O
 
 /** Whole batch in memory (tests and small refreshes): every affected (refresh) or every (rebuild) owner and audience. */
 export async function materializeBatch(reader: FrozenReader): Promise<{ works: MaterializedWork[]; stats: MaterializeStats }> {
-  const stats: MaterializeStats = { owners: 0, works: 0, maxInput: 0, totalInput: 0, requests: 0 };
+  const stats: MaterializeStats = { owners: 0, works: 0, maxInput: 0, totalInput: 0, requests: 0, peakInput: 0 };
   let owners: Owner[];
   let oldStaff: Map<string, Set<string>> = new Map();
   if (reader.kind === "refresh") ({ owners, oldStaff } = await affectedOwners(reader));
