@@ -11,6 +11,7 @@ import { REPORTING_RULE_VERSION } from "../../src/lib/domain/productionReporting
 import { projectReportingPartition } from "../../src/lib/domain/productionReportingProjection";
 import { RESULT_TABLES, resultRowProblem } from "../../api/_lib/reporting-stage";
 import { rowsByOwner } from "../fixtures/reporting-rows";
+import { evidenceOrderKey } from "../../src/lib/domain/productionCounts";
 import {
   compareFullState,
   STATE_QUERIES,
@@ -21,6 +22,9 @@ import {
   type FullState,
   expectEqual,
   fixtureRows,
+  BLANK_ORDER,
+  insertFixtures,
+  productionEventAdmissibility,
   migrationBody,
   MIGRATION_0038,
   newPublicationReport,
@@ -223,7 +227,7 @@ describe("source guards", () => {
 // ---------------------------------------------------------------------------
 
 import { runCaptureLifecycle, initialReport, finalReport } from "../staging/reportingCapture";
-import { cleanup, cleanupDecision, committedAllowance, DISCOVERY, expectedEpochIncrement, newOwnership, ownedCall, preflightProblems, runCommitted, type Conn, type Discovery, type PreflightSnapshot } from "../staging/reportingCommitted";
+import { BEGIN_GUARD_SQL, fxRow, guardBeginOwnership, cleanup, cleanupDecision, committedAllowance, DISCOVERY, expectedEpochIncrement, newOwnership, ownedCall, preflightProblems, runCommitted, type Conn, type Discovery, type PreflightSnapshot } from "../staging/reportingCommitted";
 import type { Site } from "../staging/reportingPublication";
 
 describe("T13B2b-3: report persistence never skips cleanup or the fresh audit", () => {
@@ -464,7 +468,7 @@ describe("committed harness (prepared, not run)", () => {
 
   // ---- execution with a scripted connection --------------------------------------------------------
   type Script = { log: string[]; conn: Conn; ends: number; rollbacks: number };
-  function scripted(opts: { fail?: (sql: string) => Error | null; pid?: number; alive?: () => boolean; epochAfter?: string } = {}): Script {
+  function scripted(opts: { fail?: (sql: string) => Error | null; pid?: number; alive?: () => boolean; epochAfter?: string; pointer?: string | null; live?: string[] } = {}): Script {
     const s: Script = { log: [], conn: null as unknown as Conn, ends: 0, rollbacks: 0 };
     s.conn = {
       query: async (sql: string, params: unknown[] = []) => {
@@ -476,6 +480,9 @@ describe("committed harness (prepared, not run)", () => {
         if (sql.startsWith("select pg_backend_pid()")) return { rows: [{ p: opts.pid ?? 77 }], rowCount: 1 };
         if (sql.startsWith("select current_user")) return { rows: [{ u: "service_role", claims: '{"role":"service_role"}' }], rowCount: 1 };
         if (sql.includes("capture_epoch::text as e from reporting_private.control where singleton for update")) return { rows: [{ e: "3" }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.control) return { rows: [{ e: "3" }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.site) return { rows: [{ b: opts.pointer ?? null }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.batches) return { rows: (opts.live ?? []).map((b) => ({ b, state: "active" })), rowCount: (opts.live ?? []).length };
         if (sql.includes("public.set_reporting_capture")) return { rows: [{ capture_epoch: opts.epochAfter ?? "4", capture_enabled: params[0] }], rowCount: 1 };
         if (sql.includes("select site, processor_enabled, active_generation_id::text as g")) return { rows: [{ site: "au", processor_enabled: false, g: null, e: null, c: null }, { site: "uk", processor_enabled: false, g: null, e: null, c: null }], rowCount: 2 };
         if (sql.includes("pg_stat_activity where pid")) return { rows: [{ x: opts.alive?.() ?? false }], rowCount: 1 };
@@ -490,7 +497,7 @@ describe("committed harness (prepared, not run)", () => {
     return s;
   }
   const ctxOf = (open: () => Promise<Conn>, save: () => void = () => undefined, record: (o: Observation) => void = () => undefined) => ({
-    sites: ["uk", "au"] as [Site, Site], staff: "s", maxPages: 1, open, as: async (c: Db, service: boolean) => void (await c.query(service ? "set local role service_role" : "reset role")),
+    sites: ["uk", "au"] as [Site, Site], staff: STAFF, maxPages: 1, open, as: async (c: Db, service: boolean) => void (await c.query(service ? "set local role service_role" : "reset role")),
     record, save, redact: (x: string) => x, now: () => 0, sleep: async () => undefined,
   });
 
@@ -718,6 +725,7 @@ describe("early-review residuals", () => {
         log.push(sql);
         if (sql.startsWith("select current_user")) return { rows: [{ u: "service_role", claims: '{"role":"service_role"}' }], rowCount: 1 };
         if (sql.startsWith("select pg_backend_pid")) return { rows: [{ p: 1 }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.control || sql === BEGIN_GUARD_SQL.site) return { rows: [{ e: "3", b: null }], rowCount: 1 };
         if (sql.includes("begin_reporting_batch")) return { rows: [{ batch_id: "ext-2", reused: true }], rowCount: 1 };
         return { rows: [], rowCount: 0 };
       },
@@ -778,5 +786,140 @@ describe("early-review residuals", () => {
       if (expectSet) expect(set, existing).toBeLessThan(prelock);
       expect(log.findIndex((l) => l.includes("name = 'lock_timeout'")), existing).toBeLessThan(prelock);
     }
+  });
+});
+
+describe("T13B2b-14: fixtures are admissible under the source constraints", () => {
+  it("every runner fixture passes the 0012/0029/0030 constraints; rp-x1 keeps a trimmed-blank order and its event partition", () => {
+    const rows = fixtureRows(STAFF);
+    for (const site of ["uk", "us", "au"]) expect(rows.flatMap((x) => productionEventAdmissibility(x, site))).toEqual([]);
+    const x1 = rows.find((x) => x.id === "rp-x1")!;
+    expect(x1.order_number).toBe(BLANK_ORDER);
+    expect(evidenceOrderKey(x1.order_number)).toBe("");
+    // The variants the harness inserts later (rp-v6, rp-i2, rp-i3) and every committed-mode fixture.
+    for (const id of ["rp-v6", "rp-i2", "rp-i3"]) expect(productionEventAdmissibility({ ...rows[0], id }, "uk")).toEqual([]);
+    for (const k of ["low", "high", "b", "c", "m"]) expect(productionEventAdmissibility(fxRow(STAFF, `rc-abcd1234-${k}`, "RC-abcd1234-A", "2026-01-13T09:00:00Z"), "uk")).toEqual([]);
+  });
+
+  it("the OLD empty-string fixture fails the contract (the staging 23514), as do other constraint breaks", () => {
+    const old = { ...fixtureRows(STAFF).find((x) => x.id === "rp-x1")!, order_number: "" };
+    expect(productionEventAdmissibility(old, "uk")).toEqual(['rp-x1: order_number "" violates production_events_order_number_check']);
+    const base = fixtureRows(STAFF)[0];
+    expect(productionEventAdmissibility({ ...base, order_number: null }, "uk").join()).toMatch(/order_number_check/);
+    expect(productionEventAdmissibility({ ...base, event_type: "clock_in", order_number: "RP-1" }, "uk").join()).toMatch(/order_number_check/);
+    expect(productionEventAdmissibility({ ...base, event_type: "clock_in", order_number: null }, "uk")).toEqual([]);
+    expect(productionEventAdmissibility({ ...base, department: "x" }, "uk").join()).toMatch(/department_check/);
+    expect(productionEventAdmissibility({ ...base, event_type: "verified" }, "uk").join()).toMatch(/event_type_check/);
+    expect(productionEventAdmissibility({ ...base, line_quantity: 0 }, "uk").join()).toMatch(/line_quantity_check/);
+    expect(productionEventAdmissibility({ ...base, staff_id: "nope" }, "uk").join()).toMatch(/uuid/);
+    expect(productionEventAdmissibility(base, "eu").join()).toMatch(/locations key/);
+  });
+
+  it("insertFixtures refuses an inadmissible row before sending any SQL", async () => {
+    const sent: string[] = [];
+    const c = { query: async (sql: string) => (sent.push(sql), { rows: [], rowCount: 0 }) } as unknown as Db;
+    await expect(insertFixtures(c, "uk", [{ ...fixtureRows(STAFF)[0], order_number: "" }])).rejects.toThrow(/order_number_check/);
+    expect(sent).toEqual([]);
+    await insertFixtures(c, "uk", fixtureRows(STAFF));
+    expect(sent).toHaveLength(fixtureRows(STAFF).length);
+  });
+});
+
+describe("T13B2b-15: foreign live batches are refused under the begin RPC's own locks", () => {
+  type Rec = { log: string[]; conn: Conn };
+  function conn(state: { pointer: string | null; live: string[] }, beginRows: Array<Record<string, unknown>>): Rec {
+    const r: Rec = { log: [], conn: null as unknown as Conn };
+    r.conn = {
+      query: async (sql: string) => {
+        r.log.push(sql);
+        if (sql.startsWith("select current_user")) return { rows: [{ u: "service_role", claims: '{"role":"service_role"}' }], rowCount: 1 };
+        if (sql.startsWith("select pg_backend_pid")) return { rows: [{ p: 1 }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.control) return { rows: [{ e: "5" }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.site) return { rows: [{ b: state.pointer }], rowCount: 1 };
+        if (sql === BEGIN_GUARD_SQL.batches) return { rows: state.live.map((b) => ({ b, state: "active" })), rowCount: state.live.length };
+        if (/public\.begin_reporting_(batch|rebuild)\(/.test(sql)) {
+          // The RPC's real effect on an epoch-drifted foreign batch: fail it, clear the pointer, return a NEW id.
+          state.live = [];
+          state.pointer = String(beginRows[0]?.batch_id ?? "");
+          return { rows: beginRows, rowCount: beginRows.length };
+        }
+        return { rows: [], rowCount: 0 };
+      },
+      end: async () => undefined,
+    };
+    return r;
+  }
+  const ctx = (c: Conn) => ({ as: async () => undefined, save: () => undefined, open: async () => c, redact: (s: string) => s });
+
+  for (const fn of ["begin_reporting_rebuild", "begin_reporting_batch"]) {
+    it(`${fn}: an unknown epoch-drifted external batch is refused BEFORE the RPC (which would return a NEW id); state and pointer are untouched`, async () => {
+      const state = { pointer: "ext-drifted", live: ["ext-drifted"] };
+      const r = conn(state, [{ batch_id: "new-1", lease_fence: 2, reused: false }]);
+      const own = newOwnership(["uk", "au"], "g1");
+      await expect(ownedCall(ctx(r.conn), own, [])(r.conn, `select * from public.${fn}($1)`, ["uk"])).rejects.toThrow(/live batch\(es\) this run does not own \[ext-drifted\]/);
+      expect(r.log.some((l) => l.includes(`public.${fn}(`))).toBe(false); // the RPC never ran
+      expect(state).toEqual({ pointer: "ext-drifted", live: ["ext-drifted"] });
+      expect(r.log).not.toContain("commit");
+      expect(r.log.at(-1)).toBe("rollback");
+      expect(own.identities).toEqual([]);
+      // Lock order = the RPC's: control share, then site row, then the live batches; all before the RPC.
+      const i = (q: string) => r.log.indexOf(q);
+      expect(i(BEGIN_GUARD_SQL.control)).toBeGreaterThan(-1);
+      expect(i(BEGIN_GUARD_SQL.control)).toBeLessThan(i(BEGIN_GUARD_SQL.site));
+      expect(i(BEGIN_GUARD_SQL.site)).toBeLessThan(i(BEGIN_GUARD_SQL.batches));
+    });
+  }
+
+  it("a foreign active POINTER alone (no live row) is refused too", async () => {
+    const state = { pointer: "ext-ptr", live: [] as string[] };
+    const r = conn(state, [{ batch_id: "new-2" }]);
+    await expect(ownedCall(ctx(r.conn), newOwnership(["uk", "au"], "g2"), [])(r.conn, "select * from public.begin_reporting_rebuild($1)", ["uk"])).rejects.toThrow(/\[ext-ptr\]/);
+    expect(state.pointer).toBe("ext-ptr");
+  });
+
+  it("a foreign live batch ROW alone (pointer already cleared) is refused too", async () => {
+    const state = { pointer: null as string | null, live: ["ext-row"] };
+    const r = conn(state, [{ batch_id: "new-4" }]);
+    await expect(ownedCall(ctx(r.conn), newOwnership(["uk", "au"], "g6"), [])(r.conn, "select * from public.begin_reporting_batch($1)", ["uk"])).rejects.toThrow(/\[ext-row\]/);
+    expect(state).toEqual({ pointer: null, live: ["ext-row"] });
+  });
+
+  it("a KNOWN-owned live batch is allowed through: the reused replay commits under the same transaction's locks", async () => {
+    const state = { pointer: "mine-1", live: ["mine-1"] };
+    const r = conn(state, [{ batch_id: "mine-1", lease_fence: 3, reused: true }]);
+    const own = newOwnership(["uk", "au"], "g3");
+    own.identities.push({ kind: "batch", id: "mine-1", seq: null, state: "confirmed" });
+    const rows = await ownedCall(ctx(r.conn), own, [])(r.conn, "select * from public.begin_reporting_batch($1)", ["uk"]);
+    expect(rows).toEqual([{ batch_id: "mine-1", lease_fence: 3, reused: true }]);
+    expect(own.identities.map((i) => `${i.id}:${i.state}`)).toEqual(["mine-1:confirmed"]); // no duplicate identity
+    const begin = r.log.indexOf("begin");
+    const guard = r.log.indexOf(BEGIN_GUARD_SQL.control);
+    const rpcAt = r.log.findIndex((l) => l.includes("public.begin_reporting_batch("));
+    const commit = r.log.indexOf("commit");
+    expect(begin).toBeLessThan(guard);
+    expect(guard).toBeLessThan(rpcAt);
+    expect(rpcAt).toBeLessThan(commit);
+    expect(r.log.slice(begin, commit).filter((l) => l === "begin" || l === "commit" || l === "rollback")).toEqual(["begin"]); // one transaction: no gap between check and use
+  });
+
+  it("no live batch: begin proceeds and the NEW id is recorded tentative then confirmed", async () => {
+    const r = conn({ pointer: null, live: [] }, [{ batch_id: "new-3", lease_fence: 1, reused: false }]);
+    const own = newOwnership(["uk", "au"], "g4");
+    await ownedCall(ctx(r.conn), own, [])(r.conn, "select * from public.begin_reporting_rebuild($1)", ["uk"]);
+    expect(own.identities.map((i) => `${i.id}:${i.state}`)).toEqual(["new-3:confirmed"]);
+  });
+
+  it("a missing control or site row refuses (never treated as 'nothing active')", async () => {
+    const mk = (drop: string) => ({ query: async (sql: string) => (sql === drop ? { rows: [], rowCount: 0 } : sql === BEGIN_GUARD_SQL.site ? { rows: [{ b: null }], rowCount: 1 } : { rows: [{ e: "1" }], rowCount: 1 }) }) as unknown as Db;
+    const own = newOwnership(["uk", "au"], "g5");
+    await expect(guardBeginOwnership(mk(BEGIN_GUARD_SQL.control), own, "uk")).rejects.toThrow(/control row is missing/);
+    await expect(guardBeginOwnership(mk(BEGIN_GUARD_SQL.site), own, "uk")).rejects.toThrow(/site_state for uk is missing/);
+    await expect(guardBeginOwnership(mk(""), own, undefined)).rejects.toThrow(/site argument is missing/);
+  });
+
+  it("the guard SQL takes the RPC's locks: control FOR SHARE, site FOR UPDATE, live batches FOR UPDATE", () => {
+    expect(BEGIN_GUARD_SQL.control).toMatch(/from reporting_private\.control c where c\.singleton for share$/);
+    expect(BEGIN_GUARD_SQL.site).toMatch(/from reporting_private\.site_state s where s\.site = \$1 for update$/);
+    expect(BEGIN_GUARD_SQL.batches).toMatch(/b\.state in \('active', 'frozen', 'publishing'\).* for update$/);
   });
 });

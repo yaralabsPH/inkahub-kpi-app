@@ -1723,3 +1723,32 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - baseline smoke signing in: 1.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1075/1075 tests; build OK.
   - **Next:** root review of this checkpoint. Then root runs `--baseline-smoke`, followed by the authorized rollback rehearsal if clear. Installation and the committed harness wait for their reviews.
+- 2026-11-15 — B2b runtime-evidence repair (T13B2b-14 and -15 only; no SQL, no staging mode, nothing installed; 0038 SHA-256 still `14a808ea…714b1d`, 0037 still `531bb2c5…`; the failed rehearsal artifact is preserved, not retried):
+  - **T13B2b-14 (fixture):** `rp-x1` now uses `BLANK_ORDER` (three ASCII spaces) instead of `''`. 0030's `length(order_number) > 0` admits it. It still trims to `''` under both `evidenceOrderKey` and 0038's `btrim`, so the event partition and the invalid-verification and deletion semantics are unchanged. No constraint or counting rule changed.
+    - New `productionEventAdmissibility` (in `tests/staging/reportingPublication.ts`) mirrors the source table's own constraints: locations key, uuid staff, 0012 department/quantity, 0029 event types, 0030 order number.
+    - `insertFixtures` refuses an inadmissible row before sending any SQL. Every runner insert goes through it: S1, `rp-v6`, `rp-i2`, `rp-i3` and the committed-mode `fxRow`, which is now exported for the test.
+    - The scripted committed-run test context used `staff: "s"`; it now uses a uuid.
+  - **T13B2b-15 (foreign batches):** new `guardBeginOwnership` runs inside `ownedCall`'s transaction, before either begin RPC. It takes the RPC's lock order (`control` FOR SHARE, then the `site_state` row FOR UPDATE, then the site's live batches FOR UPDATE) and refuses if the active pointer or any live batch is not one of this run's known batch ids.
+    - The locks are held through the RPC and COMMIT, so nothing changes between the check and its use.
+    - On refusal the transaction rolls back before the RPC runs, so the external batch, its state and the pointer are untouched.
+    - A missing control or site row refuses; it is never read as "nothing active".
+    - The existing `reused` check stays as a second line. Timeouts and the migration are unchanged.
+  - **Tests (`tests/reporting/reportingPublicationRunner.test.ts`, 49 → 59):**
+    - All fixtures are admissible. The old `''` fixture fails with exactly `production_events_order_number_check`, and the other constraint breaks fail too. `insertFixtures` sends nothing for a bad row.
+    - The epoch-drifted external batch is refused for both begin RPCs. The fake RPC fails the batch and returns a NEW id if reached; the tests prove it never runs, state and pointer are unchanged, rollback happens and nothing is committed. The lock order is asserted.
+    - Also covered: a foreign pointer alone; a foreign live row alone; a known-owned reused replay inside one transaction (begin, guard, RPC, commit; no duplicate identity); a fresh begin recording the new id tentative then confirmed; missing control/site/site argument; the guard SQL's lock clauses.
+  - **Mutations:** 12/12 deliberate breaks caught:
+    - fixture back to `''`;
+    - length check dropped;
+    - insert guard skipped;
+    - clock-event rule ignored;
+    - begin guard skipped;
+    - pointer ignored;
+    - live rows ignored (this one first SURVIVED; the live-row-only test was added and it is now caught);
+    - all batches treated as owned;
+    - missing control tolerated;
+    - site locked before control;
+    - control lock dropped;
+    - guard only for `begin_reporting_batch`.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1086/1086 tests; build OK.
+  - **Next:** root review of this checkpoint, then the corrected rollback rehearsal. Installation and the committed harness wait for their own checks. Task 13 stays unchecked; no Task 14 work.

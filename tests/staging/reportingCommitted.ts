@@ -205,6 +205,41 @@ export function noteIdentities(own: Ownership, sql: string, rows: Array<Record<s
   return added;
 }
 
+/**
+ * T13B2b-15: the begin RPCs' own lock order, taken in the SAME transaction
+ * before the RPC runs: control FOR SHARE, then the site's row FOR UPDATE, then
+ * the site's live batches FOR UPDATE. The locks are held through the RPC and
+ * COMMIT, so nothing can change between this check and its use.
+ */
+export const BEGIN_GUARD_SQL = {
+  control: "select c.capture_epoch::text as e from reporting_private.control c where c.singleton for share",
+  site: "select s.active_batch_id::text as b from reporting_private.site_state s where s.site = $1 for update",
+  batches: "select b.batch_id::text as b, b.state from reporting_private.batches b where b.site = $1 and b.state in ('active', 'frozen', 'publishing') order by b.batch_id for update",
+} as const;
+
+/**
+ * T13B2b-15: refuse BEFORE begin_reporting_batch / begin_reporting_rebuild when
+ * the site has a live batch (or an active pointer) this run does not own. Either
+ * RPC may otherwise mark an unknown epoch-drifted batch failed, clear the
+ * pointer and return a NEW id, so checking only the returned `reused` flag
+ * cannot protect foreign state. On refusal the caller rolls back: the external
+ * batch, its state and the site's pointer are left exactly as they were.
+ */
+export async function guardBeginOwnership(c: Db, own: Ownership, site: unknown): Promise<void> {
+  if (typeof site !== "string") throw new Error("begin guard: the site argument is missing");
+  const ctl = await c.query(BEGIN_GUARD_SQL.control);
+  if (ctl.rows.length !== 1) throw new Error("begin guard: the reporting control row is missing; refusing to begin");
+  const st = await c.query(BEGIN_GUARD_SQL.site, [site]);
+  if (st.rows.length !== 1) throw new Error(`begin guard: site_state for ${site} is missing; refusing to begin`);
+  const live = (await c.query(BEGIN_GUARD_SQL.batches, [site])).rows.map((r) => String(r.b));
+  const pointer = st.rows[0].b == null ? [] : [String(st.rows[0].b)];
+  const mine = new Set(knownIds(own, "batch"));
+  const foreign = [...new Set([...pointer, ...live])].filter((b) => !mine.has(b));
+  if (foreign.length) {
+    throw new Error(`begin guard: ${site} has live batch(es) this run does not own [${foreign.join(", ")}]; refusing to begin so the RPC cannot invalidate or replace them`);
+  }
+}
+
 /** EXPECTED epoch increments: only this run's own CONFIRMED capture transitions (after − before). */
 export function expectedEpochIncrement(own: Ownership): number {
   return own.captureTransitions.filter((t) => t.state === "confirmed").reduce((n, t) => n + Number(BigInt(t.after) - BigInt(t.before)), 0);
@@ -386,6 +421,8 @@ export function ownedCall(ctx: Pick<CommittedCtx, "as" | "save" | "open" | "reda
         // Lock the control row FIRST: no other transition can interleave between this read and this run's own.
         before = String((await c.query("select capture_epoch::text as e from reporting_private.control where singleton for update")).rows[0].e);
       }
+      // T13B2b-15: foreign live batches are refused under the RPC's own locks, BEFORE it can invalidate them.
+      if (/public\.begin_reporting_(batch|rebuild)\(/.test(sql)) await guardBeginOwnership(c, own, params[0]);
       rows = (await c.query(sql, params)).rows;
       added = noteIdentities(own, sql, rows);
       if (capture) {
@@ -490,7 +527,7 @@ async function settle(c: Conn, label: string, failures: string[], redact: (s: st
   await c.end().catch((e) => failures.push(`${label} disconnect: ${msgOf(e, redact)}`));
 }
 
-const fxRow = (staff: string, id: string, order: string, at: string) => ({ id, event_type: "line_verified", order_number: order, line_sku: "INKA-KAN0566-A4-FB", line_quantity: 1, created_at: at, parent_event_id: null, department: "framed", staff_id: staff });
+export const fxRow = (staff: string, id: string, order: string, at: string) => ({ id, event_type: "line_verified", order_number: order, line_sku: "INKA-KAN0566-A4-FB", line_quantity: 1, created_at: at, parent_event_id: null, department: "framed", staff_id: staff });
 
 // ---------------------------------------------------------------------------
 // The run

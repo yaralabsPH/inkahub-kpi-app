@@ -270,6 +270,43 @@ export function expectEqual(ctx: FlowCtx, id: string, what: string, got: unknown
 // ---------------------------------------------------------------------------
 
 export const WS_ID = " ".repeat(37);
+/**
+ * T13B2b-14: a trimmed-blank order number. Migration 0030 requires a non-null,
+ * positive-LENGTH order number for every non-clock event, so '' is refused by
+ * production_events_order_number_check (23514). Whitespace is admissible there
+ * and still trims to '' (evidenceOrderKey and 0038's btrim), so rp-x1 keeps its
+ * event partition and its invalid-verification semantics.
+ */
+export const BLANK_ORDER = "   ";
+
+const SITES_ADMISSIBLE = ["au", "uk", "us"];
+const DEPARTMENTS = ["a0_framed", "framed", "unframed", "dispatch"]; // 0012
+const EVENT_TYPES = ["started", "completed", "cancelled", "dispatched", "line_verified", "clock_in", "clock_out"]; // 0029
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * T13B2b-14: the source table's own constraints (0012 columns/CHECKs, 0029
+ * event types, 0030 order number), checked locally so a fixture the database
+ * would refuse fails before any connection. Never a rule change: it only
+ * mirrors what production_events already enforces.
+ */
+export function productionEventAdmissibility(x: Record<string, unknown>, site: string): string[] {
+  const out: string[] = [];
+  const id = typeof x.id === "string" ? x.id : String(x.id);
+  if (!SITES_ADMISSIBLE.includes(site)) out.push(`${id}: location ${site} is not a locations key`);
+  if (typeof x.id !== "string") out.push(`${id}: id must be text`);
+  if (typeof x.staff_id !== "string" || !UUID_RE.test(x.staff_id)) out.push(`${id}: staff_id must be a uuid`);
+  if (typeof x.department !== "string" || !DEPARTMENTS.includes(x.department)) out.push(`${id}: department ${String(x.department)} violates production_events_department_check`);
+  if (typeof x.event_type !== "string" || !EVENT_TYPES.includes(x.event_type)) out.push(`${id}: event_type ${String(x.event_type)} violates production_events_event_type_check`);
+  const clock = x.event_type === "clock_in" || x.event_type === "clock_out";
+  const order = x.order_number;
+  if (clock ? order !== null : !(typeof order === "string" && order.length > 0)) out.push(`${id}: order_number ${JSON.stringify(order)} violates production_events_order_number_check`);
+  const q = x.line_quantity;
+  if (!(q === null || q === undefined || (Number.isInteger(q) && (q as number) > 0))) out.push(`${id}: line_quantity ${String(q)} violates production_events_line_quantity_check`);
+  if (x.line_sku !== null && x.line_sku !== undefined && typeof x.line_sku !== "string") out.push(`${id}: line_sku must be text`);
+  if (x.parent_event_id !== null && x.parent_event_id !== undefined && typeof x.parent_event_id !== "string") out.push(`${id}: parent_event_id must be text`);
+  if (typeof x.created_at !== "string" || Number.isNaN(Date.parse(x.created_at))) out.push(`${id}: created_at must be a timestamp`);
+  return out;
+}
 const FB = "INKA-KAN0566-A4-FB";
 const HOOK = "INKA-AUX-HOOK";
 const LEGACY = "A4 21x30 cm / Framed Print (Black)";
@@ -283,7 +320,7 @@ export function fixtureRows(staff: string): Array<Record<string, unknown>> {
     r("rp-c3", "cancelled", "RP-1", FB, 1, "2026-01-12T11:20:00Z", "rp-v3"),
     r("rp-v5", "line_verified", "RP-1", LEGACY, 1, "2026-01-12T11:25:00Z"), // unclassified: 0 Items, still a line
     r("rp-t1", "completed", "RP-1", null, null, "2026-01-12T11:30:00Z"),
-    r("rp-x1", "line_verified", "", FB, 1, "2026-01-12T12:00:00Z"), // event partition
+    r("rp-x1", "line_verified", BLANK_ORDER, FB, 1, "2026-01-12T12:00:00Z"), // event partition (trimmed-blank order)
     r(WS_ID, "line_verified", "RP-1", FB, 1, "2026-01-12T12:10:00Z"), // source issue
     r("rp-m1", "line_verified", "RP-M", FB, 1, "2026-01-12T12:20:00Z"), // later moved A -> B
     r("rp-v9", "line_verified", "RP-9", FB, 1, "2026-01-12T12:30:00Z"), // RP-9: timing + occurrence, later deleted
@@ -293,6 +330,9 @@ export function fixtureRows(staff: string): Array<Record<string, unknown>> {
 const FIXTURE_IDS = (rows: Array<Record<string, unknown>>) => rows.map((x) => String(x.id));
 
 export async function insertFixtures(c: Db, site: Site, rows: Array<Record<string, unknown>>): Promise<void> {
+  // T13B2b-14: refuse a database-inadmissible fixture BEFORE sending anything.
+  const bad = rows.flatMap((x) => productionEventAdmissibility(x, site));
+  if (bad.length) throw new Error(`fixture rows the source constraints would refuse: ${bad.join("; ")}`);
   for (const x of rows) {
     await c.query(
       `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, cs_case_id, parent_event_id)
