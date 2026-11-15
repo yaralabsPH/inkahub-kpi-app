@@ -720,6 +720,32 @@ Root will review this correction before authorizing any new staging invocation. 
 
 STATUS: COMPLETE
 
+### Connection-watch review and I5 correction handoff — 2026-11-15
+
+**Reviewed head:** `de45f2eb0172bfb6a68d922ee0f500e85748138f`. Exact-head CI passed (run `43692923059`); coder reports 1,249 tests and common gate passed. Independent offline review nevertheless found two blocking failure paths. No staging SQL was run for this review. Staging remains at the previously audited capture-off epoch15, all processors off/all legacy, with immutable 0037/0038/0039 installed. Task 13 remains open; Tasks 14–20 remain blocked.
+
+**Finding 1 — evidence persistence does not stop workers.** The runner's `evidence` callback throws if saving fails, but I4's monitor catches that into `monitorError` and awaits both entire rebuilds without failing the shared watch. An offline probe through the actual I4/watch helpers reproduced `ok:false` with `watch.failed():false`, no shared errors, and both workers issuing later freeze/publication SQL. Already-issued queries must settle; this does not permit subsequent SQL after a fatal save failure.
+
+**Finding 2 — I5 connection identity and expected close sequence.** `killOwnVictim` gets PID/application_name before `work()` starts its explicit transaction. Transaction pooling can invalidate that backend identity; application_name is not ownership proof. An offline probe using the installed pg 8.23.1 error/end handlers emitted expected 57P01 followed by the no-code `Connection terminated unexpectedly` error. Both current listeners reject that normal follow-on. Do not run full I0–I5 unchanged.
+
+#### T13B2b-23 — Stop all normal work after evidence persistence failure (Claude; offline only)
+
+- [ ] In `tests/staging/reportingCapture.ts` expose a shared fatal-failure entry point on the existing watch (redacted, sticky, same final-status error store), and wire the actual evidence persistence boundary in `tests/staging/reporting-jobs.ts` to latch failure BEFORE rethrowing. Avoid recursively persisting the same failing save. Retain the original save error and any later cleanup/audit errors; error listeners must still never throw.
+- [ ] Keep all normal client queries gated after failure, including each next step of workers already in progress. Await already-issued queries and both job promises; do not abandon them or reconnect. Only explicit rollback, cleanup and fresh audit may proceed under the existing cleanup phase. Do not enter that permissive phase while normal workers are still advancing.
+- [ ] Add a regression through the real persistence callback, watch, guarded worker clients and I4 coordinator: hold both workers at already-issued queries, fail a monitor-sample save, resolve the outstanding queries, and assert no subsequent copy/freeze/seal/publish SQL reaches either raw client. Assert both jobs settle, shared final status is FAILED, and rollback/disconnect/fresh audit are attempted. Keep the pre-work ownership-save failure case. Demonstrate the regression fails on `de45f2e` behavior.
+
+#### T13B2b-24 — Pin and prove the intentional I5 termination (Claude; offline only)
+
+- [ ] In `tests/staging/reportingPublication.ts`, obtain the victim's lossless PID, backend_start and xact_start AFTER `work()` while its explicit transaction is still open. Refuse missing transaction identity. Persist a run/scenario-labelled ownership receipt before requesting termination. Remove application_name as the termination authority; use the guarded monitor to terminate only the exact PID + backend-start + transaction-start match. Persist the returned matching identity and successful termination result. Missing, mismatched or false receipts fail I5; never fall back to PID alone.
+- [ ] Arm ONLY that victim immediately before the intentional kill. Consistently classify its expected 57P01 and then the exact no-code `Connection terminated unexpectedly` follow-on only AFTER its observed expected 57P01. Centralize classification or otherwise ensure both listeners see the same decision without consuming a stateful predicate twice. This allowance is provisional until the matching kill receipt succeeds. An unarmed/other-client error, follow-on before 57P01, ECONNRESET or any other unexpected error remains a sticky run failure. Retain listeners through disconnect and cleanup; no global exemptions.
+- [ ] Add offline tests replaying the actual installed-pg two-event sequence, including events before the kill response resolves, with a successful matching receipt. Reject false/no-match receipts, missing/changed identity, the follow-on before 57P01, unexpected reset and errors on another client. Assert identity is read inside the transaction after work, persisted before kill, and every termination predicate binds all identity fields. Cover failures during work/identity/save/kill and retain disconnect plus fresh-audit behavior.
+
+**Completion and next gate:** use focused failing regressions, then the common gate, strict runner typechecks and targeted sensitivity checks for the two fixes. Keep app/API code, dependencies, installed migrations, SQL timeouts, sampling bounds and acceptance targets unchanged. Record evidence in the implementation log; commit/push and verify exact-head CI, then pause for root review. Claude must not run SQL/staging modes or begin Task 14. After review clearance only, root takes a fresh full baseline and runs the corrected rollback I0–I5 once against staging `ybrzhrgfrnvtcwymjdrq`, with guarded temporary setup/restoration and a fresh full-state audit. Committed A–D remains conditional on that passing. Do not rerun the obsolete 0038-only repair rehearsal or reinstall 0039.
+
+This handoff authorizes the scoped offline corrections under CJ's existing autonomous coordination instruction. The staging gate is still FAILED; COMPLETE below applies only to this actionable coder handoff.
+
+STATUS: COMPLETE
+
 ## Amendment implementation log
 
 - 2026-11-14 (Codex, CJ's overnight delegation): CJ authorized autonomous coordination and routine decisions while asleep. Claude remains the coder; Codex handles planner decisions/review. One writer at a time, commit before handoff. Authorized feature work and necessary staging validation target only `ybrzhrgfrnvtcwymjdrq`, checked before every SQL run; additive staging schema application requires planner review first. Production/other-account access, merges, deployment, purchases, secret disclosure, destructive source cleanup and weakened acceptance/security limits remain excluded.
