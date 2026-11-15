@@ -21,7 +21,7 @@
  *   control timestamp. Nothing else is normalized.
  */
 import { capLimit, checkFence, checkFenceObservation, type FenceId, type FenceObservation, type FenceReport } from "./reportingFence";
-import { REPORTING_SCHEMA, runCaptureLifecycle } from "./reportingCapture";
+import { REPORTING_SCHEMA, runCaptureLifecycle, type ConnectionWatch } from "./reportingCapture";
 import { launch, type Launched } from "./reportingFence";
 import { settleOrigin, transitionIncrement, type CaptureTransition, type Conn } from "./reportingCommitted";
 import { compareFullState, type Db, type FullState, type StateAllowance } from "./reportingPublication";
@@ -188,6 +188,8 @@ export interface FenceRunIO {
   restore(enabled: boolean): Promise<void>;
   fullState(c: Db): Promise<FullState>;
   controlState(c: Db): Promise<{ epoch: number; enabled: boolean }>;
+  /** T13B2b-22: the run's connection watch (optional). */
+  watch?: ConnectionWatch;
 }
 
 export async function runFence(report: FenceReport, io: FenceRunIO): Promise<FenceReport> {
@@ -198,6 +200,7 @@ export async function runFence(report: FenceReport, io: FenceRunIO): Promise<Fen
     redact: io.redact,
     save: io.save,
     stderr: io.stderr,
+    watch: io.watch,
     body: async (main) => {
       try {
         await io.prepare(main);
@@ -221,6 +224,7 @@ export async function runFence(report: FenceReport, io: FenceRunIO): Promise<Fen
           if (recorded.length) throw new Error(`${s.id} recorded a failure (${recorded[0]}); later fence scenarios are not run`);
         }
       } finally {
+        io.watch?.phase("cleanup"); // T13B2b-22: restoration is cleanup, allowed after a connection failure
         // T13B2b-16: unconditional, after every scenario session has settled; on a FRESH connection.
         if (report.captureBefore) {
           try {

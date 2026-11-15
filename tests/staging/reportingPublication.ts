@@ -166,10 +166,12 @@ export interface PublicationReport extends LifecycleReport {
   diagnostic: Record<string, unknown> | null;
   /** --rehearse-rebuild-repair only: 0039 identities, function baseline/after, plan, timings and version intervals (no source payloads). */
   repair: Record<string, unknown> | null;
+  /** T13B2b-22: durable run evidence persisted DURING the run (I4 worker ownership before work, incremental monitor samples). */
+  evidence: Array<Record<string, unknown>>;
 }
 
 export function newPublicationReport(mode: PublicationMode, sites: [Site, Site], revision: string, startedAt: string, draftSha256: string): PublicationReport {
-  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, repair: null, errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
+  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, repair: null, evidence: [], errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
 }
 
 /** One STATUS line: COMPLETE only with every observation as expected, no error/cleanup failure and a verified restoration. */
@@ -203,6 +205,7 @@ export function publicationMarkdown(r: PublicationReport): string {
     ...(r.errors.length ? ["## Errors", ...r.errors.map((p) => `- ${p}`), ""] : []),
     ...(r.cleanup.length ? ["## Cleanup failures", ...r.cleanup.map((p) => `- ${p}`), ""] : []),
     ...(r.ownership ? ["## Cleanup ownership (recorded before the first commit)", "```json", JSON.stringify(r.ownership, null, 2), "```", ""] : []),
+    ...(r.evidence.length ? ["## Run evidence (persisted during the run)", "```json", JSON.stringify(r.evidence, null, 2), "```", ""] : []),
     ...(r.repair ? ["## 0039 rebuild-repair rehearsal (rolled back; not installed)", "", "```json", JSON.stringify(r.repair, null, 2), "```", ""] : []),
     ...(r.diagnostic ? ["## Plan diagnostic (source_versions INSERT; plan only, rolled back)", "", `- ${String(r.diagnostic.label)}`, "", "```json", JSON.stringify(r.diagnostic, null, 2), "```", ""] : []),
     ...(r.restorationProblems.length ? ["## Restoration problems", ...r.restorationProblems.map((p) => `- ${p}`), ""] : []),
@@ -708,6 +711,10 @@ export async function runPublicationFlow(c: Db, ctx: FlowCtx): Promise<void> {
 export interface InterleaveCtx {
   sites: [Site, Site];
   staff: string;
+  /** T13B2b-22: persist one evidence record durably NOW (throws on a persistence failure). Required by I4. */
+  evidence?(e: Record<string, unknown>): void;
+  /** T13B2b-22: arm ONE client's narrowly expected termination (I5's victim) in the run's connection watch. */
+  armExpected?(client: object, expected: (e: unknown) => boolean): () => number;
   open(): Promise<Db & { end(): Promise<void> }>;
   as(c: Db, service: boolean): Promise<void>;
   record(o: Observation): void;
@@ -766,7 +773,7 @@ export interface MonitoredOutcome<T> {
  * stops) and never strands a job: every job is always awaited and its outcome
  * returned. Jobs are observed at once (no unhandled rejection).
  */
-export async function monitorBackends<T>(mon: Db, pids: number[], jobs: Array<Promise<T>>, ctx: Pick<InterleaveCtx, "sleep" | "now" | "redact">, opts: { intervalMs?: number; maxSamples?: number } = {}): Promise<MonitoredOutcome<T>> {
+export async function monitorBackends<T>(mon: Db, pids: number[], jobs: Array<Promise<T>>, ctx: Pick<InterleaveCtx, "sleep" | "now" | "redact">, opts: { intervalMs?: number; maxSamples?: number; onSamples?: (batch: BackendSample[]) => void } = {}): Promise<MonitoredOutcome<T>> {
   const intervalMs = opts.intervalMs ?? 1000;
   const maxSamples = opts.maxSamples ?? 150; // 150 s: beyond the existing 2 min statement_timeout, never raised
   const t0 = ctx.now();
@@ -780,8 +787,13 @@ export async function monitorBackends<T>(mon: Db, pids: number[], jobs: Array<Pr
     try {
       const r = await mon.query(BACKEND_SAMPLE_SQL, [pids]);
       const t = Math.round(ctx.now() - t0);
-      for (const x of r.rows) {
-        samples.push({ t, pid: Number(x.pid), state: (x.state as string) ?? null, wait_event_type: (x.wait_event_type as string) ?? null, wait_event: (x.wait_event as string) ?? null, blocking: ((x.blocking as unknown[]) ?? []).map(Number), xact_ms: x.xact_ms == null ? null : Number(x.xact_ms) });
+      const batch: BackendSample[] = r.rows.map((x) => ({ t, pid: Number(x.pid), state: (x.state as string) ?? null, wait_event_type: (x.wait_event_type as string) ?? null, wait_event: (x.wait_event as string) ?? null, blocking: ((x.blocking as unknown[]) ?? []).map(Number), xact_ms: x.xact_ms == null ? null : Number(x.xact_ms) }));
+      samples.push(...batch);
+      try {
+        opts.onSamples?.(batch); // T13B2b-22: incremental, durable
+      } catch (pe) {
+        monitorError = `monitor evidence persistence failed: ${msgOf(pe, ctx.redact)}`;
+        break;
       }
     } catch (e) {
       monitorError = `monitor failed: ${msgOf(e, ctx.redact)}`;
@@ -837,6 +849,10 @@ async function zeroWorkRebuild(c: Db, ctx: InterleaveCtx, site: Site): Promise<R
   return publish(c, fctx, String(b.batch_id), Number(b.lease_fence));
 }
 
+/** T13B2b-22: a worker's own identity, lossless text timestamps (no application_name). */
+export const I4_OWNER_SQL = "select a.pid, a.backend_start::text as backend_start, a.xact_start::text as xact_start, pg_catalog.transaction_timestamp()::text as transaction_timestamp from pg_catalog.pg_stat_activity a where a.pid = pg_catalog.pg_backend_pid()";
+export interface I4Owner { site: Site; session: string; pid: number; backend_start: string; xact_start: string; transaction_timestamp: string }
+
 /**
  * T13B2b-19: I4 with exact-PID monitoring. Each worker's backend PID is read
  * inside its explicit transaction BEFORE publishing; while both publications
@@ -846,16 +862,27 @@ async function zeroWorkRebuild(c: Db, ctx: InterleaveCtx, site: Site): Promise<R
  */
 export async function i4Monitored(ctx: InterleaveCtx, a: Db, b: Db, mon: Db, work: (c: Db, site: Site) => Promise<unknown>, opts?: { intervalMs?: number; maxSamples?: number }): Promise<{ ok: boolean; result: string }> {
   const [A, B] = ctx.sites;
+  const evidence = ctx.evidence;
+  if (!evidence) throw new Error("I4 needs durable evidence persistence (ownership before work, incremental samples)");
   await a.query("begin");
   await b.query("begin");
-  const pa = Number((await a.query("select pg_backend_pid() as p")).rows[0].p);
-  const pb = Number((await b.query("select pg_backend_pid() as p")).rows[0].p);
-  const m = await monitorBackends(mon, [pa, pb], [work(a, A), work(b, B)], ctx, opts);
+  // T13B2b-22: each worker's exact identity, read INSIDE its explicit transaction, persisted BEFORE any rebuild work.
+  const owner = async (c: Db, site: Site, session: string): Promise<I4Owner> => {
+    const r = (await c.query(I4_OWNER_SQL)).rows[0];
+    if (!r) throw new Error(`I4 ${session}: its own backend is not visible in pg_stat_activity`);
+    return { site, session, pid: Number(r.pid), backend_start: String(r.backend_start), xact_start: String(r.xact_start), transaction_timestamp: String(r.transaction_timestamp) };
+  };
+  const oa = await owner(a, A, "worker-a");
+  const ob = await owner(b, B, "worker-b");
+  evidence({ kind: "i4-ownership", workers: [oa, ob] }); // a persistence failure throws here: no work starts
+  const pa = oa.pid;
+  const pb = ob.pid;
+  const m = await monitorBackends(mon, [pa, pb], [work(a, A), work(b, B)], ctx, { ...opts, onSamples: (batch) => evidence({ kind: "i4-samples", samples: batch }) });
   const [x, y] = m.outcomes;
   const ok = x.ok && y.ok && m.monitorError === null;
   const res = (o: (typeof m.outcomes)[number]) => (o.ok ? "published" : msgOf(o.e, ctx.redact));
-  const evidence = { pids: { [A]: pa, [B]: pb }, elapsedMs: m.elapsedMs, exhausted: m.exhausted, uncovered: m.uncovered, monitorError: m.monitorError, samples: compactSamples(m.samples) };
-  return { ok, result: `${A}: ${res(x)}; ${B}: ${res(y)}; monitor: ${JSON.stringify(evidence)}` };
+  const summary = { pids: { [A]: pa, [B]: pb }, elapsedMs: m.elapsedMs, exhausted: m.exhausted, uncovered: m.uncovered, monitorError: m.monitorError, samples: compactSamples(m.samples) };
+  return { ok, result: `${A}: ${res(x)}; ${B}: ${res(y)}; monitor: ${JSON.stringify(summary)}` };
 }
 
 export async function runInterleavings(ctx: InterleaveCtx, cleanupFailures: string[]): Promise<void> {
@@ -966,7 +993,7 @@ export async function killOwnVictim(
   victim: Db & { end(): Promise<void>; on?: (ev: string, fn: (e: unknown) => void) => void },
   mon: Db,
   cleanupFailures: string[],
-  ctx: Pick<InterleaveCtx, "redact" | "sleep">,
+  ctx: Pick<InterleaveCtx, "redact" | "sleep" | "armExpected">,
   work: () => Promise<void>,
 ): Promise<{ terminated: boolean; expected: number }> {
   let expected = 0;
@@ -979,6 +1006,8 @@ export async function killOwnVictim(
     const tag = `rp-victim-${Math.random().toString(16).slice(2, 10)}`;
     const pid = Number((await victim.query("select pg_backend_pid() as p, set_config('application_name', $1, false) as t", [tag])).rows[0].p);
     await work();
+    // T13B2b-22: ONLY this victim, ONLY its expected 57P01 termination, armed right before it is requested.
+    ctx.armExpected?.(victim, isExpectedTermination);
     const r = await mon.query("select pg_catalog.pg_terminate_backend(a.pid) as k from pg_catalog.pg_stat_activity a where a.pid = $1 and a.application_name = $2", [pid, tag]);
     terminated = r.rows.length === 1 && r.rows[0].k === true;
     await ctx.sleep(300);

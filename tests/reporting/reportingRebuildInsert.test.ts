@@ -125,7 +125,7 @@ import {
   type VersionRow,
 } from "../staging/reportingRebuildRepair";
 import { runCaptureLifecycle } from "../staging/reportingCapture";
-import { BACKEND_SAMPLE_SQL, compactSamples, compareFullState, i4Monitored, monitorBackends, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type InterleaveCtx, type Observation } from "../staging/reportingPublication";
+import { BACKEND_SAMPLE_SQL, I4_OWNER_SQL, compactSamples, compareFullState, i4Monitored, monitorBackends, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type InterleaveCtx, type Observation } from "../staging/reportingPublication";
 
 const nrm = (s: string) => s.replace(/\s+/g, " ").trim();
 
@@ -353,10 +353,10 @@ describe("T13B2b-19: the rehearsal coordinator", () => {
 describe("T13B2b-19: monitored I4", () => {
   const ictx = (): InterleaveCtx => {
     let t = 0;
-    return { sites: ["uk", "us"], staff: "s", open: async () => { throw new Error("unused"); }, as: async () => undefined, record: () => undefined, redact: (s) => s, now: () => (t += 10), sleep: () => new Promise<void>((r) => setTimeout(r, 0)), maxPages: 1 }; // yields, so a timer can settle a job
+    return { sites: ["uk", "us"], staff: "s", open: async () => { throw new Error("unused"); }, as: async () => undefined, record: () => undefined, evidence: () => undefined, redact: (s) => s, now: () => (t += 10), sleep: () => new Promise<void>((r) => setTimeout(r, 0)), maxPages: 1 }; // yields, so a timer can settle a job
   };
   const deferred = <T>() => { let resolve!: (v: T) => void; let reject!: (e: unknown) => void; const p = new Promise<T>((a, b) => ((resolve = a), (reject = b))); return { p, resolve, reject }; };
-  const worker = (pid: number) => { const log: string[] = []; return { log, db: { query: async (q: string) => (log.push(q), q.startsWith("select pg_backend_pid()") ? { rows: [{ p: pid }], rowCount: 1 } : { rows: [], rowCount: 0 }) } as Db }; };
+  const worker = (pid: number) => { const log: string[] = []; return { log, db: { query: async (q: string) => (log.push(q), q === I4_OWNER_SQL ? { rows: [{ pid, backend_start: "2026-11-15 07:44:05.123456+00", xact_start: "2026-11-15 07:50:00.000001+00", transaction_timestamp: "2026-11-15 07:50:00.000001+00" }], rowCount: 1 } : { rows: [], rowCount: 0 }) } as Db }; };
 
   it("success: PIDs are read inside each explicit transaction BEFORE publishing; only those PIDs are sampled; sampling stops when both settle", async () => {
     const a = worker(101);
@@ -366,7 +366,7 @@ describe("T13B2b-19: monitored I4", () => {
     let polls = 0;
     const mon: Db = { query: async (q: string, p?: unknown[]) => { monLog.push({ q, p }); if (++polls === 3) { jobs[0].resolve("ok"); jobs[1].resolve("ok"); } return { rows: [{ pid: 101, state: "active", wait_event_type: "Lock", wait_event: "transactionid", blocking: [202], xact_ms: "5" }, { pid: 202, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "5" }], rowCount: 2 }; } };
     let started = 0;
-    const r = await i4Monitored(ictx(), a.db, b.db, mon, (c) => { started++; expect((c === a.db ? a : b).log).toEqual(["begin", "select pg_backend_pid() as p"]); return jobs[started - 1].p; });
+    const r = await i4Monitored(ictx(), a.db, b.db, mon, (c) => { started++; expect((c === a.db ? a : b).log).toEqual(["begin", I4_OWNER_SQL]); return jobs[started - 1].p; });
     expect(r.ok).toBe(true);
     expect(monLog.every((m) => m.q === BACKEND_SAMPLE_SQL && JSON.stringify(m.p) === "[[101,202]]")).toBe(true);
     expect(monLog.length).toBe(3);
@@ -534,10 +534,10 @@ describe("T13B2b-20: the rehearsal stops at the first RECORDED failure", () => {
 describe("T13B2b-21: I4 does not pass without monitoring coverage", () => {
   const ictx2 = (): InterleaveCtx => {
     let t = 0;
-    return { sites: ["uk", "us"], staff: "s", open: async () => { throw new Error("unused"); }, as: async () => undefined, record: () => undefined, redact: (s) => s, now: () => (t += 10), sleep: () => new Promise<void>((r) => setTimeout(r, 0)), maxPages: 1 };
+    return { sites: ["uk", "us"], staff: "s", open: async () => { throw new Error("unused"); }, as: async () => undefined, record: () => undefined, evidence: () => undefined, redact: (s) => s, now: () => (t += 10), sleep: () => new Promise<void>((r) => setTimeout(r, 0)), maxPages: 1 };
   };
   const deferred2 = <T>() => { let resolve!: (v: T) => void; const p = new Promise<T>((a) => (resolve = a)); return { p, resolve }; };
-  const w = (pid: number) => ({ query: async (q: string) => (q.startsWith("select pg_backend_pid()") ? { rows: [{ p: pid }], rowCount: 1 } : { rows: [], rowCount: 0 }) }) as Db;
+  const w = (pid: number) => ({ query: async (q: string) => (q === I4_OWNER_SQL ? { rows: [{ pid, backend_start: "2026-11-15 07:44:05.123456+00", xact_start: "2026-11-15 07:50:00.000001+00", transaction_timestamp: "2026-11-15 07:50:00.000001+00" }], rowCount: 1 } : { rows: [], rowCount: 0 }) }) as Db;
   const both = [{ pid: 101, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "1" }, { pid: 202, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "1" }];
 
   it("exhausted with jobs pending, then BOTH publications succeed: I4 still FAILS (sticky), and both jobs were awaited", async () => {

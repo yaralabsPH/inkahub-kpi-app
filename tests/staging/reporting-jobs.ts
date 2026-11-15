@@ -35,7 +35,7 @@ import { signInClaims, SESSION_ROLES, type SessionRole } from "./stagingSessions
 import { assertStagingSupabaseUrl } from "./measure-item-counting";
 import { redactSecrets } from "./itemCountingPolicyParity";
 import { become } from "./writeCompatRun";
-import { CATALOG_SQL, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
+import { CATALOG_SQL, newConnectionWatch, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ConnectionWatch, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
 import { capLimit, fenceMarkdown, fenceStatus, newFenceReport, type FenceObservation } from "./reportingFence";
 import { fenceF2, ownedToggle, runFence, type ReceiptIO } from "./reportingFenceRun";
 import { catalog } from "./policyParityRun";
@@ -82,10 +82,10 @@ async function markerCheck(client: pg.Client): Promise<void> {
   if (r.rows[0]?.loc !== 1 || !(r.rows[0]?.users >= 5)) throw new Error("Refusing to run: this database is not the staging project (no staging location/test users).");
 }
 
-async function openGuarded(raw: string, target: StagingTarget): Promise<pg.Client> {
+async function openGuarded(raw: string, target: StagingTarget, watch: ConnectionWatch): Promise<pg.Client> {
   const url = new URL(raw);
   for (const k of [...url.searchParams.keys()]) if (k.startsWith("ssl")) url.searchParams.delete(k);
-  return openGuardedClient(() => new pg.Client({ connectionString: url.toString(), ssl: { rejectUnauthorized: false }, application_name: "reporting-fence-staging-check" }), target, markerCheck, redactSecrets);
+  return openGuardedClient(() => new pg.Client({ connectionString: url.toString(), ssl: { rejectUnauthorized: false }, application_name: "reporting-fence-staging-check" }), target, markerCheck, redactSecrets, watch);
 }
 
 const errText = (e: unknown) => {
@@ -294,11 +294,18 @@ async function publicationMain(argv: string[]): Promise<number> {
     }
   })();
   const report = newPublicationReport(mode, sites, revision, new Date().toISOString(), sha256File(MIGRATION_0038));
-  const out = `staging-results-reporting-publication-${mode}-${report.startedAt.replace(/[^0-9TZ]/g, "")}-${randomBytes(4).toString("hex")}.md`;
+  const runId = randomBytes(4).toString("hex");
+  const out = `staging-results-reporting-publication-${mode}-${report.startedAt.replace(/[^0-9TZ]/g, "")}-${runId}.md`;
   if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`);
   const save = () => {
     writeFileSync(`${out}.tmp`, publicationMarkdown(report));
     renameSync(`${out}.tmp`, out);
+  };
+  // T13B2b-22: one run-scoped connection watch; its errors are the report's errors (the final status store).
+  const watch = newConnectionWatch(report.errors, redactSecrets, save);
+  const evidence = (e: Record<string, unknown>) => {
+    report.evidence.push({ run: runId, report: out, at: new Date().toISOString(), ...e });
+    save(); // throws on a persistence failure: the caller stops normal work
   };
   if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
@@ -314,7 +321,7 @@ async function publicationMain(argv: string[]): Promise<number> {
       const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
       claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
     }
-    open = () => openGuarded(s.STAGING_DB_URL, target);
+    open = () => openGuarded(s.STAGING_DB_URL, target, watch);
   } catch (e) {
     report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
     report.finishedAt = new Date().toISOString();
@@ -335,6 +342,7 @@ async function publicationMain(argv: string[]): Promise<number> {
   let own: Ownership | null = null;
   await runCaptureLifecycle(report, {
     open,
+    watch,
     now: () => new Date().toISOString(),
     redact: redactSecrets,
     save,
@@ -358,7 +366,7 @@ async function publicationMain(argv: string[]): Promise<number> {
         // Prepared under the plan's approved harness; COMMITS only its documented, owned state and always cleans up.
         own = newOwnership(sites);
         report.ownership = own as unknown as Record<string, unknown>;
-        await runCommitted({ sites, staff, maxPages, open, as, record, save, redact: redactSecrets, now: () => performance.now() }, own, report.cleanup);
+        await runCommitted({ sites, staff, maxPages, open, as, record, save, redact: redactSecrets, now: () => performance.now(), enterCleanup: () => void watch.phase("cleanup") }, own, report.cleanup);
         return;
       }
       if (mode === "rehearse-rebuild-repair") {
@@ -372,7 +380,7 @@ async function publicationMain(argv: string[]): Promise<number> {
         return;
       }
       if (mode === "interleavings") {
-        await runInterleavings({ sites, staff, open, as, record, redact: redactSecrets, now: () => performance.now(), sleep: async (ms) => void (await sleep(ms)), maxPages }, report.cleanup);
+        await runInterleavings({ sites, staff, open, as, record, redact: redactSecrets, now: () => performance.now(), sleep: async (ms) => void (await sleep(ms)), maxPages, evidence, armExpected: watch.armExpected }, report.cleanup);
         return;
       }
       await main.query("begin");
@@ -424,6 +432,7 @@ async function main(): Promise<number> {
     writeFileSync(`${out}.tmp`, fenceMarkdown(report));
     renameSync(`${out}.tmp`, out);
   };
+  const watch = newConnectionWatch(report.errors, redactSecrets, save); // T13B2b-22
   if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
   let ctx: Ctx;
@@ -440,7 +449,7 @@ async function main(): Promise<number> {
     const target = stagingTarget(s.STAGING_DB_URL);
     const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
     const claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
-    ctx = { open: () => openGuarded(s.STAGING_DB_URL, target), claims, staff: "", receipts };
+    ctx = { open: () => openGuarded(s.STAGING_DB_URL, target, watch), claims, staff: "", receipts };
   } catch (e) {
     report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
     report.finishedAt = new Date().toISOString();
@@ -450,6 +459,7 @@ async function main(): Promise<number> {
   }
   const scenarios = ([["F1", f1], ["F2", f2], ["F3", f3], ["F4", f4], ["F5", f5], ["F6", f6]] as const).map(([id, f]) => ({ id, run: () => f(ctx) }));
   await runFence(report, {
+    watch,
     open: ctx.open,
     now: () => new Date().toISOString(),
     redact: redactSecrets,

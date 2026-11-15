@@ -71,6 +71,8 @@ export interface CommittedCtx {
   save(): void;
   redact(s: string): string;
   now(): number;
+  /** T13B2b-22: switch the run's connection watch to its cleanup phase. */
+  enterCleanup?(): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +699,7 @@ export async function runCommitted(ctx: CommittedCtx, own: Ownership, cleanupFai
   } catch (e) {
     failure = e;
   } finally {
+    ctx.enterCleanup?.(); // T13B2b-22: cleanup may run after a connection failure; new normal work may not
     // 1. Settle every secondary session FIRST: an open writer would hold the control SHARE lock and make capture-off time out.
     for (const c of secondary.splice(0)) await settle(c, "secondary session", cleanupFailures, ctx.redact);
     // 2. Destructive cleanup only if this run may have committed something.

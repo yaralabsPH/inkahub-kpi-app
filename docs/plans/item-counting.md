@@ -710,11 +710,11 @@ STATUS: COMPLETE
 
 #### T13B2b-22 — Prepare connection-failure handling and durable I4 evidence (Claude; offline only)
 
-- [ ] Add a run-scoped connection failure mechanism in `tests/staging/reportingCapture.ts` and wire it through the reporting-jobs runner/lifecycle and interleaving connections. Attach an error listener before connect and keep it installed through disconnect; every unexpected event immediately appends a redacted, sticky error to the SAME store used by final status, including idle-main and late-cleanup/auditor events. Never throw from the event listener. Persistence must be attempted safely; its own failure is retained, not emitted as another unhandled exception. No silent listener that merely suppresses the crash.
-- [ ] Stop new normal scenario/SQL work after the shared failure, while allowing explicit cleanup, settlement of already-started work and the independent fresh audit. Do not abandon pending promises with a bare Promise.race. Preserve original error plus rollback/disconnect/persistence/audit failures; do not declare COMPLETE merely because cleanup succeeded. Keep target checks before every SQL. Preserve only I5's narrowly armed, intentionally terminated victim/expected 57P01; never exempt connection failures globally.
-- [ ] Persist I4's pinned PID, backend_start and xact_start for BOTH workers inside their explicit transactions BEFORE starting rebuild work. Preserve timestamp strings losslessly and associate them with run/site/session identity; do not rely on application_name. Persist incremental monitor observations so process loss cannot erase all ownership/monitor evidence. Persistence failure stops normal work and enters cleanup. No automatic backend termination, reconnect/retry, or relaxation of timeouts/sample bounds.
-- [ ] Add offline EventEmitter-based regressions through the real opener/coordinator for idle main, active worker, monitor, rollback/end, auditor and persistence failures. Prove no unhandled event, no later normal SQL/scenario, all started promises settle, cleanup and fresh audit are attempted, and all errors remain in FAILED output. Test I5's expected narrow termination separately from an unexpected reset. Verify ownership evidence is persisted before work and samples before final I4 return; deliberate breaks must detect silent swallowing, listener installed too late, continuation after error and missing receipts.
-- [ ] Keep app code and installed 0037/0038/0039 unchanged. Run focused tests, common gate and sensitivity checks; record results, commit/push, confirm CI and pause for root review. Do not run SQL or staging modes, reinstall 0039, merge/deploy or start Task 14.
+- [x] Add a run-scoped connection failure mechanism in `tests/staging/reportingCapture.ts` and wire it through the reporting-jobs runner/lifecycle and interleaving connections. Attach an error listener before connect and keep it installed through disconnect; every unexpected event immediately appends a redacted, sticky error to the SAME store used by final status, including idle-main and late-cleanup/auditor events. Never throw from the event listener. Persistence must be attempted safely; its own failure is retained, not emitted as another unhandled exception. No silent listener that merely suppresses the crash.
+- [x] Stop new normal scenario/SQL work after the shared failure, while allowing explicit cleanup, settlement of already-started work and the independent fresh audit. Do not abandon pending promises with a bare Promise.race. Preserve original error plus rollback/disconnect/persistence/audit failures; do not declare COMPLETE merely because cleanup succeeded. Keep target checks before every SQL. Preserve only I5's narrowly armed, intentionally terminated victim/expected 57P01; never exempt connection failures globally.
+- [x] Persist I4's pinned PID, backend_start and xact_start for BOTH workers inside their explicit transactions BEFORE starting rebuild work. Preserve timestamp strings losslessly and associate them with run/site/session identity; do not rely on application_name. Persist incremental monitor observations so process loss cannot erase all ownership/monitor evidence. Persistence failure stops normal work and enters cleanup. No automatic backend termination, reconnect/retry, or relaxation of timeouts/sample bounds.
+- [x] Add offline EventEmitter-based regressions through the real opener/coordinator for idle main, active worker, monitor, rollback/end, auditor and persistence failures. Prove no unhandled event, no later normal SQL/scenario, all started promises settle, cleanup and fresh audit are attempted, and all errors remain in FAILED output. Test I5's expected narrow termination separately from an unexpected reset. Verify ownership evidence is persisted before work and samples before final I4 return; deliberate breaks must detect silent swallowing, listener installed too late, continuation after error and missing receipts.
+- [x] Keep app code and installed 0037/0038/0039 unchanged. Run focused tests, common gate and sensitivity checks; record results, commit/push, confirm CI and pause for root review. Do not run SQL or staging modes, reinstall 0039, merge/deploy or start Task 14.
 
 Root will review this correction before authorizing any new staging invocation. The original 0038-only repair rehearsal is no longer applicable after installation; preserve its successful evidence. The next eventual runtime gate is the corrected rollback I0–I5 harness against installed 0039, then committed A–D only after that passes. Task 13 remains unchecked. This handoff clears offline correction work only; the staging gate remains FAILED.
 
@@ -2104,3 +2104,52 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The previous set was re-run: 18/18 caught (old X17, "jobs stranded", was dropped because its code was rewritten; Y9 now covers it).
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1228/1228 tests (35 files); build OK.
   - **Next:** root review, then the one-shot rollback `--rehearse-rebuild-repair`. Task 13 stays unchecked.
+- 2026-11-15 — T13B2b-22 connection-failure handling and durable I4 evidence, OFFLINE only. No SQL, no staging mode, no reconnect/retry/auto-termination, no app/API/migration change, no Task 14 work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 `05d7eff1…` are byte-identical:
+  - **Run-scoped watch:** `newConnectionWatch` in `tests/staging/reportingCapture.ts`, plus `WATCH_ENTRY`.
+    - `openGuardedClient(…, watch)` attaches a client `error` listener to the RAW client BEFORE `connect()`. It is never removed, so it stays through disconnect, and a client without `on` is refused.
+    - Every unexpected event immediately appends a redacted, sticky `connection failure (connection #n): <message> [code]` to the report's OWN `errors` store (the final status source) and attempts `save()`.
+    - A persistence failure is retained (`report persistence failed (after a connection failure)`) and also written to stderr.
+    - The listener never throws; even if recording itself throws, it records `connection failure (unrecordable event)`.
+  - **Stopping new work:** `guardClient(…, gate)` refuses new normal SQL before sending once the watch has failed. Target checks still run before every SQL. ROLLBACK is always allowed.
+    - `runCaptureLifecycle` switches the watch to its cleanup phase as soon as the body ends, so main's rollback/disconnect and the independent fresh auditor still run. `runFence` does the same before its unconditional capture restoration; `runCommitted` does it at the start of its cleanup (`enterCleanup`).
+    - Already-started queries settle naturally (node-postgres rejects them); there is no `Promise.race`.
+    - The original error and the rollback/disconnect/persistence/audit failures all stay in FAILED output.
+  - **Wiring:** in `tests/staging/reporting-jobs.ts`, both the publication modes and `--fence` create one watch on their report errors/save and pass it to every opened connection, the lifecycle, interleavings (`evidence`, `armExpected`), the committed harness (`enterCleanup`) and the fence coordinator.
+  - **I5:** `killOwnVictim` arms ONLY its victim, ONLY for `isExpectedTermination` (57P01), right before requesting the termination. Any other client's 57P01, or an unexpected reset of the victim, still fails the run. There is no global exemption.
+  - **I4 durable evidence:** `i4Monitored` requires `ctx.evidence`.
+    - Inside each worker's explicit transaction it reads `I4_OWNER_SQL` (pid, `backend_start`, `xact_start`, `transaction_timestamp` as lossless text; no application_name).
+    - It persists `{kind: "i4-ownership", workers: [{site, session, pid, …}]}` (stamped with run id and report name) BEFORE starting either rebuild. A persistence failure throws before any work.
+    - `monitorBackends(onSamples)` persists every poll's samples incrementally; a sample persistence failure is a sticky monitor failure, and both jobs still settle.
+    - The report gains an `evidence` array and section. No backend termination, reconnect, retry, or change to timeouts or the sample bound.
+  - **Tests:**
+    - New `tests/reporting/reportingConnectionWatch.test.ts`, 21 tests, with EventEmitter clients that behave like node-postgres (pending queries rejected AND `error` emitted). Through the real opener, guard, lifecycle and I4/I5 helpers, it covers:
+      - the original crash reproduced (emit without a listener throws);
+      - the listener installed before connect;
+      - an idle error that is sticky and persisted;
+      - a persistence failure retained;
+      - recording failure retained;
+      - new normal SQL and new connections refused while ROLLBACK and the cleanup-phase auditor are allowed;
+      - I5 arming scoped to one client;
+      - an un-reportable client refused;
+      - idle main, active worker (pending query settles), monitor (both jobs settle), rollback/end and auditor failures through `runCaptureLifecycle` (cleanup and fresh audit attempted, every error kept, FAILED);
+      - a clean run still COMPLETE;
+      - I4 ownership persisted before work with exact strings, samples persisted per poll before I4 returns, ownership persistence failure gives no work, sample persistence failure is sticky, and no evidence sink is refused;
+      - I5's expected 57P01 vs an unexpected reset vs an unarmed 57P01.
+    - The existing I4 tests in `reportingRebuildInsert.test.ts` now answer `I4_OWNER_SQL` and supply `evidence`.
+  - **Mutations:** 13/13 new breaks caught:
+    - silent swallow;
+    - listener attached after connect;
+    - gate never refusing;
+    - gate not wired;
+    - lifecycle never entering cleanup;
+    - missing ownership receipt;
+    - samples not persisted;
+    - global 57P01 exemption;
+    - the listener's fallback rethrowing (this one first SURVIVED; the recording-failure regression was added and it is now caught);
+    - rethrowing after recording;
+    - persistence failure not retained;
+    - victim not armed;
+    - rollback refused.
+    - Prior sets re-run: T13B2b-20/21 10/10. T13B2b-19 18/18, where X19 was retargeted to "rebuild work started before the ownership receipt" because the PID-read code was rewritten.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (now includes the new test); strict ES2020 tsc on both runners OK; 1249/1249 tests (36 files); build OK.
+  - **Next:** root review. The staging gate remains FAILED until the corrected rollback I0–I5 harness passes against installed 0039. Task 13 stays unchecked.

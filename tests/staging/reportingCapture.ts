@@ -507,7 +507,7 @@ function assertClientTarget(client: object, target: StagingTarget): void {
 }
 
 /** Every `query` call asserts the frozen target and the client's own connection first; nothing is sent otherwise. */
-export function guardClient<T extends { query: (...args: never[]) => unknown }>(client: T, target: StagingTarget): T {
+export function guardClient<T extends { query: (...args: never[]) => unknown }>(client: T, target: StagingTarget, gate?: (sql: unknown) => void): T {
   assertClientTarget(client, target);
   return new Proxy(client, {
     get(obj, prop, receiver) {
@@ -516,6 +516,7 @@ export function guardClient<T extends { query: (...args: never[]) => unknown }>(
       return (...args: unknown[]) => {
         try {
           assertClientTarget(obj, target);
+          gate?.(args[0]); // T13B2b-22: after a connection failure, new normal work is refused before sending
         } catch (e) {
           return Promise.reject(e); // pg's query is promise-based: refuse the same way, without sending anything
         }
@@ -542,8 +543,10 @@ export interface OpenableClient {
  * cleanup failure is appended as evidence. A wrong target throws before any
  * connection is attempted.
  */
-export async function openGuardedClient<C extends OpenableClient>(make: () => C, target: StagingTarget, marker: (client: C) => Promise<void>, redact: (s: string) => string = (s) => s): Promise<C> {
-  const client = guardClient(make(), target);
+export async function openGuardedClient<C extends OpenableClient>(make: () => C, target: StagingTarget, marker: (client: C) => Promise<void>, redact: (s: string) => string = (s) => s, watch?: ConnectionWatch): Promise<C> {
+  const raw = make();
+  watch?.attach(raw); // T13B2b-22: the error listener is installed BEFORE connect and stays through disconnect
+  const client = guardClient(raw, target, watch?.gate);
   try {
     await client.connect();
     await marker(client);
@@ -691,6 +694,8 @@ export interface LifecycleIO<C extends LifecycleClient> {
   redact(text: string): string;
   /** Where a persistence failure is written (default: console.error). */
   stderr?(text: string): void;
+  /** T13B2b-22: the run's connection watch; switched to its cleanup phase as soon as the body ends. */
+  watch?: ConnectionWatch;
 }
 
 /** The report fields the lifecycle maintains (shared by the capture and fence runners). */
@@ -752,6 +757,7 @@ export async function runCaptureLifecycle<C extends LifecycleClient, R extends L
   } catch (e) {
     report.errors.push(msg(e));
   } finally {
+    io.watch?.phase("cleanup"); // explicit cleanup and the independent fresh audit may still run after a connection failure
     if (primary) {
       try {
         await primary.query("rollback");
@@ -841,4 +847,102 @@ export function captureMarkdown(r: CaptureReport): string {
     "",
   ];
   return lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// T13B2b-22: run-scoped connection failure watch
+// ---------------------------------------------------------------------------
+
+/** Per-client watch entry, reachable through the guard proxy by this symbol. */
+export const WATCH_ENTRY: unique symbol = Symbol.for("inkahub.reporting.connectionWatch");
+
+interface WatchEntry {
+  label: string;
+  /** Narrowly armed expectation (I5's intentionally terminated victim only). */
+  expected: ((e: unknown) => boolean) | null;
+  expectedSeen: number;
+}
+
+export interface ConnectionWatch {
+  /** True once any UNEXPECTED connection error event was observed (sticky for the run). */
+  failed(): boolean;
+  /** The first unexpected connection error line, if any. */
+  first(): string | null;
+  /**
+   * "normal": after a failure, new normal SQL is refused before sending.
+   * "cleanup": explicit cleanup and the independent fresh audit may still run.
+   */
+  phase(p?: "normal" | "cleanup"): "normal" | "cleanup";
+  /** Install the error listener on a raw client BEFORE connect; it stays installed through disconnect. */
+  attach<C extends object>(client: C): C;
+  /** Throws (refusing the statement) when normal work must stop; ROLLBACK is always allowed. */
+  gate(sql: unknown): void;
+  /** Arm ONE client to accept an expected termination (e.g. 57P01) as not-a-failure; returns how many were seen. */
+  armExpected(client: object, expected: (e: unknown) => boolean): () => number;
+}
+
+/**
+ * Every unexpected client `error` event immediately appends a redacted, sticky
+ * error to `errors` (the SAME store the final status reads) and attempts to
+ * persist; a persistence failure is retained too. The listener never throws,
+ * so an EventEmitter error can no longer terminate the process outside the
+ * run's cleanup and fresh audit, and it never silently swallows anything.
+ */
+export function newConnectionWatch(errors: string[], redact: (s: string) => string, persist: () => void, stderr: (t: string) => void = (t) => console.error(t)): ConnectionWatch {
+  let failedLine: string | null = null;
+  let phase: "normal" | "cleanup" = "normal";
+  let n = 0;
+  const push = (line: string) => {
+    if (!errors.includes(line)) errors.push(line);
+  };
+  const entryOf = (client: object): WatchEntry | undefined => (client as Record<symbol, WatchEntry | undefined>)[WATCH_ENTRY];
+  return {
+    failed: () => failedLine !== null,
+    first: () => failedLine,
+    phase: (p) => (p ? (phase = p) : phase),
+    attach: <C extends object>(client: C): C => {
+      const entry: WatchEntry = { label: `connection #${++n}`, expected: null, expectedSeen: 0 };
+      Object.defineProperty(client, WATCH_ENTRY, { value: entry, enumerable: false, configurable: false, writable: false });
+      const on = (client as { on?: (ev: string, fn: (e: unknown) => void) => unknown }).on;
+      if (typeof on !== "function") throw new Error("refusing to open: this client cannot report connection errors (no on('error'))");
+      on.call(client, "error", (e: unknown) => {
+        try {
+          if (entry.expected && entry.expected(e)) {
+            entry.expectedSeen++;
+            return;
+          }
+          const code = (e as { code?: unknown } | null)?.code;
+          const line = `connection failure (${entry.label}): ${redact(e instanceof Error ? e.message : String(e))}${code !== undefined ? ` [${String(code)}]` : ""}`;
+          if (failedLine === null) failedLine = line;
+          push(line);
+          try {
+            persist();
+          } catch (pe) {
+            push(`report persistence failed (after a connection failure): ${redact(pe instanceof Error ? pe.message : String(pe))}`);
+            try {
+              stderr(line);
+            } catch {
+              /* stderr unavailable: the error is still in the report store */
+            }
+          }
+        } catch {
+          // Never throw from an EventEmitter listener; the failure line above is already recorded when reachable.
+          if (failedLine === null) failedLine = "connection failure (unrecordable event)";
+          push(failedLine);
+        }
+      });
+      return client;
+    },
+    gate: (sql: unknown) => {
+      if (failedLine === null || phase === "cleanup") return;
+      if (typeof sql === "string" && /^\s*rollback\b/i.test(sql)) return; // explicit cleanup of an open transaction
+      throw new Error(`run stopped after a connection failure; refusing new work (${failedLine})`);
+    },
+    armExpected: (client: object, expected: (e: unknown) => boolean) => {
+      const entry = entryOf(client);
+      if (!entry) throw new Error("cannot arm an expected termination on a client this run's watch does not own");
+      entry.expected = expected;
+      return () => entry.expectedSeen;
+    },
+  };
 }
