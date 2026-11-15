@@ -223,7 +223,8 @@ describe("source guards", () => {
 // ---------------------------------------------------------------------------
 
 import { runCaptureLifecycle, initialReport, finalReport } from "../staging/reportingCapture";
-import { cleanup, cleanupPlan, committedAllowance, newOwnership, preflightProblems, runCommitted, type Conn, type PreflightSnapshot } from "../staging/reportingCommitted";
+import { cleanup, cleanupDecision, committedAllowance, DISCOVERY, expectedEpochIncrement, newOwnership, ownedCall, preflightProblems, runCommitted, type Conn, type Discovery, type PreflightSnapshot } from "../staging/reportingCommitted";
+import type { Site } from "../staging/reportingPublication";
 
 describe("T13B2b-3: report persistence never skips cleanup or the fresh audit", () => {
   it("a save that throws after cleanup still lets the auditor open, keeps the failure and the run FAILED (actual lifecycle)", async () => {
@@ -338,7 +339,7 @@ describe("T13B2b-4: full-state comparison", () => {
   });
   it("the committed allowance accepts exactly the declared epoch increments and the run sites' lease bookkeeping; nothing else", () => {
     const own = newOwnership(["uk", "au"], "r1");
-    own.captureToggles = 2;
+    own.captureTransitions = [{ enable: true, before: "3", after: "4", state: "confirmed" }, { enable: false, before: "4", after: "5", state: "confirmed" }];
     const allow = committedAllowance(own);
     const after = state({ control: { capture_epoch: "5", capture_enabled: false, rule_version: "v1", updated_at: "t2" }, siteState: [{ site: "uk", processor_enabled: false, lease_fence: "9", lease_expires_at: "x", updated_at: "u2" }] });
     expect(compareFullState(state(), after, allow)).toEqual([]);
@@ -346,6 +347,9 @@ describe("T13B2b-4: full-state comparison", () => {
     const ctl5 = { capture_epoch: "5", capture_enabled: false, rule_version: "v1", updated_at: "t2" };
     expect(compareFullState(state(), state({ control: ctl5, siteState: [{ site: "uk", processor_enabled: true, lease_fence: "4", lease_expires_at: null, updated_at: "u" }] }), allow)).toEqual(["site_state uk.processor_enabled is true, was false"]);
     expect(compareFullState(state(), state({ control: ctl5, siteState: [{ site: "uk", processor_enabled: false, lease_fence: "3", lease_expires_at: null, updated_at: "u" }] }), allow)).toEqual(["site_state uk.lease_fence went backwards"]);
+    // An uncertain transition never widens the allowance.
+    own.captureTransitions.push({ enable: true, before: "5", after: "6", state: "uncertain" });
+    expect(committedAllowance(own).epochIncrement).toBe(2);
     // Rollback-only modes accept none of it.
     expect(compareFullState(state(), after, ROLLBACK_ONLY).length).toBeGreaterThan(0);
   });
@@ -353,7 +357,7 @@ describe("T13B2b-4: full-state comparison", () => {
 
 describe("committed harness (prepared, not run)", () => {
   const iso: PreflightSnapshot = {
-    installed: true, captureEnabled: false, activeBatchesAnywhere: 0, fixtureCollisions: 0,
+    installed: true, captureEnabled: false, captureEpoch: "3", activeBatchesAnywhere: 0, fixtureCollisions: 0,
     sites: ["au", "uk"].map((site) => ({ site, processor: false, readMode: "legacy", generation: null, activeBatch: null, derivedRows: 0, batches: 0, generations: 0, pendingChanges: 0 })),
   };
   it("preflight refuses every non-isolated starting state", () => {
@@ -377,91 +381,271 @@ describe("committed harness (prepared, not run)", () => {
     }
   });
 
-  it("every cleanup statement is scoped to this run's exact sites and ids/sequences; no unscoped delete; dependency order", () => {
+  // An ownership with two confirmed batches/generations (uk then au) and an unrelated uncertain nothing.
+  const owned = () => {
     const own = newOwnership(["uk", "au"], "abcd1234");
-    own.fixtureIds = ["rc-abcd1234-low"];
-    own.batches = ["b1", "b2"];
-    own.generations = ["g1", "g2"];
-    own.generationSeqs = ["11", "12"];
-    own.original = { captureEnabled: false, sites: [{ site: "uk", processor: false, generation: null, sourceEpoch: null, lastVerifiedCutoff: null }] };
-    const plan = cleanupPlan(own, ["901", "902"]);
-    for (const st of plan) {
+    own.fixtureIds = ["rc-abcd1234-low", "rc-abcd1234-m"];
+    own.original = { captureEnabled: false, captureEpoch: "3", sites: [{ site: "uk", processor: false, generation: null, sourceEpoch: null, lastVerifiedCutoff: null }, { site: "au", processor: false, generation: null, sourceEpoch: null, lastVerifiedCutoff: null }] };
+    own.identities = [
+      { kind: "batch", id: "b1", seq: null, state: "confirmed" },
+      { kind: "generation", id: "g1", seq: "11", state: "confirmed" },
+      { kind: "batch", id: "b2", seq: null, state: "confirmed" },
+      { kind: "generation", id: "g2", seq: "12", state: "confirmed" },
+      { kind: "batch", id: "bx", seq: null, state: "absent" },
+    ];
+    return own;
+  };
+  const clean = (over: Partial<Discovery> = {}): Discovery => ({
+    captureOff: true, ourChangeIds: ["901", "902"], externalJournal: 0, externalBatches: [], externalGenerations: [],
+    sites: [{ site: "uk", activeGeneration: "g2", activeBatch: null }, { site: "au", activeGeneration: "g1", activeBatch: null }], ...over,
+  });
+
+  it("isolated discovery: every statement is scoped to the run's sites and EXACT confirmed identities / fixture ids; dependency order", () => {
+    const { retainAll, steps } = cleanupDecision(owned(), clean());
+    expect(retainAll).toBe(false);
+    for (const st of steps) {
       expect(st.sql, st.label).toMatch(/\bwhere\b/i);
-      expect(st.sql, st.label).not.toMatch(/disable trigger|session_replication_role|truncate/i);
+      expect(st.sql, st.label).not.toMatch(/disable trigger|session_replication_role|truncate|\blike\b/i);
       if (/^delete/i.test(st.sql)) expect(st.sql, st.label).toMatch(/= any\(\$\d+::(text|bigint|uuid)\[\]\)|generation_id = \$1::uuid/);
     }
-    const order = plan.map((st) => st.label);
-    const at = (needle: string) => order.findIndex((l) => l.includes(needle));
+    const at = (needle: string) => steps.findIndex((st) => st.label.includes(needle));
     expect(at("event_facts")).toBeLessThan(at("mirror"));
     expect(at("mirror")).toBeLessThan(at("restore uk"));
-    expect(at("restore uk")).toBeLessThan(at("generation g2"));
     expect(at("batch_changes")).toBeLessThan(at("journal rows"));
     expect(at("journal rows")).toBeLessThan(at("this run's batches"));
     expect(at("this run's batches")).toBeLessThan(at("generation g2"));
-    expect(at("generation g2")).toBeLessThan(at("generation g1")); // newest first
-    expect(plan.at(-1)!.sql).toBe("delete from public.production_events where id = any($1::text[]) and location = any($2::text[]) and id like $3");
-    expect(plan.at(-1)!.params).toEqual([["rc-abcd1234-low"], ["uk", "au"], "rc-abcd1234-%"]);
-    // Note (3): an entangled batch protects EVERYTHING that depends on the run's generations.
-    const kept = cleanupPlan(own, ["901"], { retainBatches: ["b2"] });
-    expect(kept.find((st) => st.label === "delete this run's batches")!.params).toEqual([["b1"]]);
-    expect(kept.some((st) => /generation|mirror|_facts|cancel_edges|daily_totals|source_versions|order_occurrences/.test(st.label) && st.label.startsWith("delete"))).toBe(false);
-    expect(kept.find((st) => st.label.startsWith("restore uk"))!.sql).toBe("update reporting_private.site_state set processor_enabled = $2 where site = $1");
-    expect(kept.find((st) => st.label.startsWith("delete this run's journal"))!.params).toEqual([["901"], ["b2"]]);
-    // A site whose active batch belongs to someone else is not touched at all.
-    expect(cleanupPlan(own, [], { externalActiveSites: ["uk"] }).some((st) => st.label.startsWith("restore uk"))).toBe(false);
-    // Even without retention, the metadata reset only applies while the site's active batch is this run's (or none).
-    expect(plan.find((st) => st.label === "restore uk site metadata")!.sql).toContain("and (active_batch_id is null or active_batch_id = any($6::uuid[]))");
+    expect(at("generation g2")).toBeLessThan(at("generation g1"));
+    expect(steps.find((st) => st.label.startsWith("delete this run's event_facts"))!.params).toEqual([["uk", "au"], ["11", "12"]]);
+    expect(steps.find((st) => st.label.startsWith("delete this run's batches"))!.params).toEqual([["b1", "b2"]]); // the absent bx is not touched
+    expect(steps.find((st) => st.label.startsWith("delete this run's journal"))!.params).toEqual([["901", "902"]]);
+    expect(steps.at(-1)!).toMatchObject({ sql: "delete from public.production_events where id = any($1::text[]) and location = any($2::text[])", params: [["rc-abcd1234-low", "rc-abcd1234-m"], ["uk", "au"]] });
+    // A metadata reset applies only while the site still points at this run's batch/generation (or none).
+    expect(steps.find((st) => st.label === "restore uk site metadata")!.sql).toContain("and (active_batch_id is null or active_batch_id = any($6::uuid[])) and (active_generation_id is null or active_generation_id = any($7::uuid[]))");
   });
 
-  function fakeConn(log: string[], fail: (sql: string) => boolean = () => false): Conn {
-    return {
-      query: async (sql: string) => {
-        log.push(sql.replace(/\s+/g, " ").slice(0, 60));
-        if (fail(sql)) throw new Error(`injected: ${sql.slice(0, 20)}`);
+  it("T13B2b-10: discovery failure, external journal/batch/generation, a foreign site pointer or an uncertain identity RETAIN everything", () => {
+    const destructive = (steps: Array<{ sql: string }>) => steps.filter((st) => /^delete|active_generation_id = \$3/i.test(st.sql));
+    const cases: Array<[string, Discovery | null, (o: ReturnType<typeof owned>) => void]> = [
+      ["discovery failed", null, () => undefined],
+      ["external journal", clean({ externalJournal: 1 }), () => undefined],
+      ["external batch", clean({ externalBatches: ["bz"] }), () => undefined],
+      ["external generation", clean({ externalGenerations: ["gz"] }), () => undefined],
+      ["foreign active batch", clean({ sites: [{ site: "uk", activeGeneration: "g2", activeBatch: "bz" }, { site: "au", activeGeneration: "g1", activeBatch: null }] }), () => undefined],
+      ["foreign published generation", clean({ sites: [{ site: "uk", activeGeneration: "gz", activeBatch: null }, { site: "au", activeGeneration: "g1", activeBatch: null }] }), () => undefined],
+      ["uncertain identity", clean(), (o) => void o.identities.push({ kind: "generation", id: "g3", seq: "13", state: "uncertain" })],
+      ["tentative identity", clean(), (o) => void o.identities.push({ kind: "batch", id: "b3", seq: null, state: "tentative" })],
+    ];
+    for (const [name, d, mutate] of cases) {
+      const own = owned();
+      mutate(own);
+      const r = cleanupDecision(own, d);
+      expect(r.retainAll, name).toBe(true);
+      expect(r.reasons.length, name).toBeGreaterThan(0);
+      expect(destructive(r.steps), name).toEqual([]);
+    }
+    // With a foreign active batch the run does not even restore that site's processor setting.
+    const foreign = cleanupDecision(owned(), clean({ sites: [{ site: "uk", activeGeneration: "g2", activeBatch: "bz" }, { site: "au", activeGeneration: "g1", activeBatch: null }] }));
+    expect(foreign.steps.map((st) => st.label)).toEqual(["restore au processor setting"]);
+    expect(cleanupDecision(owned(), null).steps).toEqual([]);
+  });
+
+  it("T13B2b-11: capture not confirmed off keeps the fixture source rows", () => {
+    const r = cleanupDecision(owned(), clean({ captureOff: false }));
+    expect(r.steps.some((st) => st.sql.includes("public.production_events"))).toBe(false);
+    expect(r.reasons).toEqual(["capture is not confirmed off: fixture source rows are kept"]);
+  });
+
+  it("journal ownership uses the EXACT fixture ids (both sides), never a prefix", () => {
+    expect(DISCOVERY.ourChanges).toContain("(new_event_id = any($1::text[]) or old_event_id = any($1::text[])) and (new_event_id is null or new_event_id = any($1::text[])) and (old_event_id is null or old_event_id = any($1::text[]))");
+    expect(DISCOVERY.ourChanges).not.toMatch(/\blike\b/i);
+    expect(DISCOVERY.externalJournal).toContain("capture_epoch > $2::bigint and not (change_id = any($3::bigint[]))");
+    expect(DISCOVERY.sites).toMatch(/for update$/);
+  });
+
+  // ---- execution with a scripted connection --------------------------------------------------------
+  type Script = { log: string[]; conn: Conn; ends: number; rollbacks: number };
+  function scripted(opts: { fail?: (sql: string) => Error | null; pid?: number; alive?: () => boolean; epochAfter?: string } = {}): Script {
+    const s: Script = { log: [], conn: null as unknown as Conn, ends: 0, rollbacks: 0 };
+    s.conn = {
+      query: async (sql: string, params: unknown[] = []) => {
+        s.log.push(sql.replace(/\s+/g, " ").trim().slice(0, 200));
+        if (sql === "rollback") s.rollbacks++;
+        const f = opts.fail?.(sql);
+        if (f) throw f;
+        if (sql.startsWith("select json_build_object(")) return { rows: [{ j: iso }], rowCount: 1 };
+        if (sql.startsWith("select pg_backend_pid()")) return { rows: [{ p: opts.pid ?? 77 }], rowCount: 1 };
         if (sql.startsWith("select current_user")) return { rows: [{ u: "service_role", claims: '{"role":"service_role"}' }], rowCount: 1 };
-        if (sql.includes("json_build_object(\n  'installed'") || sql.startsWith("select json_build_object(")) return { rows: [{ j: iso }], rowCount: 1 };
-        if (sql.includes("select site, processor_enabled, active_generation_id::text as g")) return { rows: [{ site: "uk", processor_enabled: false, g: null, e: null, c: null }, { site: "au", processor_enabled: false, g: null, e: null, c: null }], rowCount: 2 };
-        if (sql.includes("array_agg(change_id::text)")) return { rows: [{ ids: [] }], rowCount: 1 };
-        if (sql.includes("count(*)::int as n from reporting_private.changes ch")) return { rows: [{ batches: [], n: 0 }], rowCount: 1 };
+        if (sql.includes("capture_epoch::text as e from reporting_private.control where singleton for update")) return { rows: [{ e: "3" }], rowCount: 1 };
+        if (sql.includes("public.set_reporting_capture")) return { rows: [{ capture_epoch: opts.epochAfter ?? "4", capture_enabled: params[0] }], rowCount: 1 };
+        if (sql.includes("select site, processor_enabled, active_generation_id::text as g")) return { rows: [{ site: "au", processor_enabled: false, g: null, e: null, c: null }, { site: "uk", processor_enabled: false, g: null, e: null, c: null }], rowCount: 2 };
+        if (sql.includes("pg_stat_activity where pid")) return { rows: [{ x: opts.alive?.() ?? false }], rowCount: 1 };
+        if (sql.includes("select exists (select 1 from reporting_private.")) return { rows: [{ x: true }], rowCount: 1 };
+        if (sql.includes("as ids from")) return { rows: [{ ids: [] }], rowCount: 1 };
+        if (sql.includes("count(*)::int as n from reporting_private.changes")) return { rows: [{ n: 0 }], rowCount: 1 };
+        if (sql.startsWith("select capture_enabled")) return { rows: [{ capture_enabled: false }], rowCount: 1 };
         return { rows: [], rowCount: 0 };
       },
-      end: async () => undefined,
+      end: async () => void s.ends++,
     };
+    return s;
   }
-
-  it("ownership is saved BEFORE the first commit; a failed save stops the run with nothing committed, and cleanup still runs", async () => {
-    const log: string[] = [];
-    const obs: Observation[] = [];
-    const own = newOwnership(["uk", "au"], "r2");
-    const cleanupFailures: string[] = [];
-    await expect(
-      runCommitted({ sites: ["uk", "au"], staff: "s", maxPages: 1, open: async () => fakeConn(log), as: async () => undefined, record: (o) => void obs.push(o), save: () => { throw new Error("disk full"); }, redact: (s) => s, now: () => 0 }, own, cleanupFailures),
-    ).rejects.toThrow("disk full");
-    expect(log.some((l) => /^commit\b/i.test(l) || /set_reporting_capture/.test(l))).toBe(false);
-    expect(obs.map((o) => [o.id, o.ok])).toEqual([["C0", true]]);
+  const ctxOf = (open: () => Promise<Conn>, save: () => void = () => undefined, record: (o: Observation) => void = () => undefined) => ({
+    sites: ["uk", "au"] as [Site, Site], staff: "s", maxPages: 1, open, as: async (c: Db, service: boolean) => void (await c.query(service ? "set local role service_role" : "reset role")),
+    record, save, redact: (x: string) => x, now: () => 0, sleep: async () => undefined,
   });
 
-  it("when a scenario fails mid-run, cleanup restores capture, deletes only owned rows, keeps going past a failing step and records it", async () => {
-    const log: string[] = [];
-    const own = newOwnership(["uk", "au"], "r3");
-    own.original = { captureEnabled: false, sites: [{ site: "uk", processor: false, generation: null, sourceEpoch: null, lastVerifiedCutoff: null }] };
-    own.batches = ["b1"];
-    own.generations = ["g1"];
-    own.generationSeqs = ["7"];
+  it("T13B2b-12: identities are saved as TENTATIVE before COMMIT and confirmed after; a failed save commits nothing", async () => {
+    const own = newOwnership(["uk", "au"], "r6");
+    const s = scripted();
+    const saves: string[] = [];
+    const call = ownedCall({ ...ctxOf(async () => s.conn, () => void saves.push(JSON.stringify(own.identities.map((i) => i.state)))) }, own, []);
+    s.conn.query = ((q) => async (sql: string, p?: unknown[]) => (sql.includes("begin_reporting_batch") ? { rows: [{ batch_id: "b9" }], rowCount: 1 } : q(sql, p)))(s.conn.query);
+    await call(s.conn, "select * from public.begin_reporting_batch($1)", ["uk"]);
+    expect(saves).toEqual(['["tentative"]', '["confirmed"]']);
+    expect(s.log.slice(-1)).toEqual(["commit"]);
+    const own2 = newOwnership(["uk", "au"], "r7");
+    const s2 = scripted();
+    s2.conn.query = ((q) => async (sql: string, p?: unknown[]) => (sql.includes("begin_reporting_batch") ? { rows: [{ batch_id: "b8" }], rowCount: 1 } : q(sql, p)))(s2.conn.query);
+    await expect(ownedCall(ctxOf(async () => s2.conn, () => { throw new Error("disk full"); }), own2, []) (s2.conn, "select * from public.begin_reporting_batch($1)", ["uk"])).rejects.toThrow("disk full");
+    expect(s2.log).not.toContain("commit");
+    expect(s2.log.at(-1)).toBe("rollback");
+    expect(own2.identities.map((i) => i.state)).toEqual(["absent"]);
+  });
+
+  it("T13B2b-12 + note: an uncertain COMMIT settles the ORIGINATING session; absence is concluded only once its backend is gone", async () => {
+    // Backend still present: identities stay uncertain (never 'absent').
+    const own = newOwnership(["uk", "au"], "r8");
+    const s = scripted({ fail: (sql) => (sql === "commit" ? new Error("connection reset during commit") : null), alive: () => true });
+    s.conn.query = ((q) => async (sql: string, p?: unknown[]) => (sql.includes("begin_reporting_batch") ? (s.log.push(sql), { rows: [{ batch_id: "b7" }], rowCount: 1 }) : q(sql, p)))(s.conn.query);
+    const fresh = scripted({ alive: () => true });
     const failures: string[] = [];
-    const conn = fakeConn(log, (sql) => sql.includes("delete from reporting_private.cancel_edges"));
-    const q = conn.query;
-    conn.query = async (sql: string, params?: unknown[]) => (sql.includes("select capture_enabled from reporting_private.control") ? { rows: [{ capture_enabled: true }], rowCount: 1 } : q(sql, params));
-    await cleanup(conn, { as: async () => undefined, redact: (s) => s, save: () => undefined }, own, failures);
-    expect(own.captureToggles).toBe(1);
-    expect(failures).toHaveLength(1);
-    expect(failures[0]).toMatch(/^delete this run's cancel_edges rows: injected: delete from/);
-    expect(log.some((l) => l.includes("delete from reporting_private.timing_facts"))).toBe(true); // continued after the failure
-    expect(log.some((l) => l.includes("delete from public.production_events where id = any"))).toBe(true);
+    await expect(ownedCall(ctxOf(async () => fresh.conn), own, failures)(s.conn, "select * from public.begin_reporting_batch($1)", ["uk"])).rejects.toThrow("connection reset");
+    expect(s.ends).toBe(1); // the originating session was closed first
+    expect(own.identities.map((i) => i.state)).toEqual(["uncertain"]);
+    expect(failures.join("; ")).toMatch(/originating session 77 is still present/);
+    expect(fresh.log.filter((l) => l.includes("pg_stat_activity where pid"))).toHaveLength(25); // bounded wait
+    // Backend gone: the exact id is resolved on a fresh connection.
+    const own2 = newOwnership(["uk", "au"], "r9");
+    const s2 = scripted({ fail: (sql) => (sql === "commit" ? new Error("lost") : null) });
+    s2.conn.query = ((q) => async (sql: string, p?: unknown[]) => (sql.includes("begin_reporting_batch") ? { rows: [{ batch_id: "b6" }], rowCount: 1 } : q(sql, p)))(s2.conn.query);
+    const fresh2 = scripted({ alive: () => false });
+    await expect(ownedCall(ctxOf(async () => fresh2.conn), own2, [])(s2.conn, "select * from public.begin_reporting_batch($1)", ["uk"])).rejects.toThrow("lost");
+    expect(own2.identities.map((i) => i.state)).toEqual(["confirmed"]);
+    expect(fresh2.log.some((l) => l.includes("from reporting_private.batches where batch_id = $1::uuid"))).toBe(true);
+  });
+
+  it("note: the expected epoch is this run's own locked, receipted transitions; observed or uncertain deltas never widen it", async () => {
+    const own = newOwnership(["uk", "au"], "ra");
+    const s = scripted({ epochAfter: "4" });
+    await ownedCall(ctxOf(async () => s.conn), own, [])(s.conn, "select * from public.set_reporting_capture($1)", [true]);
+    const lock = s.log.indexOf("select capture_epoch::text as e from reporting_private.control where singleton for update");
+    expect(lock).toBeGreaterThan(-1);
+    expect(lock).toBeLessThan(s.log.indexOf("select * from public.set_reporting_capture($1)"));
+    expect(own.captureTransitions).toEqual([{ enable: true, before: "3", after: "4", state: "confirmed" }]);
+    expect(expectedEpochIncrement(own)).toBe(1);
+    // An uncertain transition is an explicit failure and adds nothing.
+    const s2 = scripted({ epochAfter: "5", fail: (sql) => (sql === "commit" ? new Error("lost") : null) });
+    const failures: string[] = [];
+    await expect(ownedCall(ctxOf(async () => scripted().conn), own, failures)(s2.conn, "select * from public.set_reporting_capture($1)", [false])).rejects.toThrow("lost");
+    expect(own.captureTransitions.at(-1)!.state).toBe("uncertain");
+    expect(failures.join("; ")).toMatch(/uncertain commit; it is NOT added/);
+    expect(expectedEpochIncrement(own)).toBe(1);
+    expect(committedAllowance(own).epochIncrement).toBe(1);
+    // The module never derives the allowance from an observed epoch.
+    expect(readFileSync("tests/staging/reportingCommitted.ts", "utf8")).not.toMatch(/observeToggles|captureToggles/);
+  });
+
+  it("T13B2b-13: a preflight query or save failure BEFORE the first commit closes every session and runs no destructive cleanup", async () => {
+    for (const [name, fail, save] of [
+      ["preflight query", (sql: string) => (sql.startsWith("select json_build_object(") ? new Error("preflight boom") : null), () => undefined],
+      ["ownership save", () => null, () => { throw new Error("disk full"); }],
+    ] as const) {
+      const s = scripted({ fail });
+      const own = newOwnership(["uk", "au"], "rb");
+      const failures: string[] = [];
+      await expect(runCommitted(ctxOf(async () => s.conn, save), own, failures), name).rejects.toThrow();
+      expect(s.rollbacks, name).toBeGreaterThanOrEqual(1);
+      expect(s.ends, name).toBe(1);
+      expect(own.committedAnything, name).toBe(false);
+      expect(s.log.some((l) => /^delete|set_reporting_capture|^commit/.test(l)), name).toBe(false);
+    }
+  });
+
+  it("T13B2b-11: an OPEN secondary writer (case A) is rolled back and closed BEFORE capture is restored; cleanup is one locked transaction", async () => {
+    const order: string[] = [];
+    let n = 0;
+    let captureOn = false;
+    const own = newOwnership(["uk", "au"], "rc");
+    const failures: string[] = [];
+    const open = async () => {
+      const id = ++n;
+      const s = scripted();
+      const q = s.conn.query;
+      s.conn.query = async (sql: string, p?: unknown[]) => {
+        order.push(`${id}: ${sql.replace(/\s+/g, " ").trim()}`);
+        if (sql.startsWith("select json_build_object(")) return q(sql, p); // PREFLIGHT_SQL also mentions publish_reporting_batch
+        if (sql.includes("public.set_reporting_capture(")) captureOn = p?.[0] === true;
+        if (sql.startsWith("select capture_enabled")) return { rows: [{ capture_enabled: captureOn }], rowCount: 1 };
+        if (sql.includes("public.begin_reporting_rebuild(")) return { rows: [{ batch_id: `rb-${order.length}`, lease_fence: 1 }], rowCount: 1 };
+        if (sql.includes("public.copy_reporting_source_page(")) return { rows: [{ complete: true, pages: 1, total_rows: 0, next_after_event_id: null }], rowCount: 1 };
+        if (sql.includes("public.publish_reporting_batch(")) return { rows: [{ generation_id: `g-${order.length}`, generation_seq: String(order.length), replay: false }], rowCount: 1 };
+        if (id === 1 && sql.includes("public.begin_reporting_batch(")) throw new Error("stop in case A");
+        return q(sql, p);
+      };
+      const e = s.conn.end;
+      s.conn.end = async () => (order.push(`${id}: END`), e());
+      return s.conn;
+    };
+    await expect(runCommitted(ctxOf(open), own, failures)).rejects.toThrow("stop in case A");
+    // Session 2 is case A's writer: begin + uncommitted insert were sent, then the run failed.
+    expect(order.some((l) => l.startsWith("2: insert into public.production_events"))).toBe(true);
+    const writerRollback = order.indexOf("2: rollback");
+    const writerEnd = order.indexOf("2: END");
+    const captureOff = order.findIndex((l, i) => i > writerRollback && l === "1: select * from public.set_reporting_capture($1)");
+    const lock = order.indexOf("1: select 1 from reporting_private.control where singleton for share");
+    expect(writerRollback).toBeGreaterThan(-1);
+    expect(writerEnd).toBeGreaterThan(writerRollback);
+    expect(captureOff).toBeGreaterThan(writerEnd);
+    expect(lock).toBeGreaterThan(captureOff);
+    expect(order[lock - 1]).toBe("1: begin");
+    expect(order.slice(lock).some((l) => l === "1: commit")).toBe(true);
+    expect(order.at(-1)).toBe("1: END");
+    expect(own.captureTransitions.map((t) => [t.enable, t.state])).toEqual([[true, "confirmed"], [false, "confirmed"]]);
+  });
+
+  it("T13B2b-10: a failed delete rolls the WHOLE cleanup transaction back (nothing half-deleted) and is kept", async () => {
+    const own = owned();
+    own.identities = own.identities.filter((i) => i.state !== "absent");
+    const s = scripted({ fail: (sql) => (sql.includes("delete from reporting_private.cancel_edges") ? new Error("injected") : null) });
+    const failures: string[] = [];
+    // Discovery returns the run's own pointers.
+    const q = s.conn.query;
+    s.conn.query = async (sql: string, p?: unknown[]) => (sql.includes("active_batch_id::text as b from reporting_private.site_state") ? { rows: [{ site: "au", g: "g1", b: null }, { site: "uk", g: "g2", b: null }], rowCount: 2 } : q(sql, p));
+    await cleanup(s.conn, ctxOf(async () => scripted().conn), own, failures);
+    const lock = s.log.indexOf("select 1 from reporting_private.control where singleton for share");
+    expect(lock).toBeGreaterThan(-1);
+    expect(s.log[lock - 1]).toBe("begin");
+    const del = s.log.findIndex((l) => l.startsWith("delete from reporting_private.cancel_edges"));
+    expect(s.log.slice(del + 1)).not.toContain("commit");
+    expect(s.log.slice(del + 1)).toContain("rollback");
+    expect(s.log.some((l) => l.startsWith("delete from reporting_private.timing_facts"))).toBe(false); // stopped, then rolled back
+    expect(failures.join("; ")).toMatch(/cleanup transaction failed and was rolled back \(nothing deleted\): injected/);
+  });
+
+  it("T13B2b-10: a discovery failure is reported and retains everything (no delete is sent)", async () => {
+    const own = owned();
+    own.identities = own.identities.filter((i) => i.state !== "absent");
+    const s = scripted({ fail: (sql) => (sql.includes("as ids from reporting_private.changes") ? new Error("discovery boom") : null) });
+    const failures: string[] = [];
+    await cleanup(s.conn, ctxOf(async () => scripted().conn), own, failures);
+    expect(s.log.some((l) => l.startsWith("delete"))).toBe(false);
+    expect(failures.join("; ")).toMatch(/dependency discovery failed; everything is retained: discovery boom/);
+    expect(failures.join("; ")).toMatch(/retained: dependency discovery failed/);
   });
 
   it("the harness is a separate, explicit mode; the rollback-only modes never commit", () => {
     expect(parsePublicationArgs(["--committed-interleavings", "--sites=uk,au"]).mode).toBe("committed-interleavings");
+    expect(parsePublicationArgs(["--baseline-smoke", "--sites=uk,au"]).mode).toBe("baseline-smoke");
     const mod = readFileSync("tests/staging/reportingCommitted.ts", "utf8");
     expect(mod).toContain('await c.query("commit");');
     expect(mod).not.toMatch(/disable trigger|session_replication_role|truncate|statement_timeout|lock_timeout\s*=/i);
@@ -469,85 +653,130 @@ describe("committed harness (prepared, not run)", () => {
   });
 });
 
-describe("committed harness: early-review notes", () => {
-  it("note (1): each committed service RPC is its own transaction, proves service_role and rolls back on failure", async () => {
-    const { serviceCall } = await import("../staging/reportingCommitted");
-    const log: string[] = [];
-    const db = (who: { u: string; claims: string }, fail = false) => ({
-      query: async (sql: string) => {
-        log.push(sql);
-        if (sql.startsWith("select current_user")) return { rows: [who], rowCount: 1 };
-        if (fail && sql.startsWith("select * from public.x")) throw new Error("db refused");
-        return { rows: [{ ok: true }], rowCount: 1 };
-      },
-    });
-    const as = async (c: { query(s: string): Promise<unknown> }, service: boolean) => void (await c.query(service ? "set local role service_role" : "reset role"));
-    const call = serviceCall(as as never);
-    expect(await call(db({ u: "service_role", claims: '{"role":"service_role"}' }), "select * from public.x()", [])).toEqual([{ ok: true }]);
-    expect(log).toEqual(["begin", "set local role service_role", "select current_user as u, current_setting('request.jwt.claims', true) as claims", "select * from public.x()", "commit"]);
-    log.length = 0;
-    await expect(call(db({ u: "postgres", claims: "" }), "select * from public.x()", [])).rejects.toThrow(/not running as service_role \(current_user postgres/);
-    expect(log.at(-1)).toBe("rollback");
-    expect(log).not.toContain("select * from public.x()");
-    log.length = 0;
-    await expect(call(db({ u: "service_role", claims: '{"role":"service_role"}' }, true), "select * from public.x()", [])).rejects.toThrow("db refused");
-    expect(log.at(-1)).toBe("rollback");
-    // The committed flow never sends a bare service RPC: it always goes through the transactional call.
-    const mod = readFileSync("tests/staging/reportingCommitted.ts", "utf8");
-    expect(mod).toContain("call: serviceCall(ctx.as)");
-    expect(mod).not.toMatch(/await ctx\.as\(main, true\)/);
-  });
+// ---------------------------------------------------------------------------
+// B2b round 2 (T13B2b-8/9) and early-review residuals
+// ---------------------------------------------------------------------------
 
-  it("note (2): an unexpected rollback failure during disconnect is kept even when end() succeeds", async () => {
-    const failures: string[] = [];
-    const own = newOwnership(["uk", "au"], "r4");
-    let opened = 0;
-    const conn = (): Conn => ({
-      query: async (sql: string) => {
-        if (sql.startsWith("select json_build_object(")) return { rows: [{ j: { installed: false, captureEnabled: false, activeBatchesAnywhere: 0, sites: [], fixtureCollisions: 0 } }], rowCount: 1 };
-        if (sql === "rollback") throw new Error("connection lost");
-        return { rows: [], rowCount: 0 };
-      },
-      end: async () => undefined,
-    });
-    await runCommitted({ sites: ["uk", "au"], staff: "s", maxPages: 1, open: async () => (opened++, conn()), as: async () => undefined, record: () => undefined, save: () => undefined, redact: (s) => s, now: () => 0 }, own, failures);
-    expect(opened).toBe(1);
-    expect(failures).toEqual(["rollback: connection lost"]);
+import { scopedImageDiff, STATE_QUERIES as STATE_Q, surface } from "../staging/reportingPublication";
+import { noteIdentities, resolveIdentities } from "../staging/reportingCommitted";
+
+describe("T13B2b-8: baseline catalog queries", () => {
+  it("every catalog name/\"char\" column that is concatenated is cast to text (the staging failure was text || \"char\")", () => {
+    const cols = "relkind|tgenabled|relname|nspname|proname|tgname|attname|conname|rolname|schemaname|tablename|policyname";
+    for (const [name, sql] of STATE_Q) {
+      expect(sql, name).not.toMatch(new RegExp(`(?<![\\w.])(?:[a-z]\\.)?(?:${cols})(?!::text)\\s*\\|\\|`));
+      expect(sql, name).not.toMatch(new RegExp(`\\|\\|\\s*(?:[a-z]\\.)?(?:${cols})(?![\\w(])(?!::text)`));
+      expect(sql, name).not.toMatch(/pg_get_userbyid\([a-z.]+\)(?!::text)/);
+    }
+    expect(Object.fromEntries(STATE_Q)["catalog:relations"]).toContain("c.relkind::text");
+    expect(Object.fromEntries(STATE_Q)["catalog:triggers"]).toContain("t.tgenabled::text");
+  });
+  it("a failing surface is named and keeps the original error and SQLSTATE", async () => {
+    const db = { query: async () => { throw Object.assign(new Error('operator is not unique: text || "char"'), { code: "42725" }); } };
+    const e = await surface(db, "catalog:relations", "select 1").catch((x) => x);
+    expect(e.message).toBe('baseline surface catalog:relations failed: 42725 operator is not unique: text || "char"');
+    expect(e.code).toBe("42725");
+    expect(e.cause.message).toBe('operator is not unique: text || "char"');
+  });
+  it("--baseline-smoke is read-only and signs nobody in", () => {
+    const runner = readFileSync("tests/staging/reporting-jobs.ts", "utf8");
+    expect(runner).toContain('if (mode === "baseline-smoke") claims = {};');
+    const smoke = runner.slice(runner.indexOf('if (mode === "baseline-smoke") {'), runner.indexOf("return;", runner.indexOf('if (mode === "baseline-smoke") {')));
+    expect(smoke).not.toMatch(/\.query\(|begin|insert|update|delete/i);
+    expect(runner.indexOf('if (mode === "baseline-smoke") {')).toBeLessThan(runner.indexOf('      if (mode === "committed-interleavings") {'));
   });
 });
 
-describe("note (1) behaviour: the committed flow's service RPCs each run in their own proven transaction", () => {
-  it("set_reporting_capture is wrapped in begin -> role -> current_user proof -> call -> commit, and processors the same", async () => {
-    const iso: PreflightSnapshot = {
-      installed: true, captureEnabled: false, activeBatchesAnywhere: 0, fixtureCollisions: 0,
-      sites: ["au", "uk"].map((site) => ({ site, processor: false, readMode: "legacy", generation: null, activeBatch: null, derivedRows: 0, batches: 0, generations: 0, pendingChanges: 0 })),
-    };
+describe("T13B2b-9: exact scoped image equality", () => {
+  const row = (id: string, img = `{"id": "${id}"}`) => ({ event_id: id, image: img });
+  const ok = { source: [row("rp-v1"), row("rp-v6")], mirror: [row("rp-v1"), row("rp-v6")], versions: [row("rp-v1"), row("rp-v6")] };
+  it("equal sets pass; a missing current version (rp-v6), an extra, a mismatch or a duplicate each fail", () => {
+    expect(scopedImageDiff(ok)).toEqual([]);
+    expect(scopedImageDiff({ ...ok, versions: [row("rp-v1")] })).toEqual(["rp-v6 is in source but missing from versions", "rp-v6 is in mirror but missing from versions"]);
+    expect(scopedImageDiff({ ...ok, mirror: [...ok.mirror, row("rp-x1")] })).toEqual(["rp-x1 is in mirror but not in source", "rp-x1 is in mirror but missing from versions"]);
+    expect(scopedImageDiff({ ...ok, mirror: [row("rp-v1"), row("rp-v6", '{"id": "other"}')] })).toEqual(["rp-v6 differs between source and mirror", "rp-v6 differs between mirror and versions"]);
+    expect(scopedImageDiff({ ...ok, versions: [...ok.versions, row("rp-v6")] })).toEqual(["versions has rp-v6 twice"]);
+  });
+  it("F9j uses the exact helper in both directions (not inner joins and counts)", () => {
+    const mod = readFileSync("tests/staging/reportingPublication.ts", "utf8");
+    expect(mod).toContain("{ problems: scopedImageDiff(sets), sourceRows: sets.source.length }, { problems: [], sourceRows: idsR.length - 4 }");
+    expect(mod).not.toContain("FIXTURE_IMAGE_SQL");
+  });
+});
+
+describe("early-review residuals", () => {
+  it("(1) a REUSED batch this run does not own is refused BEFORE COMMIT; a known owned replay is allowed", async () => {
+    const own = newOwnership(["uk", "au"], "rr");
+    expect(() => noteIdentities(own, "select * from public.begin_reporting_batch($1)", [{ batch_id: "ext-1", reused: true }])).toThrow(/reused batch ext-1 that this run does not own/);
+    expect(own.identities).toEqual([]);
+    own.identities.push({ kind: "batch", id: "mine", seq: null, state: "confirmed" });
+    expect(noteIdentities(own, "select * from public.begin_reporting_batch($1)", [{ batch_id: "mine", reused: true }])).toEqual([]);
+    // Through the call: the refusal rolls back, nothing is committed or adopted.
     const log: string[] = [];
-    const conn: Conn = {
+    const conn = {
       query: async (sql: string) => {
-        log.push(sql.replace(/\s+/g, " ").trim().slice(0, 200));
-        if (sql.startsWith("select json_build_object(")) return { rows: [{ j: iso }], rowCount: 1 };
+        log.push(sql);
         if (sql.startsWith("select current_user")) return { rows: [{ u: "service_role", claims: '{"role":"service_role"}' }], rowCount: 1 };
-        if (sql.includes("select site, processor_enabled, active_generation_id::text as g")) return { rows: [{ site: "au", processor_enabled: false, g: null, e: null, c: null }, { site: "uk", processor_enabled: false, g: null, e: null, c: null }], rowCount: 2 };
-        if (sql.includes("begin_reporting_rebuild")) throw new Error("stop the scenario here");
-        if (sql.includes("array_agg(change_id::text)")) return { rows: [{ ids: [] }], rowCount: 1 };
-        if (sql.includes("reporting_private.changes ch")) return { rows: [{ batches: [], n: 0 }], rowCount: 1 };
+        if (sql.startsWith("select pg_backend_pid")) return { rows: [{ p: 1 }], rowCount: 1 };
+        if (sql.includes("begin_reporting_batch")) return { rows: [{ batch_id: "ext-2", reused: true }], rowCount: 1 };
         return { rows: [], rowCount: 0 };
       },
       end: async () => undefined,
     };
-    const own = newOwnership(["uk", "au"], "r5");
-    await expect(
-      runCommitted({ sites: ["uk", "au"], staff: "s", maxPages: 1, open: async () => conn, as: async (c, service) => void (await c.query(service ? "set local role service_role" : "reset role")), record: () => undefined, save: () => undefined, redact: (s) => s, now: () => 0 }, own, []),
-    ).rejects.toThrow("stop the scenario here");
-    const i = log.indexOf("select * from public.set_reporting_capture(true)");
-    expect(i).toBeGreaterThan(2);
-    expect(log.slice(i - 3, i + 2)).toEqual(["begin", "set local role service_role", "select current_user as u, current_setting('request.jwt.claims', true) as claims", "select * from public.set_reporting_capture(true)", "commit"]);
-    const j = log.findIndex((l) => l.startsWith("update reporting_private.site_state set processor_enabled = true"));
-    expect(log.slice(j - 3, j)).toEqual(["begin", "set local role service_role", "select current_user as u, current_setting('request.jwt.claims', true) as claims"]);
-    expect(log[j + 1]).toBe("commit");
-    // The failed rebuild RPC was rolled back (no aborted state or role leaks), and cleanup's capture restore is transactional too.
-    const k = log.findIndex((l) => l.includes("begin_reporting_rebuild"));
-    expect(log[k + 1]).toBe("rollback");
+    const own2 = newOwnership(["uk", "au"], "rs");
+    await expect(ownedCall({ as: async () => undefined, save: () => undefined, open: async () => conn, redact: (s) => s }, own2, [])(conn, "select * from public.begin_reporting_batch($1)", ["uk"])).rejects.toThrow(/does not own/);
+    expect(log).not.toContain("commit");
+    expect(log.at(-1)).toBe("rollback");
+    expect(own2.identities).toEqual([]);
+  });
+
+  it("(2) every resolution path keeps the origin receipt: cleanup's retry cannot conclude absence while the backend is present", async () => {
+    const ids = [{ kind: "generation" as const, id: "g7", seq: "7", state: "uncertain" as const, origin: { pid: 77, settled: false } }];
+    const lookups: string[] = [];
+    let alive = true;
+    const fresh = () => ({
+      query: async (sql: string) => {
+        if (sql.includes("pg_stat_activity")) return { rows: [{ x: alive }], rowCount: 1 };
+        lookups.push(sql);
+        return { rows: [{ x: false }], rowCount: 1 };
+      },
+      end: async () => undefined,
+    });
+    const failures: string[] = [];
+    await resolveIdentities({ open: async () => fresh(), redact: (s) => s, sleep: async () => undefined }, ids, failures);
+    expect(ids[0].state).toBe("uncertain");
+    expect(lookups).toEqual([]); // no absence lookup while the backend is present
+    expect(failures).toEqual(["originating session 77 of generation g7 is still present; it stays uncertain"]);
+    alive = false;
+    await resolveIdentities({ open: async () => fresh(), redact: (s) => s, sleep: async () => undefined }, ids, []);
+    expect(ids[0]).toMatchObject({ state: "absent", origin: { pid: 77, settled: true } });
+    expect(lookups).toHaveLength(1);
+    // cleanup() resolves through the same function (no bare lookup path).
+    const mod = readFileSync("tests/staging/reportingCommitted.ts", "utf8");
+    expect(mod.match(/from reporting_private\.(batches|generations) where (batch_id|generation_id) = \$1::uuid\) as x/g)).toHaveLength(2);
+  });
+
+  it("(3) the capture prelock runs under the same 3 s transaction-local cap, keeping a stricter limit", async () => {
+    for (const [existing, expectSet] of [["0", true], ["5000", true], ["1000", false], ["3000", false]] as const) {
+      const log: string[] = [];
+      const conn = {
+        query: async (sql: string) => {
+          log.push(sql);
+          if (sql.includes("name = 'lock_timeout'")) return { rows: [{ ms: existing }], rowCount: 1 };
+          if (sql.startsWith("select current_user")) return { rows: [{ u: "service_role", claims: '{"role":"service_role"}' }], rowCount: 1 };
+          if (sql.startsWith("select pg_backend_pid")) return { rows: [{ p: 1 }], rowCount: 1 };
+          if (sql.includes("for update")) return { rows: [{ e: "3" }], rowCount: 1 };
+          if (sql.includes("set_reporting_capture")) return { rows: [{ capture_epoch: "4" }], rowCount: 1 };
+          return { rows: [], rowCount: 0 };
+        },
+        end: async () => undefined,
+      };
+      await ownedCall({ as: async () => undefined, save: () => undefined, open: async () => conn, redact: (s) => s }, newOwnership(["uk", "au"], "rt"), [])(conn, "select * from public.set_reporting_capture($1)", [true]);
+      const set = log.indexOf("select set_config('lock_timeout', '3s', true)");
+      const prelock = log.findIndex((l) => l.includes("for update"));
+      expect(set > -1, existing).toBe(expectSet);
+      if (expectSet) expect(set, existing).toBeLessThan(prelock);
+      expect(log.findIndex((l) => l.includes("name = 'lock_timeout'")), existing).toBeLessThan(prelock);
+    }
   });
 });

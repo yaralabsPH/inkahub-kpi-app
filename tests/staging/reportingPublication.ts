@@ -42,7 +42,7 @@ import type { LifecycleReport } from "./reportingCapture";
 
 export const MIGRATION_0038 = "supabase/migrations/0038_reporting_jobs.sql";
 export type Site = "au" | "uk" | "us";
-export type PublicationMode = "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings";
+export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings";
 export interface Db {
   query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>;
 }
@@ -53,11 +53,11 @@ export interface Db {
 
 export function parsePublicationArgs(argv: readonly string[]): { mode: PublicationMode | null; sites: [Site, Site] | null; maxPages: number; problems: string[] } {
   const problems: string[] = [];
-  const modes = argv.filter((a) => ["--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings"].includes(a));
+  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings"].includes(a));
   const sitesArg = argv.find((a) => a.startsWith("--sites="));
   const pagesArg = argv.find((a) => a.startsWith("--max-pages="));
   const unknown = argv.filter((a) => a.startsWith("--") && !modes.includes(a) && a !== sitesArg && a !== pagesArg);
-  if (modes.length !== 1) problems.push("choose exactly one of --rehearse-migration, --check-installed, --interleavings, --committed-interleavings");
+  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings");
   if (unknown.length) problems.push(`unknown flags: ${unknown.join(" ")}`);
   const sites = sitesArg?.slice("--sites=".length).split(",") ?? [];
   const okSites = sites.length === 2 && sites.every((s) => s === "au" || s === "uk" || s === "us") && sites[0] !== sites[1];
@@ -421,16 +421,44 @@ export const IMAGE_DIFF_SQL = `select
   (select count(*) from (select event_id, image from reporting_private.source_candidate where batch_id = $1 except select event_id, image from reporting_private.source_versions where site = $2 and valid_to_seq is null) x)::int as candidate_not_versions,
   (select count(*) from (select event_id, image from reporting_private.source_versions where site = $2 and valid_to_seq is null except select event_id, image from reporting_private.source_candidate where batch_id = $1) x)::int as versions_not_candidate`;
 
-/** Fixture ids: mirror image = current source row = current retained version (and a deleted id is in none). */
-export const FIXTURE_IMAGE_SQL = `select
-  (select count(*) from public.production_events pe where pe.location = $1 and pe.id = any($2::text[]))::int as source_rows,
-  (select count(*) from reporting_private.source_current sc where sc.site = $1 and sc.event_id = any($2::text[]))::int as mirror_rows,
-  (select count(*) from public.production_events pe join reporting_private.source_current sc on sc.site = pe.location and sc.event_id = pe.id
-    where pe.location = $1 and pe.id = any($2::text[]) and sc.image is distinct from pg_catalog.to_jsonb(pe))::int as mirror_differs,
-  (select count(*) from reporting_private.source_current sc join reporting_private.source_versions v on v.site = sc.site and v.event_id = sc.event_id and v.valid_to_seq is null
-    where sc.site = $1 and sc.event_id = any($2::text[]) and v.image is distinct from sc.image)::int as version_differs,
-  (select count(*) from reporting_private.source_versions v where v.site = $1 and v.event_id = any($2::text[]) and v.valid_to_seq is null
-    and not exists (select 1 from public.production_events pe where pe.location = $1 and pe.id = v.event_id))::int as deleted_still_current`;
+/**
+ * T13B2b-9: the three scoped image sets, as jsonb text (jsonb output is
+ * normalized, so equal images give equal text). Compared in TypeScript by
+ * scopedImageDiff, exactly and in both directions.
+ */
+export const SCOPED_IMAGES_SQL = {
+  source: "select pe.id as event_id, pg_catalog.to_jsonb(pe)::text as image from public.production_events pe where pe.location = $1 and pe.id = any($2::text[])",
+  mirror: "select sc.event_id, sc.image::text as image from reporting_private.source_current sc where sc.site = $1 and sc.event_id = any($2::text[])",
+  versions: "select v.event_id, v.image::text as image from reporting_private.source_versions v where v.site = $1 and v.event_id = any($2::text[]) and v.valid_to_seq is null",
+} as const;
+
+export type ImageRow = { event_id: string; image: string };
+/** Every missing, extra, duplicated or mismatched (event_id, image) between source, mirror and current versions. Empty = exact equality. */
+export function scopedImageDiff(sets: { source: ImageRow[]; mirror: ImageRow[]; versions: ImageRow[] }): string[] {
+  const out: string[] = [];
+  const maps: Record<string, Map<string, string>> = {};
+  for (const [name, rows] of Object.entries(sets)) {
+    const m = new Map<string, string>();
+    for (const r of rows) {
+      if (m.has(r.event_id)) out.push(`${name} has ${r.event_id} twice`);
+      m.set(r.event_id, r.image);
+    }
+    maps[name] = m;
+  }
+  const pairs: Array<[string, string]> = [["source", "mirror"], ["source", "versions"], ["mirror", "versions"]];
+  for (const [x, y] of pairs) {
+    for (const [id, img] of maps[x]) {
+      if (!maps[y].has(id)) out.push(`${id} is in ${x} but missing from ${y}`);
+      else if (maps[y].get(id) !== img) out.push(`${id} differs between ${x} and ${y}`);
+    }
+    for (const id of maps[y].keys()) if (!maps[x].has(id)) out.push(`${id} is in ${y} but not in ${x}`);
+  }
+  return out;
+}
+async function scopedImages(c: Db, site: Site, ids: string[]) {
+  const q = async (sql: string) => (await c.query(sql, [site, ids])).rows.map((r) => ({ event_id: String(r.event_id), image: String(r.image) }));
+  return { source: await q(SCOPED_IMAGES_SQL.source), mirror: await q(SCOPED_IMAGES_SQL.mirror), versions: await q(SCOPED_IMAGES_SQL.versions) };
+}
 
 const FAMILY_KEY: Record<string, string> = { event_facts: "event_id", cancel_edges: "cancel_event_id", order_occurrences: "terminal_event_id", timing_facts: "event_id", source_issue_facts: "event_id" };
 /** Current rows of every family at a site for the given ids, as "family|audience|staff|id" (sorted). */
@@ -583,9 +611,11 @@ export async function runPublicationFlow(c: Db, ctx: FlowCtx): Promise<void> {
   expectEqual(ctx, "F9i", "replaced RP-1: occurrence and timing rows have a retained closed version and a new current one per audience",
     (await c.query("select (select count(*) filter (where valid_to_seq = $2::bigint) from reporting_private.order_occurrences where site = $1 and terminal_event_id = 'rp-t1')::int as occ_closed, (select count(*) filter (where valid_from_seq = $2::bigint and valid_to_seq is null) from reporting_private.order_occurrences where site = $1 and terminal_event_id = 'rp-t1')::int as occ_new, (select count(*) filter (where valid_to_seq = $2::bigint) from reporting_private.timing_facts where site = $1 and event_id = 'rp-v1')::int as timing_closed, (select count(*) filter (where valid_from_seq = $2::bigint and valid_to_seq is null) from reporting_private.timing_facts where site = $1 and event_id = 'rp-v1')::int as timing_new", [A, p2.generation_seq])).rows[0],
     { occ_closed: 2, occ_new: 2, timing_closed: 2, timing_new: 2 });
-  expectEqual(ctx, "F9j", "fixture mirror images equal the source rows exactly, current versions equal the mirror, and deleted ids have no current version",
-    (await c.query(FIXTURE_IMAGE_SQL, [A, idsR])).rows[0],
-    { source_rows: idsR.length - 4, mirror_rows: idsR.length - 4, mirror_differs: 0, version_differs: 0, deleted_still_current: 0 });
+  {
+    const sets = await scopedImages(c, A, idsR);
+    expectEqual(ctx, "F9j", "source, mirror and current versions are the SAME (event_id, image) set for the fixture ids, in both directions (deleted ids absent from all three)",
+      { problems: scopedImageDiff(sets), sourceRows: sets.source.length }, { problems: [], sourceRows: idsR.length - 4 });
+  }
   expectEqual(ctx, "F9e", "the A->B move is received by A but NOT acknowledged (B has not published)", (await c.query("select acknowledged_at is null as pending from reporting_private.changes where old_event_id = 'rp-m1' and old_site = $1 and new_site = $2", [A, B])).rows.map((x) => x.pending), [true]);
   expectEqual(ctx, "F9f", "previous generation superseded with a seven-day expiry", (await c.query("select state, (expires_at - superseded_at) = interval '7 days' as week from reporting_private.generations where generation_id = $1", [p1.generation_id])).rows[0], { state: "superseded", week: true });
 
@@ -822,24 +852,24 @@ export const STATE_QUERIES: ReadonlyArray<readonly [string, string]> = [
   ["ledger", rowsHash("public.ledger")],
   ["memberships:user_locations", rowsHash("public.user_locations")],
   ["memberships:profiles", rowsHash("public.profiles")],
-  ["catalog:functions", `select md5(coalesce(string_agg(n.nspname || '.' || p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')|' || md5(p.prosrc) || '|' || coalesce(p.proacl::text, '') || '|' || coalesce(array_to_string(p.proconfig, ','), '') || '|' || p.prosecdef::text || '|' || pg_catalog.pg_get_userbyid(p.proowner), E'\\n' order by n.nspname, p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid)), '')) as h
+  ["catalog:functions", `select md5(coalesce(string_agg(n.nspname::text || '.' || p.proname::text || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')|' || md5(p.prosrc) || '|' || coalesce(p.proacl::text, '') || '|' || coalesce(array_to_string(p.proconfig, ','), '') || '|' || p.prosecdef::text || '|' || pg_catalog.pg_get_userbyid(p.proowner)::text, E'\\n' order by n.nspname, p.proname, pg_catalog.pg_get_function_identity_arguments(p.oid)), '')) as h
      from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname in ('public', 'reporting_private')`],
-  ["catalog:relations", `select md5(coalesce(string_agg(n.nspname || '.' || c.relname || '|' || c.relkind || '|' || coalesce(c.relacl::text, '') || '|' || c.relrowsecurity::text || '|' || pg_catalog.pg_get_userbyid(c.relowner), E'\\n' order by n.nspname, c.relname), '')) as h
+  ["catalog:relations", `select md5(coalesce(string_agg(n.nspname::text || '.' || c.relname::text || '|' || c.relkind::text || '|' || coalesce(c.relacl::text, '') || '|' || c.relrowsecurity::text || '|' || pg_catalog.pg_get_userbyid(c.relowner)::text, E'\\n' order by n.nspname, c.relname), '')) as h
      from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname in ('public', 'reporting_private') and c.relkind in ('r', 'v', 'm', 'S', 'i', 'p')`],
-  ["catalog:columns", `select md5(coalesce(string_agg(c.relname || '.' || a.attname || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':' || a.attnotnull::text || ':' || coalesce(a.attacl::text, ''), E'\\n' order by c.relname, a.attnum), '')) as h
+  ["catalog:columns", `select md5(coalesce(string_agg(c.relname::text || '.' || a.attname::text || ':' || pg_catalog.format_type(a.atttypid, a.atttypmod) || ':' || a.attnotnull::text || ':' || coalesce(a.attacl::text, ''), E'\\n' order by c.relname, a.attnum), '')) as h
      from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace
     where n.nspname in ('public', 'reporting_private') and c.relkind = 'r' and a.attnum > 0 and not a.attisdropped`],
-  ["catalog:constraints", `select md5(coalesce(string_agg(c.relname || '.' || k.conname || ':' || pg_catalog.pg_get_constraintdef(k.oid), E'\\n' order by c.relname, k.conname), '')) as h
+  ["catalog:constraints", `select md5(coalesce(string_agg(c.relname::text || '.' || k.conname::text || ':' || pg_catalog.pg_get_constraintdef(k.oid), E'\\n' order by c.relname, k.conname), '')) as h
      from pg_catalog.pg_constraint k join pg_catalog.pg_class c on c.oid = k.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname in ('public', 'reporting_private')`],
   ["catalog:indexes", `select md5(coalesce(string_agg(d, E'\\n' order by d), '')) as h from (select pg_catalog.pg_get_indexdef(i.indexrelid) as d
      from pg_catalog.pg_index i join pg_catalog.pg_class c on c.oid = i.indrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname in ('public', 'reporting_private')) s`],
-  ["catalog:policies", `select md5(coalesce(string_agg(schemaname || '.' || tablename || '.' || policyname || ':' || cmd || ':' || roles::text || ':' || coalesce(qual, '') || ':' || coalesce(with_check, ''), E'\\n' order by schemaname, tablename, policyname), '')) as h
+  ["catalog:policies", `select md5(coalesce(string_agg(schemaname::text || '.' || tablename::text || '.' || policyname::text || ':' || cmd || ':' || roles::text || ':' || coalesce(qual, '') || ':' || coalesce(with_check, ''), E'\\n' order by schemaname, tablename, policyname), '')) as h
      from pg_catalog.pg_policies where schemaname in ('public', 'reporting_private')`],
-  ["catalog:triggers", `select md5(coalesce(string_agg(c.relname || '.' || t.tgname || ':' || t.tgenabled || ':' || pg_catalog.pg_get_triggerdef(t.oid), E'\\n' order by c.relname, t.tgname), '')) as h
+  ["catalog:triggers", `select md5(coalesce(string_agg(c.relname::text || '.' || t.tgname::text || ':' || t.tgenabled::text || ':' || pg_catalog.pg_get_triggerdef(t.oid), E'\\n' order by c.relname, t.tgname), '')) as h
      from pg_catalog.pg_trigger t join pg_catalog.pg_class c on c.oid = t.tgrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname in ('public', 'reporting_private') and not t.tgisinternal`],
-  ["catalog:schemas-roles", `select md5(coalesce((select string_agg(nspname || ':' || coalesce(nspacl::text, ''), ',' order by nspname) from pg_catalog.pg_namespace where nspname in ('public', 'reporting_private')), '') || '|' ||
-       coalesce((select string_agg(rolname || ':' || rolcanlogin::text || rolinherit::text || rolsuper::text || rolbypassrls::text || rolcreaterole::text || rolcreatedb::text, ',' order by rolname) from pg_catalog.pg_roles where rolname = 'reporting_capture'), '') || '|' ||
-       coalesce((select string_agg(pg_catalog.pg_get_userbyid(m.roleid) || '>' || pg_catalog.pg_get_userbyid(m.member) || ':' || m.inherit_option::text || m.set_option::text, ',' order by 1) from pg_catalog.pg_auth_members m
+  ["catalog:schemas-roles", `select md5(coalesce((select string_agg(nspname::text || ':' || coalesce(nspacl::text, ''), ',' order by nspname) from pg_catalog.pg_namespace where nspname in ('public', 'reporting_private')), '') || '|' ||
+       coalesce((select string_agg(rolname::text || ':' || rolcanlogin::text || rolinherit::text || rolsuper::text || rolbypassrls::text || rolcreaterole::text || rolcreatedb::text, ',' order by rolname) from pg_catalog.pg_roles where rolname = 'reporting_capture'), '') || '|' ||
+       coalesce((select string_agg(pg_catalog.pg_get_userbyid(m.roleid)::text || '>' || pg_catalog.pg_get_userbyid(m.member)::text || ':' || m.inherit_option::text || m.set_option::text, ',' order by 1) from pg_catalog.pg_auth_members m
                   where m.roleid = (select oid from pg_catalog.pg_roles where rolname = 'reporting_capture') or m.member = (select oid from pg_catalog.pg_roles where rolname = 'reporting_capture')), '')) as h`],
 ];
 
@@ -862,9 +892,25 @@ const IDENT = /^[a-z_][a-z0-9_]*$/;
  * rolled-back insert still advances an identity sequence. Everything else
  * (rows, payloads, catalog, ACLs) must match exactly unless a mode declares it.
  */
+/**
+ * T13B2b-8: run one baseline surface; a failure names the surface and keeps
+ * the original error (message, SQLSTATE and cause) instead of an anonymous
+ * "baseline failed".
+ */
+export async function surface(c: Db, name: string, sql: string): Promise<string> {
+  try {
+    return String((await c.query(sql)).rows[0].h);
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    const err = Object.assign(new Error(`baseline surface ${name} failed: ${code ? `${code} ` : ""}${e instanceof Error ? e.message : String(e)}`), { cause: e });
+    if (code) Object.assign(err, { code });
+    throw err;
+  }
+}
+
 export async function fullState(c: Db): Promise<FullState> {
   const surfaces: Record<string, string> = {};
-  for (const [k, sql] of STATE_QUERIES) surfaces[k] = String((await c.query(sql)).rows[0].h);
+  for (const [k, sql] of STATE_QUERIES) surfaces[k] = await surface(c, k, sql);
   const privateTables: Record<string, string> = {};
   let control: Record<string, unknown> | null = null;
   let siteState: Array<Record<string, unknown>> = [];
@@ -874,7 +920,7 @@ export async function fullState(c: Db): Promise<FullState> {
     for (const t of tables) {
       if (!IDENT.test(t)) throw new Error(`unexpected table name ${t}`);
       if (t === "control" || t === "site_state") continue;
-      privateTables[t] = String((await c.query(rowsHash(`reporting_private."${t}"`))).rows[0].h);
+      privateTables[t] = await surface(c, `reporting_private.${t}`, rowsHash(`reporting_private."${t}"`));
     }
     control = (await c.query(CONTROL_SQL)).rows[0] ?? null;
     siteState = (await c.query(SITE_STATE_SQL)).rows;

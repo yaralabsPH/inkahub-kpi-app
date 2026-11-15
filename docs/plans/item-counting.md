@@ -1641,3 +1641,63 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The cleanup unit test's fake answered every site_state query, which made both sites look externally active; the fake was narrowed.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict tsc on the reporting-jobs and capture runners OK; 1062/1062 tests; build OK.
   - **Next:** independent review of the fixes and the harness before any staging action. Then the rollback rehearsal, installation of the reviewed draft, the installed and committed interleavings, and the fresh restoration audits.
+- 2026-11-15 — B2b round-2 repair (T13B2b-8 to 13) plus the planner's early-review residuals:
+  - **State:**
+    - No SQL was run and no staging mode was executed. The failed diagnostic artifact `staging-results-reporting-publication-rehearse-migration-20261114T203354246Z-25d65b84.md` is preserved, not retried.
+    - 0038 is unchanged this round (SHA-256 14a808ea…, unapplied); 0037 is unchanged (531BB2C5…).
+    - Task 13 stays OPEN.
+  - **T13B2b-8 (baseline SQL):**
+    - **Casts:** every catalog `name`/`"char"` column concatenated in `STATE_QUERIES` is now cast to text (relkind, tgenabled, relname, nspname, proname, tgname, attname, conname, schemaname/tablename/policyname, and the `pg_get_userbyid` results). A test scans every surface for any uncast concatenation.
+    - **Errors:** each surface runs through `surface()`, so a failure reads `baseline surface <name> failed: <SQLSTATE> <original message>` and keeps `code` and `cause` (the ES2020-safe `Object.assign` pattern).
+    - **New `--baseline-smoke --sites=A,B` mode:** read-only. It takes the full baseline once, records each surface, and lets the lifecycle's fresh audit prove nothing changed — no transaction, no write, no migration, no sign-in.
+  - **T13B2b-9 (refresh equality):** F9j now uses `scopedImageDiff`, an exact, bidirectional comparison of scoped `(event_id, image)` sets for source/mirror/current versions (jsonb text). Each of these fails:
+    - a missing current version for `rp-v6`;
+    - an extra mirror row;
+    - a mismatched image;
+    - a duplicate.
+  - **T13B2b-10 (conservative cleanup):** discovery and deletion run in ONE transaction:
+    - control share lock, then the run sites' `site_state` rows FOR UPDATE;
+    - exact journal ownership by the recorded fixture ids on both sides (no prefix);
+    - external journal rows = rows touching the run's sites with an epoch after the baseline that are not the run's;
+    - unknown batches/generations at the run's sites;
+    - the site pointers.
+
+    `cleanupDecision` retains EVERYTHING — every derived row, the mirror, versions, generations, batches, journal rows, fixtures and pointers — on any of these:
+    - failed discovery;
+    - an external journal row, batch or generation;
+    - a foreign active batch or published generation pointer;
+    - any tentative or uncertain identity.
+
+    In that case it only restores the run's processor setting, and only where no foreign batch is active. Any delete failure rolls back the whole cleanup (nothing half-deleted), and every failure is kept.
+  - **T13B2b-11 (settle first):** every secondary session is rolled back and closed BEFORE capture is restored. A scripted case-A run proves the order: open writer rollback → END → capture-off → locked cleanup → main END. Fixture source rows are deleted only when capture-off is confirmed inside the cleanup transaction, and every session closes even if cleanup fails. No timeout was raised.
+  - **T13B2b-12 (ownership before commit):**
+    - **Tentative before COMMIT:** `ownedCall` records returned batch/generation identities as tentative and persists them BEFORE COMMIT; a failed save rolls back and nothing commits. They are confirmed after the commit.
+    - **Uncertain COMMIT:** the originating session is ended first, and absence is concluded only after its backend is seen gone in `pg_stat_activity` (bounded: 25 × 200 ms). Otherwise the identity stays uncertain.
+    - **Capture accounting** (planner note): the expected epoch increment is the sum of this run's own CONFIRMED capture transitions. Each one locks control FOR UPDATE, reads the epoch, transitions, and persists a before/after receipt before COMMIT. An uncertain transition is an explicit failure and adds nothing, and observed deltas are never used. The successful enable is confirmed before processor setup.
+  - **T13B2b-13 (whole lifecycle):** everything after opening the main session is inside try/finally. A preflight query failure or a failed ownership save closes every session (rollback + end), sends no commit, `set_reporting_capture` or delete, and never runs destructive cleanup (`committedAnything` stays false). The lifecycle's fresh audit still runs.
+  - **Early-review residuals:**
+    - **(1)** A REUSED batch returned by begin that the run does not own is refused BEFORE COMMIT; a known owned replay is allowed.
+    - **(2)** Every resolution path, including cleanup's retry, honours the origin receipt: no absence lookup while the backend is present.
+    - **(3)** The same ≤3 s transaction-local lock cap (a stricter existing limit kept) is set before the capture prelock.
+    - **(4)** `--baseline-smoke` signs nobody in.
+    - **(5)** ES2020 `cause` pattern; duplicate `Db` import removed.
+    - **(6)** The settlement test's matcher no longer matches `publish_reporting_batch` inside PREFLIGHT_SQL, and it compares duplicate lines by entry index.
+  - **Deliberate breaks** (70 focused tests; all 21 killed):
+    - relkind / tgenabled not cast: 1 each;
+    - surface not named: 1;
+    - image diff in one direction only: 1; image diff ignoring missing rows: 1;
+    - external batches ignored: 1; discovery failure treated as clean: 2; foreign generation pointer ignored: 1; uncertain identity ignored: 1;
+    - journal matched by prefix: 1;
+    - non-atomic cleanup: 2;
+    - fixtures deleted with capture on: 1;
+    - secondaries settled after cleanup: 1;
+    - ownership saved only after commit: 1;
+    - origin not settled before concluding absence: 1;
+    - uncertain transitions widening the epoch: 2;
+    - cleanup after a preflight failure: 1;
+    - reused external batch adopted: 1;
+    - retry ignoring the origin receipt: 1;
+    - prelock without the lock cap: 1;
+    - baseline smoke signing in: 1.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1075/1075 tests; build OK.
+  - **Next:** root review of this checkpoint. Then root runs `--baseline-smoke`, followed by the authorized rollback rehearsal if clear. Installation and the committed harness wait for their reviews.

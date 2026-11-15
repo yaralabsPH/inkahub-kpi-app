@@ -338,8 +338,12 @@ async function publicationMain(argv: string[]): Promise<number> {
     const s = readSettings();
     assertStagingSupabaseUrl(s.STAGING_SUPABASE_URL);
     const target = stagingTarget(s.STAGING_DB_URL);
-    const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
-    claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
+    // The read-only baseline smoke never needs a session: no sign-in, no claims.
+    if (mode === "baseline-smoke") claims = {};
+    else {
+      const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
+      claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
+    }
     open = () => openGuarded(s.STAGING_DB_URL, target);
   } catch (e) {
     report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
@@ -371,8 +375,15 @@ async function publicationMain(argv: string[]): Promise<number> {
       if (!staff) throw new Error("staff test user not found");
       const installed = Boolean((await main.query("select exists (select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'publish_reporting_batch') as x")).rows[0]?.x);
       if (mode === "rehearse-migration" && installed) throw new Error("0038 is already installed; use --check-installed");
-      if (mode !== "rehearse-migration" && !installed) throw new Error("0038 is not installed; use --rehearse-migration");
+      if (mode !== "rehearse-migration" && mode !== "baseline-smoke" && !installed) throw new Error("0038 is not installed; use --rehearse-migration");
       before = await fullState(main);
+      if (mode === "baseline-smoke") {
+        // T13B2b-8: bounded READ-ONLY check that the full baseline can be taken (no transaction, no write, no migration);
+        // the lifecycle's fresh audit then proves nothing changed.
+        const surfaces = Object.keys(before.surfaces).length + Object.keys(before.privateTables).length;
+        record({ id: "S0", what: `full-state baseline captured (${surfaces} surfaces, 0038 ${installed ? "installed" : "absent"})`, expected: "every surface query succeeds", result: "ok", ok: true, ms: 0 });
+        return;
+      }
       if (mode === "committed-interleavings") {
         // Prepared under the plan's approved harness; COMMITS only its documented, owned state and always cleans up.
         own = newOwnership(sites);
@@ -414,7 +425,7 @@ async function publicationMain(argv: string[]): Promise<number> {
 
 async function main(): Promise<number> {
   const flags = process.argv.slice(2).filter((a) => a.startsWith("--"));
-  if (flags.some((f) => f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings" || f === "--committed-interleavings")) return publicationMain(flags);
+  if (flags.some((f) => f === "--baseline-smoke" || f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings" || f === "--committed-interleavings")) return publicationMain(flags);
   if (flags.join(" ") !== "--fence") {
     console.error("usage: npm run staging:reporting-jobs -- --fence | --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N]");
     return 2;
