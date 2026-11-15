@@ -1733,7 +1733,7 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - On refusal the transaction rolls back before the RPC runs, so the external batch, its state and the pointer are untouched.
     - A missing control or site row refuses; it is never read as "nothing active".
     - The existing `reused` check stays as a second line. Timeouts and the migration are unchanged.
-  - **Tests (`tests/reporting/reportingPublicationRunner.test.ts`, 49 → 59):**
+  - **Tests (`tests/reporting/reportingPublicationRunner.test.ts`, 39 → 50):**
     - All fixtures are admissible. The old `''` fixture fails with exactly `production_events_order_number_check`, and the other constraint breaks fail too. `insertFixtures` sends nothing for a bad row.
     - The epoch-drifted external batch is refused for both begin RPCs. The fake RPC fails the batch and returns a NEW id if reached; the tests prove it never runs, state and pointer are unchanged, rollback happens and nothing is committed. The lock order is asserted.
     - Also covered: a foreign pointer alone; a foreign live row alone; a known-owned reused replay inside one transaction (begin, guard, RPC, commit; no duplicate identity); a fresh begin recording the new id tentative then confirmed; missing control/site/site argument; the guard SQL's lock clauses.
