@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest",
-    "typecheck:digest": "tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node api/reports/daily-digest.ts tests/api/daily-digest.test.ts tests/api/daily-digest-counts.test.ts api/_lib/reporting-jobs.ts tests/reporting/reportingJobs.test.ts tests/reporting/reportingRebuild.test.ts tests/reporting/reportingRebuildRecovery.test.ts api/_lib/reporting-stage.ts tests/reporting/reportingStage.test.ts api/_lib/reporting-publish.ts tests/reporting/reportingPublish.test.ts tests/reporting/reportingPublicationRunner.test.ts",
+    "typecheck:digest": "tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node api/reports/daily-digest.ts tests/api/daily-digest.test.ts tests/api/daily-digest-counts.test.ts api/_lib/reporting-jobs.ts tests/reporting/reportingJobs.test.ts tests/reporting/reportingRebuild.test.ts tests/reporting/reportingRebuildRecovery.test.ts api/_lib/reporting-stage.ts tests/reporting/reportingStage.test.ts api/_lib/reporting-publish.ts tests/reporting/reportingPublish.test.ts tests/reporting/reportingPublicationRunner.test.ts tests/reporting/reportingFenceRun.test.ts",
     "staging:item-counting": "vite-node tests/staging/run-item-counting.ts",
     "staging:reporting-capture": "vite-node tests/staging/reporting-capture.ts",
     "staging:reporting-jobs": "vite-node tests/staging/reporting-jobs.ts"

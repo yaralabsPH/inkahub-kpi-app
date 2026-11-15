@@ -750,14 +750,21 @@ async function zeroWorkRebuild(c: Db, ctx: InterleaveCtx, site: Site): Promise<R
 
 export async function runInterleavings(ctx: InterleaveCtx, cleanupFailures: string[]): Promise<void> {
   const [A, B] = ctx.sites;
+  // T13B2b-17: stop at the first failed interleaving (false expectation, exception, scenario-connection
+  // cleanup failure, or a record/persistence failure): no later scenario or RPC runs. Each scenario still
+  // closes its own connections (withConnections) and the caller's lifecycle still runs the fresh audit.
   const run = async (id: string, what: string, expected: string, fn: () => Promise<{ ok: boolean; result: string }>) => {
     const t0 = ctx.now();
+    const cleanupBefore = cleanupFailures.length;
+    let o: { ok: boolean; result: string };
     try {
-      const o = await fn();
-      ctx.record({ id, what, expected, result: o.result, ok: o.ok, ms: Math.round(ctx.now() - t0) });
+      o = await fn();
     } catch (e) {
-      ctx.record({ id, what, expected, result: msgOf(e, ctx.redact), ok: false, ms: Math.round(ctx.now() - t0) });
+      o = { ok: false, result: msgOf(e, ctx.redact) };
     }
+    const cleanupFailed = cleanupFailures.length > cleanupBefore;
+    ctx.record({ id, what, expected, result: cleanupFailed ? `${o.result}; cleanup failed: ${cleanupFailures.slice(cleanupBefore).join("; ")}` : o.result, ok: o.ok && !cleanupFailed, ms: Math.round(ctx.now() - t0) });
+    if (!o.ok || cleanupFailed) throw new Error(`${id} failed${cleanupFailed ? " (scenario connection cleanup)" : ""}; later interleavings are not run`);
   };
   const pidOf = async (c: Db) => Number((await c.query("select pg_backend_pid() as p")).rows[0].p);
   const fctx = { ...ctx, record: () => undefined } as unknown as FlowCtx;

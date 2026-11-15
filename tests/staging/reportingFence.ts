@@ -5,6 +5,7 @@
  * expected outcomes and the report. Never logs claims or credentials.
  */
 import type { LifecycleReport } from "./reportingCapture";
+import type { CaptureTransition } from "./reportingCommitted";
 
 export const FENCE_SCENARIOS = [
   { id: "F1", what: "two compatible source writers at au (capture enabled) do not wait on each other" },
@@ -97,14 +98,23 @@ export function checkFence(obs: readonly FenceObservation[]): string[] {
   const by = new Map(obs.map((o) => [o.id, o]));
   for (const s of FENCE_SCENARIOS) {
     const o = by.get(s.id);
-    if (!o) {
-      p.push(`${s.id} did not run`);
-      continue;
-    }
-    if (o.error) {
-      p.push(`${s.id} failed: ${o.error}`);
-      continue;
-    }
+    if (!o) p.push(`${s.id} did not run`);
+    else p.push(...checkFenceObservation(o));
+  }
+  return p;
+}
+
+/**
+ * T13B2b-17: one observation against its scenario's expectations, checked as
+ * soon as it is made (the runner stops at the first problem). A refusal that
+ * the scenario EXPECTS (e.g. F3's 40001, F5's 55P03) is a pass, not a problem.
+ */
+export function checkFenceObservation(o: FenceObservation): string[] {
+  const p: string[] = [];
+  const s = FENCE_SCENARIOS.find((x) => x.id === o.id);
+  if (!s) return [`unknown fence scenario ${String(o.id)}`];
+  if (o.error) return [`${s.id} failed: ${o.error}`];
+  {
     const want = (ok: boolean, msg: string) => void (ok || p.push(`${s.id}: ${msg}`));
     switch (s.id) {
       case "F1":
@@ -149,10 +159,16 @@ export interface FenceReport extends LifecycleReport {
   captureAfter: { epoch: number; enabled: boolean } | null;
   observations: FenceObservation[];
   problems: string[];
+  /**
+   * T13B2b-18: this run's OWN capture transitions. Each receipt is persisted
+   * before its COMMIT; only CONFIRMED ones count toward the audit's expected
+   * epoch increment (an uncertain one adds nothing and fails the run).
+   */
+  captureTransitions: CaptureTransition[];
 }
 
 export function newFenceReport(revision: string, startedAt: string): FenceReport {
-  return { revision, startedAt, finishedAt: "", settings: null, captureBefore: null, captureAfter: null, observations: [], problems: [], errors: [], restorationVerified: null, restoration: null, restorationProblems: [] };
+  return { revision, startedAt, finishedAt: "", settings: null, captureBefore: null, captureAfter: null, observations: [], problems: [], captureTransitions: [], errors: [], restorationVerified: null, restoration: null, restorationProblems: [] };
 }
 
 export function fenceStatus(r: FenceReport): string {
@@ -169,9 +185,10 @@ export function fenceMarkdown(r: FenceReport): string {
     `- project: ybrzhrgfrnvtcwymjdrq (staging) · code revision: ${r.revision}`,
     `- started: ${r.startedAt} · finished: ${r.finishedAt || "(not finished)"}`,
     r.settings ? `- session settings (unchanged by the runner): ${r.settings}` : "",
-    "- source writes are always rolled back; capture toggles are committed (they advance the epoch) and capture is returned to its starting on/off state",
+    "- source writes are always rolled back; capture toggles are committed (they advance the epoch), each with a receipt saved before COMMIT; capture is always returned to its starting on/off state; the run stops at the first failed scenario",
     r.captureBefore ? `- capture before: ${r.captureBefore.enabled ? "enabled" : "disabled"} at epoch ${r.captureBefore.epoch}` : "",
     r.captureAfter ? `- capture after: ${r.captureAfter.enabled ? "enabled" : "disabled"} at epoch ${r.captureAfter.epoch}` : "",
+    r.captureTransitions.length ? `- own capture transitions: ${r.captureTransitions.map((t) => `${t.enable ? "on" : "off"} ${t.before}->${t.after} (${t.state})`).join(", ")}` : "",
     "",
     "## Scenarios",
     "",

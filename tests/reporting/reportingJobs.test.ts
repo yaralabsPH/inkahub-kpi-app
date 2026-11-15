@@ -343,6 +343,7 @@ describe("staging catalog check at 0038", () => {
 import { capLimit, checkFence, FENCE_SCENARIOS, fenceMarkdown, fenceStatus, launch, near, newFenceReport, type FenceObservation } from "../staging/reportingFence";
 
 const FENCE_RUNNER = readFileSync("tests/staging/reporting-jobs.ts", "utf8");
+const FENCE_RUN = readFileSync("tests/staging/reportingFenceRun.ts", "utf8");
 
 function goodFence(): FenceObservation[] {
   return [
@@ -403,13 +404,19 @@ describe("activation fence checks", () => {
     expect(FENCE_RUNNER).not.toMatch(/statement_timeout\s*:|set (local |session )?(statement_timeout|idle_in_transaction)/i);
     expect(FENCE_RUNNER).toMatch(/select capture_epoch from public\.set_reporting_capture\(\$1\)/);
     expect(FENCE_RUNNER).toMatch(/await become\(c, "service_role", ctx\.claims\)/);
-    expect(FENCE_RUNNER).toMatch(/if \(\(await controlState\(main\)\)\.enabled !== report\.captureBefore\.enabled\) await toggle\(ctx, report\.captureBefore\.enabled\);/);
-    // Only control toggles are committed (toggle() and F2's held toggle); no source write is ever committed.
-    expect(FENCE_RUNNER.match(/\.query\("commit"\)/g)).toHaveLength(2);
-    expect(FENCE_RUNNER).toMatch(/const r = await c\.query\("select capture_epoch from public\.set_reporting_capture\(\$1\)", \[enabled\]\);\r?\n\s+await c\.query\("commit"\);/);
-    expect(FENCE_RUNNER).toMatch(/const queuedWriterWaited = await waitingOnLock\(mon, dPid\);\r?\n\s+await c\.query\("commit"\);/);
+    // T13B2b-16: restoration is the coordinator's unconditional step, through the receipt-carrying toggle.
+    expect(FENCE_RUNNER).toMatch(/restore: async \(enabled\) => void \(await toggle\(ctx, enabled, true\)\),/);
+    expect(FENCE_RUNNER).toMatch(/return ownedToggle\(\{ \.\.\.ctx\.receipts, as: \(c\) => become\(c as pg\.Client, "service_role", ctx\.claims\) \}, enabled, restoring\);/);
+    // Only control toggles are committed, each through commitReceipt (toggle() via ownedToggle, and F2's held toggle); no source write is ever committed.
+    expect(FENCE_RUNNER.match(/\.query\("commit"\)/g)).toBeNull();
+    expect(FENCE_RUNNER.match(/commitReceipt\(/g)).toHaveLength(1); // F2 (toggle() commits inside ownedToggle)
+    expect(FENCE_RUN).toMatch(/const r = await c\.query\("select capture_epoch from public\.set_reporting_capture\(\$1\)", \[enabled\]\);\r?\n\s+t = tentativeReceipt\(io, enabled, before, r\.rows\[0\]\?\.capture_epoch\);/);
+    expect(FENCE_RUNNER).toMatch(/const receiptBefore = await lockForReceipt\(c, "share"\);\r?\n(\s*\/\/.*\r?\n)*\s+const enable = launch\(c\.query\("select capture_epoch from public\.set_reporting_capture\(true\)"\)\);/); // F2: SHARE (its own UPDATE still waits), before the toggle
+    expect(FENCE_RUNNER).toMatch(/const receipt = tentativeReceipt\(ctx\.receipts, true, receiptBefore, epochAfter\);/);
+    expect(FENCE_RUNNER).toMatch(/const queuedWriterWaited = await waitingOnLock\(mon, dPid\);\r?\n\s+try \{\r?\n\s+await commitReceipt\(c, receipt, cPid, ctx\.receipts\);/);
     expect(FENCE_RUNNER).toMatch(/cleanup failed: scenario connection/);
-    expect(FENCE_RUNNER).toMatch(/runCaptureLifecycle\(report, \{/);
+    expect(FENCE_RUNNER).toMatch(/await runFence\(report, \{/);
+    expect(FENCE_RUN).toMatch(/await runCaptureLifecycle\(report, \{/);
   });
 });
 

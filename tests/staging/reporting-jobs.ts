@@ -14,10 +14,13 @@
  *
  * Several real connections. Every source write is rolled back. Capture
  * toggles go through public.set_reporting_capture as service_role and are
- * COMMITTED (each advances the epoch); capture is returned to its starting
- * on/off state at the end. Every client is guarded (frozen staging target at
- * every query) and marker-checked; a fresh guarded audit verifies restoration
- * after success and failure. No timeout is overridden except a scenario's own
+ * COMMITTED (each advances the epoch), each with a receipt saved BEFORE its
+ * COMMIT. The coordinator (reportingFenceRun.ts) stops at the first failed
+ * scenario and ALWAYS returns capture to its starting on/off state on a fresh
+ * connection. Every client is guarded (frozen staging target at every query)
+ * and marker-checked; a fresh guarded full-state audit (only this run's
+ * confirmed epoch increments allowed) verifies restoration after success and
+ * failure. No timeout is overridden except a scenario's own
  * transaction-local lock_timeout where the scenario is about lock waits.
  * Report: staging-results-reporting-fence-<start>-<id>.md (git-ignored).
  * Batch receipt/publication interleavings are added with Part B.
@@ -31,7 +34,8 @@ import { assertStagingSupabaseUrl } from "./measure-item-counting";
 import { redactSecrets } from "./itemCountingPolicyParity";
 import { become } from "./writeCompatRun";
 import { CATALOG_SQL, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
-import { capLimit, checkFence, fenceMarkdown, fenceStatus, launch, newFenceReport, type FenceObservation } from "./reportingFence";
+import { capLimit, fenceMarkdown, fenceStatus, launch, newFenceReport, type FenceObservation } from "./reportingFence";
+import { abandonReceipt, commitReceipt, lockForReceipt, ownedToggle, runFence, tentativeReceipt, type ReceiptIO } from "./reportingFenceRun";
 import { catalog } from "./policyParityRun";
 import { catalogLevel, checkCatalog, finalReport, initialReport } from "./reportingCapture";
 import { committedAllowance, newOwnership, runCommitted, type Ownership } from "./reportingCommitted";
@@ -93,20 +97,13 @@ interface Ctx {
   open: () => Promise<pg.Client>;
   claims: Record<string, string>;
   staff: string;
+  /** The run's receipt store (report.captureTransitions / report.errors / save). */
+  receipts: ReceiptIO;
 }
 
-/** Committed control transition through the service-only RPC, as service_role. */
-async function toggle(ctx: Ctx, enabled: boolean): Promise<number> {
-  const c = await ctx.open();
-  try {
-    await c.query("begin");
-    await become(c, "service_role", ctx.claims);
-    const r = await c.query("select capture_epoch from public.set_reporting_capture($1)", [enabled]);
-    await c.query("commit");
-    return Number(r.rows[0].capture_epoch);
-  } finally {
-    await c.end();
-  }
+/** Committed control transition through the service-only RPC, as service_role, with a receipt saved before COMMIT. */
+async function toggle(ctx: Ctx, enabled: boolean, restoring = false): Promise<number> {
+  return ownedToggle({ ...ctx.receipts, as: (c) => become(c as pg.Client, "service_role", ctx.claims) }, enabled, restoring);
 }
 
 /** The connection's effective lock_timeout in ms (0 = none); never changed by the runner. */
@@ -187,18 +184,28 @@ async function f2(ctx: Ctx): Promise<FenceObservation> {
     const cPid = Number((await c.query("select pg_backend_pid() as p")).rows[0].p);
     await c.query("begin");
     await become(c, "service_role", ctx.claims);
+    // T13B2b-18: the receipt's epoch under a control SHARE lock. It does not conflict with the open
+    // writer's share lock (so the toggle's own UPDATE is still what waits) but blocks any other
+    // transition until this one commits; same at-most-3-s cap the RPC applies.
+    const receiptBefore = await lockForReceipt(c, "share");
     // T13A-1: observed at once, inspected (or rethrown) where awaited; polling failures still clean up.
     const enable = launch(c.query("select capture_epoch from public.set_reporting_capture(true)"));
     const toggleWaited = await waitingOnLock(mon, cPid);
     await a.query("rollback"); // the disabled-period write ends (nothing kept)
     const epochAfter = Number((await enable.result()).rows[0].capture_epoch);
+    const receipt = tentativeReceipt(ctx.receipts, true, receiptBefore, epochAfter); // saved BEFORE the commit below
     // The toggle is applied but NOT committed: a READ COMMITTED writer queues behind it.
     const dPid = Number((await d.query("select pg_backend_pid() as p")).rows[0].p);
     await d.query("begin");
     await become(d, "staff", ctx.claims);
     const write = launch(d.query(INS("rj-f2-d"), [ctx.staff]));
     const queuedWriterWaited = await waitingOnLock(mon, dPid);
-    await c.query("commit");
+    try {
+      await commitReceipt(c, receipt, cPid, ctx.receipts);
+    } catch (e) {
+      if (receipt.state === "tentative") await abandonReceipt(c, receipt, ctx.receipts);
+      throw e;
+    }
     await write.result();
     await d.query("reset role");
     const j = await d.query(`select count(*)::int as n, max(capture_epoch) as e from ${REPORTING_SCHEMA}.changes where new_event_id = 'rj-f2-d'`);
@@ -291,22 +298,6 @@ async function f6(ctx: Ctx): Promise<FenceObservation> {
     await p.query("rollback");
     return { id: "F6", lockRows: lock.rowCount, updateUpdatedAtError, updateEnabledError };
   });
-}
-
-interface Snap {
-  catalog: ReportingCatalog | null;
-  enabled: boolean;
-  fixtures: string;
-}
-async function snapshot(c: pg.Client): Promise<Snap> {
-  const cat = (await c.query(CATALOG_SQL)).rows[0].j as ReportingCatalog;
-  const norm = JSON.parse(JSON.stringify(cat)) as ReportingCatalog & { control: Record<string, unknown> | null };
-  const enabled = Boolean(cat.control?.capture_enabled);
-  if (norm.control) norm.control = { ...norm.control, capture_epoch: null, updated_at: null } as never;
-  const f = await c.query(
-    `select concat_ws(';', 'rj-events=' || (select count(*) from public.production_events where id like 'rj-%'), 'rj-journal=' || (select count(*) from ${REPORTING_SCHEMA}.changes where coalesce(new_event_id, old_event_id) like 'rj-%')) as s`,
-  );
-  return { catalog: norm, enabled, fixtures: String(f.rows[0].s) };
 }
 
 /** Part B2b: publication rehearsal / installed flow / interleavings. Every transaction is rolled back. */
@@ -447,13 +438,20 @@ async function main(): Promise<number> {
   if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
   let ctx: Ctx;
+  const receipts: ReceiptIO = {
+    transitions: report.captureTransitions,
+    errors: report.errors,
+    save,
+    open: () => ctx.open(),
+    redact: redactSecrets,
+  };
   try {
     const s = readSettings();
     assertStagingSupabaseUrl(s.STAGING_SUPABASE_URL);
     const target = stagingTarget(s.STAGING_DB_URL);
     const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
     const claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
-    ctx = { open: () => openGuarded(s.STAGING_DB_URL, target), claims, staff: "" };
+    ctx = { open: () => openGuarded(s.STAGING_DB_URL, target), claims, staff: "", receipts };
   } catch (e) {
     report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
     report.finishedAt = new Date().toISOString();
@@ -461,45 +459,24 @@ async function main(): Promise<number> {
     console.log(fenceStatus(report));
     return 1;
   }
-  let before: Snap | null = null;
-  await runCaptureLifecycle(report, {
+  const scenarios = ([["F1", f1], ["F2", f2], ["F3", f3], ["F4", f4], ["F5", f5], ["F6", f6]] as const).map(([id, f]) => ({ id, run: () => f(ctx) }));
+  await runFence(report, {
     open: ctx.open,
     now: () => new Date().toISOString(),
     redact: redactSecrets,
     save,
-    body: async (main) => {
+    prepare: async (main) => {
       const st = await main.query("select current_setting('statement_timeout') as st, current_setting('lock_timeout') as lt, current_setting('idle_in_transaction_session_timeout') as it");
       report.settings = `statement_timeout=${st.rows[0].st}, lock_timeout=${st.rows[0].lt}, idle_in_transaction_session_timeout=${st.rows[0].it}`;
       const has = await main.query("select exists (select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'set_reporting_capture') as x");
       if (!has.rows[0]?.x) throw new Error("0038 is not installed; the fence checks need it applied");
       ctx.staff = String((await main.query("select id::text as id from auth.users where email = 'staff@inka-staging.test'")).rows[0]?.id ?? "");
       if (!ctx.staff) throw new Error("staff test user not found");
-      before = await snapshot(main);
-      report.captureBefore = await controlState(main);
-      for (const run of [f1, f2, f3, f4, f5, f6]) {
-        let o: FenceObservation;
-        try {
-          o = await run(ctx);
-        } catch (e) {
-          o = { id: (["F1", "F2", "F3", "F4", "F5", "F6"] as const)[[f1, f2, f3, f4, f5, f6].indexOf(run)], error: redactSecrets(e instanceof Error ? e.message : String(e)) };
-        }
-        report.observations.push(o);
-        save();
-      }
-      // Return capture to its starting on/off state (committed; advances the epoch if it differs).
-      if ((await controlState(main)).enabled !== report.captureBefore.enabled) await toggle(ctx, report.captureBefore.enabled);
-      report.captureAfter = await controlState(main);
-      report.problems = checkFence(report.observations);
     },
-    audit: async (fresh) => {
-      if (!before) throw new Error("no starting snapshot was taken, so nothing can be compared");
-      const after = await snapshot(fresh);
-      const p: string[] = [];
-      if (after.enabled !== before.enabled) p.push(`capture is ${after.enabled ? "enabled" : "disabled"}, was ${before.enabled ? "enabled" : "disabled"}`);
-      if (JSON.stringify(after.catalog) !== JSON.stringify(before.catalog)) p.push("reporting schema/ACL/site state differ (epoch/updated_at excluded)");
-      if (after.fixtures !== before.fixtures) p.push(`fixture state "${after.fixtures}" (before "${before.fixtures}")`);
-      return p;
-    },
+    scenarios,
+    restore: async (enabled) => void (await toggle(ctx, enabled, true)),
+    fullState: (c) => fullState(c),
+    controlState: (c) => controlState(c as pg.Client),
   });
   finalReport(save, () => fenceMarkdown(report), report.errors);
   const status = fenceStatus(report);

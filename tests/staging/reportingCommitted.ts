@@ -242,7 +242,12 @@ export async function guardBeginOwnership(c: Db, own: Ownership, site: unknown):
 
 /** EXPECTED epoch increments: only this run's own CONFIRMED capture transitions (after − before). */
 export function expectedEpochIncrement(own: Ownership): number {
-  return own.captureTransitions.filter((t) => t.state === "confirmed").reduce((n, t) => n + Number(BigInt(t.after) - BigInt(t.before)), 0);
+  return transitionIncrement(own.captureTransitions);
+}
+
+/** The epoch increment of the CONFIRMED receipts only (tentative, absent and uncertain add nothing). Shared with the fence runner. */
+export function transitionIncrement(ts: readonly CaptureTransition[]): number {
+  return ts.filter((t) => t.state === "confirmed").reduce((n, t) => n + Number(BigInt(t.after) - BigInt(t.before)), 0);
 }
 
 /**

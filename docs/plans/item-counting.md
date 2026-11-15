@@ -1772,3 +1772,48 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - guard only for `begin_reporting_batch`.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1086/1086 tests; build OK.
   - **Next:** root review of this checkpoint, then the corrected rollback rehearsal. Installation and the committed harness wait for their own checks. Task 13 stays unchecked; no Task 14 work.
+- 2026-11-15 — recovery-runner repair (T13B2b-16, -17, -18 only). No SQL, no staging mode, no migration/app/API change, no Task 14 work. 0037 `531bb2c5…` and 0038 `14a808ea…714b1d` are byte-identical:
+  - **Coordinator moved for testing:** the fence coordinator moved out of `tests/staging/reporting-jobs.ts`, which runs `main()` on import, into the new `tests/staging/reportingFenceRun.ts`. `runFence` owns ordering, stopping, restoration, receipts and the audit. The F1–F6 bodies stay in `reporting-jobs.ts`. `reportingFence.ts` gains `checkFenceObservation` (per observation; `checkFence` uses it) and `captureTransitions` in the report and its markdown. `reportingCommitted.ts` exports `transitionIncrement` (shared; `expectedEpochIncrement` uses it). `package.json` `typecheck:digest` now includes the new test file.
+  - **T13B2b-16 (unconditional restoration):** the scenarios run inside `try`. In `finally`, after every scenario's sessions have settled, `restore` returns capture to its starting state on a FRESH connection through the receipt-carrying toggle. This holds after an exception, a false expectation, a persistence failure or a query failure. A restoration failure is pushed separately (`restoration failed: …`), so the original error is never replaced. The lifecycle then still rolls back and disconnects main and runs the fresh audit.
+    - If persistence is already broken, the restoring toggle's saves are best effort: the failure is recorded and the run is FAILED, but capture is still restored.
+    - Nothing is restored when the run failed before the baseline (no toggle happened).
+  - **T13B2b-17 (stop at the first failure):**
+    - Fence: each observation is checked and saved at once. The run stops on an exception (including scenario-connection cleanup failures), a false expectation or a save failure. Expected refusals that match (F3 40001, F5 55P03, F6 42501) pass.
+    - `runInterleavings`: stops after recording the first failed scenario, which includes the I0 operator precondition, an exception, a scenario-connection cleanup failure or a record/persistence failure. Connections still close; the audit still runs.
+    - Rollback interleavings remain operator-setup-only; I0 still refuses unless capture and both processors are on. No automatic setup was added.
+  - **T13B2b-18 (full fence audit):** the narrow catalog/`rj-*` snapshot is replaced by `fullState`/`compareFullState`, so epoch and `updated_at` are no longer normalized away. The only allowance is `transitionIncrement` over this run's CONFIRMED receipts, plus the control timestamp only when a confirmed receipt changed the row. No site fields are allowed.
+    - Every committed toggle (`ownedToggle`): caps the lock wait at 3 s like the RPC (a stricter existing limit is kept), locks control FOR UPDATE, reads the epoch, calls the RPC and saves a TENTATIVE receipt BEFORE COMMIT. A failed save marks it ABSENT and rolls back. A successful COMMIT confirms it. A failed COMMIT marks it UNCERTAIN, records it and settles the originating session with the reviewed `settleOrigin`; an uncertain receipt is never counted and fails the audit.
+    - F2's held toggle takes the same receipt under a control FOR SHARE lock. FOR SHARE does not conflict with the open writer's share lock, so the toggle's own UPDATE is still the statement that waits, while it blocks any other transition until commit. Disclosed: this one added lock statement changes F2's SQL sequence but not what F2 observes.
+  - **Tests:** `tests/reporting/reportingFenceRun.test.ts` (new, 19) drives the ACTUAL `runFence`/`ownedToggle` against an in-memory fake database. The structural assertions in `tests/reporting/reportingJobs.test.ts` were updated (no direct `commit` in the runner; F2 uses a SHARE receipt lock before its toggle). Cases:
+    - a clean run with an exact allowance;
+    - a save failure after F1's committed toggle (stops; capture restored on a fresh connection; audit verified; both persistence errors kept);
+    - a restoration failure kept separately, with the audit showing capture left on;
+    - a pre-baseline failure (nothing restored);
+    - a false expectation, an exception and a cleanup failure, each stopping at once, while expected refusals pass;
+    - a same-count payload change, external epoch drift and an uncertain lost-response COMMIT, each FAILED;
+    - a failed pre-COMMIT receipt save (absent, nothing committed);
+    - the allowance rule; the lock-cap order; toggle disconnect failures;
+    - rollback interleavings: I0 false, an I0 exception, an I0 cleanup failure and a record failure all stop with no later RPC; I0 passing proceeds.
+    - One real bug was found by these tests and fixed: a failed pre-COMMIT save left its receipt "tentative" instead of "absent".
+  - **Mutations:** 19/19 deliberate breaks caught:
+    - restore skipped;
+    - restoration failure swallowed;
+    - continuing after a failed observation;
+    - no per-scenario save;
+    - allowance counting every receipt state;
+    - timestamp always allowed;
+    - increment derived from observed totals;
+    - uncertain counted;
+    - no pre-COMMIT save;
+    - restoration stopping on a persistence failure;
+    - interleavings continuing after a failure;
+    - interleavings ignoring cleanup failures;
+    - a failed save left tentative;
+    - the audit ignoring tentative/uncertain receipts;
+    - F2 locking FOR UPDATE;
+    - no lock cap;
+    - the per-observation check ignoring errors;
+    - the toggle connection not closed;
+    - the audit tolerating no baseline.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1105/1105 tests (33 files); build OK.
+  - **Next:** root review of this checkpoint. `--fence`, `--interleavings` and `--committed-interleavings` have not run. Task 13 stays unchecked.
