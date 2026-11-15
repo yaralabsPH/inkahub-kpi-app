@@ -406,7 +406,8 @@ describe("T13B2b-19: monitored I4", () => {
     const mon: Db = { query: async () => { if (++polls === 4) setTimeout(() => jobs[0].resolve("late"), 5); return { rows: [], rowCount: 0 }; } };
     const m = await monitorBackends(mon, [1], [jobs[0].p], ictx(), { maxSamples: 4 });
     expect(polls).toBe(4);
-    expect(m.bounded).toBe(true);
+    expect(m.exhausted).toBe(true); // T13B2b-21: still pending at the bound
+    expect(m.monitorError).toBe("monitor exhausted: 4 samples taken while 1 job(s) were still pending");
     expect(m.outcomes).toEqual([{ ok: true, v: "late" }]);
   });
 
@@ -432,5 +433,166 @@ describe("T13B2b-19: monitored I4", () => {
   it("I4 uses the monitored helper on three connections (two workers + an independent monitor)", () => {
     const pub = read("tests/staging/reportingPublication.ts");
     expect(pub).toMatch(/withConnections\(ctx, 3, async \(\[a, b, mon\]\) => i4Monitored\(ctx, a, b, mon, \(c, site\) => zeroWorkRebuild\(c, ctx, site\)\), cleanupFailures\)\);/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T13B2b-20: fail-fast recorder (persist the original observation, then stop)
+// ---------------------------------------------------------------------------
+
+import { failFast, runConstraintProbes } from "../staging/reportingRebuildRepair";
+import { expectEqual, type FlowCtx } from "../staging/reportingPublication";
+
+describe("T13B2b-20: the rehearsal stops at the first RECORDED failure", () => {
+  it("a flow assertion that records ok:false (and would otherwise return) stops the rehearsal: the proof never begins, the observation is persisted, outer ROLLBACK", async () => {
+    const s = scripted();
+    const t = repairCtx();
+    const calls: string[] = [];
+    const flow = async (_c: Db, x: FlowCtx) => {
+      calls.push("flow");
+      expectEqual(x, "F9j", "source, mirror and current versions are the same set", { problems: ["rp-v6 is in source but missing from versions"] }, { problems: [] });
+      calls.push("flow continued after a failed assertion");
+    };
+    await expect(rehearseRebuildRepair(s.db, t.ctx, deps(calls, { flow }))).rejects.toThrow(/^F9j failed; later steps depend on it$/);
+    expect(calls).toEqual(["flow"]); // neither the rest of the flow nor the proof ran
+    expect(t.recorded.find((o) => o.id === "F9j")).toMatchObject({ ok: false, result: '{"problems":["rp-v6 is in source but missing from versions"]}' }); // original evidence persisted first
+    expect(s.sent.at(-1)).toBe("rollback");
+    expect(s.sent.some((q) => /^\s*commit\b/i.test(q))).toBe(false);
+  });
+
+  it("a proof assertion that records ok:false stops before any further publication", async () => {
+    const s = scripted();
+    const calls: string[] = [];
+    const proof = async (c: Db, x: FlowCtx) => {
+      calls.push("proof");
+      expectEqual(x, "V5x", "whole-site check", 1, 0);
+      await c.query("select * from public.publish_reporting_batch($1, $2)", ["b", 1]); // must never be sent
+    };
+    await expect(rehearseRebuildRepair(s.db, repairCtx().ctx, deps(calls, { proof }))).rejects.toThrow(/^V5x failed/);
+    expect(s.sent).not.toContain("select * from public.publish_reporting_batch($1, $2)"); // the publish call was never sent
+    expect(s.sent.at(-1)).toBe("rollback");
+  });
+
+  // V7 through the REAL refused() path, inside the rehearsal (outer rollback) and directly (savepoint order).
+  function probeDb(v7a: "succeeds" | "wrong-error" | "right-error") {
+    const sent: string[] = [];
+    const base = scripted();
+    const db: Db = {
+      query: async (q: string, p?: unknown[]) => {
+        sent.push(q);
+        if (q === PROOF_SQL.pkProbe) {
+          if (v7a === "succeeds") return { rows: [], rowCount: 1 };
+          throw Object.assign(new Error(v7a === "wrong-error" ? "permission denied for table source_versions" : 'duplicate key value violates unique constraint "source_versions_pkey"'), { code: v7a === "wrong-error" ? "42501" : "23505" });
+        }
+        if (q === PROOF_SQL.checkProbe) throw Object.assign(new Error('new row for relation "source_versions" violates check constraint "source_versions_check1"'), { code: "23514" });
+        return base.db.query(q, p);
+      },
+    };
+    return { db, sent };
+  }
+  for (const v7a of ["succeeds", "wrong-error"] as const) {
+    it(`V7a ${v7a === "succeeds" ? "unexpectedly succeeds" : "fails with the wrong error"}: its savepoint is rolled back and released, V7b is NOT sent, the outer transaction rolls back`, async () => {
+      const p = probeDb(v7a);
+      const t = repairCtx();
+      await expect(rehearseRebuildRepair(p.db, t.ctx, deps([], { proof: (c, x) => runConstraintProbes(c, x, "uk") }))).rejects.toThrow(/^V7a failed; later steps depend on it$/);
+      const i = p.sent.indexOf(PROOF_SQL.pkProbe);
+      expect(p.sent.slice(i - 1, i + 3)).toEqual(["savepoint rp_probe", PROOF_SQL.pkProbe, "rollback to savepoint rp_probe", "release savepoint rp_probe"]);
+      expect(p.sent).not.toContain(PROOF_SQL.checkProbe);
+      expect(p.sent.at(-1)).toBe("rollback");
+      expect(t.recorded.find((o) => o.id === "V7a")).toMatchObject({ ok: false, result: v7a === "succeeds" ? "succeeded (expected a refusal)" : "42501 permission denied for table source_versions" });
+    });
+  }
+  it("V7a and V7b both raising as expected pass, each in its own cleaned-up savepoint", async () => {
+    const p = probeDb("right-error");
+    const t = repairCtx();
+    await rehearseRebuildRepair(p.db, t.ctx, deps([], { proof: (c, x) => runConstraintProbes(c, x, "uk") }));
+    expect(t.recorded.filter((o) => o.id.startsWith("V7")).map((o) => `${o.id}:${o.ok}`)).toEqual(["V7a:true", "V7b:true"]);
+    expect(p.sent.filter((q) => q === "release savepoint rp_probe")).toHaveLength(2);
+  });
+
+  it("a persistence failure while recording stays fatal (and the outer transaction rolls back)", async () => {
+    const s = scripted();
+    let n = 0;
+    const t = repairCtx({ record: () => { if (++n === 4) throw new Error("ENOSPC"); } }); // K0, K1, K2 ok; K3's record fails
+    await expect(rehearseRebuildRepair(s.db, t.ctx, deps([]))).rejects.toThrow(/K3 failed|ENOSPC/);
+    expect(s.sent.at(-1)).toBe("rollback");
+  });
+
+  it("failFast persists the observation BEFORE throwing; passing observations pass through", () => {
+    const seen: string[] = [];
+    const ctx = failFast({ record: (o: Observation) => void seen.push(`${o.id}:${o.ok}`) });
+    ctx.record({ id: "A", what: "", expected: "", result: "", ok: true, ms: 0 });
+    expect(() => ctx.record({ id: "B", what: "", expected: "", result: "x", ok: false, ms: 0 })).toThrow("B failed; later steps depend on it");
+    expect(seen).toEqual(["A:true", "B:false"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T13B2b-21: monitor exhaustion and exact-PID coverage are I4 failures
+// ---------------------------------------------------------------------------
+
+describe("T13B2b-21: I4 does not pass without monitoring coverage", () => {
+  const ictx2 = (): InterleaveCtx => {
+    let t = 0;
+    return { sites: ["uk", "us"], staff: "s", open: async () => { throw new Error("unused"); }, as: async () => undefined, record: () => undefined, redact: (s) => s, now: () => (t += 10), sleep: () => new Promise<void>((r) => setTimeout(r, 0)), maxPages: 1 };
+  };
+  const deferred2 = <T>() => { let resolve!: (v: T) => void; const p = new Promise<T>((a) => (resolve = a)); return { p, resolve }; };
+  const w = (pid: number) => ({ query: async (q: string) => (q.startsWith("select pg_backend_pid()") ? { rows: [{ p: pid }], rowCount: 1 } : { rows: [], rowCount: 0 }) }) as Db;
+  const both = [{ pid: 101, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "1" }, { pid: 202, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "1" }];
+
+  it("exhausted with jobs pending, then BOTH publications succeed: I4 still FAILS (sticky), and both jobs were awaited", async () => {
+    const jobs = [deferred2<string>(), deferred2<string>()];
+    let polls = 0;
+    const mon: Db = { query: async () => { if (++polls === 3) setTimeout(() => { jobs[0].resolve("ok"); jobs[1].resolve("ok"); }, 5); return { rows: both, rowCount: 2 }; } };
+    let i = 0;
+    const r = await i4Monitored(ictx2(), w(101), w(202), mon, () => jobs[i++].p, { maxSamples: 3 });
+    expect(polls).toBe(3);
+    expect(r.ok).toBe(false);
+    expect(r.result).toMatch(/^uk: published; us: published; monitor: /);
+    const ev = JSON.parse(r.result.slice(r.result.indexOf("monitor: ") + 9));
+    expect(ev.exhausted).toBe(true);
+    expect(ev.monitorError).toBe("monitor exhausted: 3 samples taken while 2 job(s) were still pending");
+  });
+
+  it("completing exactly at the limit is NOT exhaustion", async () => {
+    const jobs = [deferred2<string>(), deferred2<string>()];
+    let polls = 0;
+    const mon: Db = { query: async () => { if (++polls === 3) { jobs[0].resolve("ok"); jobs[1].resolve("ok"); } return { rows: both, rowCount: 2 }; } };
+    let i = 0;
+    const r = await i4Monitored(ictx2(), w(101), w(202), mon, () => jobs[i++].p, { maxSamples: 3 });
+    expect(polls).toBe(3);
+    const ev = JSON.parse(r.result.slice(r.result.indexOf("monitor: ") + 9));
+    expect(ev.exhausted).toBe(false);
+    expect(ev.monitorError).toBeNull();
+    expect(r.ok).toBe(true);
+  });
+
+  it("a pinned PID never observed is an explicit failure, even when both publish", async () => {
+    const jobs = [deferred2<string>(), deferred2<string>()];
+    let polls = 0;
+    const mon: Db = { query: async () => { if (++polls === 2) { jobs[0].resolve("ok"); jobs[1].resolve("ok"); } return { rows: [both[0]], rowCount: 1 }; } }; // only pid 101
+    let i = 0;
+    const r = await i4Monitored(ictx2(), w(101), w(202), mon, () => jobs[i++].p);
+    expect(r.ok).toBe(false);
+    const ev = JSON.parse(r.result.slice(r.result.indexOf("monitor: ") + 9));
+    expect(ev.uncovered).toEqual([202]);
+    expect(ev.monitorError).toBe("monitor coverage missing: no sample observed for pid(s) 202");
+  });
+
+  it("no rows at all (both PIDs uncovered) fails; every job is settled on every path", async () => {
+    for (const mode of ["empty", "throws", "exhausted"] as const) {
+      const jobs = [deferred2<string>(), deferred2<string>()];
+      let polls = 0;
+      const mon: Db = { query: async () => {
+        polls++;
+        if (mode === "throws" && polls === 1) { setTimeout(() => { jobs[0].resolve("a"); jobs[1].resolve("b"); }, 5); throw new Error("monitor lost"); }
+        if (mode === "exhausted" && polls === 2) setTimeout(() => { jobs[0].resolve("a"); jobs[1].resolve("b"); }, 5);
+        if (mode === "empty" && polls === 2) { jobs[0].resolve("a"); jobs[1].resolve("b"); }
+        return { rows: [], rowCount: 0 };
+      } };
+      const m = await monitorBackends(mon, [101, 202], [jobs[0].p, jobs[1].p], ictx2(), { maxSamples: 2 });
+      expect(m.outcomes, mode).toEqual([{ ok: true, v: "a" }, { ok: true, v: "b" }]);
+      expect(m.monitorError, mode).toMatch(mode === "throws" ? /^monitor failed: monitor lost$/ : mode === "exhausted" ? /^monitor exhausted/ : /^monitor coverage missing: no sample observed for pid\(s\) 101, 202$/);
+    }
   });
 });

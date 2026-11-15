@@ -750,14 +750,19 @@ export interface MonitoredOutcome<T> {
   outcomes: Array<{ ok: true; v: T } | { ok: false; e: unknown }>;
   samples: BackendSample[];
   monitorError: string | null;
-  bounded: boolean;
+  /** T13B2b-21: sampling stopped at its bound while a job was STILL pending (captured before awaiting the jobs). */
+  exhausted: boolean;
+  /** Pinned PIDs with no observed sample during the run. */
+  uncovered: number[];
   elapsedMs: number;
 }
 
 /**
  * Sample the EXACT backends while every job is pending, on an independent
  * guarded monitor connection: bounded (maxSamples x intervalMs), stopped as
- * soon as all jobs settle. A monitor failure is sticky (recorded, sampling
+ * soon as all jobs settle. Reaching the bound with a job still pending
+ * (exhaustion) and a pinned PID never observed are both monitoring FAILURES
+ * (monitorError), even when the jobs later succeed. A monitor failure is sticky (recorded, sampling
  * stops) and never strands a job: every job is always awaited and its outcome
  * returned. Jobs are observed at once (no unhandled rejection).
  */
@@ -784,8 +789,14 @@ export async function monitorBackends<T>(mon: Db, pids: number[], jobs: Array<Pr
     }
     if (pending > 0) await ctx.sleep(intervalMs);
   }
-  const outcomes = await Promise.all(settled);
-  return { outcomes, samples, monitorError, bounded: pending > 0 || rounds >= maxSamples, elapsedMs: Math.round(ctx.now() - t0) };
+  // T13B2b-21: exhaustion is decided HERE, before awaiting the jobs; it is sticky even if they later succeed.
+  const stillPending = pending;
+  const exhausted = monitorError === null && stillPending > 0;
+  if (exhausted) monitorError = `monitor exhausted: ${maxSamples} samples taken while ${stillPending} job(s) were still pending`;
+  const outcomes = await Promise.all(settled); // every job is always settled
+  const uncovered = pids.filter((p) => !samples.some((s) => s.pid === p));
+  if (monitorError === null && uncovered.length) monitorError = `monitor coverage missing: no sample observed for pid(s) ${uncovered.join(", ")}`;
+  return { outcomes, samples, monitorError, exhausted, uncovered, elapsedMs: Math.round(ctx.now() - t0) };
 }
 
 /** Collapse consecutive identical per-PID samples (state/wait/blocking) to keep the report readable; first/last times kept. */
@@ -843,7 +854,7 @@ export async function i4Monitored(ctx: InterleaveCtx, a: Db, b: Db, mon: Db, wor
   const [x, y] = m.outcomes;
   const ok = x.ok && y.ok && m.monitorError === null;
   const res = (o: (typeof m.outcomes)[number]) => (o.ok ? "published" : msgOf(o.e, ctx.redact));
-  const evidence = { pids: { [A]: pa, [B]: pb }, elapsedMs: m.elapsedMs, bounded: m.bounded, monitorError: m.monitorError, samples: compactSamples(m.samples) };
+  const evidence = { pids: { [A]: pa, [B]: pb }, elapsedMs: m.elapsedMs, exhausted: m.exhausted, uncovered: m.uncovered, monitorError: m.monitorError, samples: compactSamples(m.samples) };
   return { ok, result: `${A}: ${res(x)}; ${B}: ${res(y)}; monitor: ${JSON.stringify(evidence)}` };
 }
 

@@ -687,8 +687,8 @@ STATUS: COMPLETE
 
 Root reviewed pushed `ae68a83` (implementation `de362d2`); exact-head CI passed at 06:02:53 UTC. The 0039 definition preserves the entire installed publisher except the intended rebuild INSERT; installed 0037/0038 are unchanged. Independent lifecycle tests passed 117/117. No staging SQL or rehearsal has been run for this repair yet. The SQL change is suitable for a rollback test, but the test runner must first close these two evidence gaps:
 
-- [ ] **T13B2b-20, fail immediately on a recorded assertion failure.** `rehearseRebuildRepair` passes the original recorder into the existing flow and proof. `expectEqual` and `refused` can record `ok:false` without throwing, allowing later work (including another publication) after a failed assertion. Add a repair-local recorder that persists the original observation, then throws on `ok:false`, and pass that context through every rehearsal step, established flow and version proof. Preserve savepoint cleanup before refusal recording, original error evidence, unconditional outer rollback/disconnect and fresh audit. Do not weaken assertions or broadly rewrite shared helper behavior. Test a flow that records false and would otherwise return: proof must never begin; test V7a's real refusal path with an unexpected success/wrong error: savepoint cleanup occurs, V7b is not sent, outer rollback still occurs. Test persistence failure remains fatal. A deliberate break removing fail-fast must be caught.
-- [ ] **T13B2b-21, do not pass I4 without monitoring coverage.** The 150-sample budget covers copying/freezing as well as publication, while `i4Monitored` currently permits success after sampling exhausts with jobs still pending. Capture exhaustion at loop exit BEFORE awaiting the settled jobs. Treat exhaustion while pending as a sticky monitoring failure even if both jobs later succeed; always await both jobs and preserve cleanup. An exactly-at-limit completion with no pending jobs is not exhaustion. Require observed samples for both pinned PIDs during the run; absent PID coverage must be explicit failure, not silently treated as clean monitoring. Keep existing limits and bounded sampling; do not extend or remove the bound. Test exhausted-with-pending then successful publications => I4 failure, exact-limit completed => no false exhaustion, missing PID coverage => failure, and all pending jobs settled on every path. A deliberate break ignoring coverage/exhaustion must be caught. If real I4 later exceeds the monitoring budget, stop with the evidence; a separately reviewed phase-aware monitor can follow, not an automatic longer retry.
+- [x] **T13B2b-20, fail immediately on a recorded assertion failure.** `rehearseRebuildRepair` passes the original recorder into the existing flow and proof. `expectEqual` and `refused` can record `ok:false` without throwing, allowing later work (including another publication) after a failed assertion. Add a repair-local recorder that persists the original observation, then throws on `ok:false`, and pass that context through every rehearsal step, established flow and version proof. Preserve savepoint cleanup before refusal recording, original error evidence, unconditional outer rollback/disconnect and fresh audit. Do not weaken assertions or broadly rewrite shared helper behavior. Test a flow that records false and would otherwise return: proof must never begin; test V7a's real refusal path with an unexpected success/wrong error: savepoint cleanup occurs, V7b is not sent, outer rollback still occurs. Test persistence failure remains fatal. A deliberate break removing fail-fast must be caught.
+- [x] **T13B2b-21, do not pass I4 without monitoring coverage.** The 150-sample budget covers copying/freezing as well as publication, while `i4Monitored` currently permits success after sampling exhausts with jobs still pending. Capture exhaustion at loop exit BEFORE awaiting the settled jobs. Treat exhaustion while pending as a sticky monitoring failure even if both jobs later succeed; always await both jobs and preserve cleanup. An exactly-at-limit completion with no pending jobs is not exhaustion. Require observed samples for both pinned PIDs during the run; absent PID coverage must be explicit failure, not silently treated as clean monitoring. Keep existing limits and bounded sampling; do not extend or remove the bound. Test exhausted-with-pending then successful publications => I4 failure, exact-limit completed => no false exhaustion, missing PID coverage => failure, and all pending jobs settled on every path. A deliberate break ignoring coverage/exhaustion must be caught. If real I4 later exceeds the monitoring budget, stop with the evidence; a separately reviewed phase-aware monitor can follow, not an automatic longer retry.
 
 Claude owns these two runner/test corrections only; 0039 SQL stays unchanged. Run focused tests, common gate and sensitivity checks; record results, commit/push, check CI and pause. Root remains read-only while Claude edits. Then root reviews the correction before the previously authorized one-shot rollback rehearsal. No SQL execution, installation, production access or Task 14 work is authorized to Claude. This section authorizes correction work, not acceptance of the current staging runner.
 
@@ -2043,3 +2043,38 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (now includes the new test); strict ES2020 tsc on both runners OK; 1217/1217 tests (35 files); `npm run build` OK.
   - **CI:** exact-head `de362d212ffb7613e42f6b3f12f604c723184721` [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43683437893).
   - **Next:** root review, then the rollback-only `--rehearse-rebuild-repair` once; installation of 0039 and the monitored interleavings only after that. Task 13 stays unchecked; Tasks 14–20 stay blocked.
+- 2026-11-15 — T13B2b-20/21 runner corrections, nothing else. No SQL, no staging mode, nothing installed, no Task 14 work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 (LF `05d7eff1…`) are byte-identical; the 0039 SQL is unchanged:
+  - **T13B2b-20 (fail-fast recorder):** new `failFast(ctx)` in `tests/staging/reportingRebuildRepair.ts`. It records (persists) the ORIGINAL observation first, then throws `<id> failed; later steps depend on it` on `ok:false`. A persistence failure stays fatal.
+    - `rehearseRebuildRepair` wraps its context with it, so every K step, the established `runPublicationFlow` (whose `expectEqual`/`refused` previously recorded false without throwing) and the version proof stop at the first recorded failure.
+    - Shared helpers are unchanged. `refused()` already rolls back and releases its savepoint before recording.
+    - V7 moved into the exported `runConstraintProbes` so the real refusal path is testable. The outer rollback, the rollback error kept beside the first error, the lifecycle disconnect and the fresh audit are unchanged.
+  - **T13B2b-21 (monitor coverage):** `monitorBackends` decides exhaustion at loop exit BEFORE awaiting the jobs (`exhausted` = still pending at the bound). That sets a sticky `monitorError` even if the jobs later succeed. Completing exactly at the limit is not exhaustion.
+    - After every job settles, any pinned PID without a sample (`uncovered`) sets `monitorError` (`monitor coverage missing: …`).
+    - `i4Monitored` already fails on any `monitorError`. The report carries `exhausted`/`uncovered` (replacing `bounded`).
+    - Limits are unchanged (150 × 1 s); every job is always awaited.
+  - **Tests (`tests/reporting/reportingRebuildInsert.test.ts`, 67 → 78):**
+    - a flow `expectEqual` false stops the flow and the proof never begins (observation persisted, outer ROLLBACK, no COMMIT);
+    - a proof assertion false stops before a publish call;
+    - V7a unexpectedly succeeding, and V7a with the wrong error: savepoint `rollback to`/`release` in order, V7b never sent, outer ROLLBACK;
+    - V7a/V7b passing in their own savepoints;
+    - a recording persistence failure stays fatal;
+    - `failFast` persisting before throwing;
+    - exhausted-with-pending then both succeed gives I4 FAILED;
+    - exact-limit completion is not exhaustion;
+    - one PID uncovered gives FAILED;
+    - empty/throws/exhausted monitors each settle both jobs with the right error.
+    - The bounded test now asserts `exhausted` and the exact message.
+  - **Mutations:** 10/10 new breaks caught:
+    - fail-fast without a throw;
+    - fail-fast not applied;
+    - throw before persisting;
+    - V7b sent first;
+    - exhaustion decided after awaiting;
+    - exhaustion ignored;
+    - coverage ignored;
+    - limit treated as exhaustion;
+    - jobs not settled after exhaustion;
+    - I4 ignoring `monitorError`.
+    - The previous set was re-run: 18/18 caught (old X17, "jobs stranded", was dropped because its code was rewritten; Y9 now covers it).
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1228/1228 tests (35 files); build OK.
+  - **Next:** root review, then the one-shot rollback `--rehearse-rebuild-repair`. Task 13 stays unchecked.

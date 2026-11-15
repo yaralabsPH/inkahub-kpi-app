@@ -278,9 +278,35 @@ export async function runVersionProof(c: Db, ctx: FlowCtx, ev: RepairEvidence): 
     if (r.replay !== true || String(r.generation_seq) !== g2.seq) throw new Error(`replay ${String(r.replay)} at generation ${String(r.generation_seq)} (expected true at ${g2.seq})`);
     if (f0.n !== f1.n || f0.h !== f1.h) throw new Error("source_versions changed on replay");
   });
-  // An unrelated constraint failure is NOT suppressed by the targeted conflict clause (savepoint-isolated).
+  await runConstraintProbes(c, ctx, site);
+}
+
+/**
+ * V7: an unrelated constraint failure is NOT suppressed by the targeted
+ * conflict clause. Each probe runs in its own savepoint (refused() rolls the
+ * savepoint back and releases it BEFORE recording); under the rehearsal's
+ * fail-fast recorder a wrong outcome at V7a stops before V7b is sent.
+ */
+export async function runConstraintProbes(c: Db, ctx: FlowCtx, site: Site): Promise<void> {
   await refused(c, ctx, "V7a", "a primary-key duplicate (closed version re-inserted) still raises under the targeted ON CONFLICT", /source_versions_pkey/, () => c.query(PROOF_SQL.pkProbe, [site, PROOF_IDS.absent]));
   await refused(c, ctx, "V7b", "a check-constraint violation still raises under the targeted ON CONFLICT", /violates check constraint/, () => c.query(PROOF_SQL.checkProbe, [site]));
+}
+
+/**
+ * T13B2b-20: the rehearsal's recorder. It persists the ORIGINAL observation
+ * first (a persistence failure stays fatal), then throws on ok:false, so no
+ * later step, assertion or publication runs after any recorded failure. Shared
+ * helpers (step, expectEqual, refused) are unchanged; refused() has already
+ * rolled back and released its savepoint before it records.
+ */
+export function failFast<T extends Pick<FlowCtx, "record">>(ctx: T): T {
+  return {
+    ...ctx,
+    record: (o) => {
+      ctx.record(o);
+      if (!o.ok) throw new Error(`${o.id} failed; later steps depend on it`);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +335,8 @@ export async function rehearseRebuildRepair(raw: Db, ctx: RepairCtx, deps: Repai
   const text39 = deps.read(MIGRATION_0039).toString("utf8");
   const body = migrationBody(text39);
   const c = repairGuard(raw, new Set(body));
+  const outer = ctx;
+  ctx = failFast(ctx); // T13B2b-20: every rehearsal step, the established flow and the proof stop at the first recorded failure
   await step(c, ctx, "K0", "file identities: fixed 0039 path; 0037/0038 are the installed identities", async () => {
     ev.files = [MIGRATION_0037, MIGRATION_0038, MIGRATION_0039].map((p) => fileIdentity(p, deps.read));
     const [f37, f38] = ev.files;
@@ -350,7 +378,7 @@ export async function rehearseRebuildRepair(raw: Db, ctx: RepairCtx, deps: Repai
     try {
       await c.query("rollback");
     } catch (r) {
-      throw new Error(`${ctx.redact(e instanceof Error ? e.message : String(e))}; cleanup failed: rehearsal rollback: ${ctx.redact(r instanceof Error ? r.message : String(r))}`);
+      throw new Error(`${outer.redact(e instanceof Error ? e.message : String(e))}; cleanup failed: rehearsal rollback: ${outer.redact(r instanceof Error ? r.message : String(r))}`);
     }
     throw e;
   }
