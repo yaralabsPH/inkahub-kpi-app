@@ -38,7 +38,7 @@ import { projectReportingPartition } from "../../src/lib/domain/productionReport
 import { buildChunks, packStageRequests, reportingManifestHash, type ResultRows, type WorkDescriptor } from "../../api/_lib/reporting-stage";
 import { emptyRows, ownerKey, rowsByOwner, type Owner } from "../fixtures/reporting-rows";
 import { splitSqlStatements } from "./sqlStatements";
-import type { LifecycleReport } from "./reportingCapture";
+import { isAdminTermination, type ArmedTermination, type ConnectionWatch, type LifecycleReport } from "./reportingCapture";
 
 export const MIGRATION_0038 = "supabase/migrations/0038_reporting_jobs.sql";
 export type Site = "au" | "uk" | "us";
@@ -713,8 +713,8 @@ export interface InterleaveCtx {
   staff: string;
   /** T13B2b-22: persist one evidence record durably NOW (throws on a persistence failure). Required by I4. */
   evidence?(e: Record<string, unknown>): void;
-  /** T13B2b-22: arm ONE client's narrowly expected termination (I5's victim) in the run's connection watch. */
-  armExpected?(client: object, expected: (e: unknown) => boolean): () => number;
+  /** T13B2b-24: arm ONE watch-owned client for ONE intentional termination (I5's victim). */
+  armTermination?(client: object): ArmedTermination;
   open(): Promise<Db & { end(): Promise<void> }>;
   as(c: Db, service: boolean): Promise<void>;
   record(o: Observation): void;
@@ -840,7 +840,7 @@ async function waitsOnLock(mon: Db, pid: number, ctx: Pick<InterleaveCtx, "sleep
   return false;
 }
 
-async function zeroWorkRebuild(c: Db, ctx: InterleaveCtx, site: Site): Promise<Record<string, unknown>> {
+export async function zeroWorkRebuild(c: Db, ctx: InterleaveCtx, site: Site): Promise<Record<string, unknown>> {
   const fctx = { ...ctx, record: () => undefined } as unknown as FlowCtx;
   const [b] = await rpc(c, fctx, "select * from public.begin_reporting_rebuild($1)", [site]);
   await copyAll(c, fctx, String(b.batch_id), Number(b.lease_fence));
@@ -975,45 +975,77 @@ export async function runInterleavings(ctx: InterleaveCtx, cleanupFailures: stri
     }, cleanupFailures));
 }
 
-/** SQLSTATE 57P01 (admin_shutdown): the notice a deliberately terminated session receives. */
-export function isExpectedTermination(e: unknown): boolean {
-  const code = (e as { code?: string } | null)?.code;
-  return code === "57P01" || /terminating connection due to administrator command/i.test(e instanceof Error ? e.message : String(e));
-}
+/** SQLSTATE 57P01 (admin_shutdown): the notice a deliberately terminated session receives (the watch's centralized check). */
+export const isExpectedTermination = isAdminTermination;
 
 /**
- * T13B2b-6: run `work` on a victim connection opened by THIS invocation, then
- * terminate exactly that backend. The victim is tagged with a run-unique
- * application_name and pg_terminate_backend is only called for a session
- * whose pid AND tag match, so no other session can be killed. The expected
- * 57P01 termination notice is evidence; any other error event, and any
- * failure to end the victim, is a cleanup failure that fails the report.
+ * T13B2b-23: the durable evidence boundary. Appends one stamped record and
+ * saves NOW; if the save fails, the run's watch is latched as failed BEFORE
+ * the error is rethrown, so every next normal statement (also of workers
+ * already in progress) is refused. The save is not retried here.
+ */
+export function durableEvidence(store: Array<Record<string, unknown>>, save: () => void, watch: Pick<ConnectionWatch, "fail">, stamp: () => Record<string, unknown>, redact: (s: string) => string = (s) => s): (e: Record<string, unknown>) => void {
+  return (e) => {
+    store.push({ ...stamp(), ...e });
+    try {
+      save();
+    } catch (err) {
+      watch.fail(`evidence persistence failed (${String(e.kind ?? "record")}): ${redact(err instanceof Error ? err.message : String(err))}`);
+      throw err;
+    }
+  };
+}
+
+/** T13B2b-24: the victim's identity, read INSIDE its still-open explicit transaction after work (lossless text). */
+export const I5_VICTIM_IDENTITY_SQL = "select a.pid, a.backend_start::text as backend_start, a.xact_start::text as xact_start, (pg_catalog.transaction_timestamp() < pg_catalog.statement_timestamp()) as explicit_tx from pg_catalog.pg_stat_activity a where a.pid = pg_catalog.pg_backend_pid()";
+/** T13B2b-24: terminate ONLY the exact pid + backend_start + xact_start match, returning the matched identity as the receipt. */
+export const I5_TERMINATE_SQL = "select a.pid, a.backend_start::text as backend_start, a.xact_start::text as xact_start, pg_catalog.pg_terminate_backend(a.pid) as k from pg_catalog.pg_stat_activity a where a.pid = $1 and a.backend_start = $2::timestamptz and a.xact_start = $3::timestamptz";
+
+/**
+ * T13B2b-24: run `work` on a victim connection opened by THIS invocation
+ * (which opens its explicit transaction), then pin the victim's exact
+ * identity INSIDE that open transaction (pid, backend_start, xact_start),
+ * persist it, arm ONLY this victim, and terminate ONLY the exact identity
+ * match through the guarded monitor. The returned identity and result are
+ * persisted as the receipt; a missing, mismatched or false receipt fails I5
+ * and turns any provisional expected termination event into a run failure.
+ * There is no application_name or PID-only authority.
  */
 export async function killOwnVictim(
   victim: Db & { end(): Promise<void>; on?: (ev: string, fn: (e: unknown) => void) => void },
   mon: Db,
   cleanupFailures: string[],
-  ctx: Pick<InterleaveCtx, "redact" | "sleep" | "armExpected">,
+  ctx: Pick<InterleaveCtx, "redact" | "sleep" | "armTermination" | "evidence">,
   work: () => Promise<void>,
 ): Promise<{ terminated: boolean; expected: number }> {
+  const evidence = ctx.evidence;
+  const arm = ctx.armTermination;
+  if (!evidence || !arm) throw new Error("I5 needs durable evidence and the run's connection watch to terminate a victim");
+  let armed: ArmedTermination | null = null;
   let expected = 0;
+  // Same centralized decision as the watch's own listener (memoized per error object).
   victim.on?.("error", (e) => {
-    if (isExpectedTermination(e)) expected++;
+    if (armed && armed.classify(e) === "expected") expected++;
     else cleanupFailures.push(`victim connection error: ${msgOf(e, ctx.redact)}`);
   });
   let terminated = false;
   try {
-    const tag = `rp-victim-${Math.random().toString(16).slice(2, 10)}`;
-    const pid = Number((await victim.query("select pg_backend_pid() as p, set_config('application_name', $1, false) as t", [tag])).rows[0].p);
     await work();
-    // T13B2b-22: ONLY this victim, ONLY its expected 57P01 termination, armed right before it is requested.
-    ctx.armExpected?.(victim, isExpectedTermination);
-    const r = await mon.query("select pg_catalog.pg_terminate_backend(a.pid) as k from pg_catalog.pg_stat_activity a where a.pid = $1 and a.application_name = $2", [pid, tag]);
-    terminated = r.rows.length === 1 && r.rows[0].k === true;
+    const r = (await victim.query(I5_VICTIM_IDENTITY_SQL)).rows[0];
+    if (!r || r.explicit_tx !== true || r.backend_start == null || r.xact_start == null) throw new Error(`I5 victim: no open explicit transaction identity after work (${JSON.stringify(r ?? null)})`);
+    const id = { pid: Number(r.pid), backend_start: String(r.backend_start), xact_start: String(r.xact_start) };
+    evidence({ kind: "i5-victim-ownership", scenario: "I5", victim: id }); // persisted BEFORE the termination is requested
+    armed = arm(victim);
+    const k = await mon.query(I5_TERMINATE_SQL, [id.pid, id.backend_start, id.xact_start]);
+    const row = k.rows[0];
+    terminated = k.rows.length === 1 && row.k === true && Number(row.pid) === id.pid && String(row.backend_start) === id.backend_start && String(row.xact_start) === id.xact_start;
+    evidence({ kind: "i5-termination", scenario: "I5", requested: id, receipt: k.rows, terminated });
+    armed.confirm(terminated);
     await ctx.sleep(300);
   } finally {
+    armed?.confirm(false); // no-op once confirmed; otherwise every provisional expectation becomes a failure
     await victim.end().catch((e) => {
-      if (isExpectedTermination(e)) expected++;
+      if (armed && armed.classify(e) === "expected") expected++;
       else cleanupFailures.push(`victim connection disconnect: ${msgOf(e, ctx.redact)}`);
     });
   }

@@ -17,7 +17,8 @@ import {
   STATE_QUERIES,
   isTransactionControl,
   leadingKeywords,
-  killOwnVictim,
+  I5_TERMINATE_SQL,
+  I5_VICTIM_IDENTITY_SQL,
   ROLLBACK_ONLY,
   type FullState,
   expectEqual,
@@ -290,40 +291,15 @@ describe("T13B2b-5: transaction control is classified on executable tokens", () 
   });
 });
 
-describe("T13B2b-6: the killed victim", () => {
-  const ctx = { redact: (s: string) => s, sleep: async () => undefined };
-  const mon = (k: boolean) => ({ query: async (sql: string) => ({ rows: sql.includes("pg_terminate_backend") ? (k ? [{ k: true }] : []) : [], rowCount: 1 }) });
-  const victim = (endError: Error | null, events: unknown[] = []) => {
-    let onError: ((e: unknown) => void) | null = null;
-    return {
-      on: (_: string, fn: (e: unknown) => void) => void (onError = fn),
-      query: async (sql: string) => {
-        if (sql.includes("pg_backend_pid")) return { rows: [{ p: 4242 }], rowCount: 1 };
-        return { rows: [], rowCount: 0 };
-      },
-      end: async () => {
-        for (const e of events) onError?.(e);
-        if (endError) throw endError;
-      },
-    };
-  };
-  it("the expected 57P01 notice is evidence; an unexpected disconnect failure or error event FAILS cleanup", async () => {
-    const ok: string[] = [];
-    const term = Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
-    expect(await killOwnVictim(victim(null, [term]), mon(true), ok, ctx, async () => undefined)).toEqual({ terminated: true, expected: 1 });
-    expect(ok).toEqual([]);
-    const bad: string[] = [];
-    await killOwnVictim(victim(new Error("socket hang up"), [new Error("ECONNRESET")]), mon(true), bad, ctx, async () => undefined);
-    expect(bad).toEqual(["victim connection error: ECONNRESET", "victim connection disconnect: socket hang up"]);
-  });
-  it("only the session this invocation tagged can be terminated", async () => {
-    const sent: Array<[string, unknown[]]> = [];
-    const m = { query: async (sql: string, params: unknown[] = []) => (sent.push([sql, params]), { rows: [], rowCount: 0 }) };
-    const r = await killOwnVictim(victim(null), m, [], ctx, async () => undefined);
-    expect(r.terminated).toBe(false);
-    expect(sent[0][0]).toMatch(/pg_terminate_backend\(a\.pid\) as k from pg_catalog\.pg_stat_activity a where a\.pid = \$1 and a\.application_name = \$2/);
-    expect(sent[0][1][0]).toBe(4242);
-    expect(String(sent[0][1][1])).toMatch(/^rp-victim-[0-9a-f]+$/);
+describe("T13B2b-24 (supersedes T13B2b-6's application_name tag): the victim's termination SQL", () => {
+  it("the identity is read in the victim's OWN open explicit transaction; the kill binds pid AND backend_start AND xact_start; no application_name authority", () => {
+    expect(I5_VICTIM_IDENTITY_SQL).toContain("a.pid = pg_catalog.pg_backend_pid()");
+    expect(I5_VICTIM_IDENTITY_SQL).toContain("a.backend_start::text as backend_start");
+    expect(I5_VICTIM_IDENTITY_SQL).toContain("a.xact_start::text as xact_start");
+    expect(I5_VICTIM_IDENTITY_SQL).toContain("(pg_catalog.transaction_timestamp() < pg_catalog.statement_timestamp()) as explicit_tx");
+    expect(I5_TERMINATE_SQL).toMatch(/pg_terminate_backend\(a\.pid\) as k from pg_catalog\.pg_stat_activity a where a\.pid = \$1 and a\.backend_start = \$2::timestamptz and a\.xact_start = \$3::timestamptz$/);
+    expect(I5_TERMINATE_SQL).toMatch(/^select a\.pid, a\.backend_start::text as backend_start, a\.xact_start::text as xact_start, /); // the receipt returns the matched identity
+    for (const q of [I5_VICTIM_IDENTITY_SQL, I5_TERMINATE_SQL]) expect(q).not.toMatch(/application_name/);
   });
 });
 

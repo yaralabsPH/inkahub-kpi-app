@@ -856,18 +856,47 @@ export function captureMarkdown(r: CaptureReport): string {
 /** Per-client watch entry, reachable through the guard proxy by this symbol. */
 export const WATCH_ENTRY: unique symbol = Symbol.for("inkahub.reporting.connectionWatch");
 
+/** The no-code error node-postgres emits after a server-side termination (installed pg 8.x end/error handling). */
+export const TERMINATION_FOLLOW_ON = "Connection terminated unexpectedly";
+
+/** SQLSTATE 57P01 (admin_shutdown): the notice a deliberately terminated session receives. */
+export function isAdminTermination(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  return code === "57P01" || /terminating connection due to administrator command/i.test(e instanceof Error ? e.message : String(e));
+}
+
+/**
+ * T13B2b-24: ONE intentional termination of ONE client. Classification is
+ * centralized and memoized per error object, so every listener (the watch's
+ * and the victim's own) gets the same decision without advancing the state
+ * twice. Expected: the 57P01 notice, then ONLY AFTER it the exact no-code
+ * "Connection terminated unexpectedly" follow-on. The allowance is
+ * provisional until confirm(true) records a successful matching kill
+ * receipt; confirm(false) (or never confirming) turns every provisional
+ * expectation into a sticky run failure.
+ */
+export interface ArmedTermination {
+  classify(e: unknown): "expected" | "unexpected";
+  confirm(receiptOk: boolean): void;
+  expected(): number;
+}
+
 interface WatchEntry {
   label: string;
-  /** Narrowly armed expectation (I5's intentionally terminated victim only). */
-  expected: ((e: unknown) => boolean) | null;
-  expectedSeen: number;
+  /** Narrowly armed intentional termination (I5's victim only). */
+  armed: ArmedTermination | null;
 }
 
 export interface ConnectionWatch {
-  /** True once any UNEXPECTED connection error event was observed (sticky for the run). */
+  /** True once any UNEXPECTED connection error event, or a latched fatal failure, was observed (sticky for the run). */
   failed(): boolean;
-  /** The first unexpected connection error line, if any. */
+  /** The first failure line, if any. */
   first(): string | null;
+  /**
+   * T13B2b-23: latch a fatal run failure (e.g. an evidence save that failed) into the SAME error store, without
+   * persisting again (the save just failed); never throws. All normal SQL is gated from here on.
+   */
+  fail(reason: string): void;
   /**
    * "normal": after a failure, new normal SQL is refused before sending.
    * "cleanup": explicit cleanup and the independent fresh audit may still run.
@@ -877,8 +906,8 @@ export interface ConnectionWatch {
   attach<C extends object>(client: C): C;
   /** Throws (refusing the statement) when normal work must stop; ROLLBACK is always allowed. */
   gate(sql: unknown): void;
-  /** Arm ONE client to accept an expected termination (e.g. 57P01) as not-a-failure; returns how many were seen. */
-  armExpected(client: object, expected: (e: unknown) => boolean): () => number;
+  /** Arm ONE watch-owned client for ONE intentional termination (I5). */
+  armTermination(client: object): ArmedTermination;
 }
 
 /**
@@ -895,38 +924,57 @@ export function newConnectionWatch(errors: string[], redact: (s: string) => stri
   const push = (line: string) => {
     if (!errors.includes(line)) errors.push(line);
   };
+  const safe = (s: string) => {
+    try {
+      return redact(s);
+    } catch {
+      return "(unredactable message withheld)";
+    }
+  };
+  const latch = (line: string) => {
+    if (failedLine === null) failedLine = line;
+    push(line);
+  };
+  const recordAndPersist = (line: string) => {
+    latch(line);
+    try {
+      persist();
+    } catch (pe) {
+      push(`report persistence failed (after a connection failure): ${safe(pe instanceof Error ? pe.message : String(pe))}`);
+      try {
+        stderr(line);
+      } catch {
+        /* stderr unavailable: the error is still in the report store */
+      }
+    }
+  };
+  const describe = (label: string, e: unknown) => {
+    const code = (e as { code?: unknown } | null)?.code;
+    return `connection failure (${label}): ${redact(e instanceof Error ? e.message : String(e))}${code !== undefined ? ` [${String(code)}]` : ""}`;
+  };
   const entryOf = (client: object): WatchEntry | undefined => (client as Record<symbol, WatchEntry | undefined>)[WATCH_ENTRY];
   return {
     failed: () => failedLine !== null,
     first: () => failedLine,
+    fail: (reason: string) => {
+      try {
+        latch(safe(reason));
+      } catch {
+        if (failedLine === null) failedLine = "run failure (unrecordable)";
+      }
+    },
     phase: (p) => (p ? (phase = p) : phase),
     attach: <C extends object>(client: C): C => {
-      const entry: WatchEntry = { label: `connection #${++n}`, expected: null, expectedSeen: 0 };
+      const entry: WatchEntry = { label: `connection #${++n}`, armed: null };
       Object.defineProperty(client, WATCH_ENTRY, { value: entry, enumerable: false, configurable: false, writable: false });
       const on = (client as { on?: (ev: string, fn: (e: unknown) => void) => unknown }).on;
       if (typeof on !== "function") throw new Error("refusing to open: this client cannot report connection errors (no on('error'))");
       on.call(client, "error", (e: unknown) => {
         try {
-          if (entry.expected && entry.expected(e)) {
-            entry.expectedSeen++;
-            return;
-          }
-          const code = (e as { code?: unknown } | null)?.code;
-          const line = `connection failure (${entry.label}): ${redact(e instanceof Error ? e.message : String(e))}${code !== undefined ? ` [${String(code)}]` : ""}`;
-          if (failedLine === null) failedLine = line;
-          push(line);
-          try {
-            persist();
-          } catch (pe) {
-            push(`report persistence failed (after a connection failure): ${redact(pe instanceof Error ? pe.message : String(pe))}`);
-            try {
-              stderr(line);
-            } catch {
-              /* stderr unavailable: the error is still in the report store */
-            }
-          }
+          if (entry.armed && entry.armed.classify(e) === "expected") return;
+          recordAndPersist(describe(entry.label, e));
         } catch {
-          // Never throw from an EventEmitter listener; the failure line above is already recorded when reachable.
+          // Never throw from an EventEmitter listener; record what can be recorded.
           if (failedLine === null) failedLine = "connection failure (unrecordable event)";
           push(failedLine);
         }
@@ -938,11 +986,46 @@ export function newConnectionWatch(errors: string[], redact: (s: string) => stri
       if (typeof sql === "string" && /^\s*rollback\b/i.test(sql)) return; // explicit cleanup of an open transaction
       throw new Error(`run stopped after a connection failure; refusing new work (${failedLine})`);
     },
-    armExpected: (client: object, expected: (e: unknown) => boolean) => {
+    armTermination: (client: object): ArmedTermination => {
       const entry = entryOf(client);
-      if (!entry) throw new Error("cannot arm an expected termination on a client this run's watch does not own");
-      entry.expected = expected;
-      return () => entry.expectedSeen;
+      if (!entry) throw new Error("cannot arm a termination on a client this run's watch does not own");
+      if (entry.armed) throw new Error(`${entry.label} is already armed for a termination`);
+      const memo = new WeakMap<object, "expected" | "unexpected">();
+      let seenAdmin = false;
+      let count = 0;
+      let confirmed: boolean | null = null;
+      const provisional: string[] = [];
+      const armed: ArmedTermination = {
+        classify: (e: unknown) => {
+          if (e !== null && typeof e === "object" && memo.has(e)) return memo.get(e)!;
+          let d: "expected" | "unexpected" = "unexpected";
+          if (confirmed !== false) {
+            const code = (e as { code?: unknown } | null)?.code;
+            const message = e instanceof Error ? e.message : String(e);
+            if (isAdminTermination(e)) {
+              seenAdmin = true;
+              d = "expected";
+            } else if (seenAdmin && code === undefined && message === TERMINATION_FOLLOW_ON) {
+              d = "expected";
+            }
+          }
+          if (d === "expected") {
+            count++;
+            if (confirmed !== true) provisional.push(describe(entry.label, e));
+          }
+          if (e !== null && typeof e === "object") memo.set(e, d);
+          return d;
+        },
+        confirm: (receiptOk: boolean) => {
+          if (confirmed !== null) return;
+          confirmed = receiptOk;
+          if (!receiptOk) for (const line of provisional.splice(0)) recordAndPersist(`${line} — expected only with a successful matching kill receipt, which is missing`);
+          else provisional.length = 0;
+        },
+        expected: () => count,
+      };
+      entry.armed = armed;
+      return armed;
     },
   };
 }

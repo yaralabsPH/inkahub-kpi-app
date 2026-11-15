@@ -8,7 +8,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it } from "vitest";
 import { newConnectionWatch, openGuardedClient, runCaptureLifecycle, STAGING_PROJECT_REF, stagingTarget, type ConnectionWatch } from "../staging/reportingCapture";
-import { I4_OWNER_SQL, i4Monitored, isExpectedTermination, killOwnVictim, monitorBackends, newPublicationReport, publicationStatus, type Db, type InterleaveCtx } from "../staging/reportingPublication";
+import { durableEvidence, I4_OWNER_SQL, I5_TERMINATE_SQL, I5_VICTIM_IDENTITY_SQL, i4Monitored, killOwnVictim, monitorBackends, newPublicationReport, publicationStatus, withConnections, zeroWorkRebuild, type Db, type InterleaveCtx } from "../staging/reportingPublication";
 
 const TARGET = stagingTarget(`postgresql://postgres.${STAGING_PROJECT_REF}:pw@aws-0-region.pooler.supabase.com:5432/postgres`);
 const reset = () => Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", errno: -4077 });
@@ -119,22 +119,6 @@ describe("T13B2b-22: the watch", () => {
     const auditor = await s.open();
     await auditor.query("select 1");
     void a;
-  });
-
-  it("I5's expected termination is armed for ONE client only; an unexpected reset on that client, or 57P01 elsewhere, still fails", () => {
-    const errors: string[] = [];
-    const w = newConnectionWatch(errors, (x) => x, () => undefined, () => undefined);
-    const victim = w.attach(new FakePg());
-    const other = w.attach(new FakePg());
-    const seen = w.armExpected(victim, isExpectedTermination);
-    victim.emit("error", terminated());
-    expect(seen()).toBe(1);
-    expect(w.failed()).toBe(false);
-    other.emit("error", terminated());
-    expect(errors).toEqual(["connection failure (connection #2): terminating connection due to administrator command [57P01]"]);
-    victim.emit("error", reset());
-    expect(errors.at(-1)).toBe("connection failure (connection #1): read ECONNRESET [ECONNRESET]");
-    expect(() => w.armExpected(new FakePg(), isExpectedTermination)).toThrow(/does not own/);
   });
 
   it("even if recording itself throws (e.g. redaction), the listener never throws and the run is still failed", () => {
@@ -323,29 +307,281 @@ describe("T13B2b-22: I4 durable evidence", () => {
   });
 });
 
-describe("T13B2b-22: I5's victim through the watch", () => {
-  const victimDb = () => new FakePg({ respond: (q) => (q.startsWith("select pg_backend_pid()") ? [{ p: 9, t: "rp-victim" }] : []) });
-  it("the victim's intentional 57P01 is expected (armed right before termination); the run is not failed", async () => {
-    const s = setup({ make: victimDb });
-    const victim = await s.open();
-    const mon: Db = { query: async (q: string) => {
-      if (q.includes("pg_terminate_backend")) { (s.clients[0] as FakePg).emit("error", terminated()); return { rows: [{ k: true }], rowCount: 1 }; }
-      return { rows: [{ p: 9 }], rowCount: 1 };
-    } };
-    const cleanup: string[] = [];
-    const k = await killOwnVictim(victim as never, mon, cleanup, { redact: (x) => x, sleep: async () => undefined, armExpected: s.watch.armExpected }, async () => undefined);
-    expect(k.terminated).toBe(true);
-    expect(s.watch.failed()).toBe(false);
-    expect(s.errors).toEqual([]);
+// ---------------------------------------------------------------------------
+// T13B2b-23: a failed evidence save stops ALL normal work (also workers in progress)
+// ---------------------------------------------------------------------------
+
+describe("T13B2b-23: evidence persistence failure latches the run and gates every next statement", () => {
+  /** A worker that holds its copy page until released, then would continue with freeze/seal/publish. */
+  function rig(failKind: "i4-samples" | "i4-ownership") {
+    const errors: string[] = [];
+    const store: Array<Record<string, unknown>> = [];
+    const holds: Array<() => void> = [];
+    let savingFails = false;
+    let releaseScheduled = false;
+    const save = () => {
+      const last = store.at(-1);
+      // Deterministic: a sample save fails only once BOTH workers are held at an already-issued copy query.
+      if (savingFails || (last?.kind === failKind && (failKind === "i4-ownership" || holds.length >= 2))) {
+        savingFails = true;
+        if (!releaseScheduled) {
+          releaseScheduled = true;
+          setTimeout(() => holds.splice(0).forEach((r) => r()), 5); // the outstanding queries complete AFTER the failed save
+        }
+        throw new Error("ENOSPC: no space left on device");
+      }
+    };
+    const watch = newConnectionWatch(errors, (x) => x, () => undefined, () => undefined);
+    const evidence = durableEvidence(store, save, watch, () => ({ run: "r1" }));
+    const make = (n: number) => new FakePg({
+      respond: (q) => {
+        if (q === I4_OWNER_SQL) return [{ pid: 100 + n, backend_start: "2026-11-15 08:00:00.000001+00", xact_start: "2026-11-15 08:01:00.000002+00", transaction_timestamp: "2026-11-15 08:01:00.000002+00" }];
+        if (q.includes("begin_reporting_rebuild")) return [{ batch_id: `b${n}`, lease_fence: 1 }];
+        if (q.includes("copy_reporting_source_page")) return [{ complete: true, pages: 1, total_rows: 10 }]; // the worker would then freeze
+        if (q.includes("pg_stat_activity")) return [{ pid: 101, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "1" }, { pid: 102, state: "active", wait_event_type: null, wait_event: null, blocking: [], xact_ms: "1" }];
+        return [];
+      },
+    });
+    const clients: FakePg[] = [];
+    const open = async () => openGuardedClient(() => {
+      const c = make(clients.length);
+      // Hold every worker's copy page (an already-issued query) until the failed save has happened.
+      const q = c.query.bind(c);
+      c.query = ((sql: string, p?: unknown[]) => (sql.includes("copy_reporting_source_page") ? ((r) => new Promise((res) => holds.push(() => res(r))))(q(sql, p)) : q(sql, p))) as never;
+      clients.push(c);
+      return c;
+    }, TARGET, marker, (s) => s, watch);
+    const ctx: InterleaveCtx = {
+      sites: ["uk", "us"], staff: "s", evidence, armTermination: watch.armTermination, open: open as never, as: async () => undefined, record: () => undefined, redact: (x) => x,
+      now: () => 0, sleep: () => new Promise<void>((r) => setTimeout(r, 0)), maxPages: 5,
+    };
+    return { errors, store, watch, clients, ctx, open };
+  }
+  const later = (c: FakePg) => c.sent.filter((q) => /freeze_reporting_rebuild|seal_reporting_work|publish_reporting_batch/.test(q) || (q.includes("copy_reporting_source_page") && c.sent.filter((x) => x.includes("copy_reporting_source_page")).indexOf(q) > 0));
+
+  it("a monitor-sample save fails while both workers are held at issued queries: the queries settle, NO freeze/seal/publish reaches either raw client, both jobs settle, FAILED with rollback/disconnect/fresh audit", async () => {
+    const r = rig("i4-samples");
+    const report = newPublicationReport("interleavings", ["uk", "us"], "rev", "t0", "sha");
+    report.errors = r.errors;
+    let i4: { ok: boolean; result: string } | null = null;
+    let audited = false;
+    await runCaptureLifecycle(report, {
+      open: r.open as never,
+      watch: r.watch,
+      body: async () => {
+        i4 = await withConnections(r.ctx, 3, async ([a, b, mon]) => i4Monitored(r.ctx, a, b, mon, (c, site) => zeroWorkRebuild(c, r.ctx, site)), report.cleanup);
+      },
+      audit: async () => ((audited = true), []),
+      save: () => undefined,
+      now: () => "t1",
+      redact: (x) => x,
+      stderr: () => undefined,
+    });
+    const workers = r.clients.slice(1, 3); // #1 main, #2/#3 workers, #4 monitor, #5 auditor
+    for (const w of workers) {
+      expect(w.sent.filter((q) => q.includes("copy_reporting_source_page"))).toHaveLength(1); // the held, already-issued query only
+      expect(later(w)).toEqual([]);
+      expect(w.sent.at(-1)).toBe("rollback"); // explicit cleanup still allowed
+      expect(w.ended).toBe(true);
+    }
+    expect(i4!.ok).toBe(false);
+    expect(i4!.result).toMatch(/^uk: run stopped after a connection failure; refusing new work \(evidence persistence failed \(i4-samples\): ENOSPC.*\); us: run stopped after a connection failure/);
+    expect(r.errors[0]).toBe("evidence persistence failed (i4-samples): ENOSPC: no space left on device");
+    expect(audited).toBe(true);
+    expect(r.clients.at(-1)!.sent.length).toBeGreaterThan(0); // the fresh auditor opened (marker) in the cleanup phase
+    report.observations.push({ id: "I4", what: "", expected: "", result: "", ok: false, ms: 0 });
+    expect(publicationStatus(report)).toMatch(/^STATUS: FAILED – evidence persistence failed \(i4-samples\)/);
   });
 
-  it("an UNEXPECTED reset of the victim before its termination is armed fails the run", async () => {
-    const s = setup({ make: victimDb });
-    const victim = await s.open();
+  it("the pre-work ownership save failure: no rebuild SQL at all, the run is latched", async () => {
+    const r = rig("i4-ownership");
+    const a = await r.open();
+    const b = await r.open();
+    const mon = await r.open();
+    await expect(i4Monitored(r.ctx, a as never, b as never, mon as never, (c, site) => zeroWorkRebuild(c, r.ctx, site))).rejects.toThrow("ENOSPC");
+    for (const c of r.clients) expect(c.sent.some((q) => q.includes("begin_reporting_rebuild"))).toBe(false);
+    expect(r.watch.failed()).toBe(true);
+  });
+
+  it("durableEvidence latches BEFORE rethrowing and does not persist again; a passing save does not latch", () => {
+    const errors: string[] = [];
+    const w = newConnectionWatch(errors, (x) => x, () => { throw new Error("must not be called"); }, () => undefined);
+    const store: Array<Record<string, unknown>> = [];
+    let ok = true;
+    const ev = durableEvidence(store, () => { if (!ok) throw new Error("EIO"); }, w, () => ({ run: "r" }));
+    ev({ kind: "a" });
+    expect(w.failed()).toBe(false);
+    ok = false;
+    expect(() => ev({ kind: "b" })).toThrow("EIO");
+    expect(errors).toEqual(["evidence persistence failed (b): EIO"]);
+    expect(store.map((x) => x.kind)).toEqual(["a", "b"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T13B2b-24: the pinned, receipted, intentional I5 termination
+// ---------------------------------------------------------------------------
+
+describe("T13B2b-24: the intentional I5 termination", () => {
+  const follow = () => new Error("Connection terminated unexpectedly");
+  const ID = { pid: 4242, backend_start: "2026-11-15 08:00:00.123456+00", xact_start: "2026-11-15 08:05:00.654321+00" };
+  type Opt = { identity?: Record<string, unknown> | null; receipt?: Array<Record<string, unknown>>; during?: (v: FakePg) => void; atEnd?: Error[]; failAt?: "work" | "identity" | "kill"; saveFailsAt?: string };
+  async function run(o: Opt = {}) {
+    const errors: string[] = [];
+    const store: Array<Record<string, unknown>> = [];
+    const log: string[] = [];
+    const watch = newConnectionWatch(errors, (x) => x, () => undefined, () => undefined);
+    const evidence = durableEvidence(store, () => { const k = String(store.at(-1)?.kind); log.push(`save:${k}`); if (o.saveFailsAt === k) throw new Error("ENOSPC"); }, watch, () => ({ run: "r1" }));
+    const v = new FakePg({
+      respond: (q) => {
+        log.push(`victim:${q === I5_VICTIM_IDENTITY_SQL ? "identity" : q}`);
+        if (q === I5_VICTIM_IDENTITY_SQL) {
+          if (o.failAt === "identity") return new Error("identity query failed");
+          return o.identity === null ? [] : [o.identity ?? { ...ID, explicit_tx: true }];
+        }
+        return [];
+      },
+    });
+    // pg end(): the terminated victim's error events fire, then end resolves
+    v.end = async () => { v.ended = true; for (const e of o.atEnd ?? []) v.emit("error", e); };
+    const victim = await openGuardedClient(() => v, TARGET, marker, (s) => s, watch);
+    const kills: Array<{ q: string; p?: unknown[] }> = [];
+    const mon: Db = { query: async (q: string, p?: unknown[]) => {
+      if (q === I5_TERMINATE_SQL) {
+        kills.push({ q, p });
+        log.push("kill");
+        if (o.failAt === "kill") throw new Error("monitor lost");
+        o.during?.(v); // the installed-pg events can arrive BEFORE the kill response resolves
+        const rows = o.receipt ?? [{ ...ID, k: true }];
+        return { rows, rowCount: rows.length };
+      }
+      return { rows: [], rowCount: 0 };
+    } };
     const cleanup: string[] = [];
-    await killOwnVictim(victim as never, { query: async () => ({ rows: [{ k: false }], rowCount: 1 }) }, cleanup, { redact: (x) => x, sleep: async () => undefined, armExpected: s.watch.armExpected }, async () => { (s.clients[0] as FakePg).emit("error", reset()); });
+    let thrown: unknown = null;
+    let res: { terminated: boolean; expected: number } | null = null;
+    try {
+      res = await killOwnVictim(victim as never, mon, cleanup, { redact: (x) => x, sleep: async () => undefined, evidence, armTermination: watch.armTermination }, async () => {
+        log.push("work");
+        if (o.failAt === "work") throw new Error("rebuild failed");
+        await victim.query("begin");
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    return { errors, store, log, watch, kills, cleanup, res, thrown, v };
+  }
+  const installedPgSequence = (v: FakePg) => { v.emit("error", terminated()); v.emit("error", follow()); };
+
+  it("the installed-pg sequence (57P01, then the no-code follow-on) arriving BEFORE the kill response, with a matching receipt: expected, not a failure", async () => {
+    const t = await run({ during: installedPgSequence });
+    expect(t.res).toEqual({ terminated: true, expected: 2 });
+    expect(t.watch.failed()).toBe(false);
+    expect(t.errors).toEqual([]);
+    expect(t.cleanup).toEqual([]);
+    expect(t.v.ended).toBe(true);
+  });
+
+  it("the sequence at disconnect after the kill (events after the receipt) is also expected", async () => {
+    const t = await run({ atEnd: [terminated(), follow()] });
+    expect(t.res).toEqual({ terminated: true, expected: 2 });
+    expect(t.watch.failed()).toBe(false);
+  });
+
+  it("identity is read INSIDE the open transaction AFTER work, persisted BEFORE the kill; the kill binds pid + backend_start + xact_start; the receipt is persisted", async () => {
+    const t = await run({ during: installedPgSequence });
+    const order = t.log.filter((l) => l === "work" || l === "victim:identity" || l.startsWith("save:") || l === "kill");
+    expect(order).toEqual(["work", "victim:identity", "save:i5-victim-ownership", "kill", "save:i5-termination"]);
+    expect(t.log.indexOf("victim:begin")).toBeLessThan(t.log.indexOf("victim:identity"));
+    expect(t.kills).toEqual([{ q: I5_TERMINATE_SQL, p: [ID.pid, ID.backend_start, ID.xact_start] }]);
+    expect(t.store[0]).toEqual({ run: "r1", kind: "i5-victim-ownership", scenario: "I5", victim: ID });
+    expect(t.store[1]).toMatchObject({ kind: "i5-termination", requested: ID, receipt: [{ ...ID, k: true }], terminated: true });
+  });
+
+  const receiptFails: Array<[string, Array<Record<string, unknown>>]> = [
+    ["false (k=false)", [{ ...ID, k: false }]],
+    ["no matching row", []],
+    ["another pid", [{ ...ID, pid: 4243, k: true }]],
+    ["another backend_start", [{ ...ID, backend_start: "2026-11-15 08:00:00.123457+00", k: true }]],
+    ["another xact_start", [{ ...ID, xact_start: "2026-11-15 09:00:00+00", k: true }]],
+    ["two rows", [{ ...ID, k: true }, { ...ID, k: true }]],
+  ];
+  for (const [name, receipt] of receiptFails) {
+    it(`a ${name} receipt fails I5 AND turns the provisional expected events into a sticky run failure`, async () => {
+      const t = await run({ receipt, during: installedPgSequence });
+      expect(t.res?.terminated).toBe(false);
+      expect(t.watch.failed()).toBe(true);
+      expect(t.errors.join("\n")).toMatch(/terminating connection due to administrator command \[57P01\] — expected only with a successful matching kill receipt, which is missing/);
+    });
+  }
+
+  it("the follow-on BEFORE any 57P01 is unexpected", async () => {
+    const t = await run({ during: (v) => { v.emit("error", follow()); v.emit("error", terminated()); } });
+    expect(t.watch.failed()).toBe(true);
+    expect(t.errors[0]).toBe("connection failure (connection #1): Connection terminated unexpectedly");
+    expect(t.cleanup).toEqual(["victim connection error: Connection terminated unexpectedly"]);
+  });
+
+  it("a coded or differently worded follow-on, an ECONNRESET, or a 57P01 on another client are unexpected", async () => {
+    const coded = Object.assign(new Error("Connection terminated unexpectedly"), { code: "ECONNRESET" });
+    for (const e of [coded, new Error("Connection terminated"), reset()]) {
+      const t = await run({ during: (v) => { v.emit("error", terminated()); v.emit("error", e); } });
+      expect(t.watch.failed(), e.message).toBe(true);
+    }
+    const errors: string[] = [];
+    const w = newConnectionWatch(errors, (x) => x, () => undefined, () => undefined);
+    const victim = w.attach(new FakePg());
+    const other = w.attach(new FakePg());
+    w.armTermination(victim);
+    other.emit("error", terminated());
+    expect(errors).toEqual(["connection failure (connection #2): terminating connection due to administrator command [57P01]"]);
+  });
+
+  it("missing or non-transactional identity is refused BEFORE any kill; nothing is armed", async () => {
+    for (const identity of [null, { ...ID, explicit_tx: false }, { ...ID, xact_start: null, explicit_tx: true }, { ...ID, backend_start: null, explicit_tx: true }]) {
+      const t = await run({ identity });
+      expect(String((t.thrown as Error)?.message)).toMatch(/I5 victim: no open explicit transaction identity after work/);
+      expect(t.kills).toEqual([]);
+      expect(t.v.ended).toBe(true);
+    }
+  });
+
+  it("failures during work / identity / ownership save / kill: no kill (or no receipt), the victim is still disconnected, and nothing is silently expected", async () => {
+    for (const failAt of ["work", "identity", "kill"] as const) {
+      const t = await run({ failAt, during: installedPgSequence });
+      expect(t.thrown, failAt).toBeTruthy();
+      expect(t.v.ended, failAt).toBe(true);
+      if (failAt !== "kill") expect(t.kills, failAt).toEqual([]);
+    }
+    const s = await run({ saveFailsAt: "i5-victim-ownership" });
+    expect(String((s.thrown as Error).message)).toBe("ENOSPC");
+    expect(s.kills).toEqual([]); // never killed without a persisted ownership receipt
     expect(s.watch.failed()).toBe(true);
-    expect(s.errors[0]).toBe("connection failure (connection #1): read ECONNRESET [ECONNRESET]");
+    const r = await run({ saveFailsAt: "i5-termination", during: installedPgSequence });
+    expect(r.watch.failed()).toBe(true); // receipt not persisted: the provisional events are failures too
+    expect(r.errors.join("\n")).toMatch(/which is missing/);
+  });
+
+  it("I5 refuses to run without a durable evidence sink or the run's watch", async () => {
+    const v = new FakePg();
+    await expect(killOwnVictim(v as never, { query: async () => ({ rows: [], rowCount: 0 }) }, [], { redact: (x) => x, sleep: async () => undefined }, async () => undefined)).rejects.toThrow(/needs durable evidence and the run's connection watch/);
+  });
+
+  it("classification is centralized: two listeners asking about the same event get one decision and one state advance", () => {
+    const errors: string[] = [];
+    const w = newConnectionWatch(errors, (x) => x, () => undefined, () => undefined);
+    const c = w.attach(new FakePg());
+    const armed = w.armTermination(c);
+    const e57 = terminated();
+    expect(armed.classify(e57)).toBe("expected");
+    expect(armed.classify(e57)).toBe("expected");
+    expect(armed.expected()).toBe(1);
+    const f = follow();
+    expect(armed.classify(f)).toBe("expected");
+    expect(armed.classify(f)).toBe("expected");
+    expect(armed.expected()).toBe(2);
+    expect(() => w.armTermination(c)).toThrow(/already armed/);
+    expect(() => w.armTermination(new FakePg())).toThrow(/does not own/);
   });
 
   it("without arming, even a 57P01 is a failure (never a global exemption)", () => {

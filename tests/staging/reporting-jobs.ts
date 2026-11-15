@@ -45,6 +45,7 @@ import { runPlanDiagnostic } from "./reportingPlanDiagnostic";
 import { rehearseRebuildRepair } from "./reportingRebuildRepair";
 import {
   compareFullState,
+  durableEvidence,
   fullState,
   ROLLBACK_ONLY,
   MIGRATION_0038,
@@ -303,10 +304,8 @@ async function publicationMain(argv: string[]): Promise<number> {
   };
   // T13B2b-22: one run-scoped connection watch; its errors are the report's errors (the final status store).
   const watch = newConnectionWatch(report.errors, redactSecrets, save);
-  const evidence = (e: Record<string, unknown>) => {
-    report.evidence.push({ run: runId, report: out, at: new Date().toISOString(), ...e });
-    save(); // throws on a persistence failure: the caller stops normal work
-  };
+  // T13B2b-23: a failed evidence save latches the watch (all next normal SQL refused) before it rethrows.
+  const evidence = durableEvidence(report.evidence, save, watch, () => ({ run: runId, report: out, at: new Date().toISOString() }), redactSecrets);
   if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
   let open: () => Promise<pg.Client>;
@@ -380,7 +379,7 @@ async function publicationMain(argv: string[]): Promise<number> {
         return;
       }
       if (mode === "interleavings") {
-        await runInterleavings({ sites, staff, open, as, record, redact: redactSecrets, now: () => performance.now(), sleep: async (ms) => void (await sleep(ms)), maxPages, evidence, armExpected: watch.armExpected }, report.cleanup);
+        await runInterleavings({ sites, staff, open, as, record, redact: redactSecrets, now: () => performance.now(), sleep: async (ms) => void (await sleep(ms)), maxPages, evidence, armTermination: watch.armTermination }, report.cleanup);
         return;
       }
       await main.query("begin");
