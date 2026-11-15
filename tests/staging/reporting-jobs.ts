@@ -34,8 +34,8 @@ import { assertStagingSupabaseUrl } from "./measure-item-counting";
 import { redactSecrets } from "./itemCountingPolicyParity";
 import { become } from "./writeCompatRun";
 import { CATALOG_SQL, openGuardedClient, REPORTING_SCHEMA, runCaptureLifecycle, stagingTarget, type ReportingCatalog, type StagingTarget } from "./reportingCapture";
-import { capLimit, fenceMarkdown, fenceStatus, launch, newFenceReport, type FenceObservation } from "./reportingFence";
-import { abandonReceipt, commitReceipt, lockForReceipt, ownedToggle, runFence, tentativeReceipt, type ReceiptIO } from "./reportingFenceRun";
+import { capLimit, fenceMarkdown, fenceStatus, newFenceReport, type FenceObservation } from "./reportingFence";
+import { fenceF2, ownedToggle, runFence, type ReceiptIO } from "./reportingFenceRun";
 import { catalog } from "./policyParityRun";
 import { catalogLevel, checkCatalog, finalReport, initialReport } from "./reportingCapture";
 import { committedAllowance, newOwnership, runCommitted, type Ownership } from "./reportingCommitted";
@@ -175,41 +175,16 @@ async function f1(ctx: Ctx): Promise<FenceObservation> {
   });
 }
 
+/** F2 lives in reportingFenceRun.ts (fenceF2) so its whole lifecycle is tested without a database. */
 async function f2(ctx: Ctx): Promise<FenceObservation> {
-  const epochBefore = await toggle(ctx, false);
-  return withClients(ctx, 4, async ([a, c, d, mon]) => {
-    await a.query("begin");
-    await become(a, "staff", ctx.claims);
-    await a.query(INS("rj-f2-a"), [ctx.staff]); // disabled period: holds the control share lock, no journal
-    const cPid = Number((await c.query("select pg_backend_pid() as p")).rows[0].p);
-    await c.query("begin");
-    await become(c, "service_role", ctx.claims);
-    // T13B2b-18: the receipt's epoch under a control SHARE lock. It does not conflict with the open
-    // writer's share lock (so the toggle's own UPDATE is still what waits) but blocks any other
-    // transition until this one commits; same at-most-3-s cap the RPC applies.
-    const receiptBefore = await lockForReceipt(c, "share");
-    // T13A-1: observed at once, inspected (or rethrown) where awaited; polling failures still clean up.
-    const enable = launch(c.query("select capture_epoch from public.set_reporting_capture(true)"));
-    const toggleWaited = await waitingOnLock(mon, cPid);
-    await a.query("rollback"); // the disabled-period write ends (nothing kept)
-    const epochAfter = Number((await enable.result()).rows[0].capture_epoch);
-    const receipt = tentativeReceipt(ctx.receipts, true, receiptBefore, epochAfter); // saved BEFORE the commit below
-    // The toggle is applied but NOT committed: a READ COMMITTED writer queues behind it.
-    const dPid = Number((await d.query("select pg_backend_pid() as p")).rows[0].p);
-    await d.query("begin");
-    await become(d, "staff", ctx.claims);
-    const write = launch(d.query(INS("rj-f2-d"), [ctx.staff]));
-    const queuedWriterWaited = await waitingOnLock(mon, dPid);
-    try {
-      await commitReceipt(c, receipt, cPid, ctx.receipts);
-    } catch (e) {
-      if (receipt.state === "tentative") await abandonReceipt(c, receipt, ctx.receipts);
-      throw e;
-    }
-    await write.result();
-    await d.query("reset role");
-    const j = await d.query(`select count(*)::int as n, max(capture_epoch) as e from ${REPORTING_SCHEMA}.changes where new_event_id = 'rj-f2-d'`);
-    return { id: "F2", toggleWaited, queuedWriterWaited, epochBefore, epochAfter, journalRows: Number(j.rows[0].n), journalEpoch: j.rows[0].e === null ? null : Number(j.rows[0].e) };
+  return fenceF2({
+    open: ctx.open,
+    become: (c, role) => become(c as pg.Client, role, ctx.claims),
+    waitingOnLock: (mon, pid) => waitingOnLock(mon as pg.Client, pid),
+    toggle: (on) => toggle(ctx, on),
+    receipts: ctx.receipts,
+    insertSql: INS,
+    staff: ctx.staff,
   });
 }
 

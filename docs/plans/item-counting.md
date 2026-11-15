@@ -1829,3 +1829,43 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - the audit tolerating no baseline.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1105/1105 tests (33 files); build OK.
   - **Next:** root review of this checkpoint. `--fence`, `--interleavings` and `--committed-interleavings` have not run. Task 13 stays unchecked.
+- 2026-11-15 — recovery-runner residual repair, the three residuals only. No SQL, no staging mode, no app/API/migration change, no Task 14 work. 0037 `531bb2c5…` and 0038 `14a808ea…714b1d` are installed, immutable and byte-identical. Unconditional restoration, the full-state audit, the F2 SHARE prelock and every timeout limit are unchanged:
+  - **T13B2b-17, recorded toggle cleanup errors:**
+    - `ownedToggle`: after a successful COMMIT, a disconnect failure is now recorded AND thrown. The receipt stays confirmed and is still counted. After an earlier failure the disconnect error is still kept beside it and the original is rethrown.
+    - `runFence` also stops when a scenario adds report errors even though its observation passes (`<id> recorded a failure (…)`). Restoration and the audit stay unconditional.
+  - **I1 evidence:** `ok` now requires the observed wait AND a successful second begin. An SQL error after the wait fails I1, keeps the SQLSTATE and message verbatim, and the stop-on-first-failure wrapper means I2 onward is never invoked.
+  - **T13B2b-18, F2 settlement:** F2 is extracted to `fenceF2` (with `F2Deps`) in `tests/staging/reportingFenceRun.ts`, so its real orchestration is tested without importing the runner that executes `main`. `reporting-jobs.ts` `f2` delegates to it. `fenceF2` owns the receipt and both launched queries across its whole lifecycle; on every exit:
+    - sessions are rolled back in order a, c, d, mon (a first, so a blocked enable or write can finish) and closed;
+    - each launched query is inspected, and an error that is not the first failure is kept beside it;
+    - a still-tentative receipt becomes ABSENT only when c's rollback is KNOWN to have succeeded; otherwise it stays tentative and that is reported;
+    - confirmed and uncertain receipts are never overwritten;
+    - the first failure stays first in the thrown message.
+  - **Tests:** `tests/reporting/reportingFenceRun.test.ts` 19 → 31. The structural assertions in `tests/reporting/reportingJobs.test.ts` were retargeted to `fenceF2` (SHARE prelock before the toggle, launched queries, no un-awaited held query).
+    - Coordinator: a toggle disconnect failure stops after F1 with exactly 2 commits (F1 and the restoration, not six); the committed receipt is counted; capture is restored. A scenario that only records an error stops.
+    - I1: wait then `40P01 deadlock detected` gives FAILED with the error verbatim and no I2 write. A pass needs both the wait and the begin.
+    - Actual `fenceF2`, 9 cases:
+      - a clean run (confirmed; rollback order; SHARE before the toggle);
+      - the second monitor poll failing (absent; all four sessions settled; no commit);
+      - d's pid failing (absent);
+      - c's rollback unknown (stays tentative, reported beside the first error);
+      - an enable-query failure plus a monitor failure (monitor first, enable kept);
+      - an enable failure alone (not duplicated);
+      - an uncertain COMMIT (stays uncertain);
+      - a save failure after commit (stays confirmed);
+      - a failed tentative save (absent; no commit).
+  - **Mutations:** 12/12 new breaks caught:
+    - the toggle disconnect swallowed;
+    - recorded errors ignored;
+    - I1 passing on the wait alone;
+    - a tentative receipt never made absent;
+    - absent without a known rollback;
+    - launched queries not inspected;
+    - a secondary failure replacing the first;
+    - rollback order reversed;
+    - the first error duplicated;
+    - F2 locking FOR UPDATE;
+    - cleanup overwriting confirmed/uncertain;
+    - F2 sessions not closed.
+    - The previous 19/19 set was re-run and all were caught (M15/M18 retargeted to their new locations).
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1117/1117 tests (33 files); build OK.
+  - **Next:** root review. `--fence`, `--interleavings` and `--committed-interleavings` have still not run. Task 13 stays unchecked.

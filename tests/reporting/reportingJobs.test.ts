@@ -409,11 +409,13 @@ describe("activation fence checks", () => {
     expect(FENCE_RUNNER).toMatch(/return ownedToggle\(\{ \.\.\.ctx\.receipts, as: \(c\) => become\(c as pg\.Client, "service_role", ctx\.claims\) \}, enabled, restoring\);/);
     // Only control toggles are committed, each through commitReceipt (toggle() via ownedToggle, and F2's held toggle); no source write is ever committed.
     expect(FENCE_RUNNER.match(/\.query\("commit"\)/g)).toBeNull();
-    expect(FENCE_RUNNER.match(/commitReceipt\(/g)).toHaveLength(1); // F2 (toggle() commits inside ownedToggle)
+    expect(FENCE_RUNNER.match(/commitReceipt\(/g)).toBeNull(); // toggle() commits inside ownedToggle; F2 inside fenceF2
+    expect(FENCE_RUN.match(/await commitReceipt\(/g)).toHaveLength(2); // ownedToggle and fenceF2
+    expect(FENCE_RUNNER).toMatch(/return fenceF2\(\{/);
     expect(FENCE_RUN).toMatch(/const r = await c\.query\("select capture_epoch from public\.set_reporting_capture\(\$1\)", \[enabled\]\);\r?\n\s+t = tentativeReceipt\(io, enabled, before, r\.rows\[0\]\?\.capture_epoch\);/);
-    expect(FENCE_RUNNER).toMatch(/const receiptBefore = await lockForReceipt\(c, "share"\);\r?\n(\s*\/\/.*\r?\n)*\s+const enable = launch\(c\.query\("select capture_epoch from public\.set_reporting_capture\(true\)"\)\);/); // F2: SHARE (its own UPDATE still waits), before the toggle
-    expect(FENCE_RUNNER).toMatch(/const receipt = tentativeReceipt\(ctx\.receipts, true, receiptBefore, epochAfter\);/);
-    expect(FENCE_RUNNER).toMatch(/const queuedWriterWaited = await waitingOnLock\(mon, dPid\);\r?\n\s+try \{\r?\n\s+await commitReceipt\(c, receipt, cPid, ctx\.receipts\);/);
+    expect(FENCE_RUN).toMatch(/const receiptBefore = await lockForReceipt\(c, "share"\);\r?\n(\s*\/\/.*\r?\n)*\s+enable = launch\(c\.query\("select capture_epoch from public\.set_reporting_capture\(true\)"\)\);/); // F2: SHARE (its own UPDATE still waits), before the toggle
+    expect(FENCE_RUN).toMatch(/receipt = tentativeReceipt\(d\.receipts, true, receiptBefore, epochAfter\);/);
+    expect(FENCE_RUN).toMatch(/const queuedWriterWaited = await d\.waitingOnLock\(mon, dPid\);\r?\n\s+await commitReceipt\(c, receipt, cPid, d\.receipts\);/);
     expect(FENCE_RUNNER).toMatch(/cleanup failed: scenario connection/);
     expect(FENCE_RUNNER).toMatch(/await runFence\(report, \{/);
     expect(FENCE_RUN).toMatch(/await runCaptureLifecycle\(report, \{/);
@@ -481,12 +483,13 @@ describe("T13A-1: launched queries are observed at once", () => {
   });
 
   it("the runner launches F2's toggle and queued write through launch() and inspects them where awaited", () => {
-    expect(FENCE_RUNNER).toMatch(/const enable = launch\(c\.query\("select capture_epoch from public\.set_reporting_capture\(true\)"\)\);/);
-    expect(FENCE_RUNNER).toMatch(/const write = launch\(d\.query\(INS\("rj-f2-d"\), \[ctx\.staff\]\)\);/);
-    expect(FENCE_RUNNER).toMatch(/await enable\.result\(\)/);
-    expect(FENCE_RUNNER).toMatch(/await write\.result\(\)/);
+    expect(FENCE_RUN).toMatch(/enable = launch\(c\.query\("select capture_epoch from public\.set_reporting_capture\(true\)"\)\);/);
+    expect(FENCE_RUN).toMatch(/write = launch\(w\.query\(d\.insertSql\("rj-f2-d"\), \[d\.staff\]\)\);/);
+    expect(FENCE_RUN).toMatch(/await enable\.result\(\)/);
+    expect(FENCE_RUN).toMatch(/await write\.result\(\)/);
     // No other query promise is held un-awaited in a variable.
     expect(FENCE_RUNNER).not.toMatch(/const \w+ = (?!await |launch\()[a-z]\.query\(/);
+    expect(FENCE_RUN).not.toMatch(/(const \w+|\b(enable|write)) = (?!await |launch\()[a-z]\.query\(/);
   });
 });
 

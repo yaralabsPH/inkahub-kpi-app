@@ -786,7 +786,8 @@ export async function runInterleavings(ctx: InterleaveCtx, cleanupFailures: stri
       const waited = await waitsOnLock(mon, bPid, ctx);
       await a.query("rollback");
       const out = await second;
-      return { ok: waited, result: `waited=${waited}; after the first rolled back: ${out.ok ? "second began" : msgOf(out.e, ctx.redact)}` };
+      // The wait AND a successful second begin are both required; an SQL error after the wait is kept verbatim.
+      return { ok: waited && out.ok, result: `waited=${waited}; after the first rolled back: ${out.ok ? "second began" : msgOf(out.e, ctx.redact)}` };
     }, cleanupFailures));
 
   await run("I2", "an UNCOMMITTED source write is invisible to a concurrent freeze (the committed lower-id case is --committed-interleavings A)", "the freeze does not include it", async () =>

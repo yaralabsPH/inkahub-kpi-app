@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { fenceStatus, newFenceReport, type FenceId, type FenceObservation, type FenceReport } from "../staging/reportingFence";
-import { fenceAllowance, ownedToggle, RECEIPT_LOCK_SQL, runFence, type FenceRunIO, type ReceiptIO } from "../staging/reportingFenceRun";
+import { fenceAllowance, fenceF2, ownedToggle, RECEIPT_LOCK_SQL, runFence, type F2Deps, type FenceRunIO, type ReceiptIO } from "../staging/reportingFenceRun";
 import type { Conn } from "../staging/reportingCommitted";
 import { runInterleavings, type FullState, type InterleaveCtx, type Observation } from "../staging/reportingPublication";
 
@@ -279,12 +279,26 @@ describe("T13B2b-16/-17/-18: the fence coordinator", () => {
     expect(RECEIPT_LOCK_SQL.share).toMatch(/where c\.singleton for share$/);
   });
 
-  it("toggle disconnect failures are recorded, not swallowed", async () => {
+  it("T13B2b-17 residual: a toggle disconnect failure after a successful commit is recorded AND stops the run: no later scenario or ordinary toggle", async () => {
     const h = harness();
     h.db.failEnd = true;
     await h.run();
     expect(h.report.errors.join("\n")).toMatch(/cleanup failed: toggle disconnect: socket hang up/);
+    expect(h.ran).toEqual(["F1"]); // F2..F6 never ran
+    expect(h.db.commits).toBe(2); // F1's toggle and the unconditional restoration only (not six)
+    expect(h.report.captureTransitions.map((t) => `${t.before}->${t.after}:${t.state}`)).toEqual(["3->4:confirmed", "4->5:confirmed"]); // the committed toggle is still counted
+    expect(h.db.committed.enabled).toBe(false);
+    expect(h.report.observations).toEqual([{ id: "F1", error: "cleanup failed: toggle disconnect: socket hang up" }]);
     expect(fenceStatus(h.report)).toMatch(/^STATUS: FAILED/);
+  });
+
+  it("T13B2b-17 residual: a scenario that only RECORDS a failure (returns a passing observation) also stops the run", async () => {
+    const h = harness({ F1: async (x, t) => (await t(true), x.report.errors.push("cleanup failed: receipt something"), GOOD.F1) });
+    await h.run();
+    expect(h.ran).toEqual(["F1"]);
+    expect(h.report.errors.join("\n")).toMatch(/F1 recorded a failure \(cleanup failed: receipt something\); later fence scenarios are not run/);
+    expect(h.restored).toEqual([false]);
+    expect(h.db.committed.enabled).toBe(false);
   });
 });
 
@@ -293,7 +307,8 @@ describe("T13B2b-16/-17/-18: the fence coordinator", () => {
 // ---------------------------------------------------------------------------
 
 describe("T13B2b-17: rollback interleavings stop at the first failure", () => {
-  function ctxFor(i0: () => Record<string, unknown>, opts: { endFails?: boolean; throwI0?: boolean } = {}) {
+  function ctxFor(i0: () => Record<string, unknown>, opts: { endFails?: boolean; throwI0?: boolean; rebuild?: (n: number) => Record<string, unknown>[]; lockWait?: boolean } = {}) {
+    let rebuilds = 0;
     const log: string[] = [];
     const recorded: Observation[] = [];
     let opened = 0;
@@ -310,6 +325,12 @@ describe("T13B2b-17: rollback interleavings stop at the first failure", () => {
               if (opts.throwI0) throw new Error("permission denied for table control");
               return { rows: [i0()], rowCount: 1 };
             }
+            if (opts.rebuild && sql.includes("public.begin_reporting_rebuild(")) {
+              const rows = opts.rebuild(++rebuilds);
+              return { rows, rowCount: rows.length };
+            }
+            if (opts.lockWait && sql.includes("select wait_event_type from pg_catalog.pg_stat_activity")) return { rows: [{ wait_event_type: "Lock" }], rowCount: 1 };
+            if (sql.startsWith("select pg_backend_pid()")) return { rows: [{ p: 4242 }], rowCount: 1 };
             return { rows: [], rowCount: 0 };
           },
           end: async () => {
@@ -369,5 +390,176 @@ describe("T13B2b-17: rollback interleavings stop at the first failure", () => {
     expect(t.recorded.map((o) => o.id)).toEqual(["I0", "I1"]); // ...but it ran, and nothing after it did
     expect(t.log.some((l) => l.includes("begin_reporting_rebuild"))).toBe(true);
     expect(t.log.some((l) => l.includes("rp-i2") || l.includes("insert into public.production_events"))).toBe(false);
+  });
+
+  const I0_OK = () => ({ cap: true, proc: true, active: 0 });
+
+  it("I1 residual: the second begin WAITED but then failed with an SQL error: I1 fails (error kept verbatim) and I2 never runs", async () => {
+    const t = ctxFor(I0_OK, {
+      lockWait: true,
+      rebuild: (n) => {
+        if (n === 2) throw Object.assign(new Error("deadlock detected"), { code: "40P01" });
+        return [{ batch_id: "b1", lease_fence: 1 }];
+      },
+    });
+    await expect(runInterleavings(t.ctx, [])).rejects.toThrow(/I1 failed; later interleavings are not run/);
+    const i1 = t.recorded.find((o) => o.id === "I1")!;
+    expect(i1.ok).toBe(false);
+    expect(i1.result).toBe("waited=true; after the first rolled back: 40P01 deadlock detected") // SQLSTATE and message kept;
+    expect(t.recorded.map((o) => o.id)).toEqual(["I0", "I1"]);
+    expect(t.log.some((l) => l.includes("insert into public.production_events"))).toBe(false); // I2's write never happened
+  });
+
+  it("I1 passes only with BOTH the wait and a successful second begin", async () => {
+    const t = ctxFor(I0_OK, { lockWait: true, rebuild: () => [{ batch_id: "b1", lease_fence: 1 }] });
+    await expect(runInterleavings(t.ctx, [])).rejects.toThrow(/I2 failed/); // the fake cannot run I2, but I1 passed and I2 was reached
+    expect(t.recorded.find((o) => o.id === "I1")).toMatchObject({ ok: true, result: "waited=true; after the first rolled back: second began" });
+    const noWait = ctxFor(I0_OK, { lockWait: false, rebuild: () => [{ batch_id: "b1", lease_fence: 1 }] });
+    await expect(runInterleavings(noWait.ctx, [])).rejects.toThrow(/I1 failed/);
+    expect(noWait.recorded.find((o) => o.id === "I1")).toMatchObject({ ok: false, result: "waited=false; after the first rolled back: second began" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T13B2b-18 residual: the ACTUAL F2 orchestration (fenceF2) owns its receipt and launched queries
+// ---------------------------------------------------------------------------
+
+describe("T13B2b-18 residual: fenceF2 settles its receipt and every launched query on every exit", () => {
+  type Opts = {
+    monFailOn?: number;
+    enableFails?: boolean;
+    dPidFails?: boolean;
+    cRollbackFails?: boolean;
+    commitFails?: boolean;
+    saveFails?: () => boolean;
+  };
+  function setup(o: Opts = {}) {
+    const log: string[] = [];
+    const ends: number[] = [];
+    const errors: string[] = [];
+    const transitions: ReceiptIO["transitions"] = [];
+    let opened = 0;
+    let polls = 0;
+    const lockErr = Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" });
+    const conn = (id: number): Conn => ({
+      query: async (sql: string) => {
+        log.push(`${id}:${sql.replace(/\s+/g, " ").slice(0, 70)}`);
+        const ok = (rows: Array<Record<string, unknown>> = []) => ({ rows, rowCount: rows.length });
+        if (sql === "rollback" && id === 2 && o.cRollbackFails) throw new Error("connection terminated");
+        if (sql.startsWith("select pg_backend_pid()")) {
+          if (id === 3 && o.dPidFails) throw new Error("d pid unavailable");
+          return ok([{ p: 100 + id }]);
+        }
+        if (sql.includes("name = 'lock_timeout'")) return ok([{ ms: 0 }]);
+        if (sql === RECEIPT_LOCK_SQL.share) return ok([{ e: "4" }]);
+        if (sql.includes("public.set_reporting_capture(true)")) {
+          if (o.enableFails) throw lockErr;
+          return ok([{ capture_epoch: 5 }]);
+        }
+        if (sql === "commit" && o.commitFails) throw new Error("connection reset during commit");
+        if (sql.includes("wait_event_type")) {
+          if (o.monFailOn && ++polls === o.monFailOn) throw new Error("monitor connection lost");
+          return ok([{ wait_event_type: "Lock" }]);
+        }
+        if (sql.includes("from reporting_private.changes")) return ok([{ n: 1, e: 5 }]);
+        if (sql.includes("pg_stat_activity where pid")) return ok([{ x: false }]);
+        return ok();
+      },
+      end: async () => void ends.push(id),
+    });
+    const receipts: ReceiptIO = {
+      transitions,
+      errors,
+      save: () => {
+        if (o.saveFails?.()) throw new Error("ENOSPC");
+      },
+      open: async () => conn(99),
+      redact: (x) => x,
+      sleep: async () => undefined,
+    };
+    const deps: F2Deps = {
+      open: async () => conn(++opened),
+      become: async (c, role) => void (await c.query(`set role ${role}`)),
+      waitingOnLock: async (mon, pid) => (await mon.query("select wait_event_type from pg_catalog.pg_stat_activity where pid = $1", [pid])).rows[0]?.wait_event_type === "Lock",
+      toggle: async () => 4,
+      receipts,
+      insertSql: (id) => `insert into public.production_events values ('${id}')`,
+      staff: "s",
+    };
+    const rolledBack = () => [1, 2, 3, 4].filter((id) => log.includes(`${id}:rollback`));
+    return { deps, log, ends, errors, transitions, rolledBack };
+  }
+
+  it("a clean F2: the receipt is confirmed; all four sessions are rolled back and closed", async () => {
+    const t = setup();
+    const obs = await fenceF2(t.deps);
+    expect(obs).toEqual({ id: "F2", toggleWaited: true, queuedWriterWaited: true, epochBefore: 4, epochAfter: 5, journalRows: 1, journalEpoch: 5 });
+    expect(t.transitions).toEqual([{ enable: true, before: "4", after: "5", state: "confirmed" }]);
+    expect(t.rolledBack()).toEqual([1, 2, 3, 4]);
+    expect(t.ends.sort()).toEqual([1, 2, 3, 4]);
+    // The SHARE receipt lock precedes the toggle on c; a is rolled back first on cleanup.
+    const c = t.log.filter((l) => l.startsWith("2:"));
+    expect(c.findIndex((l) => l.includes("for share"))).toBeLessThan(c.findIndex((l) => l.includes("set_reporting_capture")));
+    const rb = t.log.filter((l) => l.endsWith(":rollback"));
+    expect(rb.slice(-4)).toEqual(["1:rollback", "2:rollback", "3:rollback", "4:rollback"]);
+  });
+
+  it("the SECOND monitor poll fails after the tentative receipt: sessions settle, then the receipt is ABSENT (not left tentative)", async () => {
+    const t = setup({ monFailOn: 2 });
+    await expect(fenceF2(t.deps)).rejects.toThrow(/^monitor connection lost$/);
+    expect(t.transitions).toEqual([{ enable: true, before: "4", after: "5", state: "absent" }]);
+    expect(t.rolledBack()).toEqual([1, 2, 3, 4]);
+    expect(t.ends.sort()).toEqual([1, 2, 3, 4]);
+    expect(t.log.some((l) => l === "2:commit")).toBe(false);
+  });
+
+  it("getting d's pid fails after the tentative receipt: ABSENT after c's rollback", async () => {
+    const t = setup({ dPidFails: true });
+    await expect(fenceF2(t.deps)).rejects.toThrow(/^d pid unavailable$/);
+    expect(t.transitions[0].state).toBe("absent");
+    expect(t.ends.sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("c's rollback is NOT known: the receipt stays tentative and that is reported beside the first error", async () => {
+    const t = setup({ monFailOn: 2, cRollbackFails: true });
+    const e = await fenceF2(t.deps).then(() => null, (x: Error) => x);
+    expect(e?.message).toMatch(/^monitor connection lost; cleanup failed: scenario connection rollback: connection terminated; capture transition 4 -> 5: the toggle session's rollback is not known; the receipt stays tentative$/);
+    expect(t.transitions[0].state).toBe("tentative");
+    expect(t.ends.sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("the enable query fails AND the first monitor poll fails: the monitor error stays first and the enable error is kept beside it", async () => {
+    const t = setup({ enableFails: true, monFailOn: 1 });
+    const e = await fenceF2(t.deps).then(() => null, (x: Error) => x);
+    expect(e?.message).toBe("monitor connection lost; F2 enable query failed: canceling statement due to lock timeout");
+    expect(t.transitions).toEqual([]); // no receipt was ever taken
+    expect(t.ends.sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it("the enable query alone fails: reported once (as the first error), not duplicated", async () => {
+    const t = setup({ enableFails: true });
+    const e = await fenceF2(t.deps).then(() => null, (x: Error) => x);
+    expect(e?.message).toBe("canceling statement due to lock timeout");
+  });
+
+  it("an uncertain COMMIT stays UNCERTAIN (never turned absent by cleanup)", async () => {
+    const t = setup({ commitFails: true });
+    await expect(fenceF2(t.deps)).rejects.toThrow(/connection reset during commit/);
+    expect(t.transitions[0].state).toBe("uncertain");
+    expect(t.errors.join()).toMatch(/uncertain commit/);
+  });
+
+  it("a save failure AFTER a successful commit keeps the receipt CONFIRMED", async () => {
+    let n = 0;
+    const t = setup({ saveFails: () => ++n === 2 }); // 1 = tentative (before commit), 2 = after commit
+    await expect(fenceF2(t.deps)).rejects.toThrow("ENOSPC");
+    expect(t.transitions[0].state).toBe("confirmed");
+  });
+
+  it("a failed tentative save (before commit) leaves the receipt ABSENT and commits nothing", async () => {
+    const t = setup({ saveFails: () => true });
+    await expect(fenceF2(t.deps)).rejects.toThrow("ENOSPC");
+    expect(t.transitions[0].state).toBe("absent");
+    expect(t.log.includes("2:commit")).toBe(false);
   });
 });
