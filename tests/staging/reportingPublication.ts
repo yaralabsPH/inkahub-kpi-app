@@ -42,7 +42,7 @@ import type { LifecycleReport } from "./reportingCapture";
 
 export const MIGRATION_0038 = "supabase/migrations/0038_reporting_jobs.sql";
 export type Site = "au" | "uk" | "us";
-export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings" | "explain-source-versions";
+export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings" | "explain-source-versions" | "rehearse-rebuild-repair";
 export interface Db {
   query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>;
 }
@@ -53,14 +53,14 @@ export interface Db {
 
 export function parsePublicationArgs(argv: readonly string[]): { mode: PublicationMode | null; sites: [Site, Site] | null; maxPages: number; problems: string[] } {
   const problems: string[] = [];
-  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings", "--explain-source-versions"].includes(a));
+  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings", "--explain-source-versions", "--rehearse-rebuild-repair"].includes(a));
   const explain = modes.length === 1 && modes[0] === "--explain-source-versions";
   // The plan diagnostic takes ONE site (--site=X); every other mode takes two (--sites=A,B).
   const sitesArg = explain ? undefined : argv.find((a) => a.startsWith("--sites="));
   const siteArg = explain ? argv.find((a) => a.startsWith("--site=")) : undefined;
   const pagesArg = argv.find((a) => a.startsWith("--max-pages="));
   const unknown = argv.filter((a) => a.startsWith("--") && !modes.includes(a) && a !== sitesArg && a !== siteArg && a !== pagesArg);
-  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings, --explain-source-versions");
+  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings, --explain-source-versions, --rehearse-rebuild-repair");
   if (unknown.length) problems.push(`unknown flags: ${unknown.join(" ")}`);
   const supported = (s: string) => s === "au" || s === "uk" || s === "us";
   const one = siteArg?.slice("--site=".length) ?? "";
@@ -164,10 +164,12 @@ export interface PublicationReport extends LifecycleReport {
   ownership: Record<string, unknown> | null;
   /** --explain-source-versions only: the plan, environment and parameter identities (no source payloads). */
   diagnostic: Record<string, unknown> | null;
+  /** --rehearse-rebuild-repair only: 0039 identities, function baseline/after, plan, timings and version intervals (no source payloads). */
+  repair: Record<string, unknown> | null;
 }
 
 export function newPublicationReport(mode: PublicationMode, sites: [Site, Site], revision: string, startedAt: string, draftSha256: string): PublicationReport {
-  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
+  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, repair: null, errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
 }
 
 /** One STATUS line: COMPLETE only with every observation as expected, no error/cleanup failure and a verified restoration. */
@@ -201,6 +203,7 @@ export function publicationMarkdown(r: PublicationReport): string {
     ...(r.errors.length ? ["## Errors", ...r.errors.map((p) => `- ${p}`), ""] : []),
     ...(r.cleanup.length ? ["## Cleanup failures", ...r.cleanup.map((p) => `- ${p}`), ""] : []),
     ...(r.ownership ? ["## Cleanup ownership (recorded before the first commit)", "```json", JSON.stringify(r.ownership, null, 2), "```", ""] : []),
+    ...(r.repair ? ["## 0039 rebuild-repair rehearsal (rolled back; not installed)", "", "```json", JSON.stringify(r.repair, null, 2), "```", ""] : []),
     ...(r.diagnostic ? ["## Plan diagnostic (source_versions INSERT; plan only, rolled back)", "", `- ${String(r.diagnostic.label)}`, "", "```json", JSON.stringify(r.diagnostic, null, 2), "```", ""] : []),
     ...(r.restorationProblems.length ? ["## Restoration problems", ...r.restorationProblems.map((p) => `- ${p}`), ""] : []),
     publicationStatus(r),
@@ -738,6 +741,73 @@ function settle<T>(p: Promise<T>): Promise<{ ok: true; v: T } | { ok: false; e: 
   return p.then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e }));
 }
 
+/** T13B2b-19: one monitor sample per exact backend PID (no query text, no source payloads). */
+export const BACKEND_SAMPLE_SQL = `select a.pid, a.state, a.wait_event_type, a.wait_event, pg_catalog.pg_blocking_pids(a.pid) as blocking,
+  round(extract(epoch from (clock_timestamp() - a.xact_start)) * 1000)::bigint as xact_ms
+from pg_catalog.pg_stat_activity a where a.pid = any($1::int[]) order by a.pid`;
+export interface BackendSample { t: number; pid: number; state: string | null; wait_event_type: string | null; wait_event: string | null; blocking: number[]; xact_ms: number | null }
+export interface MonitoredOutcome<T> {
+  outcomes: Array<{ ok: true; v: T } | { ok: false; e: unknown }>;
+  samples: BackendSample[];
+  monitorError: string | null;
+  bounded: boolean;
+  elapsedMs: number;
+}
+
+/**
+ * Sample the EXACT backends while every job is pending, on an independent
+ * guarded monitor connection: bounded (maxSamples x intervalMs), stopped as
+ * soon as all jobs settle. A monitor failure is sticky (recorded, sampling
+ * stops) and never strands a job: every job is always awaited and its outcome
+ * returned. Jobs are observed at once (no unhandled rejection).
+ */
+export async function monitorBackends<T>(mon: Db, pids: number[], jobs: Array<Promise<T>>, ctx: Pick<InterleaveCtx, "sleep" | "now" | "redact">, opts: { intervalMs?: number; maxSamples?: number } = {}): Promise<MonitoredOutcome<T>> {
+  const intervalMs = opts.intervalMs ?? 1000;
+  const maxSamples = opts.maxSamples ?? 150; // 150 s: beyond the existing 2 min statement_timeout, never raised
+  const t0 = ctx.now();
+  let pending = jobs.length;
+  const settled = jobs.map((j) => settle(j).finally(() => void pending--));
+  const samples: BackendSample[] = [];
+  let monitorError: string | null = null;
+  let rounds = 0;
+  while (pending > 0 && rounds < maxSamples) {
+    rounds++;
+    try {
+      const r = await mon.query(BACKEND_SAMPLE_SQL, [pids]);
+      const t = Math.round(ctx.now() - t0);
+      for (const x of r.rows) {
+        samples.push({ t, pid: Number(x.pid), state: (x.state as string) ?? null, wait_event_type: (x.wait_event_type as string) ?? null, wait_event: (x.wait_event as string) ?? null, blocking: ((x.blocking as unknown[]) ?? []).map(Number), xact_ms: x.xact_ms == null ? null : Number(x.xact_ms) });
+      }
+    } catch (e) {
+      monitorError = `monitor failed: ${msgOf(e, ctx.redact)}`;
+      break;
+    }
+    if (pending > 0) await ctx.sleep(intervalMs);
+  }
+  const outcomes = await Promise.all(settled);
+  return { outcomes, samples, monitorError, bounded: pending > 0 || rounds >= maxSamples, elapsedMs: Math.round(ctx.now() - t0) };
+}
+
+/** Collapse consecutive identical per-PID samples (state/wait/blocking) to keep the report readable; first/last times kept. */
+export function compactSamples(samples: readonly BackendSample[]): Array<BackendSample & { until: number; n: number }> {
+  const out: Array<BackendSample & { until: number; n: number }> = [];
+  const last = new Map<number, BackendSample & { until: number; n: number }>();
+  for (const s of samples) {
+    const key = JSON.stringify([s.state, s.wait_event_type, s.wait_event, s.blocking]);
+    const prev = last.get(s.pid);
+    if (prev && JSON.stringify([prev.state, prev.wait_event_type, prev.wait_event, prev.blocking]) === key) {
+      prev.until = s.t;
+      prev.n++;
+      prev.xact_ms = s.xact_ms;
+      continue;
+    }
+    const x = { ...s, until: s.t, n: 1 };
+    out.push(x);
+    last.set(s.pid, x);
+  }
+  return out;
+}
+
 async function waitsOnLock(mon: Db, pid: number, ctx: Pick<InterleaveCtx, "sleep">): Promise<boolean> {
   for (let i = 0; i < 30; i++) {
     const r = await mon.query("select wait_event_type from pg_catalog.pg_stat_activity where pid = $1", [pid]);
@@ -754,6 +824,27 @@ async function zeroWorkRebuild(c: Db, ctx: InterleaveCtx, site: Site): Promise<R
   await rpc(c, fctx, "select * from public.freeze_reporting_rebuild($1, $2)", [b.batch_id, b.lease_fence]);
   await rpc(c, fctx, "select * from public.seal_reporting_work($1, $2, 0, $3)", [b.batch_id, b.lease_fence, reportingManifestHash([])]);
   return publish(c, fctx, String(b.batch_id), Number(b.lease_fence));
+}
+
+/**
+ * T13B2b-19: I4 with exact-PID monitoring. Each worker's backend PID is read
+ * inside its explicit transaction BEFORE publishing; while both publications
+ * are pending the independent monitor samples those PIDs only (state, wait
+ * event, blocking PIDs, transaction age). Passes only if both publish and the
+ * monitor did not fail.
+ */
+export async function i4Monitored(ctx: InterleaveCtx, a: Db, b: Db, mon: Db, work: (c: Db, site: Site) => Promise<unknown>, opts?: { intervalMs?: number; maxSamples?: number }): Promise<{ ok: boolean; result: string }> {
+  const [A, B] = ctx.sites;
+  await a.query("begin");
+  await b.query("begin");
+  const pa = Number((await a.query("select pg_backend_pid() as p")).rows[0].p);
+  const pb = Number((await b.query("select pg_backend_pid() as p")).rows[0].p);
+  const m = await monitorBackends(mon, [pa, pb], [work(a, A), work(b, B)], ctx, opts);
+  const [x, y] = m.outcomes;
+  const ok = x.ok && y.ok && m.monitorError === null;
+  const res = (o: (typeof m.outcomes)[number]) => (o.ok ? "published" : msgOf(o.e, ctx.redact));
+  const evidence = { pids: { [A]: pa, [B]: pb }, elapsedMs: m.elapsedMs, bounded: m.bounded, monitorError: m.monitorError, samples: compactSamples(m.samples) };
+  return { ok, result: `${A}: ${res(x)}; ${B}: ${res(y)}; monitor: ${JSON.stringify(evidence)}` };
 }
 
 export async function runInterleavings(ctx: InterleaveCtx, cleanupFailures: string[]): Promise<void> {
@@ -830,12 +921,7 @@ export async function runInterleavings(ctx: InterleaveCtx, cleanupFailures: stri
     }, cleanupFailures));
 
   await run("I4", "two sites publish concurrently without deadlock (no controlled shared move here; shared acknowledgement is --committed-interleavings D)", "both publications complete", async () =>
-    withConnections(ctx, 2, async ([a, b]) => {
-      await a.query("begin");
-      await b.query("begin");
-      const [x, y] = await Promise.all([settle(zeroWorkRebuild(a, ctx, A)), settle(zeroWorkRebuild(b, ctx, B))]);
-      return { ok: x.ok && y.ok, result: `${A}: ${x.ok ? "published" : msgOf(x.e, ctx.redact)}; ${B}: ${y.ok ? "published" : msgOf(y.e, ctx.redact)}` };
-    }, cleanupFailures));
+    withConnections(ctx, 3, async ([a, b, mon]) => i4Monitored(ctx, a, b, mon, (c, site) => zeroWorkRebuild(c, ctx, site)), cleanupFailures));
 
   await run("I5", "a worker killed after publishing but before commit leaves nothing behind", "no generation, batch or mirror row survives", async () =>
     withConnections(ctx, 1, async ([mon]) => {
