@@ -2980,3 +2980,39 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - FakeDb `save_reporting_walk` is now atomic.
     - The pg RPC shim now returns single-column TABLE rows as objects, as PostgREST does.
   - No SQL was run against any real database.
+- 2026-11-16 — **Task 16: published report summaries and details (offline gate green; runtime gate pending)** (Claude). Task 16 stays UNCHECKED: 0044 is a draft, not applied anywhere, and CJ-run real-role/SQL staging parity is still required. This is not release completion.
+  - **0044 (draft, unapplied; 0037–0043 unchanged):**
+    - **Counts:** Items stay exact numerics through every internal calculation (days worked, staff-days, ordering, rates). `safe_items` applies only at the JSON output; counts go through `safe_count`. An overflow-only worked day counts in daysWorked/staffDays (planner T16 rule). Rates use the raw value, which differs from the app reducer's `items ?? 0` only when Items overflow.
+    - **Summary pages:** the daily and people lists are SQL-bounded first pages `{rows, total}` with exact totals (`sel_board`, `sel_people_page`, `sel_daily_page`).
+    - **Shared check:** `checked_generation` validates site, audience, work type, range, exact production-day window and a retained complete generation; both public reads use it.
+    - **`public.read_reporting_detail`** (service_role only) serves all seven kinds over the summary's pinned generation, audience, window and filters. Rows are SQL-bounded (limit+1), with exact `total_rows`/`more`/`last` and strict continuation checks:
+      - days/people: an offset continuing the summary's order;
+      - orders: the overall key in UTF-16 order, as `summarizeProduction` groups it;
+      - events and raw-export: the selection's in-window rows with their `source_versions` image at the generation's seq, keyed [instant, id]; raw values are never coerced;
+      - coverage: issues only, from `sel_anchored`, deduplicated by ord precedence, keyed [kind, eventId];
+      - timing: the `sel_timing` stream, with staff and order applied after predecessors, exact predecessor and completion instants, keyed [completion instant, id].
+    - **Order selector:** trimmed; a blank selector is refused.
+    - **`sel_timing`:** decides "in range" by millisecond, as the app does, over the exact selection (review T11-1).
+  - **API:**
+    - `production-reporting-dto.ts` parses summary pages and every detail kind strictly. Errors are named per RPC, with no shared mutable state.
+    - `rpcPublishedReader.detail` checks the 1..1000 integer limit and the offset cursor before any RPC.
+  - **Tests (new):**
+    - real-SQL PGlite: `tests/reporting/pg/detail-days-people.test.ts`, `detail-orders.test.ts`, `detail-events.test.ts`, `detail-coverage.test.ts`, `detail-timing.test.ts`, `timing-t11.test.ts`;
+    - updated: `summary-api-e2e.test.ts` (overflow-only day), `report-view-parity.test.ts` (paged contract) and `tests/api/reporting-reads.test.ts` (paged summary, per-kind detail mutations, error context, limit guard).
+    - Each detail kind was test-first, with its failing run recorded before its SQL. The oracles are the app reference or independent fixtures, never SQL compared to itself.
+  - **Gate (root, independent):**
+
+    | Check | Result |
+    |---|---|
+    | Focused Task 16 SQL/API set | 9 files, 326/326 |
+    | Full suite | 59 files, 2,036/2,036 |
+    | `npx tsc -b` | exit 0 |
+    | `npm run typecheck:digest` | exit 0 |
+    | `npm run build` | exit 0 (only the existing Browserslist/chunk warnings) |
+    | `git diff --check` | clean |
+  - **Open semantics for review:**
+    - Detail-only extensions: `p_order` narrowing on coverage; the `orders` `workTypes`/`firstAtUtc`/`lastAtUtc`/`verifiedLines` definitions.
+    - The events/raw-export stream is the four counting event types in the window only; `production_events.note` is NOT NULL, so a null note cannot occur.
+    - Each detail page counts its whole scope for `total_rows`; staging should measure this on long ranges.
+  - **Runtime gate pending:** CJ installs 0044 on staging, then runs real-role read parity and authorization checks.
+  - No SQL was run against any real database; no merge or deploy.

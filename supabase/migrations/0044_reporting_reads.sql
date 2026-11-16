@@ -277,7 +277,8 @@ $fn$;
 -- previous line of the same worker in THIS selected stream; gaps > 0 and <= 30 min with weight > 0 are timed.
 CREATE FUNCTION reporting_private.sel_timing(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
                                              p_scope_start timestamptz, p_scope_end timestamptz, p_work_type text)
-RETURNS TABLE (event_id text, staff_id uuid, work_type text, order_key text, sku text, weight numeric, started_ms bigint, completed_ms bigint, duration_min numeric)
+RETURNS TABLE (event_id text, staff_id uuid, work_type text, order_key text, sku text, weight numeric, started_ms bigint, completed_ms bigint, duration_min numeric,
+               started_at timestamptz, completed_at timestamptz)
 LANGUAGE sql
 STABLE
 SECURITY INVOKER
@@ -288,24 +289,26 @@ AS $fn$
            pg_catalog.floor(EXTRACT(epoch FROM e.created_at) * 1000)::bigint AS ms
       FROM reporting_private.sel_eval(p_site, p_ak, p_staff, p_seq, p_start, p_end) e
      WHERE e.role = 'verification' AND e.effective AND e.timing_stream
-       AND e.created_at >= p_scope_start AND e.created_at < p_scope_end AND (p_work_type IS NULL OR e.work_type = p_work_type)
+       -- "in range" by MILLISECOND, as the app's timing (Date.parse of the bounds); the selection itself stays exact (review T11-1)
+       AND pg_catalog.floor(EXTRACT(epoch FROM e.created_at) * 1000) >= pg_catalog.floor(EXTRACT(epoch FROM p_scope_start) * 1000)
+       AND pg_catalog.floor(EXTRACT(epoch FROM e.created_at) * 1000) < pg_catalog.floor(EXTRACT(epoch FROM p_scope_end) * 1000)
+       AND (p_work_type IS NULL OR e.work_type = p_work_type)
   ), s AS (
-    SELECT v.*, pg_catalog.lag(v.ms) OVER (PARTITION BY v.staff_id ORDER BY v.created_at, reporting_private.utf16_key(v.event_id)) AS prev_ms FROM v
+    SELECT v.*, pg_catalog.lag(v.ms) OVER w AS prev_ms, pg_catalog.lag(v.created_at) OVER w AS prev_at
+      FROM v WINDOW w AS (PARTITION BY v.staff_id ORDER BY v.created_at, reporting_private.utf16_key(v.event_id))
   )
   SELECT s.event_id, s.staff_id, s.work_type, s.order_key, s.sku, s.timing_weight, coalesce(s.prev_ms, s.ms), s.ms,
          CASE WHEN s.prev_ms IS NOT NULL AND s.ms - s.prev_ms > 0 AND s.ms - s.prev_ms <= 30 * 60000 AND s.timing_weight > 0
-              THEN (s.ms - s.prev_ms)::numeric / 60000 ELSE 0 END
+              THEN (s.ms - s.prev_ms)::numeric / 60000 ELSE 0 END,
+         coalesce(s.prev_at, s.created_at), s.created_at
     FROM s
 $fn$;
 
--- The Reports view for one range (p_first_date..p_last_date = p_start..p_end) and display filters:
--- tiles (staff + work type), page coverage (everyone, work type), leaderboard of every visible person
--- (staff-days from per-production-date credit), timing totals per tile/person, per-SKU timing aggregates
--- (the server groups them by size/variant with the shared SKU parser), and the tile's daily series for
--- EVERY production date of the range (zero days included).
-CREATE FUNCTION reporting_private.sel_report(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
-                                             p_first_date date, p_last_date date, p_filter_staff uuid, p_work_type text)
-RETURNS jsonb
+-- Every visible person of a Reports selection with EXACT raw aggregates (numeric Items, bigint Orders,
+-- days worked from raw per-production-date credit). Items become the overflow null only at the JSON
+-- output boundary; days worked, ordering and rates always use the raw values.
+CREATE FUNCTION reporting_private.sel_board(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz, p_work_type text)
+RETURNS TABLE (staff_id uuid, n_items numeric, n_orders bigint, r_items numeric, r_orders bigint, days_worked bigint, duration numeric, weight numeric)
 LANGUAGE sql
 STABLE
 SECURITY INVOKER
@@ -324,22 +327,111 @@ AS $fn$
   ), people AS (
     SELECT DISTINCT x.staff_id FROM (SELECT c.staff_id FROM credit c UNION SELECT o.staff_id FROM orders o) x
   ), pday AS (
+    -- raw per person-day values (never the overflow null): an overflow-only day still counts as worked
     SELECT p.staff_id, d.production_date,
-           reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.production_date = d.production_date), 0)) AS items,
-           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.production_date = d.production_date)) AS orders
+           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.production_date = d.production_date), 0) AS items,
+           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.production_date = d.production_date) AS orders
       FROM people p CROSS JOIN (SELECT DISTINCT c.production_date FROM credit c UNION SELECT o.production_date FROM orders o) d
+  ), tt AS (
+    SELECT t.staff_id, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight
+      FROM reporting_private.sel_timing(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, p_work_type) t GROUP BY t.staff_id
+  )
+  SELECT p.staff_id,
+         coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND NOT c.rework), 0),
+         (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND NOT o.rework),
+         coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.rework), 0),
+         (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.rework),
+         (SELECT count(*) FROM pday d WHERE d.staff_id = p.staff_id AND (d.items > 0 OR d.orders > 0)),
+         coalesce(x.duration, 0), coalesce(x.weight, 0)
+    FROM people p LEFT JOIN tt x ON x.staff_id = p.staff_id
+$fn$;
+
+-- One bounded page of the leaderboard (Orders desc, raw Items desc, staff id bytewise: a total order) and
+-- the exact number of rows; p_offset continues the same ordering under the same pinned generation/filter.
+CREATE FUNCTION reporting_private.sel_people_page(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                                  p_work_type text, p_offset bigint, p_limit integer)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH b AS (SELECT * FROM reporting_private.sel_board(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_work_type)),
+  page AS (
+    SELECT b.*, pg_catalog.row_number() OVER (ORDER BY b.n_orders DESC, b.n_items DESC, b.staff_id::text COLLATE "C") AS rn FROM b
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'total', reporting_private.safe_count((SELECT count(*) FROM b)),
+    'rows', coalesce((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'staffId', p.staff_id,
+               'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(p.n_items), 'orders', reporting_private.safe_count(p.n_orders)),
+               'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(p.r_items), 'orders', reporting_private.safe_count(p.r_orders)),
+               'daysWorked', reporting_private.safe_count(p.days_worked),
+               'itemsPerDay', CASE WHEN p.days_worked > 0 THEN p.n_items / p.days_worked ELSE 0 END,
+               'ordersPerDay', CASE WHEN p.days_worked > 0 THEN p.n_orders::numeric / p.days_worked ELSE 0 END,
+               'timing', pg_catalog.jsonb_build_object('durationMin', p.duration, 'timedWeight', p.weight, 'avgMinPerUnit', CASE WHEN p.weight > 0 THEN p.duration / p.weight ELSE 0 END))
+               ORDER BY p.rn)
+             FROM page p WHERE p.rn > p_offset AND p.rn <= p_offset + p_limit), '[]'::jsonb))
+$fn$;
+
+-- One bounded page of the tile's daily series (EVERY production date of the range, zero days included)
+-- and the exact number of dates.
+CREATE FUNCTION reporting_private.sel_daily_page(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                                 p_first_date date, p_last_date date, p_filter_staff uuid, p_work_type text, p_offset bigint, p_limit integer)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH ev AS (SELECT * FROM reporting_private.sel_eval(p_site, p_ak, p_staff, p_seq, p_start, p_end)),
+  dates AS (
+    SELECT (p_first_date + (p_offset + i)::integer) AS production_date
+      FROM pg_catalog.generate_series(0::bigint, (p_limit - 1)::bigint) i
+     WHERE p_first_date + (p_offset + i)::integer <= p_last_date
+  ), credit AS (
+    SELECT v.production_date, v.case_id IS NOT NULL AS rework, CASE WHEN v.item_status = 'counted' THEN v.items ELSE 0 END::numeric AS items
+      FROM ev v
+     WHERE v.role = 'verification' AND v.effective AND v.created_at >= p_start AND v.created_at < p_end
+       AND (p_work_type IS NULL OR v.work_type = p_work_type) AND (p_filter_staff IS NULL OR v.staff_id = p_filter_staff)
+       AND v.production_date IN (SELECT d.production_date FROM dates d)
+  ), orders AS (
+    SELECT t.production_date, t.case_id IS NOT NULL AS rework, t.order_key, t.case_id
+      FROM ev t
+     WHERE t.role = 'terminal' AND NOT t.reversed AND t.qualification <> 'excluded_only' AND t.created_at >= p_start AND t.created_at < p_end
+       AND (p_work_type IS NULL OR t.work_type = p_work_type) AND (p_filter_staff IS NULL OR t.staff_id = p_filter_staff)
+       AND t.production_date IN (SELECT d.production_date FROM dates d)
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'total', reporting_private.safe_count((p_last_date - p_first_date + 1)::bigint),
+    'rows', coalesce((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('productionDate', d.production_date, 'totals', pg_catalog.jsonb_build_object(
+               'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework), 0)),
+                                                       'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework))),
+               'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework), 0)),
+                                                       'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework)))))
+               ORDER BY d.production_date) FROM dates d), '[]'::jsonb))
+$fn$;
+
+-- The Reports view for one range (p_first_date..p_last_date = p_start..p_end) and display filters:
+-- tiles (staff + work type), page coverage (everyone, work type), the FIRST bounded leaderboard and daily
+-- pages with their exact row counts (continued by read_reporting_detail), staff-days from raw
+-- per-production-date credit, timing totals per tile, and per-SKU timing aggregates (the server groups
+-- them by size/variant with the shared SKU parser). Whole-range scalars never depend on the pages.
+CREATE FUNCTION reporting_private.sel_report(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                             p_first_date date, p_last_date date, p_filter_staff uuid, p_work_type text,
+                                             p_daily_limit integer, p_people_limit integer)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH board AS (
+    SELECT * FROM reporting_private.sel_board(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_work_type)
   ), timing AS (
     SELECT * FROM reporting_private.sel_timing(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, p_work_type)
   ), tt AS (
     SELECT t.staff_id, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight FROM timing t GROUP BY t.staff_id
-  ), board AS (
-    SELECT p.staff_id,
-           reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND NOT c.rework), 0)) AS n_items,
-           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND NOT o.rework)) AS n_orders,
-           reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.rework), 0)) AS r_items,
-           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.rework)) AS r_orders,
-           (SELECT count(*) FROM pday d WHERE d.staff_id = p.staff_id AND (d.items > 0 OR d.orders > 0)) AS days_worked
-      FROM people p
   ), tiles AS (
     SELECT reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end,
              CASE WHEN p_filter_staff IS NULL THEN NULL ELSE ARRAY[p_filter_staff] END, CASE WHEN p_work_type IS NULL THEN NULL ELSE ARRAY[p_work_type] END) AS j
@@ -348,45 +440,37 @@ AS $fn$
   ), staff_days AS (
     SELECT CASE WHEN p_filter_staff IS NULL THEN coalesce((SELECT sum(b.days_worked) FROM board b), 0)
                 ELSE coalesce((SELECT b.days_worked FROM board b WHERE b.staff_id = p_filter_staff), 0) END AS n
-  ), dates AS (
-    SELECT d::date AS production_date FROM pg_catalog.generate_series(p_first_date::timestamp, p_last_date::timestamp, interval '1 day') d
   )
   SELECT pg_catalog.jsonb_build_object(
     'totals', (SELECT tl.j -> 'totals' FROM tiles tl),
     'byWorkType', (SELECT tl.j -> 'byWorkType' FROM tiles tl),
     'coverage', (SELECT e.j -> 'coverage' FROM everyone e),
     'tileCoverage', (SELECT tl.j -> 'coverage' FROM tiles tl),
-    'activeStaff', reporting_private.safe_count((SELECT count(*) FROM people p WHERE p_filter_staff IS NULL OR p.staff_id = p_filter_staff)),
+    'activeStaff', reporting_private.safe_count((SELECT count(*) FROM board b WHERE p_filter_staff IS NULL OR b.staff_id = p_filter_staff)),
     'staffDays', reporting_private.safe_count((SELECT s.n FROM staff_days s)::bigint),
     'avgOrdersPerStaffDay', (SELECT CASE WHEN s.n > 0 THEN ((SELECT tl.j #>> '{totals,normal,orders}' FROM tiles tl)::numeric / s.n) ELSE 0 END FROM staff_days s),
     'timing', (SELECT pg_catalog.jsonb_build_object('durationMin', coalesce(sum(x.duration), 0), 'timedWeight', coalesce(sum(x.weight), 0),
                  'avgMinPerUnit', CASE WHEN coalesce(sum(x.weight), 0) > 0 THEN sum(x.duration) / sum(x.weight) ELSE 0 END)
                  FROM tt x WHERE p_filter_staff IS NULL OR x.staff_id = p_filter_staff),
-    'people', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
-                 'staffId', b.staff_id, 'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(b.n_items), 'orders', b.n_orders), 'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(b.r_items), 'orders', b.r_orders),
-                 'daysWorked', b.days_worked, 'itemsPerDay', CASE WHEN b.days_worked > 0 THEN coalesce(reporting_private.safe_items(b.n_items), 0) / b.days_worked ELSE 0 END,
-                 'ordersPerDay', CASE WHEN b.days_worked > 0 THEN b.n_orders::numeric / b.days_worked ELSE 0 END,
-                 'timing', pg_catalog.jsonb_build_object('durationMin', coalesce(x.duration, 0), 'timedWeight', coalesce(x.weight, 0),
-                    'avgMinPerUnit', CASE WHEN coalesce(x.weight, 0) > 0 THEN x.duration / x.weight ELSE 0 END))
-                 ORDER BY b.n_orders DESC, coalesce(reporting_private.safe_items(b.n_items), 0) DESC, b.staff_id::text COLLATE "C"), '[]'::jsonb)
-                 FROM board b LEFT JOIN tt x ON x.staff_id = b.staff_id),
+    'people', reporting_private.sel_people_page(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_work_type, 0, p_people_limit),
     'skuTiming', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('sku', g.sku, 'durationMin', g.duration, 'weight', g.weight) ORDER BY g.sku COLLATE "C"), '[]'::jsonb)
                     FROM (SELECT t.sku, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight
                             FROM timing t WHERE t.sku IS NOT NULL AND t.weight > 0 AND (p_filter_staff IS NULL OR t.staff_id = p_filter_staff) GROUP BY t.sku) g),
-    'daily', (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('productionDate', d.production_date, 'totals', pg_catalog.jsonb_build_object(
-                 'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0)),
-                                                         'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff)))),
-                 'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0)),
-                                                         'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff))))))
-                 ORDER BY d.production_date) FROM dates d))
+    'daily', reporting_private.sel_daily_page(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_first_date, p_last_date, p_filter_staff, p_work_type, 0, p_daily_limit))
 $fn$;
 
 REVOKE ALL ON FUNCTION reporting_private.utf16_key(text) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION reporting_private.sel_timing(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz, text) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_board(text, text, uuid, bigint, timestamptz, timestamptz, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_people_page(text, text, uuid, bigint, timestamptz, timestamptz, text, bigint, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_daily_page(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text, bigint, integer) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text, integer, integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION reporting_private.utf16_key(text) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.sel_timing(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz, text) TO service_role;
-GRANT EXECUTE ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_board(text, text, uuid, bigint, timestamptz, timestamptz, text) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_people_page(text, text, uuid, bigint, timestamptz, timestamptz, text, bigint, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_daily_page(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text, bigint, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text, integer, integer) TO service_role;
 
 -- Welcome cells over one selection (the Welcome range): per production date, (date), (date, work type),
 -- (date, work type, person) and (date, person) normal/rework Items and distinct (order, case) Orders,
@@ -476,6 +560,42 @@ AS $fn$
      AND CASE WHEN p_generation IS NULL THEN g.state = 'published' ELSE g.generation_id = p_generation END
 $fn$;
 
+-- The one validation every public read shares: a supported site and work type, a well-formed trusted
+-- audience, a nonempty date range whose window is exactly its production-day starts, and a retained
+-- complete publication of that site. Returns that generation's sequence (the version-visibility seq).
+CREATE FUNCTION reporting_private.checked_generation(p_fn text, p_site text, p_audience_kind text, p_audience_staff uuid, p_generation uuid,
+                                                     p_first_date date, p_last_date date, p_start timestamptz, p_end timestamptz, p_work_type text)
+RETURNS bigint
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+  g reporting_private.generations;
+BEGIN
+  IF p_site IS NULL OR p_site NOT IN ('au', 'uk', 'us') THEN RAISE EXCEPTION '%: unsupported site', p_fn; END IF;
+  IF p_audience_kind = 'site' THEN
+    IF p_audience_staff IS NOT NULL THEN RAISE EXCEPTION '%: a site audience has no staff', p_fn; END IF;
+  ELSIF p_audience_kind = 'self' THEN
+    IF p_audience_staff IS NULL THEN RAISE EXCEPTION '%: a self audience needs its staff', p_fn; END IF;
+  ELSE
+    RAISE EXCEPTION '%: unsupported audience', p_fn;
+  END IF;
+  IF p_work_type IS NOT NULL AND p_work_type NOT IN ('a0_framed', 'framed', 'unframed', 'dispatch') THEN RAISE EXCEPTION '%: unsupported work type', p_fn; END IF;
+  IF p_first_date IS NULL OR p_last_date IS NULL OR p_first_date > p_last_date THEN RAISE EXCEPTION '%: invalid date range', p_fn; END IF;
+  IF p_start IS DISTINCT FROM reporting_private.production_day_start(p_site, p_first_date)
+     OR p_end IS DISTINCT FROM reporting_private.production_day_start(p_site, p_last_date + 1) THEN
+    RAISE EXCEPTION '%: the window does not match the production dates', p_fn;
+  END IF;
+  SELECT * INTO g FROM reporting_private.generations x WHERE x.generation_id = p_generation;
+  IF NOT FOUND OR g.site <> p_site OR g.state NOT IN ('published', 'superseded') OR NOT g.complete THEN
+    RAISE EXCEPTION '%: generation % is not a retained complete publication of %', p_fn, p_generation, p_site;
+  END IF;
+  RETURN g.generation_seq;
+END
+$fn$;
+
 -- One published summary for a trusted audience (chosen by the server, never the client): the Reports
 -- view parts and, for Welcome, the Welcome cells. Refuses anything malformed or not published/retained.
 CREATE FUNCTION public.read_reporting_summary(p_site text, p_audience_kind text, p_audience_staff uuid, p_generation uuid,
@@ -488,42 +608,380 @@ SECURITY INVOKER
 SET search_path = ''
 AS $fn$
 DECLARE
-  g reporting_private.generations;
+  v_seq bigint;
 BEGIN
-  IF p_site IS NULL OR p_site NOT IN ('au', 'uk', 'us') THEN RAISE EXCEPTION 'read_reporting_summary: unsupported site'; END IF;
-  IF p_audience_kind = 'site' THEN
-    IF p_audience_staff IS NOT NULL THEN RAISE EXCEPTION 'read_reporting_summary: a site audience has no staff'; END IF;
-  ELSIF p_audience_kind = 'self' THEN
-    IF p_audience_staff IS NULL THEN RAISE EXCEPTION 'read_reporting_summary: a self audience needs its staff'; END IF;
-  ELSE
-    RAISE EXCEPTION 'read_reporting_summary: unsupported audience';
-  END IF;
+  v_seq := reporting_private.checked_generation('read_reporting_summary', p_site, p_audience_kind, p_audience_staff, p_generation,
+                                                p_first_date, p_last_date, p_start, p_end, p_work_type);
   IF p_view IS NULL OR p_view NOT IN ('reports', 'welcome') THEN RAISE EXCEPTION 'read_reporting_summary: unsupported view'; END IF;
-  IF p_work_type IS NOT NULL AND p_work_type NOT IN ('a0_framed', 'framed', 'unframed', 'dispatch') THEN RAISE EXCEPTION 'read_reporting_summary: unsupported work type'; END IF;
-  IF p_first_date IS NULL OR p_last_date IS NULL OR p_first_date > p_last_date THEN RAISE EXCEPTION 'read_reporting_summary: invalid date range'; END IF;
-  IF p_start IS DISTINCT FROM reporting_private.production_day_start(p_site, p_first_date)
-     OR p_end IS DISTINCT FROM reporting_private.production_day_start(p_site, p_last_date + 1) THEN
-    RAISE EXCEPTION 'read_reporting_summary: the window does not match the production dates';
-  END IF;
   IF p_daily_limit IS NULL OR p_daily_limit < 1 OR p_daily_limit > 1000 OR p_people_limit IS NULL OR p_people_limit < 1 OR p_people_limit > 1000 THEN
     RAISE EXCEPTION 'read_reporting_summary: page limits must be 1..1000';
   END IF;
-  SELECT * INTO g FROM reporting_private.generations x WHERE x.generation_id = p_generation;
-  IF NOT FOUND OR g.site <> p_site OR g.state NOT IN ('published', 'superseded') OR NOT g.complete THEN
-    RAISE EXCEPTION 'read_reporting_summary: generation % is not a retained complete publication of %', p_generation, p_site;
-  END IF;
   RETURN pg_catalog.jsonb_build_object(
-    'report', reporting_private.sel_report(p_site, p_audience_kind, p_audience_staff, g.generation_seq, p_start, p_end, p_first_date, p_last_date, p_staff, p_work_type),
-    'welcome', CASE WHEN p_view = 'welcome' THEN reporting_private.sel_welcome(p_site, p_audience_kind, p_audience_staff, g.generation_seq, p_start, p_end,
+    'report', reporting_private.sel_report(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end, p_first_date, p_last_date, p_staff, p_work_type,
+                                           p_daily_limit, p_people_limit),
+    'welcome', CASE WHEN p_view = 'welcome' THEN reporting_private.sel_welcome(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end,
                                                     reporting_private.production_day_start(p_site, p_last_date), p_end) END);
 END
 $fn$;
 
 REVOKE ALL ON FUNCTION reporting_private.production_day_start(text, date) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION reporting_private.production_day_start(text, date) TO service_role;
+REVOKE ALL ON FUNCTION reporting_private.checked_generation(text, text, text, uuid, uuid, date, date, timestamptz, timestamptz, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.checked_generation(text, text, text, uuid, uuid, date, date, timestamptz, timestamptz, text) TO service_role;
 REVOKE ALL ON FUNCTION public.read_reporting_generation(text, uuid) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.read_reporting_summary(text, text, uuid, uuid, date, date, timestamptz, timestamptz, uuid, text, text, integer, integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.read_reporting_generation(text, uuid) TO service_role;
 GRANT EXECUTE ON FUNCTION public.read_reporting_summary(text, text, uuid, uuid, date, date, timestamptz, timestamptz, uuid, text, text, integer, integer) TO service_role;
+
+-- Canonical exact UTC instant text for every DTO timestamp (six fractional digits, Z).
+CREATE FUNCTION reporting_private.utc_text(p timestamptz)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT pg_catalog.to_char(p AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+$fn$;
+
+-- The `orders` detail: one row per overall order key (site|order[|case:id]) exactly as
+-- summarizeProduction groups it, over the summary's selection (same evaluated facts) and display scope
+-- (window, optional staff, optional work type applied to every CONTRIBUTING event): effective
+-- verifications give verified lines and Items (counted only), qualifying non-reversed terminals give
+-- completion. workTypes = the work types of the in-scope contributions, in work-type order; firstAtUtc /
+-- lastAtUtc = the earliest / latest contributing event. Ascending UTF-16 order of the key (the app's
+-- `<`), continued strictly after p_after; p_limit + 1 rows are read to decide `more`.
+CREATE FUNCTION reporting_private.sel_detail_orders(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                                    p_filter_staff uuid, p_work_type text, p_order_key text, p_after text, p_limit integer)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH ev AS (SELECT * FROM reporting_private.sel_eval(p_site, p_ak, p_staff, p_seq, p_start, p_end)),
+  contrib AS (
+    SELECT v.order_key, v.case_id, v.work_type, v.staff_id, v.created_at, true AS verified, false AS completed,
+           CASE WHEN v.item_status = 'counted' THEN v.items ELSE 0 END::numeric AS items
+      FROM ev v
+     WHERE v.role = 'verification' AND v.effective
+    UNION ALL
+    SELECT t.order_key, t.case_id, t.work_type, t.staff_id, t.created_at, false, true, 0::numeric
+      FROM ev t
+     WHERE t.role = 'terminal' AND NOT t.reversed AND t.qualification <> 'excluded_only'
+  ), scoped AS (
+    SELECT c.*, p_site || '|' || c.order_key || CASE WHEN c.case_id IS NULL THEN '' ELSE '|case:' || c.case_id END AS key
+      FROM contrib c
+     WHERE c.created_at >= p_start AND c.created_at < p_end AND c.order_key IS NOT NULL
+       AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)
+       AND (p_work_type IS NULL OR c.work_type = p_work_type)
+       AND (p_order_key IS NULL OR c.order_key = p_order_key)
+  ), grp AS (
+    SELECT s.key, min(s.order_key) AS order_key, min(s.case_id) AS case_id, min(s.created_at) AS first_at, max(s.created_at) AS last_at,
+           pg_catalog.array_agg(DISTINCT s.work_type) FILTER (WHERE s.work_type IS NOT NULL) AS types,
+           count(*) FILTER (WHERE s.verified) AS lines, sum(s.items) AS items, bool_or(s.completed) AS completed,
+           reporting_private.utf16_key(s.key) AS ord
+      FROM scoped s
+     GROUP BY s.key
+  ), page AS (
+    SELECT g.* FROM grp g
+     WHERE p_after IS NULL OR g.ord > reporting_private.utf16_key(p_after)
+     ORDER BY g.ord
+     LIMIT p_limit + 1
+  ), shown AS (
+    SELECT p.*, pg_catalog.row_number() OVER (ORDER BY p.ord) AS rn FROM page p
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'rows', coalesce((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'key', s.key, 'orderNumber', s.order_key, 'caseId', s.case_id, 'group', CASE WHEN s.case_id IS NULL THEN 'normal' ELSE 'rework' END,
+               'firstAtUtc', reporting_private.utc_text(s.first_at), 'lastAtUtc', reporting_private.utc_text(s.last_at),
+               'workTypes', coalesce((SELECT pg_catalog.jsonb_agg(w.wt ORDER BY w.ord)
+                                        FROM pg_catalog.unnest(ARRAY['a0_framed', 'framed', 'unframed', 'dispatch']) WITH ORDINALITY AS w(wt, ord)
+                                       WHERE w.wt = ANY (s.types)), '[]'::jsonb),
+               'verifiedLines', reporting_private.safe_count(s.lines), 'items', reporting_private.safe_items(s.items), 'completed', s.completed)
+               ORDER BY s.rn) FROM shown s WHERE s.rn <= p_limit), '[]'::jsonb),
+    'last', (SELECT pg_catalog.to_jsonb(s.key) FROM shown s WHERE s.rn = least(p_limit, (SELECT count(*) FROM shown))),
+    'more', (SELECT count(*) > p_limit FROM shown),
+    'total_rows', reporting_private.safe_count((SELECT count(*) FROM grp)))
+$fn$;
+
+-- The `events` and `raw-export` details: the selection's own event stream for the pinned generation and
+-- audience — every selected fact or source-issue row (the four relevant event types) whose instant is in
+-- the window — with each event's retained source image AS OF that generation (source_versions visible at
+-- its seq; never the live table or source_current). Display filters narrow it: staff (the event's
+-- worker), work type (the stored classification; unclassified rows drop out) and the trimmed order.
+-- Strict ascending (created_at, event id in UTF-16 order — the selection's own tie comparator), continued
+-- strictly after p_after; exact total; p_limit + 1 rows read to decide `more`. Values are the raw saved
+-- image values (quantity as its raw JSON value; blank text stays blank, null stays null).
+CREATE FUNCTION reporting_private.sel_detail_events(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                                    p_filter_staff uuid, p_work_type text, p_order_key text, p_after_at timestamptz, p_after_id text,
+                                                    p_limit integer, p_raw boolean)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH sel AS (
+    SELECT DISTINCT ON (x.event_id) x.event_id, x.created_at, x.staff_id, x.work_type, x.order_key
+      FROM (
+        SELECT e.event_id, e.created_at, e.staff_id, e.work_type, reporting_private.order_key(e.raw_order) AS order_key, 0 AS pref
+          FROM reporting_private.event_facts e
+         WHERE e.site = p_site AND e.audience_kind = p_ak AND e.audience_staff IS NOT DISTINCT FROM p_staff
+           AND e.valid_from_seq <= p_seq AND (e.valid_to_seq IS NULL OR e.valid_to_seq > p_seq)
+           AND e.event_type IN ('line_verified', 'completed', 'dispatched', 'cancelled') AND e.created_at >= p_start AND e.created_at < p_end
+        UNION ALL
+        SELECT i.event_id, i.created_at, i.staff_id, NULL::text, reporting_private.order_key(i.raw_order), 1
+          FROM reporting_private.source_issue_facts i
+         WHERE i.site = p_site AND i.audience_kind = p_ak AND i.audience_staff IS NOT DISTINCT FROM p_staff
+           AND i.valid_from_seq <= p_seq AND (i.valid_to_seq IS NULL OR i.valid_to_seq > p_seq)
+           AND i.event_type IN ('line_verified', 'completed', 'dispatched', 'cancelled') AND i.created_at >= p_start AND i.created_at < p_end
+      ) x
+     ORDER BY x.event_id, x.pref
+  ), scoped AS (
+    SELECT s.event_id, s.created_at, reporting_private.utf16_key(s.event_id) AS tie, v.image
+      FROM sel s
+      JOIN reporting_private.source_versions v
+        ON v.site = p_site AND v.event_id = s.event_id AND v.valid_from_seq <= p_seq AND (v.valid_to_seq IS NULL OR v.valid_to_seq > p_seq)
+     WHERE (p_filter_staff IS NULL OR s.staff_id = p_filter_staff)
+       AND (p_work_type IS NULL OR s.work_type = p_work_type)
+       AND (p_order_key IS NULL OR s.order_key = p_order_key)
+  ), page AS (
+    SELECT s.* FROM scoped s
+     WHERE p_after_at IS NULL OR s.created_at > p_after_at OR (s.created_at = p_after_at AND s.tie > reporting_private.utf16_key(p_after_id))
+     ORDER BY s.created_at, s.tie
+     LIMIT p_limit + 1
+  ), shown AS (
+    SELECT p.*, pg_catalog.row_number() OVER (ORDER BY p.created_at, p.tie) AS rn FROM page p
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'rows', coalesce((SELECT pg_catalog.jsonb_agg(
+               pg_catalog.jsonb_build_object(
+                 'id', s.event_id, 'staffId', s.image -> 'staff_id', 'department', s.image -> 'department', 'orderNumber', s.image -> 'order_number',
+                 'sku', s.image -> 'line_sku', 'quantity', coalesce(s.image -> 'line_quantity', 'null'::jsonb), 'eventType', s.image -> 'event_type',
+                 'createdAtUtc', reporting_private.utc_text(s.created_at), 'parentEventId', s.image -> 'parent_event_id', 'caseId', s.image -> 'cs_case_id')
+               || CASE WHEN p_raw THEN pg_catalog.jsonb_build_object('note', s.image -> 'note', 'stationId', s.image -> 'station_id') ELSE '{}'::jsonb END
+               ORDER BY s.rn) FROM shown s WHERE s.rn <= p_limit), '[]'::jsonb),
+    'last', (SELECT pg_catalog.jsonb_build_array(reporting_private.utc_text(s.created_at), s.event_id) FROM shown s WHERE s.rn = least(p_limit, (SELECT count(*) FROM shown))),
+    'more', (SELECT count(*) > p_limit FROM shown),
+    'total_rows', reporting_private.safe_count((SELECT count(*) FROM scoped)))
+$fn$;
+
+-- The `coverage` detail: the summary's coverage ISSUES (never notes) as rows {kind, eventId, location,
+-- detail}, from sel_anchored at the pinned generation: selected source issues stay selection-wide,
+-- anchored issues obey the window, staff and work type; one row per (kind, event) by the same ord
+-- precedence as the summary's counts. The order selector narrows to the trimmed order of the issue's
+-- own stored row (its fact's raw order, or the source issue's raw order). Ascending (kind, event id) in
+-- UTF-16 order (the app's comparator), continued strictly after p_after; exact total; limit + 1 read.
+CREATE FUNCTION reporting_private.sel_detail_coverage(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                                      p_filter_staff uuid, p_work_type text, p_order_key text, p_after_kind text, p_after_id text, p_limit integer)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH cov AS (
+    SELECT DISTINCT ON (a.name, a.event_id) a.name, a.event_id, a.detail, a.scoped
+      FROM reporting_private.sel_anchored(p_site, p_ak, p_staff, p_seq, p_start, p_end) a
+     WHERE a.kind = 'issue'
+       AND (NOT a.scoped OR (a.created_at >= p_start AND a.created_at < p_end
+                             AND (p_filter_staff IS NULL OR a.staff_id = p_filter_staff) AND (p_work_type IS NULL OR a.work_type = p_work_type)))
+     ORDER BY a.name, a.event_id, a.ord
+  ), scoped AS (
+    SELECT c.*, reporting_private.utf16_key(c.name) AS k1, reporting_private.utf16_key(c.event_id) AS k2
+      FROM cov c
+     WHERE p_order_key IS NULL OR p_order_key = (
+       CASE WHEN c.scoped THEN
+         (SELECT reporting_private.order_key(e.raw_order) FROM reporting_private.event_facts e
+           WHERE e.site = p_site AND e.audience_kind = p_ak AND e.audience_staff IS NOT DISTINCT FROM p_staff AND e.event_id = c.event_id
+             AND e.valid_from_seq <= p_seq AND (e.valid_to_seq IS NULL OR e.valid_to_seq > p_seq))
+       ELSE
+         (SELECT reporting_private.order_key(i.raw_order) FROM reporting_private.source_issue_facts i
+           WHERE i.site = p_site AND i.audience_kind = p_ak AND i.audience_staff IS NOT DISTINCT FROM p_staff AND i.event_id = c.event_id
+             AND i.valid_from_seq <= p_seq AND (i.valid_to_seq IS NULL OR i.valid_to_seq > p_seq)
+           LIMIT 1)
+       END)
+  ), page AS (
+    SELECT s.* FROM scoped s
+     WHERE p_after_kind IS NULL OR (s.k1, s.k2) > (reporting_private.utf16_key(p_after_kind), reporting_private.utf16_key(p_after_id))
+     ORDER BY s.k1, s.k2
+     LIMIT p_limit + 1
+  ), shown AS (
+    SELECT p.*, pg_catalog.row_number() OVER (ORDER BY p.k1, p.k2) AS rn FROM page p
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'rows', coalesce((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('kind', s.name, 'eventId', s.event_id, 'location', p_site, 'detail', s.detail) ORDER BY s.rn)
+                        FROM shown s WHERE s.rn <= p_limit), '[]'::jsonb),
+    'last', (SELECT pg_catalog.jsonb_build_array(s.name, s.event_id) FROM shown s WHERE s.rn = least(p_limit, (SELECT count(*) FROM shown))),
+    'more', (SELECT count(*) > p_limit FROM shown),
+    'total_rows', reporting_private.safe_count((SELECT count(*) FROM scoped)))
+$fn$;
+
+-- The `timing` detail: the selection's effective timing stream (sel_timing at the pinned generation:
+-- self isolation before selection; the work type narrows the stream BEFORE predecessors), narrowed
+-- AFTER predecessors by staff and the trimmed order. Each line keeps the exact source instants of its
+-- stream predecessor (or itself, first in range) and of itself; the duration is the existing
+-- millisecond arithmetic. Ascending (completion instant, event id in UTF-16 order), continued strictly
+-- after p_after; exact total; limit + 1 read.
+CREATE FUNCTION reporting_private.sel_detail_timing(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                                    p_filter_staff uuid, p_work_type text, p_order_key text, p_after_at timestamptz, p_after_id text, p_limit integer)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH scoped AS (
+    SELECT l.*, reporting_private.utf16_key(l.event_id) AS tie
+      FROM reporting_private.sel_timing(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, p_work_type) l
+     WHERE (p_filter_staff IS NULL OR l.staff_id = p_filter_staff)
+       AND (p_order_key IS NULL OR l.order_key = p_order_key)
+  ), page AS (
+    SELECT s.* FROM scoped s
+     WHERE p_after_at IS NULL OR s.completed_at > p_after_at OR (s.completed_at = p_after_at AND s.tie > reporting_private.utf16_key(p_after_id))
+     ORDER BY s.completed_at, s.tie
+     LIMIT p_limit + 1
+  ), shown AS (
+    SELECT p.*, pg_catalog.row_number() OVER (ORDER BY p.completed_at, p.tie) AS rn FROM page p
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'rows', coalesce((SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+               'eventId', s.event_id, 'staffId', s.staff_id, 'workType', s.work_type, 'orderNumber', s.order_key, 'sku', s.sku, 'weight', s.weight,
+               'startedAtUtc', reporting_private.utc_text(s.started_at), 'completedAtUtc', reporting_private.utc_text(s.completed_at), 'durationMin', s.duration_min)
+               ORDER BY s.rn) FROM shown s WHERE s.rn <= p_limit), '[]'::jsonb),
+    'last', (SELECT pg_catalog.jsonb_build_array(reporting_private.utc_text(s.completed_at), s.event_id) FROM shown s WHERE s.rn = least(p_limit, (SELECT count(*) FROM shown))),
+    'more', (SELECT count(*) > p_limit FROM shown),
+    'total_rows', reporting_private.safe_count((SELECT count(*) FROM scoped)))
+$fn$;
+
+-- One bounded detail page of ONE kind over the summary's exact selection (same generation, trusted
+-- audience, window and staff/work-type filters): {rows, last, more, total_rows}. Rows are SQL-bounded
+-- (overfetch one to decide `more`), total_rows is exact, and `last` is the continuation a signed cursor
+-- carries back as p_after. days/people continue an OFFSET into the summary's own deterministic order
+-- (production date; Orders desc, raw Items desc, staff id bytewise), so page 2 follows the summary's
+-- first page with no gap or repeat. The remaining kinds are added with their keysets.
+CREATE FUNCTION public.read_reporting_detail(p_site text, p_audience_kind text, p_audience_staff uuid, p_generation uuid,
+                                             p_first_date date, p_last_date date, p_start timestamptz, p_end timestamptz,
+                                             p_staff uuid, p_work_type text, p_kind text, p_order text, p_after jsonb, p_limit integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+  v_seq    bigint;
+  v_offset bigint;
+  v_page   jsonb;
+  v_rows   jsonb;
+  v_n      integer;
+  v_total  bigint;
+  v_at     timestamptz;
+BEGIN
+  v_seq := reporting_private.checked_generation('read_reporting_detail', p_site, p_audience_kind, p_audience_staff, p_generation,
+                                                p_first_date, p_last_date, p_start, p_end, p_work_type);
+  IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000 THEN RAISE EXCEPTION 'read_reporting_detail: p_limit must be 1..1000'; END IF;
+  IF p_kind IS NULL OR p_kind NOT IN ('days', 'people', 'orders', 'events', 'coverage', 'timing', 'raw-export') THEN
+    RAISE EXCEPTION 'read_reporting_detail: unsupported kind';
+  END IF;
+  IF p_kind IN ('days', 'people') THEN
+    IF p_order IS NOT NULL THEN RAISE EXCEPTION 'read_reporting_detail: an order selector does not apply to %', p_kind; END IF;
+    -- the offset continuation: absent, or an exact non-negative safe integer (never text, fraction or tuple)
+    IF p_after IS NULL OR p_after = 'null'::jsonb THEN
+      v_offset := 0;
+    ELSIF pg_catalog.jsonb_typeof(p_after) <> 'number' OR (p_after #>> '{}')::numeric <> pg_catalog.trunc((p_after #>> '{}')::numeric)
+          OR (p_after #>> '{}')::numeric < 0 OR (p_after #>> '{}')::numeric > 9007199254740991 THEN
+      RAISE EXCEPTION 'read_reporting_detail: the % continuation must be a non-negative integer offset', p_kind;
+    ELSE
+      v_offset := (p_after #>> '{}')::bigint;
+    END IF;
+    v_page := CASE p_kind
+      WHEN 'days' THEN reporting_private.sel_daily_page(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end,
+                                                        p_first_date, p_last_date, p_staff, p_work_type, v_offset, p_limit + 1)
+      ELSE reporting_private.sel_people_page(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end, p_work_type, v_offset, p_limit + 1) END;
+    v_total := (v_page ->> 'total')::bigint;
+    SELECT coalesce(pg_catalog.jsonb_agg(x.e ORDER BY x.i), '[]'::jsonb), count(*)::integer INTO v_rows, v_n
+      FROM pg_catalog.jsonb_array_elements(v_page -> 'rows') WITH ORDINALITY AS x(e, i)
+     WHERE x.i <= p_limit;
+    RETURN pg_catalog.jsonb_build_object(
+      'rows', v_rows,
+      'last', CASE WHEN v_n > 0 THEN pg_catalog.to_jsonb(v_offset + v_n) ELSE 'null'::jsonb END,
+      'more', pg_catalog.jsonb_array_length(v_page -> 'rows') > p_limit,
+      'total_rows', v_total);
+  END IF;
+  IF p_kind = 'orders' THEN
+    -- keyset continuation: absent, or the previous page's last overall order key (a non-empty string)
+    IF p_after IS NOT NULL AND p_after <> 'null'::jsonb AND (pg_catalog.jsonb_typeof(p_after) <> 'string' OR p_after #>> '{}' = '') THEN
+      RAISE EXCEPTION 'read_reporting_detail: the orders continuation must be an order key';
+    END IF;
+    -- an order selector narrows to that order number (trimmed as order keys are); every other scope stays
+    IF p_order IS NOT NULL AND coalesce(reporting_private.order_key(p_order), '') = '' THEN
+      RAISE EXCEPTION 'read_reporting_detail: the order selector is blank';
+    END IF;
+    RETURN reporting_private.sel_detail_orders(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end, p_staff, p_work_type,
+                                               reporting_private.order_key(p_order), CASE WHEN p_after IS NULL OR p_after = 'null'::jsonb THEN NULL ELSE p_after #>> '{}' END, p_limit);
+  END IF;
+  IF p_kind IN ('events', 'raw-export', 'timing') THEN
+    -- keyset continuation: absent, or exactly [canonical UTC instant text, non-empty event id]
+    IF p_after IS NOT NULL AND p_after <> 'null'::jsonb THEN
+      IF pg_catalog.jsonb_typeof(p_after) <> 'array' OR pg_catalog.jsonb_array_length(p_after) <> 2
+         OR pg_catalog.jsonb_typeof(p_after -> 0) <> 'string' OR pg_catalog.jsonb_typeof(p_after -> 1) <> 'string' OR p_after ->> 1 = ''
+         OR (p_after ->> 0) !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$' THEN
+        RAISE EXCEPTION 'read_reporting_detail: the % continuation must be [canonical UTC instant, event id]', p_kind;
+      END IF;
+      BEGIN
+        v_at := (p_after ->> 0)::timestamptz;
+      EXCEPTION WHEN others THEN
+        RAISE EXCEPTION 'read_reporting_detail: the % continuation must be [canonical UTC instant, event id]', p_kind;
+      END;
+      IF reporting_private.utc_text(v_at) IS DISTINCT FROM p_after ->> 0 THEN
+        RAISE EXCEPTION 'read_reporting_detail: the % continuation must be [canonical UTC instant, event id]', p_kind;
+      END IF;
+    END IF;
+    IF p_order IS NOT NULL AND coalesce(reporting_private.order_key(p_order), '') = '' THEN
+      RAISE EXCEPTION 'read_reporting_detail: the order selector is blank';
+    END IF;
+    IF p_kind = 'timing' THEN
+      RETURN reporting_private.sel_detail_timing(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end, p_staff, p_work_type,
+                                                 reporting_private.order_key(p_order), v_at, CASE WHEN v_at IS NULL THEN NULL ELSE p_after ->> 1 END, p_limit);
+    END IF;
+    RETURN reporting_private.sel_detail_events(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end, p_staff, p_work_type,
+                                               reporting_private.order_key(p_order), v_at, CASE WHEN v_at IS NULL THEN NULL ELSE p_after ->> 1 END,
+                                               p_limit, p_kind = 'raw-export');
+  END IF;
+  IF p_kind = 'coverage' THEN
+    -- keyset continuation: absent, or exactly [non-empty issue kind, non-empty event id]
+    IF p_after IS NOT NULL AND p_after <> 'null'::jsonb
+       AND (pg_catalog.jsonb_typeof(p_after) <> 'array' OR pg_catalog.jsonb_array_length(p_after) <> 2
+            OR pg_catalog.jsonb_typeof(p_after -> 0) <> 'string' OR pg_catalog.jsonb_typeof(p_after -> 1) <> 'string'
+            OR p_after ->> 0 = '' OR p_after ->> 1 = '') THEN
+      RAISE EXCEPTION 'read_reporting_detail: the coverage continuation must be [issue kind, event id]';
+    END IF;
+    IF p_order IS NOT NULL AND coalesce(reporting_private.order_key(p_order), '') = '' THEN
+      RAISE EXCEPTION 'read_reporting_detail: the order selector is blank';
+    END IF;
+    RETURN reporting_private.sel_detail_coverage(p_site, p_audience_kind, p_audience_staff, v_seq, p_start, p_end, p_staff, p_work_type,
+                                                 reporting_private.order_key(p_order),
+                                                 CASE WHEN p_after IS NULL OR p_after = 'null'::jsonb THEN NULL ELSE p_after ->> 0 END,
+                                                 CASE WHEN p_after IS NULL OR p_after = 'null'::jsonb THEN NULL ELSE p_after ->> 1 END, p_limit);
+  END IF;
+  RAISE EXCEPTION 'read_reporting_detail: kind % is not available yet', p_kind;
+END
+$fn$;
+
+REVOKE ALL ON FUNCTION reporting_private.utc_text(timestamptz) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_detail_orders(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, text, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.utc_text(timestamptz) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_detail_orders(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, text, integer) TO service_role;
+REVOKE ALL ON FUNCTION reporting_private.sel_detail_events(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, timestamptz, text, integer, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_detail_events(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, timestamptz, text, integer, boolean) TO service_role;
+REVOKE ALL ON FUNCTION reporting_private.sel_detail_coverage(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, text, text, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_detail_coverage(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, text, text, integer) TO service_role;
+REVOKE ALL ON FUNCTION reporting_private.sel_detail_timing(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, timestamptz, text, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_detail_timing(text, text, uuid, bigint, timestamptz, timestamptz, uuid, text, text, timestamptz, text, integer) TO service_role;
+REVOKE ALL ON FUNCTION public.read_reporting_detail(text, text, uuid, uuid, date, date, timestamptz, timestamptz, uuid, text, text, text, jsonb, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.read_reporting_detail(text, text, uuid, uuid, date, date, timestamptz, timestamptz, uuid, text, text, text, jsonb, integer) TO service_role;
 
 COMMIT;

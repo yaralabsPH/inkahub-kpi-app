@@ -5,13 +5,14 @@
  * scope (audience!) it was asked for. SQL parity of the 0044 reader is a
  * separate staging gate (tests/staging/reporting-read-parity.ts).
  */
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   audienceFor, authorizeReportingRequest, bearerToken, effectiveNav, errorResponse, filterKey, freshness, NAV, readPublishedDetail, readPublishedSummary, ReportingHttpError, resolveGeneration, signCursor, verifyCursor,
   type AuthDeps, type GenerationMeta, type PublishedReader, type ReaderScope, type ReportingPrincipal, type SummaryBody,
 } from "../../api/_lib/production-reporting";
 import { parseGeneration, rpcPublishedReader } from "../../api/_lib/production-reporting-rpc";
-import { parseSummaryResponse } from "../../api/_lib/production-reporting-dto";
+import { parseDetailResponse, parseSummaryResponse } from "../../api/_lib/production-reporting-dto";
 import { createDetailHandler } from "../../api/reports/detail";
 import { createSummaryHandler } from "../../api/reports/summary";
 import { effectiveNavAccess } from "../../src/lib/auth/permissions";
@@ -202,15 +203,18 @@ describe("Task 16: detail pages and signed cursors", () => {
   });
 });
 
+const ORDER_ROW = { key: "uk|O-1", orderNumber: "O-1", caseId: null, group: "normal", firstAtUtc: "2026-11-01T09:00:00.000000Z", lastAtUtc: "2026-11-01T10:00:00.000000Z", workTypes: ["framed", "dispatch"], verifiedLines: 2, items: 4, completed: true };
 describe("Task 16: the RPC reader contract", () => {
   it("passes only the derived scope (audience kind/staff, generation, window) and validates shapes", async () => {
     const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
-    const client = { rpc: async (fn: string, args: Record<string, unknown>) => (calls.push({ fn, args }), { data: fn === "read_reporting_detail" ? { rows: [{ a: 1 }], last: ["k"], more: true, total_rows: 9 } : sqlSummary(), error: null }) };
+    const client = { rpc: async (fn: string, args: Record<string, unknown>) => (calls.push({ fn, args }), { data: fn === "read_reporting_detail" ? { rows: [ORDER_ROW], last: "uk|O-1", more: true, total_rows: 9 } : sqlSummary("2026-11-01", 2), error: null }) };
     const reader = rpcPublishedReader(client);
     const scope: ReaderScope = { site: "uk", audience: { kind: "self", staffId: U }, generationId: "g-1", firstDate: "2026-11-01", lastDate: "2026-11-02", startUtc: "s", endUtcExclusive: "e", staffId: null, workType: "framed" };
     await reader.summary(scope, "reports", { dailyLimit: 1000, peopleLimit: 200 });
     expect(calls[0]).toEqual({ fn: "read_reporting_summary", args: { p_site: "uk", p_audience_kind: "self", p_audience_staff: U, p_generation: "g-1", p_first_date: "2026-11-01", p_last_date: "2026-11-02", p_start: "s", p_end: "e", p_staff: null, p_work_type: "framed", p_view: "reports", p_daily_limit: 1000, p_people_limit: 200 } });
-    expect(await reader.detail(scope, "orders", null, null, 5)).toMatchObject({ rows: [{ kind: "orders", row: { a: 1 } }], last: ["k"], more: true, totalRows: 9 });
+    expect(await reader.detail(scope, "orders", null, null, 1)).toEqual({ rows: [{ kind: "orders", row: ORDER_ROW }], last: "uk|O-1", more: true, totalRows: 9 });
+    expect(calls[1]).toEqual({ fn: "read_reporting_detail", args: { ...calls[0].args, p_view: undefined, p_daily_limit: undefined, p_people_limit: undefined, p_kind: "orders", p_order: null, p_after: null, p_limit: 1 } });
+    await expect(reader.detail(scope, "people", null, "x", 1)).rejects.toMatchObject({ status: 400 }); // an offset cursor must be a safe count
     const broken = rpcPublishedReader({ rpc: async () => ({ data: { totals: {} }, error: null }) });
     await expect(broken.summary(scope, "reports", { dailyLimit: 1, peopleLimit: 1 })).rejects.toMatchObject({ status: 503 });
     const failing = rpcPublishedReader({ rpc: async () => ({ data: null, error: { message: "permission denied for function read_reporting_summary" } }) });
@@ -305,21 +309,22 @@ describe("Task 16 review: bearer auth is parsed before any configuration or clie
 // Review item 2: strict count safety of the 0044 response
 // ---------------------------------------------------------------------------
 
-function sqlSummary(): Record<string, unknown> {
+function sqlSummary(first = "2026-11-16", days = 1): Record<string, unknown> {
   const g = (items: number | null = 3, orders = 1) => ({ normal: { items, orders }, rework: { items: 0, orders: 0 } });
+  const date = (i: number) => new Date(Date.parse(`${first}T00:00:00Z`) + i * 86_400_000).toISOString().slice(0, 10);
   const cov = { issueCounts: { invalid_event: 0, unclassified_sku: 0, invalid_quantity: 0, unresolved_parent: 0, missing_completion_detail: 0, ambiguous_repeat: 0 }, notes: { expected_exclusion: 0, corrected_verification: 0, reversed_terminal: 0, excluded_only_completion: 0 }, issueRows: 0, overflow: false };
   return {
     report: {
       totals: g(), byWorkType: ["a0_framed", "framed", "unframed", "dispatch"].map((workType) => ({ workType, totals: g() })), coverage: cov, tileCoverage: cov,
       activeStaff: 1, staffDays: 2, avgOrdersPerStaffDay: 0.5, timing: { durationMin: 10.5, timedWeight: 2, avgMinPerUnit: 5.25 },
-      people: [{ staffId: U, ...g(), daysWorked: 2, itemsPerDay: 1.5, ordersPerDay: 0.5, timing: { durationMin: 1, timedWeight: 1, avgMinPerUnit: 1 } }],
-      skuTiming: [], daily: [{ productionDate: "2026-11-16", totals: g() }],
+      people: { rows: [{ staffId: U, ...g(), daysWorked: 2, itemsPerDay: 1.5, ordersPerDay: 0.5, timing: { durationMin: 1, timedWeight: 1, avgMinPerUnit: 1 } }], total: 1 },
+      skuTiming: [], daily: { rows: Array.from({ length: days }, (_, i) => ({ productionDate: date(i), totals: g() })), total: days },
     },
     welcome: null,
   };
 }
 describe("Task 16 review: every summary count is exact, safe and validated deeply", () => {
-  const parse = (v: unknown) => parseSummaryResponse(v, "reports", "2026-11-16", { dailyLimit: 1000, peopleLimit: 200 });
+  const parse = (v: unknown) => parseSummaryResponse(v, "reports", { firstDate: "2026-11-16", lastDate: "2026-11-16" }, { dailyLimit: 1000, peopleLimit: 200 });
   it("a valid response parses; Items may be the overflow null (never zero), Orders stay exact", () => {
     const v = sqlSummary();
     ((v.report as Record<string, unknown>).totals as { normal: { items: number | null } }).normal.items = null;
@@ -331,20 +336,27 @@ describe("Task 16 review: every summary count is exact, safe and validated deepl
     ["negative orders", (r) => (r.totals.normal.orders = -1)],
     ["fractional orders", (r) => (r.totals.rework.orders = 1.5)],
     ["unsafe items in a work type", (r) => (r.byWorkType[1].totals.normal.items = 2 ** 53)],
-    ["unsafe daily orders", (r) => (r.daily[0].totals.normal.orders = 2 ** 53 + 2)],
+    ["unsafe daily orders", (r) => (r.daily.rows[0].totals.normal.orders = 2 ** 53 + 2)],
     ["string count", (r) => (r.activeStaff = "1")],
     ["NaN rate", (r) => (r.avgOrdersPerStaffDay = Number.NaN)],
     ["infinite timing", (r) => (r.timing.durationMin = Number.POSITIVE_INFINITY)],
-    ["negative person items", (r) => (r.people[0].normal.items = -3)],
-    ["unsafe person days", (r) => (r.people[0].daysWorked = Number.MAX_SAFE_INTEGER + 1)],
+    ["negative person items", (r) => (r.people.rows[0].normal.items = -3)],
+    ["unsafe person days", (r) => (r.people.rows[0].daysWorked = Number.MAX_SAFE_INTEGER + 1)],
     ["unsafe issue count", (r) => (r.coverage.issueCounts.invalid_event = 2 ** 60)],
     ["missing note kind", (r) => delete r.coverage.notes.reversed_terminal],
     ["extra key", (r) => (r.totals.extra = 1)],
     ["missing work type", (r) => r.byWorkType.pop()],
     ["work types out of order", (r) => r.byWorkType.reverse()],
-    ["bad person id", (r) => (r.people[0].staffId = "x")],
-    ["bad date", (r) => (r.daily[0].productionDate = "16/11/2026")],
+    ["bad person id", (r) => (r.people.rows[0].staffId = "x")],
+    ["bad date", (r) => (r.daily.rows[0].productionDate = "16/11/2026")],
     ["null orders", (r) => (r.totals.normal.orders = null)],
+    ["unsafe daily total", (r) => (r.daily.total = 2 ** 53)],
+    ["unsafe people total", (r) => (r.people.total = Number.MAX_SAFE_INTEGER + 2)],
+    ["people total below its rows", (r) => (r.people.total = 0)],
+    ["daily total not the range", (r) => (r.daily.total = 3)],
+    ["a page without total", (r) => delete r.people.total],
+    ["a whole array instead of a page", (r) => (r.people = r.people.rows)],
+    ["a repeated person", (r) => r.people.rows.push(r.people.rows[0]) && (r.people.total = 2)],
   ];
   for (const [name, mut] of MUT) {
     it(`refuses: ${name}`, () => {
@@ -355,13 +367,25 @@ describe("Task 16 review: every summary count is exact, safe and validated deepl
   }
   it("a Reports response carrying a Welcome part, or a Welcome request without one, is refused", () => {
     expect(() => parse({ ...sqlSummary(), welcome: { cells: [] } })).toThrow(/no Welcome view/);
-    expect(() => parseSummaryResponse(sqlSummary(), "welcome", "2026-11-16", { dailyLimit: 1, peopleLimit: 1 })).toThrow(/welcome/);
+    expect(() => parseSummaryResponse(sqlSummary(), "welcome", { firstDate: "2026-11-16", lastDate: "2026-11-16" }, { dailyLimit: 1, peopleLimit: 1 })).toThrow(/welcome/);
   });
-  it("pages hold at most their limits while totalRows reports every row", () => {
-    const v = sqlSummary();
-    (v.report as Record<string, any>).daily = Array.from({ length: 5 }, (_, i) => ({ productionDate: `2026-11-1${i}`, totals: (v.report as Record<string, any>).totals }));
-    const out = parseSummaryResponse(v, "reports", "2026-11-16", { dailyLimit: 2, peopleLimit: 200 });
-    expect([out.dailyPage.rows.length, out.dailyPage.totalRows]).toEqual([2, 5]);
+  it("summary pages are SQL-bounded first pages: at most the limit, exact totals, consecutive dates, short only when last", () => {
+    const R = { firstDate: "2026-11-12", lastDate: "2026-11-16" };
+    const ok = sqlSummary("2026-11-12", 2);
+    ((ok.report as Record<string, any>).daily.total = 5);
+    const out = parseSummaryResponse(ok, "reports", R, { dailyLimit: 2, peopleLimit: 200 });
+    expect([out.dailyPage.rows.map((d) => d.productionDate), out.dailyPage.totalRows]).toEqual([["2026-11-12", "2026-11-13"], 5]);
+    const page = (mut: (r: Record<string, any>) => void, limit = 2) => {
+      const v = sqlSummary("2026-11-12", 2);
+      (v.report as Record<string, any>).daily.total = 5;
+      mut(v.report as Record<string, any>);
+      return () => parseSummaryResponse(v, "reports", R, { dailyLimit: limit, peopleLimit: 200 });
+    };
+    expect(page(() => undefined, 1)).toThrow(/page limit is 1/); // more rows than the limit: never sliced
+    expect(page((r) => r.daily.rows.pop())).toThrow(/short page but not the last/);
+    expect(page((r) => (r.daily.rows[1].productionDate = "2026-11-14"))).toThrow(/no gap or repeat/);
+    expect(page((r) => (r.daily.rows[1].productionDate = "2026-11-12"))).toThrow(/no gap or repeat/);
+    expect(page((r) => (r.daily.rows[0].productionDate = "2026-11-11"))).toThrow(/no gap or repeat/);
   });
   it("the server signs a continuation cursor when a summary page does not hold every row; no secret → 500", async () => {
     const r = fakeReader();
@@ -370,5 +394,125 @@ describe("Task 16 review: every summary count is exact, safe and validated deepl
     expect(out.dailyPage.nextCursor).toMatch(/\./);
     expect(out.peoplePage.nextCursor).toBeNull();
     await expect(readPublishedSummary(principal("owner"), SUM, { ...deps(r), cursorSecret: undefined })).rejects.toMatchObject({ status: 500 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 16 review: strict per-kind detail pages
+// ---------------------------------------------------------------------------
+
+describe("Task 16 review: every detail kind is validated deeply", () => {
+  const g = () => ({ normal: { items: 1, orders: 1 }, rework: { items: null, orders: 0 } });
+  const EV = { id: "e1", staffId: U, department: "framed", orderNumber: "O-1", sku: "INKA-KAN0566-A4-FB", quantity: "2", eventType: "line_verified", createdAtUtc: "2026-11-16T09:00:00.123456Z", parentEventId: null, caseId: null };
+  const ROWS: Record<string, { row: Record<string, unknown>; last: unknown }> = {
+    days: { row: { productionDate: "2026-11-16", totals: g() }, last: 1 },
+    people: { row: { staffId: U, ...g(), daysWorked: 1, itemsPerDay: 1, ordersPerDay: 1, timing: { durationMin: 0, timedWeight: 0, avgMinPerUnit: 0 } }, last: 1 },
+    orders: { row: ORDER_ROW, last: "uk|O-1" },
+    events: { row: EV, last: [EV.createdAtUtc, "e1"] },
+    "raw-export": { row: { ...EV, note: "", stationId: "s1" }, last: [EV.createdAtUtc, "e1"] },
+    coverage: { row: { kind: "unclassified_sku", eventId: "e1", location: "uk", detail: null }, last: ["unclassified_sku", "e1"] },
+    timing: { row: { eventId: "e1", staffId: U, workType: "framed", orderNumber: "O-1", sku: null, weight: 1, startedAtUtc: "2026-11-16T08:50:00.000000Z", completedAtUtc: "2026-11-16T09:00:00.000000Z", durationMin: 10 }, last: ["2026-11-16T09:00:00.000000Z", "e1"] },
+  };
+  const ctx = { site: "uk", firstDate: "2026-11-16", lastDate: "2026-11-16", limit: 1, offset: 0 };
+  const resp = (kind: string, mut?: (row: Record<string, any>, page: Record<string, any>) => void) => {
+    const page: Record<string, any> = { rows: [JSON.parse(JSON.stringify(ROWS[kind].row))], last: ROWS[kind].last, more: false, total_rows: 1 };
+    mut?.(page.rows[0], page);
+    return page;
+  };
+  for (const kind of Object.keys(ROWS)) {
+    it(`${kind}: a valid page parses exactly`, () => {
+      const out = parseDetailResponse(resp(kind), kind as never, ctx);
+      expect(out).toEqual({ rows: [{ kind, row: ROWS[kind].row }], last: ROWS[kind].last, more: false, totalRows: 1 });
+    });
+    const common: Array<[string, (row: Record<string, any>, page: Record<string, any>) => void]> = [
+      ["an extra row key", (row) => (row.extra = 1)],
+      ["a missing row key", (row) => delete row[Object.keys(row)[0]]],
+      ["unsafe total_rows", (_r, p) => (p.total_rows = 2 ** 53)],
+      ["negative total_rows", (_r, p) => (p.total_rows = -1)],
+      ["string total_rows", (_r, p) => (p.total_rows = "1")],
+      ["more rows than the limit", (row, p) => p.rows.push(row)],
+      ["a last that is not the last row's keyset", (_r, p) => (p.last = "zz")],
+      ["more on a short page", (_r, p) => ((p.more = true), (p.total_rows = 5), (p.rows = []), (p.last = null))],
+      ["an extra page key", (_r, p) => (p.cursor = "x")],
+    ];
+    for (const [name, mut] of common) it(`${kind}: refuses ${name}`, () => expect(() => parseDetailResponse(resp(kind, mut), kind as never, ctx)).toThrow(/read_reporting_detail/));
+  }
+  const SPECIFIC: Array<[string, string, (row: Record<string, any>, page: Record<string, any>) => void]> = [
+    ["days", "a date outside the offset sequence", (row) => (row.productionDate = "2026-11-15")],
+    ["days", "unsafe nested orders", (row) => (row.totals.normal.orders = 2 ** 53)],
+    ["days", "total_rows that is not the range", (_r, p) => (p.total_rows = 2)],
+    ["people", "unsafe days worked", (row) => (row.daysWorked = 2 ** 53)],
+    ["people", "a negative rate", (row) => (row.itemsPerDay = -1)],
+    ["people", "an infinite timing value", (row) => (row.timing.durationMin = Number.POSITIVE_INFINITY)],
+    ["people", "a bad staff id", (row) => (row.staffId = "U")],
+    ["orders", "unsafe verified lines", (row) => (row.verifiedLines = 2 ** 53)],
+    ["orders", "fractional items", (row) => (row.items = 1.5)],
+    ["orders", "a group that contradicts the case", (row) => (row.group = "rework")],
+    ["orders", "a key that is not the overall order key", (row, p) => ((row.key = "uk|O-2"), (p.last = "uk|O-2"))],
+    ["orders", "work types out of order", (row) => (row.workTypes = ["dispatch", "framed"])],
+    ["orders", "an unknown work type", (row) => (row.workTypes = ["paint"])],
+    ["orders", "a non-UTC instant", (row) => (row.firstAtUtc = "2026-11-01 09:00")],
+    ["orders", "an order that ends before it starts", (row) => (row.lastAtUtc = "2026-11-01T08:00:00.000000Z")],
+    ["orders", "a non-boolean completion", (row) => (row.completed = 1)],
+    ["events", "a bad staff id", (row) => (row.staffId = "nope")],
+    ["events", "a non-string event type", (row) => (row.eventType = 7)],
+    ["events", "a numeric department", (row) => (row.department = 3)],
+    ["events", "a missing quantity", (row) => delete row.quantity],
+    ["raw-export", "a non-string note", (row) => (row.note = 5)],
+    ["coverage", "an unknown issue kind", (row, p) => ((row.kind = "other"), (p.last = ["other", "e1"]))],
+    ["coverage", "another site", (row) => (row.location = "us")],
+    ["timing", "an unknown work type", (row) => (row.workType = "paint")],
+    ["timing", "a negative weight", (row) => (row.weight = -1)],
+    ["timing", "a NaN duration", (row) => (row.durationMin = Number.NaN)],
+    ["timing", "completion before start", (row, p) => ((row.completedAtUtc = "2026-11-16T08:00:00.000000Z"), (p.last = ["2026-11-16T08:00:00.000000Z", "e1"]))],
+  ];
+  for (const [kind, name, mut] of SPECIFIC) it(`${kind}: refuses ${name}`, () => expect(() => parseDetailResponse(resp(kind, mut), kind as never, ctx)).toThrow(/read_reporting_detail/));
+  it("Items may be the overflow null only where the contract allows it", () => {
+    expect(parseDetailResponse(resp("orders", (row) => (row.items = null)), "orders", ctx).rows[0].row).toMatchObject({ items: null });
+    expect(() => parseDetailResponse(resp("orders", (row) => (row.verifiedLines = null)), "orders", ctx)).toThrow(/verifiedLines/);
+    expect(() => parseDetailResponse(resp("days", (row) => (row.totals.normal.orders = null)), "days", ctx)).toThrow(/orders/);
+  });
+  it("days/people continue an offset: rows follow the offset, last = offset + rows, more agrees with total_rows", () => {
+    const c = { ...ctx, firstDate: "2026-11-14", limit: 1, offset: 2 };
+    const p = { rows: [{ productionDate: "2026-11-16", totals: g() }], last: 3, more: false, total_rows: 3 };
+    expect(parseDetailResponse(p, "days", c)).toMatchObject({ last: 3, more: false, totalRows: 3 });
+    expect(() => parseDetailResponse({ ...p, more: true }, "days", c)).toThrow(/more disagrees/);
+    expect(() => parseDetailResponse({ ...p, last: 1 }, "days", c)).toThrow(/keyset/);
+    expect(() => parseDetailResponse({ ...p, rows: [{ productionDate: "2026-11-15", totals: g() }] }, "days", c)).toThrow(/no gap or repeat/);
+  });
+});
+
+describe("Task 16 review: parser error context and the detail page bound", () => {
+  it("each parse names its own RPC, whatever parsed or failed before it (no shared mutable parser state)", () => {
+    const badSummary = sqlSummary();
+    (badSummary.report as Record<string, any>).activeStaff = -1;
+    const badDetail = { rows: [], last: null, more: false, total_rows: -1 };
+    const R = { firstDate: "2026-11-16", lastDate: "2026-11-16" };
+    const P = { dailyLimit: 10, peopleLimit: 10 };
+    const C = { site: "uk", firstDate: "2026-11-16", lastDate: "2026-11-16", limit: 1, offset: 0 };
+    for (let i = 0; i < 3; i++) {
+      expect(() => parseDetailResponse(badDetail, "orders", C)).toThrow(/^read_reporting_detail: total_rows/);
+      expect(() => parseSummaryResponse(badSummary, "reports", R, P)).toThrow(/^read_reporting_summary: activeStaff/);
+      expect(parseDetailResponse({ rows: [], last: null, more: false, total_rows: 0 }, "orders", C).totalRows).toBe(0);
+      expect(() => parseSummaryResponse(badSummary, "reports", R, P)).toThrow(/^read_reporting_summary: /);
+      expect(() => parseDetailResponse(badDetail, "coverage", C)).toThrow(/^read_reporting_detail: /);
+    }
+    // a detail failure inside a summary-shaped value still names the detail RPC, and vice versa
+    expect(() => parseDetailResponse(sqlSummary(), "days", C)).toThrow(/^read_reporting_detail: response has unexpected keys/);
+    expect(() => parseSummaryResponse(badDetail, "reports", R, P)).toThrow(/^read_reporting_summary: response has unexpected keys/);
+  });
+  it("the module keeps no mutable top-level state", () => {
+    const src = readFileSync(new URL("../../api/_lib/production-reporting-dto.ts", import.meta.url), "utf8");
+    expect(src.match(/^(let|var)\s/gm)).toBeNull();
+  });
+  it("an invalid detail limit is refused before any RPC (zero calls)", async () => {
+    let calls = 0;
+    const reader = rpcPublishedReader({ rpc: async () => (calls++, { data: null, error: null }) });
+    const scope: ReaderScope = { site: "uk", audience: { kind: "site" }, generationId: "g-1", firstDate: "2026-11-16", lastDate: "2026-11-16", startUtc: "s", endUtcExclusive: "e", staffId: null, workType: null };
+    for (const limit of [0, -1, 1.5, 1001, Number.NaN, Number.POSITIVE_INFINITY, "5" as unknown as number, 2 ** 53]) {
+      await expect(reader.detail(scope, "orders", null, null, limit)).rejects.toMatchObject({ status: 400, code: "BAD_REQUEST" });
+    }
+    await expect(reader.detail(scope, "people", null, -2, 10)).rejects.toMatchObject({ status: 400 }); // the offset cursor guard stays
+    expect(calls).toBe(0);
   });
 });

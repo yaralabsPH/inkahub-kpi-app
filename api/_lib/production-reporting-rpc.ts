@@ -12,7 +12,7 @@ import type { ReportSite } from "../../src/lib/domain/productionPeriods.js";
 import { DETAIL_PAGE_MAX, DETAIL_RESPONSE_MAX_BYTES, type PublishedDetailRow } from "../../src/lib/domain/productionReporting.js";
 import type { AuthDeps, GenerationMeta, PublishedReader, ReaderScope, SummaryBody } from "./production-reporting.js";
 import { ReportingHttpError } from "./production-reporting.js";
-import { parseSummaryResponse } from "./production-reporting-dto.js";
+import { parseDetailResponse, parseSummaryResponse } from "./production-reporting-dto.js";
 import type { RpcClient } from "./reporting-jobs.js";
 
 const STATES = ["published", "superseded", "expired", "building", "failed"] as const;
@@ -53,14 +53,16 @@ export function rpcPublishedReader(client: RpcClient): PublishedReader {
     async summary(scope, view, pages) {
       const v = await one(client, "read_reporting_summary", { ...scopeArgs(scope), p_view: view, p_daily_limit: pages.dailyLimit, p_people_limit: pages.peopleLimit });
       // Deep, strict validation: safe-integer counts, null-or-safe Items, finite rates, exact key sets.
-      return parseSummaryResponse(v, view, scope.lastDate, pages) as SummaryBody;
+      return parseSummaryResponse(v, view, { firstDate: scope.firstDate, lastDate: scope.lastDate }, pages) as SummaryBody;
     },
     async detail(scope, kind, orderNumber, after, limit) {
-      if (!Number.isInteger(limit) || limit < 1 || limit > DETAIL_PAGE_MAX) throw new ReportingHttpError(400, "BAD_REQUEST", "invalid limit");
-      const v = (await one(client, "read_reporting_detail", { ...scopeArgs(scope), p_kind: kind, p_order: orderNumber, p_after: after ?? null, p_limit: limit })) as Record<string, unknown> | null;
-      if (!v || !Array.isArray(v.rows) || typeof v.more !== "boolean" || typeof v.total_rows !== "number") throw new ReportingHttpError(503, "UNAVAILABLE", "read_reporting_detail returned an unexpected shape");
-      if (v.rows.length > limit) throw new ReportingHttpError(503, "UNAVAILABLE", "read_reporting_detail returned more rows than requested");
-      return { rows: (v.rows as unknown[]).map((row) => ({ kind, row }) as PublishedDetailRow), last: v.last ?? null, more: v.more, totalRows: v.total_rows };
+      // Bounded before any RPC: an integer page size within the contract's maximum.
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > DETAIL_PAGE_MAX) throw new ReportingHttpError(400, "BAD_REQUEST", `limit must be an integer 1..${DETAIL_PAGE_MAX}`);
+      // days/people continue an offset (the signed cursor's `last`); every other kind is a keyset tuple.
+      const offset = kind === "days" || kind === "people" ? (after === null || after === undefined ? 0 : Number.isSafeInteger(after) && (after as number) >= 0 ? (after as number) : -1) : 0;
+      if (offset < 0) throw new ReportingHttpError(400, "BAD_CURSOR", "The page cursor is not valid for this list");
+      const v = await one(client, "read_reporting_detail", { ...scopeArgs(scope), p_kind: kind, p_order: orderNumber, p_after: after ?? null, p_limit: limit });
+      return parseDetailResponse(v, kind, { site: scope.site, firstDate: scope.firstDate, lastDate: scope.lastDate, limit, offset });
     },
   };
 }

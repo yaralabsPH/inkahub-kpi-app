@@ -60,6 +60,7 @@ interface SqlReport {
   skuTiming: SkuTiming[];
   daily: Array<{ productionDate: string; totals: { normal: { items: number; orders: number }; rework: { items: number; orders: number } } }>;
 }
+type PagedReport = Omit<SqlReport, "people" | "daily"> & { people: { rows: SqlReport["people"]; total: number }; daily: { rows: SqlReport["daily"]; total: number } };
 const n = (v: unknown) => Number(v);
 const close = (a: unknown, b: number) => expect(n(a)).toBeCloseTo(b, 9);
 
@@ -74,8 +75,11 @@ describe("Task 16: 0044 Reports view equals the existing reducer over the same s
       const source = a.kind === "self" ? view.filter((e) => e.staff_id === a.staffId) : view;
       const snap = fourFamilySnapshot(source, { startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive }, a.kind === "site" ? { kind: "site" } : { kind: "limited", reason: "own work only" }, SITE, cutoff);
       const ref = buildProductionReportView(prepareProductionEvidence(snap), { range, staffId: f.staffId, workType: f.workType });
-      const got = (await db.query<{ v: SqlReport }>("select reporting_private.sel_report($1, $2, $3::uuid, $4::bigint, $5::timestamptz, $6::timestamptz, $7::date, $8::date, $9::uuid, $10) as v",
+      const paged = (await db.query<{ v: PagedReport }>("select reporting_private.sel_report($1, $2, $3::uuid, $4::bigint, $5::timestamptz, $6::timestamptz, $7::date, $8::date, $9::uuid, $10, 1000, 1000) as v",
         [SITE, a.kind, a.kind === "self" ? a.staffId : null, seq, range.startUtc, range.endUtcExclusive, first, last, f.staffId, f.workType])).rows[0].v;
+      // the first pages hold every row here (limits 1,000) and the exact counts agree with them
+      expect([n(paged.people.total), n(paged.daily.total)]).toEqual([paged.people.rows.length, paged.daily.rows.length]);
+      const got: SqlReport = { ...paged, people: paged.people.rows, daily: paged.daily.rows };
       const io = (g: { items: number | null; orders: number }) => ({ items: g.items, orders: g.orders });
       expect({ normal: { items: n(got.totals.normal.items), orders: n(got.totals.normal.orders) }, rework: { items: n(got.totals.rework.items), orders: n(got.totals.rework.orders) } }).toEqual({ normal: io(ref.summary.normal), rework: io(ref.summary.rework) });
       expect(Object.fromEntries(got.byWorkType.map((x) => [x.workType, { normal: { items: n(x.totals.normal.items), orders: n(x.totals.normal.orders) }, rework: { items: n(x.totals.rework.items), orders: n(x.totals.rework.orders) } }]))).toEqual(Object.fromEntries(Object.entries(ref.summary.byWorkType).map(([k, g]) => [k, { normal: io(g.normal), rework: io(g.rework) }])));
