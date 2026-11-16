@@ -2858,3 +2858,28 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - anon/authenticated get `permission denied` on the worker RPCs.
   - **Limits:** PGlite is one in-process PostgreSQL 17. It proves SQL semantics and parity, not hosted roles, PostgREST, concurrency, timeouts or performance. Staging remains the runtime gate.
   - **Gate:** `npx tsc -b` OK; 1650/1650 tests (46 files, 27 s); build OK.
+- 2026-11-16 — **Task 16: 0044 read SQL, layer 1 (selection, evaluation, coverage, range totals), executed offline in PGlite** (Claude). This is a draft, not applied. Task 16 stays open: the public summary/detail RPCs, people/timing/SKU board/staff-days/Welcome and the staging parity harness remain.
+  - **New `supabase/migrations/0044_reporting_reads.sql`.** Internal service-only functions over ONE generation's versioned facts (`valid_from_seq <= seq < valid_to_seq`) and ONE trusted audience, mirroring the Task 11 reference:
+    - `sel_rows`: the four families over facts ∪ source issues — window rows; pre-window verifications whose RAW order equals a window terminal's (space-trimmed non-blank); cancelled parents; post-window cancellations of window targets.
+    - `sel_eval`, per selected fact:
+      - `effective`: not cancelled by a VALID edge whose parent is selected, a verification/terminal and not later;
+      - `reversed`;
+      - qualification from the selected original verifications of the same (order, work type, case) at or before the terminal.
+    - `sel_anchored`: coverage issues and notes in the reference's order; selected source issues are unscoped.
+    - `sel_totals`: normal/rework Items (exact numeric, null past 2^53−1), distinct (order, case) Orders, by work type, by production date, plus issue counts (deduplicated by kind and event), notes and issue rows.
+  - **Parity (`tests/reporting/pg/reads-parity.test.ts`, 73 cases):**
+    - Inputs: the Task 11 `history()` and `randomHistory(7, 600)` fixtures, including malformed-identity source rows and one order reworked under two cases. They are saved as source rows, published by the REAL worker, then for each case compared with `referenceSummary` over the same frozen source.
+    - Coverage: 6 windows (full days, a partial day, multi-day, microsecond edges) × site/self(ANNA)/self(BEN) × 4 display scopes (none, staff, work type, work type + staffs).
+    - Compared: totals, by work type, issue counts, notes and issue rows are exactly equal. Non-vacuity is asserted.
+  - **SQL mutations: 10/12 caught:**
+    - a later parent cancelling;
+    - the qualification family, post-window cancellations, and time and case in qualification;
+    - repeats over non-effective lines;
+    - case identity in Orders;
+    - excluded-only terminals;
+    - scoped source issues;
+    - trimmed raw-order matching.
+  - Two first survived because the fixture lacked malformed ids and two-case rework; both were added and are now caught.
+  - Two survivors are equivalent and kept as defensive clauses: non-counted lines are stored with 0 items, and duplicate (kind, event) issues cannot arise from distinct paths.
+  - One pinned test updated: the migration list includes 0044.
+  - **Gate:** `npx tsc -b` OK; full suite run; build OK.
