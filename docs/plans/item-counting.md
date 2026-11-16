@@ -2819,3 +2819,29 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - `tests/staging/reporting-read-parity.ts`.
   - **Proposal for root (recorded under Open questions):** add `@electric-sql/pglite` as a dev-only test dependency to run 0037–0044 in vitest and prove 0044 SQL parity against the TypeScript reference before staging. There is no local PostgreSQL. Without it, the complex 0044 SQL can only be validated textually and by root's staging harness. It changes no app or runtime code. I have not added it.
   - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK; 1627/1627 tests (42 files); build OK.
+- 2026-11-16 — **Task 16 read-mode signal and Task 17 checkpoint 1 (published client layer), OFFLINE** (Claude). Neither task is complete; both stay unchecked. CI is green for `e02efa2` (Task 15) and `d3a676f` (Task 16 checkpoint 1).
+  - **Task 16 contract addition (scope-consistent decision):** the plan says clients receive the effective per-site read mode only through the authorized API.
+    - `GenerationMeta` now carries the site's `readMode`. `read_reporting_generation` must return `read_mode`; the parser refuses its absence.
+    - A site in `legacy` or `shadow` mode answers 503 `READ_MODE_LEGACY` / `READ_MODE_SHADOW`. The app then keeps its existing reads: an explicit operator-controlled mode, not a silent raw-history fallback.
+    - Tests cover both codes and the missing field.
+  - **Task 17 files:**
+    - new `src/lib/domain/productionReportingFreshness.ts`:
+      - freshness from `verifiedAtUtc`: ≤30 min current, ≤120 "Update delayed", beyond that "Report out of date";
+      - 15-minute refresh due/overdue; non-negative age;
+      - per-site production-date coverage, so an older generation after the 04:00 rollover does not cover "today";
+    - its test (8);
+    - new `src/lib/repository/supabase/productionPublished.ts`: bearer-token GETs to `/api/reports/summary` and `/detail`, no-store, typed `PublishedReadError` with `legacyMode`/`expired`;
+    - new `src/lib/hooks/usePublishedProduction.ts`: a framework-free `PublishedViewController` plus a thin hook;
+    - new `tests/production/published-reporting.test.ts` (9).
+  - **Controller rules:**
+    - The identity is (user, site, view, range, staff, work type). A change clears the old result at once and aborts it; late responses are discarded.
+    - A refresh pins the shown generation. A 410 reloads the WHOLE view at the current generation and drops old pages.
+    - Detail pages are fetched only in the summary's generation; a `BAD_CURSOR` or 410 reloads the whole view. Whole-period totals always come from the summary.
+    - A failed refresh keeps the previous result, marked stale; legacy mode → `legacy`.
+    - The network trace shows only the published endpoints (no raw history).
+  - **Mutations: 10/10 caught.** "Pages kept across generations" first survived because of a loose `toMatchObject({})`; it is now an exact assertion.
+  - **Still to do in Task 17:**
+    - wire Reports/Welcome/ProductionCountStatus to the controller for `summary`-mode sites, keeping the existing path for `legacy`, Production's immediate-feedback path and Dexie unchanged;
+    - the side-card audit and changes (PackageHistory/Usage historical drill-down lazy; DailyTimesheet/CurrentlyClockedIn/LiveOrderCompletions never presenting truncated totals);
+    - the staging browser check.
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK; 1644/1644 tests (44 files); build OK.

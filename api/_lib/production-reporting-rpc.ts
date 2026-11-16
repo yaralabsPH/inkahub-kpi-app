@@ -37,9 +37,10 @@ export function parseGeneration(v: unknown): GenerationMeta | null {
   };
   if (!(STATES as readonly unknown[]).includes(r.state)) throw new ReportingHttpError(503, "UNAVAILABLE", "generation state is unknown");
   if (typeof r.complete !== "boolean") throw new ReportingHttpError(503, "UNAVAILABLE", "generation completeness is unknown");
+  if (r.read_mode !== "legacy" && r.read_mode !== "shadow" && r.read_mode !== "summary") throw new ReportingHttpError(503, "UNAVAILABLE", "site read mode is unknown");
   return {
     generationId: s("generation_id"), site: s("site") as ReportSite, state: r.state as GenerationMeta["state"], complete: r.complete, ruleVersion: s("rule_version"),
-    sourceCutoffUtc: s("source_cutoff"), verifiedAtUtc: s("verified_at"), publishedAtUtc: s("published_at"), expiresAtUtc: r.expires_at == null ? null : s("expires_at"),
+    sourceCutoffUtc: s("source_cutoff"), verifiedAtUtc: s("verified_at"), publishedAtUtc: s("published_at"), expiresAtUtc: r.expires_at == null ? null : s("expires_at"), readMode: r.read_mode,
   };
 }
 

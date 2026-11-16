@@ -185,6 +185,8 @@ export interface GenerationMeta {
   publishedAtUtc: string;
   /** null while published (no expiry yet); set when superseded. */
   expiresAtUtc: string | null;
+  /** The site's CURRENT effective read mode (operator-controlled, per site). */
+  readMode: "legacy" | "shadow" | "summary";
 }
 export interface ReaderScope {
   site: ReportSite;
@@ -212,6 +214,9 @@ export async function resolveGeneration(reader: PublishedReader, site: ReportSit
   const g = await reader.generation(site, pinned);
   if (!g) throw pinned ? new ReportingHttpError(410, "GENERATION_EXPIRED", "This report version is no longer available; reload the view") : new ReportingHttpError(503, "UNAVAILABLE", "No published report is available for this site yet");
   if (g.site !== site) throw new ReportingHttpError(400, "BAD_GENERATION", "The report version belongs to another site");
+  // Effective per-site mode, delivered only through this authorized API: before activation (legacy) and during
+  // shadow comparison the app keeps its existing reads; this explicit signal is never a silent raw-history fallback.
+  if (g.readMode !== "summary") throw new ReportingHttpError(503, g.readMode === "shadow" ? "READ_MODE_SHADOW" : "READ_MODE_LEGACY", "Published reports are not enabled for this site");
   if (g.state === "building" || g.state === "failed" || !g.complete) throw new ReportingHttpError(503, "UNAVAILABLE", "The report publication is incomplete");
   if (g.state === "expired" || (g.expiresAtUtc !== null && Date.parse(g.expiresAtUtc) <= nowMs)) throw new ReportingHttpError(410, "GENERATION_EXPIRED", "This report version has expired; reload the view");
   return g;

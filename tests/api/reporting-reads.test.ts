@@ -22,7 +22,7 @@ const JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln";
 const NOW = Date.parse("2026-11-16T12:00:00Z");
 const SECRET = "cursor-secret-for-tests";
 
-const gen = (o: Partial<GenerationMeta> = {}): GenerationMeta => ({ generationId: "g-1", site: "uk", state: "published", complete: true, ruleVersion: "item-counting-summary-v1", sourceCutoffUtc: "2026-11-16T11:50:00.000000Z", verifiedAtUtc: "2026-11-16T11:50:00.000Z", publishedAtUtc: "2026-11-16T11:51:00.000Z", expiresAtUtc: null, ...o });
+const gen = (o: Partial<GenerationMeta> = {}): GenerationMeta => ({ generationId: "g-1", site: "uk", state: "published", complete: true, ruleVersion: "item-counting-summary-v1", sourceCutoffUtc: "2026-11-16T11:50:00.000000Z", verifiedAtUtc: "2026-11-16T11:50:00.000Z", publishedAtUtc: "2026-11-16T11:51:00.000Z", expiresAtUtc: null, readMode: "summary", ...o });
 const body = (): SummaryBody => ({
   totals: { normal: { items: 4, orders: 1 }, rework: { items: 0, orders: 0 } }, byWorkType: [], dailyPage: { rows: [], nextCursor: null, pageComplete: true, totalRows: 0 },
   coverage: { issueCounts: {} as never, notes: {} as never, visibility: { kind: "site" }, incomplete: false, issueRows: 0 }, timing: {} as never,
@@ -122,6 +122,9 @@ describe("Task 16: generations, freshness and the Welcome shape", () => {
     await expect(resolveGeneration(fakeReader(gen({ state: "superseded", expiresAtUtc: "2026-11-16T11:59:59Z" })), "uk", "g-1", NOW)).rejects.toMatchObject({ status: 410 });
     expect((await resolveGeneration(fakeReader(gen({ state: "superseded", expiresAtUtc: "2026-11-20T00:00:00Z" })), "uk", "g-1", NOW)).state).toBe("superseded");
     await expect(resolveGeneration(fakeReader(gen({ site: "au" })), "uk", null, NOW)).rejects.toMatchObject({ status: 400 });
+    // the effective per-site mode: legacy/shadow sites tell the app explicitly to keep its existing reads
+    await expect(resolveGeneration(fakeReader(gen({ readMode: "legacy" })), "uk", null, NOW)).rejects.toMatchObject({ status: 503, code: "READ_MODE_LEGACY" });
+    await expect(resolveGeneration(fakeReader(gen({ readMode: "shadow" })), "uk", null, NOW)).rejects.toMatchObject({ status: 503, code: "READ_MODE_SHADOW" });
   });
   it("a stale generation is returned labelled (not zeroed); the reader scope is one pinned generation", async () => {
     const r = fakeReader(gen({ verifiedAtUtc: "2026-11-16T08:00:00.000Z" }));
@@ -214,7 +217,8 @@ describe("Task 16: the RPC reader contract", () => {
   });
   it("parseGeneration: none → null; strict states and fields", () => {
     expect(parseGeneration([])).toBeNull();
-    expect(parseGeneration([{ generation_id: "g", site: "uk", state: "published", complete: true, rule_version: "r", source_cutoff: "c", verified_at: "v", published_at: "p", expires_at: null }])).toMatchObject({ generationId: "g", expiresAtUtc: null });
+    expect(parseGeneration([{ generation_id: "g", site: "uk", state: "published", complete: true, rule_version: "r", source_cutoff: "c", verified_at: "v", published_at: "p", expires_at: null, read_mode: "summary" }])).toMatchObject({ generationId: "g", expiresAtUtc: null, readMode: "summary" });
+    expect(() => parseGeneration([{ generation_id: "g", site: "uk", state: "published", complete: true, rule_version: "r", source_cutoff: "c", verified_at: "v", published_at: "p", expires_at: null }])).toThrow(/read mode/);
     expect(() => parseGeneration([{ generation_id: "g", site: "uk", state: "weird", complete: true }])).toThrow();
   });
 });
