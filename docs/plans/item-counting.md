@@ -3114,3 +3114,67 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     | `npx tsc -b` | 0 |
   - The broader suite was not rerun: this commit changes only a test and the plan.
   - No SQL was run, nothing was deployed or merged.
+- 2026-11-16 — **Task 14 access-path repair: append-only 0042 (draft, unapplied)** (Claude). Task 14 stays UNCHECKED until CJ runs the hosted evidence.
+  - **Evidence used:** the ignored T14S3 report `staging-results-reporting-publication-diagnose-dependency-plans-20261116T145318246Z-1989fbb0.md` (SHA-256 CCAED271…F027; not committed).
+    - Rebuild owner members: the 0041 OR join used `source_candidate_owner_order` with only `Index Cond (batch_id, site)`. It read 42,343 rows × 2 loops, and the join filter removed 84,679, to return 7 rows.
+    - Staff streams: the outer direction-CASE sort read every row of the worker (about 29,930) before LIMIT, on both batch kinds.
+    - Refresh member reads were acceptable and are kept.
+  - **`supabase/migrations/0042_reporting_access_paths.sql`** replaces only `read_reporting_owner_members` and `read_reporting_staff_stream`.
+    - Same signatures and RETURNS TABLE; the restated service-only grants are the 0041 ACL.
+    - No index, table, timeout or other function changes; 0037–0041 and 0043/0044 are untouched (0040/0041 LF hashes are pinned in a test).
+    - Members: the rebuild candidate is read by per-owner LATERAL keyed lookups, each bounded to the page after the keyset:
+      - an order owner by `order_key = key` (default collation, `source_candidate_order`);
+      - an event owner by `event_id = key` with a blank order (the primary key).
+
+      Both refresh branches are the exact 0041 text.
+    - Stream: all six branches (overlay, base mirror and candidate, each after/before) have a branch-local direction guard, ORDER BY and `LIMIT p_limit` before the merge, so the final sort sees at most three pages.
+      - The base-mirror and candidate branches match the staff_time indexes.
+      - The `batch_events` overlay branch is NOT claimed bounded. It has only the PK, and still filters and sorts the batch's whole frozen overlay on JSON staff/created_at. It is a measured hosted gate.
+    - Unchanged from 0041: validation, `frozen_read_batch` (locks, fence, lease, drift), the complete-response 1 MiB accounting, bytewise keyset order, ≤1,000 rows, SECURITY INVOKER and the empty search_path.
+  - **Tests:**
+    - `tests/reporting/pg/access-paths.test.ts` (14) runs over the real worker, held at its first frozen read.
+      - Every page equals an independent oracle built from plain table reads, covering:
+        - event, order (padded/trimmed), missing and mixed owners;
+        - first and later cursors and page sizes 1–1,000;
+        - bytewise ties;
+        - both stream directions;
+        - the 1 MiB cap (2 of 4 rows of ~400 KB);
+        - refresh replacements, moved owners, tombstones and inserts.
+      - Parameter checks, fence, client-role refusal and no writes.
+      - EXPLAIN ANALYZE of the exact extracted SELECTs:
+        - 0042 members are keyed and read ≤ member + owner rows, under default settings and with bitmap scans off.
+        - The 0041 OR join, with bitmap scans off (the hosted shape; PGlite otherwise picks a BitmapOr), reads the whole candidate and fails the same assertion.
+        - 0042 candidate and mirror stream branches read ≤ limit+1 rows; 0041 fails the same check.
+        - The overlay branch's reads are measured only.
+    - `tests/reporting/reportingAccessPaths.test.ts` (8) checks:
+      - allocation and immutability;
+      - the statement shape;
+      - that only the FOR query differs from 0041;
+      - default-collation owner equality;
+      - per-branch limits;
+      - the real-catalog effective bodies and ACLs.
+    - `reportingJobs.test.ts`: the migration list now includes 0042.
+  - **Prepared, NOT run:** `npm run staging:reporting-jobs -- --diagnose-access-paths --sites=uk,us`, in `tests/staging/reportingDependencyPlans.ts`.
+    - It uses the same guarded lifecycle and skeleton as T14S3, with the exact pinned 0042 (LF `94440fc0…`) applied inside the rolled-back transaction (A0/A1).
+    - It runs the same 20-explain matrix with slots members-0041 / members-0042 / stream-0042.
+    - It records `reads` per relation for every probe.
+    - The shared skeleton gained an optional extra-DDL allowlist (empty by default; T14S3 and the rehearsal are unchanged).
+  - **Process note:** three mechanical one-line wiring replacements (the mode lists in `reportingPublication.ts` and `reporting-jobs.ts`) were made with sed rather than the Edit tool. The content was reviewed in the diff.
+  - The Task 15 allocation test (`tests/api/reporting-worker.test.ts`) previously asserted that 0042 was unallocated; it now asserts that 0042 is this fix.
+  - **Gate:**
+
+    | Check | Result |
+    |---|---|
+    | `access-paths.test.ts` (real SQL) | 14/14 |
+    | `reportingAccessPaths` + `reportingJobs` | 60/60 |
+    | Diagnostic + rehearsal tests | 213/213 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 66 files, 2,161/2,161 |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Remaining hosted gate (CJ):** review, then run `--diagnose-access-paths --sites=uk,us` once.
+    - Accept 0042 only if the rebuild member reads are bounded by owner rows and the stream reads are about one page per branch.
+    - Judge the overlay (`batch_events`) reads against the expected refresh overlay size.
+    - After that, install 0040 → 0041 → 0042 in order. No SQL was run; nothing was deployed or merged.

@@ -1175,13 +1175,14 @@ export type EmitCtx<E> = FlowCtx & { emit(ev: E): void };
  * beside the first error), then D9. `allowedExplainAnalyze` is the exact
  * diagnostic SELECT allowlist (empty for the rehearsal).
  */
-export async function dependencyTransaction<E extends DependencyBaseEvidence>(raw: Db, ctxIn: EmitCtx<E>, read: (p: string) => Buffer, ev: E, allowedExplainAnalyze: ReadonlySet<string>, inside: (c: Db, ctx: EmitCtx<E>, texts: { text40: string; text41: string }) => Promise<void>, done: string): Promise<void> {
+export async function dependencyTransaction<E extends DependencyBaseEvidence>(raw: Db, ctxIn: EmitCtx<E>, read: (p: string) => Buffer, ev: E, allowedExplainAnalyze: ReadonlySet<string>, inside: (c: Db, ctx: EmitCtx<E>, texts: { text40: string; text41: string }) => Promise<void>, done: string, extraDdl: readonly string[] = []): Promise<void> {
   const deps = { read };
   const text40 = deps.read(MIGRATION_0040).toString("utf8");
   const text41 = deps.read(MIGRATION_0041).toString("utf8");
   const body40 = migrationBody(text40);
   const body41 = migrationBody(text41);
-  const c = dependencyGuard(raw, new Set([...body40, ...body41]), [], allowedExplainAnalyze);
+  // T14 0042 diagnostic: the exact 0042 statements may also run (inside the same rolled-back transaction); none by default.
+  const c = dependencyGuard(raw, new Set([...body40, ...body41, ...extraDdl]), [], allowedExplainAnalyze);
   const tracked: EmitCtx<E> = { ...ctxIn, record: (o) => { ctxIn.record(o); if (o.ok && !ev.recorded.includes(o.id)) ev.recorded.push(o.id); } };
   const ctx = failFast(tracked);
   await step(c, ctx, "D0", "file identities: installed 0037/0038/0039 and the exact reviewed 0040/0041 drafts", async () => {

@@ -24,9 +24,9 @@ import { readFileSync } from "node:fs";
 import { compareUtf8, reportingManifestHash } from "../../api/_lib/reporting-stage";
 import { compareStream, ownerKey, ownerOfEvent, type Owner } from "../../api/_lib/production-reporting-materialize";
 import { canonicalJson } from "../../src/lib/domain/productionReporting";
-import { BLANK_ORDER, copyAll, publish, rpc, step, type Db, type FlowCtx, type Site } from "./reportingPublication";
-import { failFast } from "./reportingRebuildRepair";
-import { boundReadQuery, CASE_SQL, dependencyTransaction, insertDependencyFixtures, MIGRATION_0041, rawView, type DependencyBaseEvidence, type EmitCtx, type FixtureRow, type RawView } from "./reportingDependencyRehearsal";
+import { BLANK_ORDER, copyAll, migrationBody, publish, rpc, step, type Db, type FlowCtx, type Site } from "./reportingPublication";
+import { bodyHashes, failFast, fileIdentity } from "./reportingRebuildRepair";
+import { boundReadQuery, CASE_SQL, dependencyTransaction, functionBody, insertDependencyFixtures, MIGRATION_0041, rawView, stripSqlComments, type DependencyBaseEvidence, type EmitCtx, type FixtureRow, type RawView } from "./reportingDependencyRehearsal";
 
 export const DIAG_PREFIX = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON, TIMING OFF) ";
 export const MAX_EXPLAINS = 24;
@@ -107,6 +107,26 @@ export function summarizePlan(explain: unknown): PlanSummary {
   const num = (v: unknown) => (typeof v === "number" ? v : null);
   return { planningMs: num(top["Planning Time"]), executionMs: num(top["Execution Time"]), rootRows: num(root["Actual Rows"]), settings: top.Settings ?? {}, nodes, truncated };
 }
+/**
+ * Rows each reporting relation's scans read, over the WHOLE plan (not the
+ * 80-node summary): (actual rows + rows removed by its own filter/recheck) x
+ * loops, summed per relation. The overlay (batch_events) is reported, never
+ * assumed bounded.
+ */
+export function relationReads(explain: unknown): Record<string, number> {
+  const top = (Array.isArray(explain) ? explain[0] : explain) as Record<string, unknown> | undefined;
+  const root = top?.Plan as PlanNode | undefined;
+  if (!root) throw new Error("EXPLAIN returned no JSON plan");
+  const out: Record<string, number> = {};
+  const n = (v: unknown) => (typeof v === "number" ? v : 0);
+  const walk = (p: PlanNode) => {
+    const rel = p["Relation Name"];
+    if (typeof rel === "string") out[rel] = (out[rel] ?? 0) + (n(p["Actual Rows"]) + n(p["Rows Removed by Filter"]) + n(p["Rows Removed by Index Recheck"])) * n(p["Actual Loops"]);
+    for (const k of p.Plans ?? []) walk(k);
+  };
+  walk(root);
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Independent expectations and exact comparison
@@ -164,7 +184,7 @@ export function expectedStreamCount(view: RawView, staff: string, direction: "be
 // Evidence and the fixed case matrix
 // ---------------------------------------------------------------------------
 
-export interface ProbeEvidence { statement: Statement; batch: "rebuild" | "refresh"; page: string; limit: number; cursor: unknown; expectedRows: number; actualRows: number | null; plan: PlanSummary }
+export interface ProbeEvidence { statement: string; batch: "rebuild" | "refresh"; page: string; limit: number; cursor: unknown; expectedRows: number; actualRows: number | null; reads: Record<string, number>; plan: PlanSummary }
 export interface PlanEvidence extends DependencyBaseEvidence {
   label: string;
   fullVolume: Record<string, unknown> | null;
@@ -215,12 +235,14 @@ export function planFixtures(staff: string, raw: string): { before: FixtureRow[]
   return { before: [r("dr-pm-1", raw, "01:00"), r("dr-pm-3", raw, "01:10"), r("dr-pe", BLANK_ORDER, "01:20")], inserted: [r("dr-pm-2", raw, "01:05")] };
 }
 
-export interface PlanCaseEnv { text0041: string; ev: PlanEvidence }
+/** `statements`/`names` (0042 follow-up only) replace the three slots' SQL and their recorded names; the matrix is unchanged. */
+export interface PlanCaseEnv { text0041: string; ev: PlanEvidence; statements?: Record<Statement, string>; names?: Record<Statement, string> }
 /** The fixed diagnostic (all inside the caller's rolled-back transaction). */
 export async function runPlanCases(c: Db, ctx: FlowCtx, env: PlanCaseEnv): Promise<void> {
   const { ev } = env;
   const [A, B] = ctx.sites;
-  const st = diagnosticStatements(env.text0041);
+  const st = env.statements ?? diagnosticStatements(env.text0041);
+  const name = (s: Statement) => env.names?.[s] ?? s;
   const plain = async (s: Statement, params: unknown[]) => {
     await ctx.as(c, true);
     const r = await c.query(st[s], params);
@@ -228,14 +250,14 @@ export async function runPlanCases(c: Db, ctx: FlowCtx, env: PlanCaseEnv): Promi
     return r.rows;
   };
   const explain = async (id: string, s: Statement, batch: "rebuild" | "refresh", page: string, params: unknown[], limit: number, cursor: unknown, expectedRows: number) =>
-    step(c, ctx, id, `EXPLAIN ANALYZE ${s} (${batch}, ${page})`, async () => {
+    step(c, ctx, id, `EXPLAIN ANALYZE ${name(s)} (${batch}, ${page})`, async () => {
       if (ev.explains >= MAX_EXPLAINS) throw new Error(`more than ${MAX_EXPLAINS} explained executions`);
       ev.explains++;
       await ctx.as(c, true);
       const r = await c.query(DIAG_PREFIX + st[s], params);
       await ctx.as(c, false);
       const plan = summarizePlan(r.rows[0]?.["QUERY PLAN"]);
-      ev.probes[id] = { statement: s, batch, page, limit, cursor, expectedRows, actualRows: plan.rootRows, plan };
+      ev.probes[id] = { statement: name(s), batch, page, limit, cursor, expectedRows, actualRows: plan.rootRows, reads: relationReads(r.rows[0]?.["QUERY PLAN"]), plan };
       if (plan.rootRows !== expectedRows) throw new Error(`the explained statement returned ${String(plan.rootRows)} rows, expected ${expectedRows}`);
       return plan;
     }, (p) => `${String(p.rootRows)} rows; planning ${String(p.planningMs)} ms, execution ${String(p.executionMs)} ms`);
@@ -358,6 +380,95 @@ export async function diagnoseDependencyPlans(raw: Db, ctxIn: PlanCtx, deps: Pla
   const text41 = deps.read(MIGRATION_0041).toString("utf8");
   await dependencyTransaction(raw, ctxIn, deps.read, ev, explainAllowlist(text41), (c, ctx, t) => deps.cases(c, ctx, { text0041: t.text41, ev }), "the diagnostic transaction rolled back (0040/0041 not installed)");
   const missing = planEvidenceProblems(ev);
+  if (missing.length) throw new Error(missing.join("; "));
+  ev.complete = true;
+  failFast(ctxIn).emit(ev);
+  return ev;
+}
+
+// ---------------------------------------------------------------------------
+// Task 14 0042 follow-up (prepared; NOT run by the coder)
+//
+//   npm run staging:reporting-jobs -- --diagnose-access-paths --sites=uk,us
+//
+// The SAME guarded lifecycle, skeleton (D0..D3, D9) and fixed 20-explain case
+// matrix as T14S3, with the exact 0042 draft ALSO applied inside the one
+// rolled-back transaction (A0) and verified (A1). The three statement slots:
+//   members-original  -> the bound 0041 member SELECT (the T14S3 baseline)
+//   members-split     -> the bound 0042 member SELECT (per-owner keyed lookups)
+//   stream            -> the bound 0042 stream SELECT (branch-local limits)
+// Every probe records rows read per relation (relationReads). The refresh
+// overlay (batch_events) is measured, not assumed bounded: its stream branch
+// still filters the frozen overlay of the batch on JSON staff/created_at.
+// COMPLETE means the evidence was collected, NOT that performance is accepted.
+// ---------------------------------------------------------------------------
+
+export const MIGRATION_0042 = "supabase/migrations/0042_reporting_access_paths.sql";
+/** The exact reviewed 0042 draft (LF sha256); any edit must update this pin and its test. */
+export const REVIEWED_0042_LF = "94440fc06582c8c5c68455d8f7e59cb36f40bec4e0c1b2af1955e13dc56ecbf0";
+export const ACCESS_NAMES: Record<Statement, string> = { "members-original": "members-0041", "members-split": "members-0042", stream: "stream-0042" };
+export const ACCESS_FUNCTIONS = ["read_reporting_owner_members", "read_reporting_staff_stream"] as const;
+export function accessStatements(text0041: string, text0042: string): Record<Statement, string> {
+  return { "members-original": boundReadQuery(text0041, "read_reporting_owner_members"), "members-split": boundReadQuery(text0042, "read_reporting_owner_members"), stream: boundReadQuery(text0042, "read_reporting_staff_stream") };
+}
+export const accessAllowlist = (text0041: string, text0042: string): Set<string> => new Set(Object.values(accessStatements(text0041, text0042)).map((q) => DIAG_PREFIX + q));
+/** 0042 must be exactly the two same-signature replacements plus their restated grants. */
+export function accessBodyProblems(body: readonly string[]): string[] {
+  const want = [
+    "CREATE OR REPLACE FUNCTION public.read_reporting_owner_members(p_batch uuid, p_fence bigint, p_owners jsonb, p_after_index integer, p_after_event_id text, p_limit integer DEFAULT 1000)",
+    "CREATE OR REPLACE FUNCTION public.read_reporting_staff_stream(p_batch uuid, p_fence bigint, p_staff uuid, p_direction text, p_at timestamptz, p_at_event_id text, p_limit integer DEFAULT 200)",
+    "REVOKE ALL ON FUNCTION public.read_reporting_owner_members(uuid, bigint, jsonb, integer, text, integer) FROM PUBLIC, anon, authenticated",
+    "REVOKE ALL ON FUNCTION public.read_reporting_staff_stream(uuid, bigint, uuid, text, timestamptz, text, integer) FROM PUBLIC, anon, authenticated",
+    "GRANT EXECUTE ON FUNCTION public.read_reporting_owner_members(uuid, bigint, jsonb, integer, text, integer) TO service_role",
+    "GRANT EXECUTE ON FUNCTION public.read_reporting_staff_stream(uuid, bigint, uuid, text, timestamptz, text, integer) TO service_role",
+  ];
+  if (body.length !== want.length) return [`0042 has ${body.length} statements, expected ${want.length}`];
+  return body.flatMap((s, i) => ((stripSqlComments(s) ?? "").trimStart().startsWith(want[i]) ? [] : [`0042 statement ${i + 1} is not: ${want[i].slice(0, 80)}`]));
+}
+export const REQUIRED_ACCESS_CASES = [...REQUIRED_PLAN_CASES, "A0", "A1"] as const;
+export const newAccessEvidence = (): PlanEvidence => ({
+  ...newPlanEvidence(),
+  label: "0042 access-path follow-up: 0040+0041+0042 applied inside a rolled-back transaction; slots members-original = 0041 members (baseline), members-split = 0042 members, stream = 0042 stream; EXPLAIN ANALYZE (TIMING OFF) single observations on the full original source; reads = rows read per relation; the refresh overlay (batch_events) branch is measured, not claimed bounded; COMPLETE means evidence collected, not accepted performance",
+});
+export interface AccessDeps extends PlanDeps { pin?: string }
+export const DEFAULT_ACCESS_DEPS: AccessDeps = DEFAULT_PLAN_DEPS;
+
+/** D0..D3 (0040/0041) via the shared skeleton, then A0/A1 (the exact 0042), then the fixed cases; always rolled back. */
+export async function diagnoseAccessPaths(raw: Db, ctxIn: PlanCtx, deps: AccessDeps = DEFAULT_ACCESS_DEPS): Promise<PlanEvidence> {
+  const ev = newAccessEvidence();
+  const text41 = deps.read(MIGRATION_0041).toString("utf8");
+  const id42 = fileIdentity(MIGRATION_0042, deps.read);
+  const text42 = deps.read(MIGRATION_0042).toString("utf8");
+  const body42 = migrationBody(text42);
+  // Refused before BEGIN: an unreviewed 0042 file or an unexpected statement list.
+  const pin = deps.pin ?? REVIEWED_0042_LF;
+  if (id42.lf !== pin && id42.crlf !== pin) throw new Error(`0042 is not the reviewed draft (${id42.lf})`);
+  const shape = accessBodyProblems(body42);
+  if (shape.length) throw new Error(shape.join("; "));
+  await dependencyTransaction(raw, ctxIn, deps.read, ev, accessAllowlist(text41, text42), async (c, ctx, t) => {
+    await step(c, ctx, "A0", "apply the exact 0042 draft (parsed body) after 0040/0041 inside the rolled-back transaction", async () => {
+      for (const sql of body42) await c.query(sql);
+      ev.files.push(id42);
+      ev.statementsApplied += body42.length;
+    }, () => `${body42.length} statements (${id42.lf.slice(0, 12)}…)`);
+    await step(c, ctx, "A1", "effective functions: the two 0042 bodies, the other reads still 0041, all SECURITY INVOKER, empty search_path, service-only", async () => {
+      const rows = (await c.query(CASE_SQL.effective)).rows;
+      ev.functions.effective0042 = rows;
+      const p: string[] = [];
+      if (rows.length !== 7) p.push(`${rows.length} functions found, expected 7`);
+      for (const r of rows) {
+        const nm = String(r.name);
+        if (nm === "frozen_read_batch") continue;
+        const src = (ACCESS_FUNCTIONS as readonly string[]).includes(nm) ? text42 : t.text41;
+        if (!bodyHashes(functionBody(src, `public.${nm}`)).includes(String(r.body_md5))) p.push(`${nm} body is not the ${src === text42 ? "0042" : "0041"} one`);
+        if (r.definer !== false || r.config !== 'search_path=""' || r.anon !== false || r.authenticated !== false || r.service !== true) p.push(`${nm} security ${JSON.stringify(r)}`);
+      }
+      if (p.length) throw new Error(p.join("; "));
+      ctx.emit(ev);
+    });
+    await deps.cases(c, ctx, { text0041: t.text41, ev, statements: accessStatements(t.text41, text42), names: ACCESS_NAMES });
+  }, "the access-path transaction rolled back (0040/0041/0042 not installed)", body42);
+  const missing = [...REQUIRED_ACCESS_CASES.filter((id) => !ev.recorded.includes(id)).map((id) => `required case ${id} was not recorded`), ...planEvidenceProblems(ev)];
   if (missing.length) throw new Error(missing.join("; "));
   ev.complete = true;
   failFast(ctxIn).emit(ev);

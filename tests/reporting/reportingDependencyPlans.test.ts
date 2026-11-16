@@ -11,7 +11,9 @@ import { runCaptureLifecycle } from "../staging/reportingCapture";
 import {
   comparePages, DIAG_PREFIX, diagnoseDependencyPlans, diagnosticStatements, EXPLAIN_CASES, expectedMembers, expectedStreamCount, explainAllowlist, MAX_EXPLAINS, memberPage, newPlanEvidence, OR_CANDIDATE, OR_MIRROR,
   PLAN_SQL, planEvidenceProblems, REQUIRED_PLAN_CASES, runPlanCases, smallLimit, SPLIT_CANDIDATE, SPLIT_MIRROR, splitMembersSql, summarizePlan, type MemberRow, type PlanCtx, type PlanDeps, type PlanEvidence,
+  ACCESS_FUNCTIONS, ACCESS_NAMES, accessAllowlist, accessBodyProblems, accessStatements, diagnoseAccessPaths, MIGRATION_0042, relationReads, REQUIRED_ACCESS_CASES, REVIEWED_0042_LF,
 } from "../staging/reportingDependencyPlans";
+import { fileIdentity } from "../staging/reportingRebuildRepair";
 import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, executesExplain, planSql, stripSqlComments, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
 import { compareFullState, migrationBody, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type Observation } from "../staging/reportingPublication";
 import { bodyHashes, FUNCTION_SQL, publishBody } from "../staging/reportingRebuildRepair";
@@ -19,6 +21,9 @@ import { bodyHashes, FUNCTION_SQL, publishBody } from "../staging/reportingRebui
 const read = (p: string) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 const T41 = read(MIGRATION_0041);
 const ST = diagnosticStatements(T41);
+const T42 = read(MIGRATION_0042);
+const AS = accessStatements(T41, T42);
+const B42 = migrationBody(T42);
 const S = "11111111-1111-4111-8111-111111111111";
 const S2 = "22222222-2222-4222-8222-222222222222";
 
@@ -39,7 +44,7 @@ describe("T14S3: argument and dispatch wiring", () => {
     expect(pub).toMatch(/const allow = mode === "committed-interleavings" && own \? committedAllowance\(own\) : ROLLBACK_ONLY;/);
     expect(pub).toContain('const out = `staging-results-reporting-publication-${mode}-'); // unique per run; never overwrites the earlier reports
     const main = runner.slice(runner.indexOf("async function main()"));
-    expect(main).toMatch(/f === "--diagnose-dependency-plans"\)\) return publicationMain\(flags\);/);
+    expect(main).toMatch(/f === "--diagnose-dependency-plans"( \|\| f === "--diagnose-access-paths")?\)\) return publicationMain\(flags\);/); // + the 0042 follow-up flag
     expect(main).toContain("--diagnose-dependency-plans --sites=A,B [--max-pages=N]");
   });
   it("is never COMPLETE without complete plan evidence; other modes unchanged", () => {
@@ -222,7 +227,7 @@ describe("T14S3: fixed case matrix and evidence", () => {
 // ---------------------------------------------------------------------------
 
 type Img = Record<string, unknown> & { id: string; location: string; order_number: string | null; staff_id: string | null; created_at: string };
-type Fail = Partial<Record<"splitFirstDrop" | "splitReordered" | "explainRows" | "rollbackFails" | "alreadyApplied" | "candidateDiffers" | "streamShort", boolean>>;
+type Fail = Partial<Record<"splitFirstDrop" | "splitReordered" | "explainRows" | "rollbackFails" | "alreadyApplied" | "candidateDiffers" | "streamShort" | "stale42", boolean>>;
 function scriptedDb(fail: Fail = {}) {
   const sent: string[] = [];
   const t40 = read(MIGRATION_0040);
@@ -245,9 +250,21 @@ function scriptedDb(fail: Fail = {}) {
     return xs.slice(0, fail.streamShort ? Math.max(0, limit - 995) : limit).map((e) => ({ event_id: e.id, image: src.get(e.id) }));
   };
   let batch = 0;
+  let applied42 = false;
   const db: Db = {
     query: async (sql: string, params: unknown[] = []) => {
       sent.push(sql);
+      if (B42.includes(sql) && sql.startsWith("CREATE OR REPLACE FUNCTION")) applied42 = true;
+      if (sql === CASE_SQL.effective && applied42) {
+        const r = ["frozen_read_batch", "list_reporting_owners", "read_reporting_changed_keys", "read_reporting_children", "read_reporting_events_by_id", "read_reporting_owner_members", "read_reporting_staff_stream"].map((name) => ({ name, body_md5: bodyHashes(name === "frozen_read_batch" ? functionBody(t40, "reporting_private.frozen_read_batch") : functionBody((ACCESS_FUNCTIONS as readonly string[]).includes(name) && !fail.stale42 ? T42 : T41, `public.${name}`))[0], definer: false, config: 'search_path=""', anon: false, authenticated: false, service: true }));
+        return { rows: r, rowCount: r.length };
+      }
+      if (sql === AS["members-split"]) return { rows: members(params), rowCount: 0 };
+      if (sql === AS.stream) return { rows: stream(params), rowCount: 0 };
+      if (sql.startsWith(DIAG_PREFIX) && sql.slice(DIAG_PREFIX.length) === AS.stream) {
+        const n = stream(params).length;
+        return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Limit", "Actual Rows": n, Plans: [{ "Node Type": "Index Scan", "Relation Name": "source_candidate", "Actual Rows": n, "Actual Loops": 1 }, { "Node Type": "Seq Scan", "Relation Name": "batch_events", "Actual Rows": 1, "Rows Removed by Filter": 3, "Actual Loops": 1 }] }, "Planning Time": 0.1, "Execution Time": 2 }] }], rowCount: 1 };
+      }
       const rows = (r: Array<Record<string, unknown>>) => ({ rows: r, rowCount: r.length });
       if (sql === "rollback" && fail.rollbackFails) throw new Error("connection terminated");
       if (sql === FUNCTION_SQL) return rows([{ body_md5: b39, security_definer: false, service_exec: true, authenticated_exec: false, anon_exec: false }]);
@@ -458,5 +475,107 @@ describe("T14S3 review 2: comments can never hide ANALYZE or a statement's kind"
     const g = dependencyGuard(db, new Set(body), [], allow);
     for (const q of [...allow, ...body]) await g.query(q);
     expect(sent).toHaveLength(allow.size + body.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 14: the 0042 access-path follow-up (prepared; NOT run)
+// ---------------------------------------------------------------------------
+
+describe("Task 14 0042 follow-up: wiring, pin, statements and allowlist", () => {
+  it("--diagnose-access-paths takes exactly --sites=A,B; the runner dispatches it in the guarded lifecycle; COMPLETE only with complete evidence", () => {
+    expect(parsePublicationArgs(["--diagnose-access-paths", "--sites=uk,us"])).toMatchObject({ mode: "diagnose-access-paths", sites: ["uk", "us"], problems: [] });
+    for (const argv of [["--diagnose-access-paths", "--site=uk"], ["--diagnose-access-paths", "--diagnose-dependency-plans", "--sites=uk,us"]]) expect(parsePublicationArgs(argv).mode).toBeNull();
+    const runner = read("tests/staging/reporting-jobs.ts");
+    const pub = runner.slice(runner.indexOf("async function publicationMain"), runner.indexOf("async function main()"));
+    expect(pub.indexOf("before = await fullState(main);")).toBeLessThan(pub.indexOf('if (mode === "diagnose-access-paths") {'));
+    expect(pub).toMatch(/await diagnoseAccessPaths\(main, \{ sites, maxPages, staff, as, record, redact: redactSecrets, now: \(\) => performance\.now\(\), emit: \(ev\) => \{ report\.accessPaths = ev as unknown as Record<string, unknown>; save\(\); \} \}\);\n\s+return;/);
+    expect(runner.slice(runner.indexOf("async function main()"))).toContain('f === "--diagnose-access-paths")) return publicationMain(flags);');
+    const r = newPublicationReport("diagnose-access-paths", ["uk", "us"], "rev", "t0", "sha");
+    Object.assign(r, { finishedAt: "t1", restorationVerified: true, observations: [{ id: "D0", what: "x", expected: "y", result: "ok", ok: true, ms: 0 }] });
+    expect(publicationStatus(r)).toBe("STATUS: FAILED – 0042 access-path evidence is missing or incomplete");
+    r.accessPaths = { complete: true };
+    expect(publicationStatus(r)).toBe("STATUS: COMPLETE");
+  });
+  it("the pin is the current 0042 file; the body is exactly the two replacements and their restated grants", () => {
+    expect(fileIdentity(MIGRATION_0042).lf).toBe(REVIEWED_0042_LF);
+    expect(accessBodyProblems(B42)).toEqual([]);
+    expect(accessBodyProblems([...B42, "CREATE INDEX x ON y (z)"])).toEqual(["0042 has 7 statements, expected 6"]);
+    expect(accessBodyProblems(B42.map((s, i) => (i === 1 ? s.replace("read_reporting_staff_stream", "read_reporting_children") : s)))[0]).toMatch(/statement 2/);
+  });
+  it("the slots: members-original = 0041 members, members-split = 0042 members, stream = 0042 stream; exactly three allowlisted EXPLAINs", () => {
+    expect(AS["members-original"]).toBe(ST["members-original"]);
+    expect(AS["members-split"]).toBe(boundReadQuery(T42, "read_reporting_owner_members"));
+    expect(AS.stream).toBe(boundReadQuery(T42, "read_reporting_staff_stream"));
+    expect(AS["members-split"]).not.toBe(AS["members-original"]);
+    expect(AS.stream).not.toBe(ST.stream);
+    expect([...accessAllowlist(T41, T42)].sort()).toEqual(Object.values(AS).map((q) => DIAG_PREFIX + q).sort());
+    expect(ACCESS_NAMES).toEqual({ "members-original": "members-0041", "members-split": "members-0042", stream: "stream-0042" });
+  });
+  it("the guard runs the exact 0042 statements only when the follow-up passes them; the T14S3 guard still refuses them", async () => {
+    const db: Db = { query: async () => ({ rows: [], rowCount: 0 }) };
+    const body41 = migrationBody(T41);
+    await expect(dependencyGuard(db, new Set(body41)).query(B42[0])).rejects.toThrow(/refuses/);
+    const g = dependencyGuard(db, new Set([...body41, ...B42]));
+    for (const q of B42) await g.query(q);
+    await expect(g.query("CREATE INDEX x ON reporting_private.batch_events (event_id)")).rejects.toThrow(/refuses/);
+  });
+  it("relationReads sums (rows + removed by filter/recheck) x loops per relation over the whole plan", () => {
+    const plan = [{ Plan: { "Node Type": "Limit", "Actual Rows": 5, Plans: [
+      { "Node Type": "Index Scan", "Relation Name": "source_candidate", "Actual Rows": 4, "Rows Removed by Filter": 1, "Actual Loops": 3 },
+      { "Node Type": "Seq Scan", "Relation Name": "batch_events", "Actual Rows": 2, "Rows Removed by Filter": 40, "Actual Loops": 1, Plans: [{ "Node Type": "Bitmap Heap Scan", "Relation Name": "source_candidate", "Actual Rows": 1, "Rows Removed by Index Recheck": 1, "Actual Loops": 2 }] },
+      { "Node Type": "Index Scan", "Relation Name": "source_current", "Actual Loops": 0 },
+    ] } }];
+    expect(relationReads(plan)).toEqual({ source_candidate: 19, batch_events: 42, source_current: 0 });
+    expect(() => relationReads([{}])).toThrow(/no JSON plan/);
+  });
+});
+
+describe("Task 14 0042 follow-up end to end (real cases over a scripted database)", () => {
+  it("success: refusals before BEGIN, 0040/0041 then 0042 inside, effective 0042 bodies, 20 allowlisted explains with per-relation reads, ROLLBACK; COMPLETE", async () => {
+    const s = scriptedDb();
+    const t = planCtx();
+    const ev = await diagnoseAccessPaths(s.db, t.ctx, realDeps());
+    const begin = s.sent.indexOf("begin");
+    expect(s.sent.slice(0, begin)).toEqual([FUNCTION_SQL, CASE_SQL.absent, CASE_SQL.collisions]);
+    const at42 = s.sent.indexOf(B42[0]);
+    expect(at42).toBeGreaterThan(s.sent.indexOf(CASE_SQL.indexes)); // after D3
+    expect(s.sent.slice(at42, at42 + B42.length)).toEqual(B42);
+    expect(s.sent.at(-1)).toBe("rollback");
+    expect(s.sent.some((q) => /^\s*(commit|end)\b/i.test(q))).toBe(false);
+    const explains = s.sent.filter((q) => /^\s*explain/i.test(q));
+    expect(explains).toHaveLength(20);
+    const allow = accessAllowlist(T41, T42);
+    expect(explains.every((q) => allow.has(q))).toBe(true);
+    expect(ev.complete).toBe(true);
+    expect(REQUIRED_ACCESS_CASES.every((id) => ev.recorded.includes(id))).toBe(true);
+    expect(t.recorded.map((o) => o.id).slice(0, 6)).toEqual(["D0", "D1", "D2", "D3", "A0", "A1"]);
+    expect(ev.files.map((f) => f.path).at(-1)).toBe(MIGRATION_0042);
+    expect(ev.statementsApplied).toBe(25 + 6 + 6);
+    expect(ev.probes["E-rb-ms-1"].statement).toBe("members-0042");
+    expect(ev.probes["E-rb-mo-1"].statement).toBe("members-0041");
+    expect(ev.probes["E-rf-sa-1"].statement).toBe("stream-0042");
+    expect(ev.probes["E-rf-sa-1"].reads.batch_events).toBe(4); // the overlay branch is measured
+    expect(ev.label).toMatch(/overlay \(batch_events\) branch is measured, not claimed bounded/);
+  });
+  it("refuses before BEGIN on an unreviewed 0042 file", async () => {
+    const s = scriptedDb();
+    await expect(diagnoseAccessPaths(s.db, planCtx().ctx, { ...realDeps(), pin: "0".repeat(64) })).rejects.toThrow(/0042 is not the reviewed draft/);
+    expect(s.sent).toEqual([]);
+  });
+  it("A1 refuses when the effective functions are not the 0042 bodies; rolls back and is never complete", async () => {
+    const s = scriptedDb({ stale42: true });
+    const t = planCtx();
+    await expect(diagnoseAccessPaths(s.db, t.ctx, realDeps())).rejects.toThrow(/A1 failed/);
+    expect(s.sent.at(-1)).toBe("rollback");
+    expect(t.emitted.every((e) => !e.complete)).toBe(true);
+  });
+  it("is never complete when the cases record nothing", async () => {
+    const s = scriptedDb();
+    await expect(diagnoseAccessPaths(s.db, planCtx().ctx, realDeps({ cases: async () => undefined }))).rejects.toThrow(/not recorded/);
+    expect(s.sent.at(-1)).toBe("rollback");
+  });
+  it("the functions under test are the two 0042 replacements", () => {
+    expect(ACCESS_FUNCTIONS).toEqual(["read_reporting_owner_members", "read_reporting_staff_stream"]);
   });
 });

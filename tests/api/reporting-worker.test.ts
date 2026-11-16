@@ -784,10 +784,10 @@ describe("Task 15 schedule and migration", () => {
     expect(c).not.toMatch(/public\.production_events/);
     expect(c).toContain("FOR UPDATE");
   });
-  it("no existing migration changed; 0042 is still unallocated (reserved for an evidence-backed fix)", () => {
+  it("no existing migration changed; 0042 is the evidence-backed Task 14 access-path fix it was reserved for", () => {
     const { readdirSync } = require("node:fs") as typeof import("node:fs");
     const names = readdirSync("supabase/migrations").filter((n: string) => n.endsWith(".sql")).sort();
-    expect(names.filter((n: string) => n.startsWith("0042"))).toEqual([]);
+    expect(names.filter((n: string) => n.startsWith("0042"))).toEqual(["0042_reporting_access_paths.sql"]);
     expect(names).toContain("0043_reporting_worker_state.sql");
   });
 });

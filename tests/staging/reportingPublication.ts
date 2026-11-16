@@ -42,7 +42,7 @@ import { isAdminTermination, type ArmedTermination, type ConnectionWatch, type L
 
 export const MIGRATION_0038 = "supabase/migrations/0038_reporting_jobs.sql";
 export type Site = "au" | "uk" | "us";
-export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings" | "explain-source-versions" | "rehearse-rebuild-repair" | "rehearse-dependency-reads" | "diagnose-dependency-plans";
+export type PublicationMode = "baseline-smoke" | "rehearse-migration" | "check-installed" | "interleavings" | "committed-interleavings" | "explain-source-versions" | "rehearse-rebuild-repair" | "rehearse-dependency-reads" | "diagnose-dependency-plans" | "diagnose-access-paths";
 export interface Db {
   query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>>; rowCount: number | null }>;
 }
@@ -53,14 +53,14 @@ export interface Db {
 
 export function parsePublicationArgs(argv: readonly string[]): { mode: PublicationMode | null; sites: [Site, Site] | null; maxPages: number; problems: string[] } {
   const problems: string[] = [];
-  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings", "--explain-source-versions", "--rehearse-rebuild-repair", "--rehearse-dependency-reads", "--diagnose-dependency-plans"].includes(a));
+  const modes = argv.filter((a) => ["--baseline-smoke", "--rehearse-migration", "--check-installed", "--interleavings", "--committed-interleavings", "--explain-source-versions", "--rehearse-rebuild-repair", "--rehearse-dependency-reads", "--diagnose-dependency-plans", "--diagnose-access-paths"].includes(a));
   const explain = modes.length === 1 && modes[0] === "--explain-source-versions";
   // The plan diagnostic takes ONE site (--site=X); every other mode takes two (--sites=A,B).
   const sitesArg = explain ? undefined : argv.find((a) => a.startsWith("--sites="));
   const siteArg = explain ? argv.find((a) => a.startsWith("--site=")) : undefined;
   const pagesArg = argv.find((a) => a.startsWith("--max-pages="));
   const unknown = argv.filter((a) => a.startsWith("--") && !modes.includes(a) && a !== sitesArg && a !== siteArg && a !== pagesArg);
-  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings, --explain-source-versions, --rehearse-rebuild-repair, --rehearse-dependency-reads, --diagnose-dependency-plans");
+  if (modes.length !== 1) problems.push("choose exactly one of --baseline-smoke, --rehearse-migration, --check-installed, --interleavings, --committed-interleavings, --explain-source-versions, --rehearse-rebuild-repair, --rehearse-dependency-reads, --diagnose-dependency-plans, --diagnose-access-paths");
   if (unknown.length) problems.push(`unknown flags: ${unknown.join(" ")}`);
   const supported = (s: string) => s === "au" || s === "uk" || s === "us";
   const one = siteArg?.slice("--site=".length) ?? "";
@@ -170,12 +170,14 @@ export interface PublicationReport extends LifecycleReport {
   dependency: Record<string, unknown> | null;
   /** --diagnose-dependency-plans only (T14S3): exact-SELECT EXPLAIN ANALYZE summaries, parity comparisons and counts (no source payloads). */
   dependencyPlans: Record<string, unknown> | null;
+  /** --diagnose-access-paths only (Task 14 0042 follow-up): the same plan evidence with 0042 applied, plus rows read per relation (no source payloads). */
+  accessPaths: Record<string, unknown> | null;
   /** T13B2b-22: durable run evidence persisted DURING the run (I4 worker ownership before work, incremental monitor samples). */
   evidence: Array<Record<string, unknown>>;
 }
 
 export function newPublicationReport(mode: PublicationMode, sites: [Site, Site], revision: string, startedAt: string, draftSha256: string): PublicationReport {
-  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, repair: null, dependency: null, dependencyPlans: null, evidence: [], errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
+  return { mode, sites, revision, startedAt, draftSha256, statementsApplied: null, settings: "", catalogProblems: [], observations: [], cleanup: [], ownership: null, diagnostic: null, repair: null, dependency: null, dependencyPlans: null, accessPaths: null, evidence: [], errors: [], finishedAt: "", restorationVerified: null, restoration: null, restorationProblems: [] };
 }
 
 /** One STATUS line: COMPLETE only with every observation as expected, no error/cleanup failure and a verified restoration. */
@@ -187,6 +189,8 @@ export function publicationStatus(r: PublicationReport): string {
   if (r.mode === "rehearse-dependency-reads" && r.dependency?.complete !== true) all.push("dependency-read evidence is missing or incomplete");
   // T14S3: COMPLETE only with every required measurement/comparison (it means evidence collected, not acceptable performance).
   if (r.mode === "diagnose-dependency-plans" && r.dependencyPlans?.complete !== true) all.push("dependency-plan evidence is missing or incomplete");
+  // Task 14 0042 follow-up: likewise; COMPLETE is evidence collected, never accepted performance.
+  if (r.mode === "diagnose-access-paths" && r.accessPaths?.complete !== true) all.push("0042 access-path evidence is missing or incomplete");
   if (r.restorationVerified !== true && !all.some((x) => x.startsWith("restoration not verified"))) all.push("restoration not verified");
   return all.length ? `STATUS: FAILED – ${all[0]}${all.length > 1 ? ` (+${all.length - 1} more)` : ""}` : "STATUS: COMPLETE";
 }
@@ -217,6 +221,7 @@ export function publicationMarkdown(r: PublicationReport): string {
     ...(r.repair ? ["## 0039 rebuild-repair rehearsal (rolled back; not installed)", "", "```json", JSON.stringify(r.repair, null, 2), "```", ""] : []),
     ...(r.dependency ? ["## 0040 + 0041 dependency-read rehearsal (rolled back; not installed)", "", `- ${String(r.dependency.label)}`, "", "```json", JSON.stringify(r.dependency, null, 2), "```", ""] : []),
     ...(r.dependencyPlans ? ["## 0040 + 0041 access-path diagnostic (rolled back; not installed)", "", `- ${String(r.dependencyPlans.label)}`, "", "```json", JSON.stringify(r.dependencyPlans, null, 2), "```", ""] : []),
+    ...(r.accessPaths ? ["## 0040 + 0041 + 0042 access-path follow-up (rolled back; not installed)", "", `- ${String(r.accessPaths.label)}`, "", "```json", JSON.stringify(r.accessPaths, null, 2), "```", ""] : []),
     ...(r.diagnostic ? ["## Plan diagnostic (source_versions INSERT; plan only, rolled back)", "", `- ${String(r.diagnostic.label)}`, "", "```json", JSON.stringify(r.diagnostic, null, 2), "```", ""] : []),
     ...(r.restorationProblems.length ? ["## Restoration problems", ...r.restorationProblems.map((p) => `- ${p}`), ""] : []),
     publicationStatus(r),
