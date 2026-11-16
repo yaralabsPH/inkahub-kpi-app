@@ -86,7 +86,13 @@ import handler from "../../api/reports/daily-digest";
 import { encodeV2, fakeEvidence, type FakeRpcArgs } from "../fixtures/fakeSupabaseEvents";
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
 
+/** The site's reporting status as get_reporting_job_status returns it: the existing (legacy) read path. */
+const legacyStatus = (site: unknown) => ({
+  data: [{ site, processor_enabled: false, read_mode: "legacy", capture_enabled: false, capture_epoch: 0, source_epoch: null, active_generation_id: null, active_batch_id: null, active_batch_state: null, active_batch_kind: null, lease_fence: 0, lease_expires_at: null, heartbeat_at: null, last_verified_cutoff: null, pending_changes: 0, oldest_pending_captured_at: null }],
+  error: null,
+});
 h.state.rpcImpl = (name, raw) => {
+  if (name === "get_reporting_job_status") return legacyStatus((raw as { p_site?: unknown }).p_site);
   if (name !== "load_production_evidence_v2") return { data: null, error: { message: `unexpected rpc ${name}` } };
   const args = raw as unknown as FakeRpcArgs;
   const rows = (h.state.tables.production_events ?? []).filter((r) => ["line_verified", "completed", "dispatched", "cancelled"].includes(String(r.event_type))) as unknown as ProductionEvidenceEvent[];
@@ -207,9 +213,10 @@ describe("digest counts use the shared F1 rules", () => {
       counts: { orders_today: 1, items_today: 5, staff_today: 2, rework_orders_today: 1, rework_items_today: 1 },
     });
 
-    // One evidence read for both days under one cutoff.
-    expect(h.state.rpcCalls).toHaveLength(1);
-    expect(h.state.rpcCalls[0].args).toEqual({
+    // One evidence read for both days under one cutoff (after the one read-mode lookup: legacy).
+    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(["get_reporting_job_status", "load_production_evidence_v2"]);
+    expect(h.state.rpcCalls[0].args).toEqual({ p_site: "uk" });
+    expect(h.state.rpcCalls[1].args).toEqual({
       p_site: "uk",
       p_start_utc: "2026-01-14T04:00:00.000Z",
       p_end_utc_exclusive: "2026-01-16T04:00:00.000Z",

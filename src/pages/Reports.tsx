@@ -21,7 +21,7 @@ import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard"
 import { ProductionCountStatus } from "@/components/ProductionCountStatus";
 import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
 import { usePublishedManagement } from "@/lib/hooks/usePublishedManagement";
-import { managementSource, publishedCsv, publishedDetailList, publishedOrders, publishedStatusLine, rawRangeFor, reportViewFromSummary } from "@/lib/domain/productionPublishedView";
+import { managementSource, publishedCsvHeader, publishedCsvLines, publishedDetailList, publishedOrders, publishedStatusLine, rawRangeFor, reportViewFromSummary } from "@/lib/domain/productionPublishedView";
 import {
   isProductionDate,
   isReportSite,
@@ -387,10 +387,18 @@ function SupabaseReports() {
     setExportError(null);
     setExporting(true);
     try {
-      // Complete pages or a typed refusal (view changed, page failure, no progress): never a partial file.
-      const rows = await pub.collectAll("raw-export", { limit: 1000 });
-      const csv = publishedCsv(rows, nameOf);
-      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      // Page-chunked: ONE BlobPart per validated page (the header, then each page as one CRLF-led chunk),
+      // never a string per row or a whole-file join. The Blob is created only after the WHOLE collection
+      // resolved - any typed refusal (view changed, page failure, revocation, no progress) rejects first and
+      // every buffered chunk is discarded: never a partial file.
+      const chunks: BlobPart[] = [publishedCsvHeader()];
+      await pub.collectAll("raw-export", {
+        limit: 1000,
+        onPage: (rows) => {
+          if (rows.length) chunks.push(`\r\n${publishedCsvLines(rows, nameOf).join("\r\n")}`);
+        },
+      });
+      const blob = new Blob(chunks, { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;

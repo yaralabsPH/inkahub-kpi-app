@@ -3060,3 +3060,40 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The legacy CSV over 100,000 rows now fails explicitly at the cap.
     - There is no DOM test dependency; page wiring is pinned by source contracts and pure adapters.
   - **Pending:** CJ applies 0044 on staging, then runs the staging browser checks (warnings, immediate worker confirmation with the worker job stopped, no new data exposure or false zeroes).
+- 2026-11-16 — **Task 18: digest and exports pinned to published generations (offline gate green; runtime/staging gate pending)** (Claude). Task 18 stays UNCHECKED: 0044 is still an unapplied draft (not modified by this task), and CJ's staging dry digests and browser checks are pending. No SQL was run, nothing was deployed or merged, and no test email was sent.
+  - **Digest (`api/reports/daily-digest.ts`):**
+    - It is now `createDigestHandler(deps)`, and the default export uses the real client, fetch and clock.
+    - S1 auth, method, recipient override and allowlist, the diagnostics, recipients, no-store and their precedence are unchanged and still first.
+    - The site's read mode comes from `get_reporting_job_status` (0038). Legacy and shadow keep the existing raw-evidence digest unchanged; an unreadable mode fails the digest rather than falling back.
+  - **In summary mode:**
+    - ONE generation is resolved through the internal `rpcPublishedReader` (no HTTP self-call) and must be published, complete, for this site and still in summary mode.
+    - A generation verified more than 30 minutes earlier is refused with 503 before any summary read, workbook or email.
+    - All 10 summary reads (2 days × all + 4 work types) are pinned to that `p_generation`. People are paged completely, and work-type totals that disagree with the day's breakdown fail the digest.
+    - The workbook prints the source cutoff (`as_of_utc`), `published_at_utc`, `rule_version`, `verified_at_utc`, `generation_id`, `source=published` and `operational_reads_as_of_utc`; the notes and email body add the same labels.
+  - **Operational reads:** clock rows (hours, staff on shift), the completion spans behind the hours fallback, and ledger boxes are bounded paged reads with their own cutoff. They are labelled "live operational reads … not from the published report", and their attendance and packaging definitions are kept.
+    - Known difference: in summary mode, a span-endpoint terminal is excluded when the bounded read holds a cancellation of it. Legacy uses the full reversal rules; this affects the hours fallback only, never counts.
+  - **Workbook ceiling:** an explicit `MAX_DIGEST_XLSX_BYTES` of 4 MiB in both modes, failing with 500 and nothing downloaded or emailed, never truncated.
+  - **Published CSV:**
+    - `collectAll` has a streamed `onPage` mode: bounded pages of at most 1,000 rows, a token per page, and all total/progress checks.
+    - Reports keeps one BlobPart per validated page (the header, then each page as one CRLF-led chunk), with no per-row parts and no whole-file join. The Blob is created only after the whole collection resolves, so a revocation, page failure, view change or lack of progress discards everything.
+    - There is no production_events read; raw quantity, timestamp, note and station come from the generation-pinned DTO.
+  - **Tests:**
+    - new `tests/reporting/pg/digest-published.test.ts` (6, real SQL): digest counts equal the app's live counter at the generation's cutoff across the Summary, Departments and Staff sheets; every summary read is pinned to the one expected `p_generation`, with a single active-generation lookup before the first read; operational reads are labelled; a newer worker save differs until the next publication, then agrees; a stale publication gives no workbook and no email; and the operator API and schema both refuse summary mode without a generation.
+    - new `tests/api/daily-digest-published.test.ts` (21): the mode gate, published refusals (none, incomplete, building, another site, a mode race, a failing read) in both dry and send runs, staleness at 31 and 30 minutes, inconsistent reads, the service-key requirement (RLS/context), the workbook ceiling, and S1 order. Two deliberate breaks (no staleness check, no ceiling) each failed it.
+    - existing `tests/api/daily-digest.test.ts`, `daily-digest-counts.test.ts` and `tests/production/item-counting-parity.test.ts`: their fixtures now answer the read-mode lookup with legacy, and their single-RPC assertions are tightened to [mode lookup, one evidence read].
+    - `tests/production/published-reporting.test.ts` and `published-view-adapter.test.ts`: streamed collection, mid-export revocation (403), page-chunk CSV equality, and the source contract.
+  - **Gate (current tree):**
+
+    | Check | Result |
+    |---|---|
+    | Focused Task 18 set | 9 files, 476/476 (before the final chunking edit) |
+    | Export files after the chunking edit | 61/61 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Full suite | 64 files, 2,128/2,128 |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Runtime limitations:**
+    - The browser CSV still holds the page chunks in memory until the download. There is no streaming file writer, and no page holds more than 1,000 rows.
+    - Digest timing on real data is unmeasured: 10 summary RPCs per digest.
+  - **Pending:** CJ applies 0044 on staging and puts a site in summary mode, downloads dry digests for three sites and verifies counts and cutoffs, then checks the negative auth and stale cases.

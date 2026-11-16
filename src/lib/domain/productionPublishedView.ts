@@ -167,7 +167,17 @@ const rawText = (v: unknown) => (v === null || v === undefined ? "" : typeof v =
  * own lookup. Any row of another kind is refused (never a silently different file).
  */
 export function publishedCsv(rows: readonly PublishedDetailRow[], nameOf: (staffId: string) => string): string {
-  const lines = rows.map((r) => {
+  return [publishedCsvHeader(), ...publishedCsvLines(rows, nameOf)].join("\r\n");
+}
+
+/** The published CSV's header line (the legacy export's columns). */
+export function publishedCsvHeader(): string {
+  return CSV_HEADERS.map(csvCell).join(",");
+}
+
+/** CSV lines for ONE page of raw-export rows (the export is built page by page; joined with CRLF). */
+export function publishedCsvLines(rows: readonly PublishedDetailRow[], nameOf: (staffId: string) => string): string[] {
+  return rows.map((r) => {
     if (r.kind !== "raw-export") throw new RangeError(`A published CSV holds raw-export rows only, not ${r.kind}`);
     const e = r.row;
     return [
@@ -180,9 +190,8 @@ export function publishedCsv(rows: readonly PublishedDetailRow[], nameOf: (staff
       e.eventType,
       e.stationId ?? "",
       (e.note ?? "").replace(/[\r\n]+/g, " "),
-    ];
+    ].map((c) => csvCell(String(c))).join(",");
   });
-  return [CSV_HEADERS, ...lines].map((r) => r.map((c) => csvCell(String(c))).join(",")).join("\r\n");
 }
 
 type DetailRowOf<K extends PublishedDetailRow["kind"]> = Extract<PublishedDetailRow, { kind: K }>["row"];

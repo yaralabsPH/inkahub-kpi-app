@@ -15,12 +15,22 @@
  * themselves. Anything else gets 401 before any other work. A cron-
  * identifying header or an app login is NOT authorization. GET only.
  *
- * Counts (F1) use the same code as the app: one production-evidence read
- * for the report day and the day before under one cutoff, the shared
- * reducer for Items/Orders/rework/coverage, and site production days that
- * start at 04:00 local. A full-site report needs the server credential
- * (SUPABASE_SERVICE_ROLE_KEY); without it the digest refuses rather than
- * reporting an RLS-limited view as complete.
+ * Counts (F1), by the site's read mode (get_reporting_job_status):
+ *   legacy / shadow  the same code as the app: one production-evidence read
+ *                    for the report day and the day before under one cutoff
+ *                    and the shared reducer (unchanged);
+ *   summary          ONE complete published generation through the internal
+ *                    published reader (no HTTP self-call): its source cutoff,
+ *                    published-at and rule version are printed, and a missing,
+ *                    incomplete or more-than-30-minutes-stale publication is
+ *                    refused BEFORE any workbook or email.
+ * Clock rows (hours, staff on shift), completion spans (hours fallback) and
+ * ledger boxes are bounded operational reads; in summary mode they carry their
+ * own cutoff and are labelled as such, never as frozen summary evidence.
+ * Site production days start at 04:00 local. A full-site report needs the
+ * server credential (SUPABASE_SERVICE_ROLE_KEY); without it the digest refuses
+ * rather than reporting an RLS-limited view as complete. The workbook has an
+ * explicit size ceiling (never truncated).
  *
  * Sends via Resend using RESEND_API_KEY from env.
  */
@@ -45,6 +55,10 @@ import {
   type ReportSite,
 } from "../../src/lib/domain/productionPeriods.js";
 import { loadProductionEvidence } from "../../src/lib/repository/supabase/productionEvidence.js";
+import { publishedFreshness } from "../../src/lib/domain/productionReportingFreshness.js";
+import { ReportingHttpError, type GenerationMeta, type PublishedReader, type ReaderScope } from "../_lib/production-reporting.js";
+import { rpcPublishedReader } from "../_lib/production-reporting-rpc.js";
+import { getReportingJobStatus, type RpcClient } from "../_lib/reporting-jobs.js";
 
 interface VercelRequest {
   method?: string;
@@ -158,8 +172,15 @@ interface PersonDay {
   clock_out_ts: number | null;
 }
 
+interface Counts { items: number | null; orders: number }
+interface GroupCounts { normal: Counts; rework: Counts }
+/** What the workbook and email use of one day: counts and coverage counts (both read paths). */
+interface DayCounts extends GroupCounts {
+  coverage: { issueCounts: Record<CoverageIssueKind, number>; issueRows: number };
+}
+
 interface DeptDay {
-  summary: ProductionSummary;
+  summary: GroupCounts;
   boxes: number;
   people: Map<string, PersonDay>;
 }
@@ -167,10 +188,12 @@ interface DeptDay {
 interface DayReport {
   date: string;
   range: ProductionRange;
-  summary: ProductionSummary;
+  summary: DayCounts;
   depts: Record<Department, DeptDay>;
   distinctStaff: Set<string>;
 }
+
+const dayCounts = (s: ProductionSummary): DayCounts => ({ normal: s.normal, rework: s.rework, coverage: { issueCounts: s.coverage.issueCounts, issueRows: s.coverage.issues.length } });
 
 function projectDay(
   evidence: PreparedProductionEvidence,
@@ -212,6 +235,12 @@ function projectDay(
     }
     depts[d] = { summary: s, boxes: 0, people };
   }
+  applyClocks(depts, distinctStaff, clocks, startMs, endMs);
+  return { date, range, summary: dayCounts(summary), depts, distinctStaff };
+}
+
+/** Clock rows add staff on shift and clock times per department (operational; never counts). */
+function applyClocks(depts: Record<Department, DeptDay>, distinctStaff: Set<string>, clocks: readonly ClockRow[], startMs: number, endMs: number): void {
   for (const c of clocks) {
     const ms = Date.parse(c.created_at);
     if (!c.staff_id || !Number.isFinite(ms) || ms < startMs || ms >= endMs) continue;
@@ -226,7 +255,60 @@ function projectDay(
     if (c.event_type === "clock_in") p.clock_in_ts = p.clock_in_ts == null ? ms : Math.min(p.clock_in_ts, ms);
     else if (c.event_type === "clock_out") p.clock_out_ts = p.clock_out_ts == null ? ms : Math.max(p.clock_out_ts, ms);
   }
-  return { date, range, summary, depts, distinctStaff };
+}
+
+/** A raw completion/dispatch/cancellation row of the bounded operational read (hours fallback only). */
+interface SpanRow { id: string; staff_id: string | null; department: string | null; event_type: string; created_at: string; parent_event_id: string | null }
+
+/** Every people row of one published summary scope: its first page, then offset detail pages (never a silent first page). */
+async function publishedPeople(reader: PublishedReader, scope: ReaderScope, first: Awaited<ReturnType<PublishedReader["summary"]>>) {
+  const rows = [...first.peoplePage.rows];
+  const total = first.peoplePage.totalRows;
+  while (rows.length < total) {
+    const page = await reader.detail(scope, "people", null, rows.length, 1000);
+    if (page.rows.length === 0) throw new Error(`published people: incomplete read (${rows.length} of ${total} rows)`);
+    for (const r of page.rows) if (r.kind === "people") rows.push(r.row);
+  }
+  if (rows.length !== total) throw new Error(`published people: ${rows.length} rows for a total of ${total}`);
+  return rows;
+}
+
+/**
+ * One production day from ONE published generation (every read pinned to `base.generationId`): day and
+ * per-work-type totals, coverage counts and people. Clock rows and completion spans (hours) come from the
+ * bounded operational reads; a terminal with a cancellation in that read is not a span endpoint.
+ */
+async function publishedDay(reader: PublishedReader, base: Pick<ReaderScope, "site" | "audience" | "generationId">, site: ReportSite, date: string, clocks: readonly ClockRow[], spans: readonly SpanRow[]): Promise<DayReport> {
+  const range = productionRange(site, date, date);
+  const startMs = Date.parse(range.startUtc);
+  const endMs = Date.parse(range.endUtcExclusive);
+  const scope = (workType: WorkType | null): ReaderScope => ({ ...base, firstDate: date, lastDate: date, startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive, staffId: null, workType });
+  const pages = { dailyLimit: 1, peopleLimit: 1000 };
+  const all = await reader.summary(scope(null), "reports", pages);
+  const distinctStaff = new Set<string>((await publishedPeople(reader, scope(null), all)).map((p) => p.staffId));
+  const cancelled = new Set(spans.filter((s) => s.event_type === "cancelled" && s.parent_event_id).map((s) => s.parent_event_id as string));
+  const depts = {} as Record<Department, DeptDay>;
+  for (const d of DEPARTMENTS) {
+    const s = await reader.summary(scope(d as WorkType), "reports", pages);
+    const fromAll = all.byWorkType.find((w) => w.workType === d)?.totals;
+    // The same generation answers every read: a department that disagrees with the day's own breakdown is refused.
+    if (!fromAll || JSON.stringify(fromAll) !== JSON.stringify(s.totals)) throw new Error(`published report: ${d} totals differ between reads of one generation`);
+    const people = new Map<string, PersonDay>();
+    for (const p of await publishedPeople(reader, scope(d as WorkType), s)) {
+      people.set(p.staffId, { staff_id: p.staffId, normal: p.normal, rework: p.rework, first_ts: null, last_ts: null, clock_in_ts: null, clock_out_ts: null });
+    }
+    for (const t of spans) {
+      const ms = Date.parse(t.created_at);
+      const terminalHere = (t.event_type === "completed" && t.department === d && d !== "dispatch") || (t.event_type === "dispatched" && t.department === "dispatch" && d === "dispatch");
+      if (!terminalHere || !t.staff_id || cancelled.has(t.id) || !Number.isFinite(ms) || ms < startMs || ms >= endMs) continue;
+      const p = people.get(t.staff_id) ?? people.set(t.staff_id, { staff_id: t.staff_id, normal: { items: 0, orders: 0 }, rework: { items: 0, orders: 0 }, first_ts: null, last_ts: null, clock_in_ts: null, clock_out_ts: null }).get(t.staff_id)!;
+      if (p.first_ts == null || ms < p.first_ts) p.first_ts = ms;
+      if (p.last_ts == null || ms > p.last_ts) p.last_ts = ms;
+    }
+    depts[d] = { summary: s.totals, boxes: 0, people };
+  }
+  applyClocks(depts, distinctStaff, clocks, startMs, endMs);
+  return { date, range, summary: { normal: all.totals.normal, rework: all.totals.rework, coverage: { issueCounts: all.coverage.issueCounts, issueRows: all.coverage.issueRows } }, depts, distinctStaff };
 }
 
 /** Boxes used from ledger, routed to the department slot by package code / mail tube id (unchanged rules). */
@@ -296,6 +378,10 @@ interface ReportMeta {
   generatedAtUtc: string;
   /** False while the production day is still open at the cutoff. */
   closed: boolean;
+  /** The published generation behind every count (summary read mode), else null (legacy reads). */
+  published: Pick<GenerationMeta, "generationId" | "sourceCutoffUtc" | "publishedAtUtc" | "verifiedAtUtc" | "ruleVersion"> | null;
+  /** Summary mode: the cutoff of the bounded operational reads (clock rows, completion spans, ledger boxes). */
+  opsAsOfUtc: string | null;
 }
 
 function windowLabel(m: ReportMeta): string {
@@ -310,6 +396,10 @@ interface Note { severity: string; department: string; staff: string; note: stri
 
 function reportNotes(today: DayReport, yesterday: DayReport, m: ReportMeta): Note[] {
   const notes: Note[] = [];
+  if (m.published) {
+    notes.push({ severity: "info", department: "-", staff: "-", note: `Counts are the published report (generation ${m.published.generationId}, rule ${m.published.ruleVersion}, source cutoff ${m.published.sourceCutoffUtc}, published ${m.published.publishedAtUtc}).` });
+    notes.push({ severity: "info", department: "-", staff: "-", note: `Staff on shift, hours and boxes come from live operational reads as of ${m.opsAsOfUtc}, not from the published report.` });
+  }
   if (!m.closed) notes.push({ severity: "info", department: "-", staff: "-", note: `Counts as of ${localStamp(m.asOfUtc, m.tz)}; the production day was still open.` });
   // Warnings for every day whose figures are published: the report day and the comparison day.
   for (const [day, label] of [[today, ""], [yesterday, ` on ${yesterday.date} (comparison day)`]] as const) {
@@ -340,9 +430,11 @@ function buildXlsx(payload: { meta: ReportMeta; today: DayReport; yesterday: Day
 
   // Sheet 1 - Summary. orders_total is distinct completed orders across work types
   // (not a sum of departments); items_total is work processed across work types.
+  const pub = meta.published;
   const summarySheet = XLSX.utils.aoa_to_sheet([
     ["date", "location", "orders_total", "items_total", "orders_yesterday", "items_yesterday", "staff_on_shift", "staff_yesterday", "items_per_staff", "items_per_staff_yesterday", "notes",
-      "rework_orders", "rework_items", "rework_orders_yesterday", "rework_items_yesterday", "coverage_issues", "coverage_issues_yesterday", "status", "timezone", "production_window", "window_start_utc", "window_end_utc", "as_of_utc", "loaded_at_utc", "generated_at_utc"],
+      "rework_orders", "rework_items", "rework_orders_yesterday", "rework_items_yesterday", "coverage_issues", "coverage_issues_yesterday", "status", "timezone", "production_window", "window_start_utc", "window_end_utc", "as_of_utc", "loaded_at_utc", "generated_at_utc",
+      ...(pub ? ["source", "generation_id", "published_at_utc", "rule_version", "verified_at_utc", "operational_reads_as_of_utc"] : [])],
     [
       ymd, locLabel,
       T.normal.orders, n(T.normal.items),
@@ -351,8 +443,9 @@ function buildXlsx(payload: { meta: ReportMeta; today: DayReport; yesterday: Day
       Number(perStaffToday.toFixed(1)), Number(perStaffYesterday.toFixed(1)),
       notes.map((x) => x.note).join(" | "),
       T.rework.orders, n(T.rework.items), Y.rework.orders, n(Y.rework.items),
-      T.coverage.issues.length, Y.coverage.issues.length, statusLabel(meta), tz, windowLabel(meta),
+      T.coverage.issueRows, Y.coverage.issueRows, statusLabel(meta), tz, windowLabel(meta),
       meta.range.startUtc, meta.range.endUtcExclusive, meta.asOfUtc, meta.loadedAtUtc, meta.generatedAtUtc,
+      ...(pub ? ["published", pub.generationId, pub.publishedAtUtc, pub.ruleVersion, pub.verifiedAtUtc, meta.opsAsOfUtc ?? ""] : []),
     ],
   ]);
 
@@ -436,6 +529,10 @@ function buildBodyText(payload: { meta: ReportMeta; today: DayReport; yesterday:
   lines.push(`Production day: ${windowLabel(meta)}`);
   lines.push(`Status: ${statusLabel(meta)}`);
   lines.push(`Cutoff (as of): ${localStamp(meta.asOfUtc, meta.tz)} (${meta.asOfUtc}); later corrections appear on a re-run.`);
+  if (meta.published) {
+    lines.push(`Published report: generation ${meta.published.generationId}, rule ${meta.published.ruleVersion}, published ${localStamp(meta.published.publishedAtUtc, meta.tz)}.`);
+    lines.push(`Staff on shift, hours and boxes: live operational reads as of ${meta.opsAsOfUtc ? localStamp(meta.opsAsOfUtc, meta.tz) : "-"} (not part of the published report).`);
+  }
   lines.push("");
   lines.push(`Orders completed    ${String(ot).padStart(6)}   (${pct(ot, oy)} vs ${oy} yesterday; each order once across departments)`);
   lines.push(`Items processed     ${String(n(it)).padStart(6)}   (${itemsPct} vs ${n(iy)} yesterday; work across all departments)`);
@@ -566,7 +663,19 @@ function resolveRecipientOverride(
 /* ============================================================
  * Handler
  * ============================================================ */
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+/** The workbook ceiling: a larger digest fails explicitly (never truncated, never emailed). */
+export const MAX_DIGEST_XLSX_BYTES = 4 * 1024 * 1024;
+
+export interface DigestDeps {
+  now(): number;
+  createClient(url: string, key: string): SupabaseClient;
+  fetch: typeof fetch;
+  /** Workbook ceiling in bytes (default MAX_DIGEST_XLSX_BYTES). */
+  maxXlsxBytes?: number;
+}
+
+export function createDigestHandler(deps: DigestDeps) {
+  return async function handler(req: VercelRequest, res: VercelResponse) {
   // Applies to every response below, including early returns and errors.
   res.setHeader("Cache-Control", "no-store");
   try {
@@ -609,7 +718,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       let rawStatus: number | null = null;
       let rawBody: string | null = null;
       try {
-        const r = await fetch(
+        const r = await deps.fetch(
           `${url}/rest/v1/production_events?select=id&limit=1`,
           {
             headers: {
@@ -664,7 +773,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const dateOverride = req.query.date;
     let ymd: string;
     if (dateOverride === undefined) {
-      ymd = productionDateAt(new Date(), site);
+      ymd = productionDateAt(new Date(deps.now()), site);
     } else if (typeof dateOverride === "string" && isProductionDate(dateOverride)) {
       ymd = dateOverride;
     } else {
@@ -686,40 +795,97 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.status(500).json({ error: "Full-site report needs SUPABASE_SERVICE_ROLE_KEY" });
       return;
     }
-    const supabase = createClient(supabaseUrl, supabaseKey);
-
-    // One cutoff for every read in this report.
-    const asOfUtc = new Date().toISOString();
+    const supabase = deps.createClient(supabaseUrl, supabaseKey);
     const todayRange = productionRange(site, ymd, ymd);
     const bothDays = productionRange(site, yYmd, ymd);
-    const snapshot = await loadProductionEvidence(supabase, {
-      site,
-      range: { startUtc: bothDays.startUtc, endUtcExclusive: bothDays.endUtcExclusive },
-      asOfUtc,
-      visibility: { kind: "site" },
-      deadlineMs: Date.now() + EVIDENCE_DEADLINE_MS,
-    });
-    const evidence = prepareProductionEvidence(snapshot);
 
-    // Clock rows drive hours only (not counts); same window and cutoff, paged.
-    const clocks = await readAll<ClockRow>(
-      () =>
-        supabase
-          .from("production_events")
-          .select("id, staff_id, department, event_type, created_at", { count: "exact" })
-          .eq("location", location)
-          .in("event_type", ["clock_in", "clock_out"])
-          .gte("created_at", bothDays.startUtc)
-          .lt("created_at", bothDays.endUtcExclusive)
-          .lte("created_at", asOfUtc)
-          .order("created_at", { ascending: true })
-          .order("id", { ascending: true }) as unknown as PageQuery,
-      "production_events (clock)",
-    );
+    // Clock rows drive hours only (not counts): the report window, one cutoff, paged.
+    const readClocks = (cutoffUtc: string) =>
+      readAll<ClockRow>(
+        () =>
+          supabase
+            .from("production_events")
+            .select("id, staff_id, department, event_type, created_at", { count: "exact" })
+            .eq("location", location)
+            .in("event_type", ["clock_in", "clock_out"])
+            .gte("created_at", bothDays.startUtc)
+            .lt("created_at", bothDays.endUtcExclusive)
+            .lte("created_at", cutoffUtc)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true }) as unknown as PageQuery,
+        "production_events (clock)",
+      );
 
-    const today = projectDay(evidence, site, ymd, clocks);
-    const yesterday = projectDay(evidence, site, yYmd, clocks);
-    await addBoxes(supabase, location, [today, yesterday], asOfUtc);
+    // The site's effective read mode decides the count source (never a silent fallback).
+    const status = await getReportingJobStatus(supabase as unknown as RpcClient, site);
+    let today: DayReport;
+    let yesterday: DayReport;
+    let asOfUtc: string;
+    let loadedAtUtc: string;
+    let published: ReportMeta["published"] = null;
+    let opsAsOfUtc: string | null = null;
+    if (status.readMode === "summary") {
+      // ONE complete, fresh published generation, checked before any workbook or email.
+      const reader = rpcPublishedReader(supabase as unknown as RpcClient);
+      const g = await reader.generation(site, null);
+      if (!g) {
+        res.status(503).json({ error: "No published report is available for this site yet; no digest was produced" });
+        return;
+      }
+      if (g.site !== site || g.state !== "published" || !g.complete) {
+        res.status(503).json({ error: "The published report is incomplete; no digest was produced" });
+        return;
+      }
+      if (g.readMode !== "summary") {
+        res.status(503).json({ error: "The site's read mode changed during the digest; no digest was produced" });
+        return;
+      }
+      const fresh = publishedFreshness(g.verifiedAtUtc, deps.now());
+      if (fresh.state !== "current") {
+        res.status(503).json({ error: `The published report is stale: verified ${fresh.ageMinutes} minutes ago (more than 30 minutes); no digest was produced` });
+        return;
+      }
+      opsAsOfUtc = new Date(deps.now()).toISOString();
+      const clocks = await readClocks(opsAsOfUtc);
+      // Completion spans for the hours fallback (operational, bounded, own cutoff; not counts).
+      const spans = await readAll<SpanRow>(
+        () =>
+          supabase
+            .from("production_events")
+            .select("id, staff_id, department, event_type, created_at, parent_event_id", { count: "exact" })
+            .eq("location", location)
+            .in("event_type", ["completed", "dispatched", "cancelled"])
+            .gte("created_at", bothDays.startUtc)
+            .lt("created_at", bothDays.endUtcExclusive)
+            .lte("created_at", opsAsOfUtc as string)
+            .order("created_at", { ascending: true })
+            .order("id", { ascending: true }) as unknown as PageQuery,
+        "production_events (completion spans)",
+      );
+      const base = { site, audience: { kind: "site" as const }, generationId: g.generationId };
+      today = await publishedDay(reader, base, site, ymd, clocks, spans);
+      yesterday = await publishedDay(reader, base, site, yYmd, clocks, spans);
+      await addBoxes(supabase, location, [today, yesterday], opsAsOfUtc);
+      asOfUtc = g.sourceCutoffUtc;
+      loadedAtUtc = g.verifiedAtUtc;
+      published = { generationId: g.generationId, sourceCutoffUtc: g.sourceCutoffUtc, publishedAtUtc: g.publishedAtUtc, verifiedAtUtc: g.verifiedAtUtc, ruleVersion: g.ruleVersion };
+    } else {
+      // legacy / shadow: one cutoff for every read in this report (unchanged).
+      asOfUtc = new Date(deps.now()).toISOString();
+      const snapshot = await loadProductionEvidence(supabase, {
+        site,
+        range: { startUtc: bothDays.startUtc, endUtcExclusive: bothDays.endUtcExclusive },
+        asOfUtc,
+        visibility: { kind: "site" },
+        deadlineMs: Date.now() + EVIDENCE_DEADLINE_MS,
+      });
+      const evidence = prepareProductionEvidence(snapshot);
+      const clocks = await readClocks(asOfUtc);
+      today = projectDay(evidence, site, ymd, clocks);
+      yesterday = projectDay(evidence, site, yYmd, clocks);
+      await addBoxes(supabase, location, [today, yesterday], asOfUtc);
+      loadedAtUtc = snapshot.loadedAtUtc;
+    }
 
     // Staff names for anyone who appeared. A failed lookup fails the report;
     // a person with no name row falls back to their saved id.
@@ -746,9 +912,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       tz,
       range: todayRange,
       asOfUtc,
-      loadedAtUtc: snapshot.loadedAtUtc,
-      generatedAtUtc: new Date().toISOString(),
+      loadedAtUtc,
+      generatedAtUtc: new Date(deps.now()).toISOString(),
       closed: Date.parse(asOfUtc) >= Date.parse(todayRange.endUtcExclusive),
+      published,
+      opsAsOfUtc,
     };
 
     // Skip sending only when there is truly nothing to report: no normal
@@ -758,7 +926,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const noActivity =
       T.normal.orders === 0 && (T.normal.items ?? 0) === 0 &&
       T.rework.orders === 0 && (T.rework.items ?? 0) === 0 &&
-      T.coverage.issues.length === 0;
+      T.coverage.issueRows === 0;
     const forceSend = req.query.force === "1" || req.query.force === "true";
     if (noActivity && !forceSend && !req.query.dry) {
       res.status(200).json({
@@ -772,6 +940,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const xlsxBytes = buildXlsx({ meta, today, yesterday, staffNames });
+    const maxBytes = deps.maxXlsxBytes ?? MAX_DIGEST_XLSX_BYTES;
+    if (xlsxBytes.byteLength > maxBytes) {
+      res.status(500).json({ error: `The digest workbook is ${xlsxBytes.byteLength} bytes, over the ${maxBytes}-byte limit; nothing was sent` });
+      return;
+    }
     const filename = `${locLabel}-KPI-${ymd}.xlsx`;
 
     const dry = req.query.dry;
@@ -804,7 +977,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const b64 = Buffer.from(xlsxBytes).toString("base64");
-    const resendRes = await fetch("https://api.resend.com/emails", {
+    const resendRes = await deps.fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${resendKey}`,
@@ -832,6 +1005,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       ymd,
       location,
       as_of_utc: asOfUtc,
+      source: published ? "published" : "legacy",
+      ...(published ? { generation_id: published.generationId, published_at_utc: published.publishedAtUtc, rule_version: published.ruleVersion } : {}),
       counts: {
         orders_today: T.normal.orders,
         items_today: T.normal.items,
@@ -841,6 +1016,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
     });
   } catch (e) {
+    // A typed published-read failure keeps its status (503 unavailable / 410 expired); nothing is sent.
+    if (e instanceof ReportingHttpError) {
+      res.status(e.status).json({ error: e.message });
+      return;
+    }
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
+  };
 }
+
+export default createDigestHandler({
+  now: () => Date.now(),
+  createClient: (url, key) => createClient(url, key),
+  fetch: (input, init) => fetch(input, init),
+});

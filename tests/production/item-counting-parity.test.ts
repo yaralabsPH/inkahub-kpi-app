@@ -66,7 +66,11 @@ import { buildProductionCounterView } from "../../src/lib/domain/productionCount
 import { encodeV2, fakeEvidence, type FakeRpcArgs } from "../fixtures/fakeSupabaseEvents";
 import { CASE_1, SKU, WORKER_A, WORKER_B, cancel, complete, dispatch, resetIds, shuffled, verify } from "../fixtures/item-counting";
 
-h.state.rpcImpl = (_name, raw) => {
+h.state.rpcImpl = (name, raw) => {
+  // The digest's read-mode lookup (Task 18): this site is on the existing (legacy) read path.
+  if (name === "get_reporting_job_status") {
+    return { data: [{ site: (raw as { p_site?: unknown }).p_site, processor_enabled: false, read_mode: "legacy", capture_enabled: false, capture_epoch: 0, source_epoch: null, active_generation_id: null, active_batch_id: null, active_batch_state: null, active_batch_kind: null, lease_fence: 0, lease_expires_at: null, heartbeat_at: null, last_verified_cutoff: null, pending_changes: 0, oldest_pending_captured_at: null }], error: null };
+  }
   const args = raw as unknown as FakeRpcArgs;
   const rows = (h.state.tables.production_events ?? []) as unknown as ProductionEvidenceEvent[];
   const enc = encodeV2(fakeEvidence(rows, args, () => true));

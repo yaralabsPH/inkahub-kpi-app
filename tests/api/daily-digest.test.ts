@@ -102,8 +102,14 @@ import handler from "../../api/reports/daily-digest";
 import { encodeV2, fakeEvidence, type FakeRpcArgs } from "../fixtures/fakeSupabaseEvents";
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
 
+/** The site's reporting status as get_reporting_job_status returns it: the existing (legacy) read path. */
+const legacyStatus = (site: unknown) => ({
+  data: [{ site, processor_enabled: false, read_mode: "legacy", capture_enabled: false, capture_epoch: 0, source_epoch: null, active_generation_id: null, active_batch_id: null, active_batch_state: null, active_batch_kind: null, lease_fence: 0, lease_expires_at: null, heartbeat_at: null, last_verified_cutoff: null, pending_changes: 0, oldest_pending_captured_at: null }],
+  error: null,
+});
 /** The digest's evidence RPC, served from the mocked production_events table (service role: no RLS). */
 h.state.rpcImpl = (name, raw) => {
+  if (name === "get_reporting_job_status") return legacyStatus((raw as { p_site?: unknown }).p_site);
   if (name !== "load_production_evidence_v2") return { data: null, error: { message: `unexpected rpc ${name}` } };
   const args = raw as unknown as FakeRpcArgs;
   // Saved rows as the database returns them: absent columns are NULL.
@@ -613,8 +619,12 @@ function expectLocationFilters(loc: string) {
   for (const q of h.state.queries) {
     expect(q.ops).toContainEqual(["eq", ["location", loc]]);
   }
-  expect(h.state.rpcCalls.length).toBe(1);
-  expect(h.state.rpcCalls[0].args.p_site).toBe(loc);
+  // One evidence read (legacy mode), after exactly one read-mode lookup for the same site.
+  const evidence = h.state.rpcCalls.filter((c) => c.name === "load_production_evidence_v2");
+  expect(evidence.length).toBe(1);
+  expect(evidence[0].args.p_site).toBe(loc);
+  expect(h.state.rpcCalls.filter((c) => c.name === "get_reporting_job_status").map((c) => c.args.p_site)).toEqual([loc]);
+  expect(h.state.rpcCalls.map((c) => c.name)).toEqual(["get_reporting_job_status", "load_production_evidence_v2"]);
 }
 
 function sheetNames(): string[] {

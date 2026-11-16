@@ -12,7 +12,7 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { managementSource, publishedCsv, publishedDetailList, publishedOrders, publishedStatusLine, rawRangeFor, reportViewFromSummary, welcomeFromSummary } from "../../src/lib/domain/productionPublishedView";
+import { managementSource, publishedCsv, publishedCsvHeader, publishedCsvLines, publishedDetailList, publishedOrders, publishedStatusLine, rawRangeFor, reportViewFromSummary, welcomeFromSummary } from "../../src/lib/domain/productionPublishedView";
 import type { PublishedState, PublishedStatus } from "../../src/lib/hooks/usePublishedProduction";
 import { detailKey } from "../../src/lib/hooks/usePublishedProduction";
 import { productionRange } from "../../src/lib/domain/productionPeriods";
@@ -230,5 +230,39 @@ describe("Task 17 review: coverage issues and timing observations are lazy publi
     expect(src).toMatch(/Load coverage issues/);
     expect(src).toMatch(/Load timing observations/);
     expect(src).toMatch(/coverage\.issueRows > 0/); // coverage issues are offered only when there are some
+  });
+});
+
+describe("Task 18: the published CSV is built incrementally, page by page", () => {
+  const ev = (id: string, note: string) => ({ kind: "raw-export" as const, row: { id, staffId: null, department: "framed", orderNumber: "O-1", sku: null, quantity: 1, eventType: "line_verified", createdAtUtc: "2026-11-16T09:00:00.000001Z", parentEventId: null, caseId: null, note, stationId: null } });
+  it("header + per-page lines joined equal the whole-file CSV (same columns, escaping and raw values)", () => {
+    const p1 = [ev("e1", ""), ev("e2", 'a "b", c')];
+    const p2 = [ev("e3", "x\ny")];
+    const name = (id: string) => id;
+    const streamed = [publishedCsvHeader(), ...publishedCsvLines(p1, name), ...publishedCsvLines(p2, name)].join("\r\n");
+    expect(streamed).toBe(publishedCsv([...p1, ...p2], name));
+    expect(publishedCsvLines([], name)).toEqual([]);
+  });
+  it("Reports streams the export page-chunked: ONE BlobPart per validated page, no per-row parts or whole-file join, Blob only after the collection resolved", () => {
+    const src = readFileSync("src/pages/Reports.tsx", "utf8");
+    const start = src.indexOf("const handlePublishedExport = useCallback(");
+    const body = src.slice(start, src.indexOf("}, [", start));
+    expect(body).toMatch(/const chunks: BlobPart\[\] = \[publishedCsvHeader\(\)\];/);
+    expect(body).toMatch(/collectAll\("raw-export", \{\s*limit: 1000,\s*onPage: /);
+    // each page becomes exactly one CRLF-led chunk
+    expect(body).toMatch(/chunks\.push\(`\\r\\n\$\{publishedCsvLines\(rows, nameOf\)\.join\("\\r\\n"\)\}`\)/);
+    expect(body).not.toMatch(/\.push\(\.\.\./); // never one part per row
+    expect(body).not.toMatch(/(chunks|parts)\.join\(/); // never a whole-file string copy
+    expect(body).toMatch(/new Blob\(chunks, /);
+    expect(body.indexOf("await pub.collectAll(")).toBeLessThan(body.indexOf("new Blob("));
+    expect(body).not.toMatch(/production_events|fetchAllRows|supabase\.from/);
+  });
+  it("the page chunks concatenate to exactly the whole-file CSV", () => {
+    const ev = (id: string) => ({ kind: "raw-export" as const, row: { id, staffId: null, department: "framed", orderNumber: "O-1", sku: null, quantity: 1, eventType: "line_verified", createdAtUtc: "2026-11-16T09:00:00.000001Z", parentEventId: null, caseId: null, note: "", stationId: null } });
+    const pages = [[ev("e1"), ev("e2")], [], [ev("e3")]];
+    const name = (id: string) => id;
+    const chunks = [publishedCsvHeader(), ...pages.filter((p) => p.length).map((p) => `\r\n${publishedCsvLines(p, name).join("\r\n")}`)];
+    expect(chunks).toHaveLength(3); // header + one chunk per non-empty page
+    expect(chunks.join("")).toBe(publishedCsv(pages.flat(), name));
   });
 });

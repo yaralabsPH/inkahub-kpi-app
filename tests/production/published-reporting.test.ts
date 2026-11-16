@@ -562,3 +562,42 @@ describe("Task 17: an export aborted by the view is always the typed VIEW_CHANGE
     await expect(ctrl.collectAll(ID, "raw-export")).rejects.toBe(boom);
   });
 });
+
+describe("Task 18: the published raw export streams bounded pages (incremental, never partial)", () => {
+  const rawRow = (n: number) => ({ kind: "raw-export", row: { id: `e${n}` } });
+  function harness(detail: (url: string) => { status: number; body: unknown }) {
+    const urls: string[] = [];
+    const fetchImpl: FetchLike = async (url) => {
+      urls.push(url);
+      const r = url.startsWith("/api/reports/detail") ? detail(url) : { status: 200, body: summary("g1") };
+      return { status: r.status, ok: r.status < 400, json: async () => r.body };
+    };
+    return { urls, ctrl: new PublishedViewController({ fetch: fetchImpl, token: async () => "tok" }) };
+  }
+  const pages = (url: string) => {
+    const at = Number(new URL(url, "http://x").searchParams.get("cursor") ?? "0");
+    return { status: 200, body: { rows: [rawRow(at * 2 + 1), rawRow(at * 2 + 2)], nextCursor: at < 2 ? String(at + 1) : null, pageComplete: true, totalRows: 6 } };
+  };
+  it("onPage receives every page in order and no rows are retained by the collector", async () => {
+    const h = harness(pages);
+    await h.ctrl.load(ID);
+    const seen: string[][] = [];
+    const kept = await h.ctrl.collectAll(ID, "raw-export", { onPage: (rows) => void seen.push(rows.map((r) => (r.row as { id: string }).id)) });
+    expect(seen).toEqual([["e1", "e2"], ["e3", "e4"], ["e5", "e6"]]);
+    expect(kept).toEqual([]); // streamed: the caller owns the output, nothing accumulates here
+  });
+  it("the totals/progress checks still hold when streaming: a short end is INCOMPLETE after pages were delivered", async () => {
+    const h = harness(() => ({ status: 200, body: { rows: [rawRow(1)], nextCursor: null, pageComplete: true, totalRows: 2 } }));
+    await h.ctrl.load(ID);
+    let delivered = 0;
+    await expect(h.ctrl.collectAll(ID, "raw-export", { onPage: (rows) => void (delivered += rows.length) })).rejects.toMatchObject({ code: "INCOMPLETE" });
+    expect(delivered).toBe(1); // the caller saw a page but the export as a whole is refused
+  });
+  it("mid-export revocation (403 on page 2) rejects with the typed error; the export is refused", async () => {
+    const h = harness((url) => (new URL(url, "http://x").searchParams.get("cursor") === "1" ? { status: 403, body: { error: "No membership for this site", code: "FORBIDDEN" } } : pages(url)));
+    await h.ctrl.load(ID);
+    let delivered = 0;
+    await expect(h.ctrl.collectAll(ID, "raw-export", { onPage: (rows) => void (delivered += rows.length) })).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(delivered).toBe(2);
+  });
+});
