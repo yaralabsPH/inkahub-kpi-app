@@ -9,11 +9,12 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { rpcFrozenReader } from "../../api/_lib/production-reporting-reader";
-import { materializeOwners, memoryFrozenReader, type MaterializedWork } from "../../api/_lib/production-reporting-materialize";
+import { compareUtf8 } from "../../api/_lib/reporting-stage";
+import { materializeOwners, memoryFrozenReader, ownerKey, type MaterializedWork, type Owner } from "../../api/_lib/production-reporting-materialize";
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
 import { runCaptureLifecycle } from "../staging/reportingCapture";
 import {
-  BIG_IDS, BIG_NOTE, CASE_SQL, compareEvents, compareMaterialization, DEPENDENCY_RPCS, dependencyFixtures, dependencyGuard, dependencyRpcSql,
+  BIG_IDS, BIG_NOTE, CASE_SQL, checkOwnerByteProbe, OWNER_PROBE_ANCHOR, runOwnerByteProbe, compareEvents, compareMaterialization, DEPENDENCY_RPCS, dependencyFixtures, dependencyGuard, dependencyRpcSql,
   effectiveReadQuery, evidenceProblems, expectedChangedKeys, frozenOracle, functionBody, isContinuation, MIB, missingRequired, rawView, requiredWorks, MIGRATION_0040, MIGRATION_0041, newDependencyEvidence, newRpcStats, planSql,
   refreshInserts, rehearseDependencyReads, REQUIRED_CASES, REVIEWED, runDependencyCases, sqlRpcClient, type DependencyCtx, type DependencyDeps,
 } from "../staging/reportingDependencyRehearsal";
@@ -644,5 +645,132 @@ describe("T14S1 review: case structure (fingerprints, anchors, due probe)", () =
   });
   it("cutoffs are read as exact microsecond UTC text (no JavaScript Date rounding)", () => {
     expect(CASE_SQL.batch).toContain(`pg_catalog.to_char(b.source_cutoff at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as cutoff`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T14S2: deterministic anchored owner byte-cap probe
+// ---------------------------------------------------------------------------
+
+/** list_reporting_owners as 0041 accounts it: brackets (2) + per row jsonb text + 1; a row that alone cannot fit raises; otherwise the page ends short. */
+function ownerDb(keys: readonly string[]) {
+  const owners = [...keys].map((k) => ({ partition_kind: "order", partition_key: k })).sort((a, b) => compareUtf8(`${a.partition_kind}\u0000${a.partition_key}`, `${b.partition_kind}\u0000${b.partition_key}`));
+  const rowBytes = (r: { partition_kind: string; partition_key: string }) => Buffer.byteLength(`{"partition_key": ${JSON.stringify(r.partition_key)}, "partition_kind": ${JSON.stringify(r.partition_kind)}}`) + 1;
+  return aggDb((fn, p) => {
+    expect(fn).toBe("list_reporting_owners");
+    const [afterKind, afterKey, limit] = [p[2] as string | null, p[3] as string | null, p[4] as number];
+    const after = afterKind === null ? null : `${afterKind}\u0000${afterKey}`;
+    const out: typeof owners = [];
+    let bytes = 2;
+    for (const r of owners) {
+      if (after !== null && compareUtf8(`${r.partition_kind}\u0000${r.partition_key}`, after) <= 0) continue;
+      if (out.length >= limit) break;
+      const b = rowBytes(r);
+      if (bytes + b > MIB) {
+        if (!out.length) throw new Error(`one response row (owner ${r.partition_key.slice(0, 64)}) is larger than 1 MiB`);
+        break;
+      }
+      bytes += b;
+      out.push(r);
+    }
+    return out;
+  });
+}
+const LONG = dependencyFixtures(W).a.filter((x) => String(x.order_number).startsWith("DRK-")).map((x) => String(x.order_number));
+/** 600 pre-existing short owners before the long group and a few after it: the real staging shape that defeated R2's old assertion. */
+const SHORT_BEFORE = Array.from({ length: 600 }, (_, i) => `A-${String(i).padStart(5, "0")}`);
+const SHORT_AFTER = Array.from({ length: 50 }, (_, i) => `Z-${String(i).padStart(5, "0")}`);
+const asOwners = (keys: readonly string[]): Owner[] => [...keys].map((k) => ({ partitionKind: "order" as const, partitionKey: k })).sort((a, b) => compareUtf8(ownerKey(a), ownerKey(b)));
+const REF = { p_batch: BATCH, p_fence: 1 };
+
+describe("T14S2: the owner byte cap is proven by an anchored probe, not by where ordinary pages fall", () => {
+  const all = [...SHORT_BEFORE, ...LONG, ...SHORT_AFTER];
+  const expected = asOwners(all);
+  it("regression (staging shape): complete enumeration is exact, but its ordinary 1,000-row pages straddle the long keys and NO byte-capped page occurs, so the old R2 assertion fails", async () => {
+    const stats = newRpcStats();
+    const { db } = ownerDb(all);
+    const reader = rpcFrozenReader(sqlRpcClient(db, async () => undefined, stats, () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" });
+    const got: Owner[] = [];
+    for await (const o of reader.owners()) got.push(o);
+    expect(got).toEqual(expected);
+    expect(stats.list_reporting_owners.cappedContinuations).toBe(0); // the old assertion's input: it would report "no byte-capped non-final owner page"
+    expect(stats.list_reporting_owners.maxCompactBytes).toBeLessThan(MIB);
+  });
+  it("the anchored probe through the actual adapter forces a byte cutoff and an exact non-empty continuation covering all 1,000 long keys", async () => {
+    const stats = newRpcStats();
+    const { db, sent } = ownerDb(all);
+    const client = sqlRpcClient(db, async () => undefined, stats, () => 0);
+    const call = async (fn: string, args: Record<string, unknown>) => (await client.rpc(fn, args)).data as Array<Record<string, unknown>>;
+    const { page1, page2 } = await runOwnerByteProbe(call, REF);
+    const r = checkOwnerByteProbe(expected, LONG, page1, page2);
+    expect(r.problems).toEqual([]);
+    expect(page1.length).toBeGreaterThan(0);
+    expect(page1.length).toBeLessThan(1000);
+    expect(page1.length + page2.length).toBeGreaterThanOrEqual(1000);
+    expect(r.evidence.uncappedCompactBytes).toBeGreaterThan(MIB);
+    expect(r.evidence.pages.every((x) => x.compactBytes <= MIB)).toBe(true);
+    expect(r.evidence.longKeysCovered).toBe(1000);
+    expect(stats.list_reporting_owners.cappedContinuations).toBe(1); // the existing owner cap check now has deterministic evidence
+    expect(sent).toHaveLength(2);
+    expect(OWNER_PROBE_ANCHOR).toEqual({ kind: "order", key: "DRK-" });
+  });
+  it("runOwnerByteProbe sends exactly the anchored call (limit 1,000) and then the continuation from the last returned key", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const pages = [[{ partition_kind: "order", partition_key: "DRK-1" }, { partition_kind: "order", partition_key: "DRK-2" }], [{ partition_kind: "order", partition_key: "DRK-3" }]];
+    await runOwnerByteProbe(async (fn, args) => (expect(fn).toBe("list_reporting_owners"), calls.push(args), pages.shift()!), REF);
+    expect(calls).toEqual([{ ...REF, p_after_kind: "order", p_after_key: "DRK-", p_limit: 1000 }, { ...REF, p_after_kind: "order", p_after_key: "DRK-2", p_limit: 1000 }]);
+    const none: Array<Record<string, unknown>> = [];
+    expect(await runOwnerByteProbe(async (_f, a) => (none.push(a), []), REF)).toEqual({ page1: [], page2: [] });
+    expect(none).toHaveLength(1); // no continuation after an empty first page
+  });
+
+  describe("checkOwnerByteProbe catches every wrong outcome", () => {
+    const rows = (os: readonly Owner[]) => os.map((o) => ({ partition_kind: o.partitionKind, partition_key: o.partitionKey }));
+    const suffix = expected.filter((o) => compareUtf8(ownerKey(o), `order\u0000DRK-`) > 0);
+    const good1 = rows(suffix.slice(0, 800)); // ~800 x 1.2 KB keys: under 1 MiB, short of 1,000
+    const good2 = rows(suffix.slice(800, 1050));
+    it("accepts the exact capped page and continuation", () => expect(checkOwnerByteProbe(expected, LONG, good1, good2).problems).toEqual([]));
+    const cases: Array<[string, () => [Array<{ partition_kind: string; partition_key: string }>, Array<{ partition_kind: string; partition_key: string }>], RegExp]> = [
+      ["a truncated continuation (not all 1,000 long keys)", () => [good1, good2.slice(0, 100)], /hold 900 of the 1000 long-key owners/],
+      ["an owner missing from the first page", () => [[...good1.slice(0, 10), ...good1.slice(11)], good2], /position 10 \(first page\)/],
+      ["a repeated owner at the continuation", () => [good1, [good1[good1.length - 1], ...good2]], /returned twice/],
+      ["a wrong continuation (skips ahead)", () => [good1, good2.slice(5)], /position 800 \(continuation\)/],
+      ["an incorrectly FULL first page", () => [rows(suffix.slice(0, 1000)), rows(suffix.slice(1000, 1050))], /first owner page is full \(1000 rows\)/],
+      ["an empty continuation", () => [good1, []], /continuation after the byte-capped owner page is empty/],
+      ["an empty first page", () => [[], good2], /anchored first owner page is empty/],
+      ["a first page that starts before the anchor", () => [[{ partition_kind: "order", partition_key: "A-00599" }, ...good1], good2], /position 0 \(first page\)/],
+    ];
+    for (const [name, make, re] of cases) it(`rejects ${name}`, () => { const [a, b] = make(); expect(checkOwnerByteProbe(expected, LONG, a, b).problems.join("; ")).toMatch(re); });
+    it("rejects an unexpected owner interleaved in the long-key prefix (never assumed away)", () => {
+      const withIntruder = asOwners([...all, "DRK-0000-a"]); // a real key sorting inside the fixture group
+      expect(checkOwnerByteProbe(withIntruder, LONG, good1, good2).problems.join("; ")).toMatch(/does not begin with the 1000 long-key fixture owners \(first difference at 0/);
+    });
+    it("rejects a fixture whose requested page would NOT exceed 1 MiB", () => {
+      const short = Array.from({ length: 1000 }, (_, i) => `DRK-${String(i).padStart(4, "0")}`);
+      const ex = asOwners([...SHORT_BEFORE, ...short]);
+      const sfx = ex.filter((o) => o.partitionKey.startsWith("DRK-"));
+      expect(checkOwnerByteProbe(ex, short, rows(sfx.slice(0, 500)), rows(sfx.slice(500))).problems.join("; ")).toMatch(/the probe needs more than 1 MiB/);
+    });
+    it("rejects a page over 1 MiB", () => {
+      const huge = [{ partition_kind: "order", partition_key: "x".repeat(MIB) }];
+      expect(checkOwnerByteProbe(expected, LONG, good1, huge).problems.join("; ")).toMatch(/exceeds 1 MiB/);
+    });
+  });
+
+  it("R2 keeps only complete enumeration parity; R2c (required, before R3) holds the anchored probe and the existing owner cap check", () => {
+    const src = read("tests/staging/reportingDependencyRehearsal.ts");
+    const body = src.slice(src.indexOf("export async function runDependencyCases"), src.indexOf("// Coordinator"));
+    const r2 = body.slice(body.indexOf('"R2", "list_reporting_owners'), body.indexOf('"R2c"'));
+    expect(r2).toContain("await drain(reader.owners())");
+    expect(r2).toContain("canonicalJson(got) !== canonicalJson(ownersExpected)");
+    expect(r2).toContain('o.partitionKey.startsWith("DRK-")).length !== 1000');
+    expect(r2).not.toContain("capped(");
+    const r2c = body.slice(body.indexOf('"R2c"'), body.indexOf("const controlled"));
+    expect(r2c).toContain("runOwnerByteProbe(call, { p_batch: rb.batchId, p_fence: rb.fence })");
+    expect(r2c).toContain("checkOwnerByteProbe(ownersExpected, longKeys, page1, page2)");
+    expect(r2c).toContain('capped("list_reporting_owners", "owner", p)');
+    expect(body.indexOf('"R2c"')).toBeLessThan(body.indexOf('"R3"'));
+    expect(REQUIRED_CASES).toContain("R2c");
+    expect(LONG).toHaveLength(1000);
   });
 });

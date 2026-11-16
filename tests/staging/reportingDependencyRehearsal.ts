@@ -320,7 +320,7 @@ export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: st
 /** Every case the rehearsal must record before it may be COMPLETE. */
 export const REQUIRED_CASES = [
   "D0", "D1", "D2", "D3", "S0", "S1",
-  "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R7m", "R7s", "R8", "R9",
+  "R0", "R1", "R2", "R2c", "R3", "R4", "R5", "R6", "R7", "R7m", "R7s", "R8", "R9",
   "P0",
   "F0", "F1", "F2", "F3", "F4", "F5", "F5x",
   "X1", "X2", "X3", "X4", "X5", "X6d", "X6", "X7", "X8", "X9",
@@ -341,12 +341,14 @@ export interface DependencyEvidence {
   plans: Record<string, unknown>;
   /** The controlled due-probe (U*) cutoffs and key count. */
   dueProbe: Record<string, unknown> | null;
+  /** T14S2: the anchored owner byte-cap probe's per-page rows/bytes and coverage. */
+  ownerByteProbe: Record<string, unknown> | null;
   recorded: string[];
   complete: boolean;
 }
 export const newDependencyEvidence = (): DependencyEvidence => ({
   label: "SQL-serialization evidence (json_agg of the real function rows on the rehearsal transaction), NOT an observed PostgREST HTTP response; full-volume timings are single observations, not a scale certification",
-  files: [], statementsApplied: 0, functions: {}, rpc: newRpcStats(), fullVolume: null, materialization: {}, timings: {}, plans: {}, dueProbe: null, recorded: [], complete: false,
+  files: [], statementsApplied: 0, functions: {}, rpc: newRpcStats(), fullVolume: null, materialization: {}, timings: {}, plans: {}, dueProbe: null, ownerByteProbe: null, recorded: [], complete: false,
 });
 /** Missing required cases (never COMPLETE with any). */
 export function evidenceProblems(ev: DependencyEvidence): string[] {
@@ -488,6 +490,69 @@ order by 1`,
 } as const;
 
 // ---------------------------------------------------------------------------
+// T14S2: deterministic owner byte-cap probe (anchored immediately before the long-key group)
+// ---------------------------------------------------------------------------
+
+/** Anchor: strictly before every `DRK-…` key (owner keyset is (kind, key COLLATE "C")). */
+export const OWNER_PROBE_ANCHOR = { kind: "order" as const, key: "DRK-" };
+type OwnerRow = { partition_kind: string; partition_key: string };
+const ownerRowBytes = (rows: readonly unknown[]) => Buffer.byteLength(JSON.stringify(rows), "utf8");
+export interface OwnerProbeEvidence { anchor: string; suffixOwners: number; uncappedCompactBytes: number; pages: Array<{ rows: number; compactBytes: number }>; longKeysCovered: number }
+/**
+ * Pure check of the anchored probe's two pages against the INDEPENDENT sorted
+ * owner list. The suffix after the anchor must begin with exactly the 1,000
+ * fixture owners (anything interleaved fails, never assumed away); the full
+ * requested page of that suffix must exceed 1 MiB; the first response must be
+ * non-empty and SHORT of the 1,000-row limit; the second must be a non-empty
+ * exact continuation; both pages must be the exact suffix in order (no
+ * missing, repeated or skipped owner), together hold all 1,000 fixture owners,
+ * and each stay within 1 MiB.
+ */
+export function checkOwnerByteProbe(expected: readonly Owner[], fixtureKeys: readonly string[], page1: readonly OwnerRow[], page2: readonly OwnerRow[]): { problems: string[]; evidence: OwnerProbeEvidence } {
+  const anchor = ownerKey({ partitionKind: OWNER_PROBE_ANCHOR.kind, partitionKey: OWNER_PROBE_ANCHOR.key });
+  const suffix = expected.filter((o) => compareUtf8(ownerKey(o), anchor) > 0);
+  const wantLong = [...fixtureKeys].sort(compareUtf8);
+  const asRows = (os: readonly Owner[]): OwnerRow[] => os.map((o) => ({ partition_kind: o.partitionKind, partition_key: o.partitionKey }));
+  const uncapped = ownerRowBytes(asRows(suffix.slice(0, 1000)));
+  const p: string[] = [];
+  const head = suffix.slice(0, wantLong.length);
+  if (head.length !== wantLong.length || head.some((o, i) => o.partitionKind !== "order" || o.partitionKey !== wantLong[i])) {
+    const bad = head.findIndex((o, i) => o.partitionKind !== "order" || o.partitionKey !== wantLong[i]);
+    p.push(`the independent owner suffix after (order, ${JSON.stringify(OWNER_PROBE_ANCHOR.key)}) does not begin with the ${wantLong.length} long-key fixture owners (first difference at ${bad < 0 ? head.length : bad}: ${JSON.stringify(head[bad]?.partitionKey?.slice(0, 40) ?? null)})`);
+  }
+  if (uncapped <= MIB) p.push(`the uncapped requested page would be ${uncapped} bytes; the probe needs more than 1 MiB`);
+  const id = (r: OwnerRow) => `${r.partition_kind}\u0000${r.partition_key}`;
+  const want = asRows(suffix).map(id);
+  if (page1.length === 0) p.push("the anchored first owner page is empty");
+  if (page1.length >= 1000) p.push(`the anchored first owner page is full (${page1.length} rows); it must be byte-capped short of 1,000`);
+  if (page2.length === 0) p.push("the exact continuation after the byte-capped owner page is empty");
+  const got = [...page1, ...page2].map(id);
+  const seen = new Set<string>();
+  for (const [i, k] of got.entries()) {
+    if (seen.has(k)) p.push(`owner probe: ${JSON.stringify(k.slice(0, 48))} returned twice`);
+    seen.add(k);
+    if (want[i] !== k) {
+      p.push(`owner probe position ${i}${i < page1.length ? " (first page)" : " (continuation)"}: got ${JSON.stringify(k.slice(0, 48))}, the independent suffix has ${JSON.stringify(want[i]?.slice(0, 48) ?? null)}`);
+      break;
+    }
+  }
+  const covered = wantLong.filter((k) => seen.has(`order\u0000${k}`)).length;
+  if (covered !== wantLong.length) p.push(`the two pages hold ${covered} of the ${wantLong.length} long-key owners`);
+  const b1 = ownerRowBytes(page1);
+  const b2 = ownerRowBytes(page2);
+  if (b1 > MIB || b2 > MIB) p.push(`an owner probe response exceeds 1 MiB (${b1}, ${b2})`);
+  return { problems: p, evidence: { anchor: `order/${OWNER_PROBE_ANCHOR.key}`, suffixOwners: suffix.length, uncappedCompactBytes: uncapped, pages: [{ rows: page1.length, compactBytes: b1 }, { rows: page2.length, compactBytes: b2 }], longKeysCovered: covered } };
+}
+/** The probe's two real calls: anchored first page (limit 1,000), then the exact continuation from its last returned key. */
+export async function runOwnerByteProbe(call: (fn: string, args: Record<string, unknown>) => Promise<Array<Record<string, unknown>>>, ref: { p_batch: string; p_fence: number }): Promise<{ page1: OwnerRow[]; page2: OwnerRow[] }> {
+  const page1 = (await call("list_reporting_owners", { ...ref, p_after_kind: OWNER_PROBE_ANCHOR.kind, p_after_key: OWNER_PROBE_ANCHOR.key, p_limit: 1000 })) as OwnerRow[];
+  if (!page1.length) return { page1, page2: [] };
+  const last = page1[page1.length - 1];
+  const page2 = (await call("list_reporting_owners", { ...ref, p_after_kind: last.partition_kind, p_after_key: last.partition_key, p_limit: 1000 })) as OwnerRow[];
+  return { page1, page2 };
+}
+
+// ---------------------------------------------------------------------------
 // The cases
 // ---------------------------------------------------------------------------
 
@@ -584,13 +649,22 @@ export async function runDependencyCases(c: Db, ctx: FlowCtx, env: CaseEnv): Pro
     if (ev.rpc[fn].cappedContinuations < 1) p.push(`no byte-capped non-final ${what} page was followed by its exact continuation`);
   };
   const ownersExpected = [...new Map(view1.map((e) => [ownerKey(ownerOfEvent(e)), ownerOfEvent(e)])).values()].sort((x, y) => compareUtf8(ownerKey(x), ownerKey(y)));
-  await step(c, ctx, "R2", "list_reporting_owners: every owner exactly once in bytewise order, incl. 1,000 ~1,200-byte keys; a byte-capped page continues exactly", async () => {
+  await step(c, ctx, "R2", "list_reporting_owners: complete enumeration through the real reader; every owner exactly once in bytewise order, incl. all 1,000 ~1,200-byte keys", async () => {
     const got = await drain(reader.owners());
     const p: string[] = [];
     if (canonicalJson(got) !== canonicalJson(ownersExpected)) p.push(`owners differ (${got.length} vs ${ownersExpected.length})`);
     if (got.filter((o) => o.partitionKey.startsWith("DRK-")).length !== 1000) p.push("not all 1,000 long-key owners were listed");
-    capped("list_reporting_owners", "owner", p);
     return expectNone("R2", p);
+  });
+  // T14S2: the byte cap is proven by its OWN anchored probe, never by wherever ordinary 1,000-row pages happened to fall in R2.
+  const longKeys = fx.a.filter((x) => String(x.order_number).startsWith("DRK-")).map((x) => String(x.order_number));
+  await step(c, ctx, "R2c", "owner byte cap (deterministic): anchored at (order, 'DRK-') with limit 1,000, the first response is non-empty and byte-capped short, its exact continuation is non-empty, both pages are the independent owner suffix and hold all 1,000 long keys", async () => {
+    const { page1, page2 } = await runOwnerByteProbe(call, { p_batch: rb.batchId, p_fence: rb.fence });
+    const r = checkOwnerByteProbe(ownersExpected, longKeys, page1, page2);
+    ev.ownerByteProbe = r.evidence as unknown as Record<string, unknown>;
+    const p = [...r.problems];
+    capped("list_reporting_owners", "owner", p); // the existing owner cap check, now evaluated where its evidence is deterministic
+    return expectNone("R2c", p);
   });
   const controlled: Owner[] = [
     owner("order", "DR-0"), owner("order", "DR-U"), owner("order", "DR-1"), owner("order", "DR-P"), owner("order", "DR-N"), owner("order", "DR-C"), owner("event", "dr-cx"),

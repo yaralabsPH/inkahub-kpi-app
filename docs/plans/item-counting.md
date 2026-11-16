@@ -2545,3 +2545,32 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The `requiredWorks` oracle projects the full UK view once per audience, which is CPU-heavy but finite.
   - **Request-cost concern (still open, explicit):** T14R3's per-candidate incremental cancellation reads raised the 300-line fan-out fixture from 96 to 1,704 requests. This rehearsal records `sqlCalls` and the per-function call counts for R8/F3, but that is a measurement only. Batching while keeping equivalent bounded consumption remains a Task 15/19 item.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (includes both new files); strict ES2020 tsc on both runners OK; 1427/1427 tests (39 files); build OK.
+- 2026-11-16 — T14S2 deterministic owner-byte probe, OFFLINE (Claude). No SQL executed, no staging retry, nothing installed, no Task 15+. Edited only `tests/staging/reportingDependencyRehearsal.ts`, its focused test and this log. `api/`, the application, every migration, dependencies, timeouts, fixture volume and every acceptance limit are unchanged. The failed `dcf9924` evidence stays failed and is untouched.
+  - **Cause (as diagnosed in the plan):** R2 judged the owner byte cap from wherever complete enumeration's ordinary 1,000-row pages fell. With 600-odd real owners before `DRK-`, the 1,000 long keys straddled two ordinary pages, each under 1 MiB, so no byte-capped page existed. That is a positioning gap in the harness, not a limiter failure.
+  - **Fix:**
+    - R2 keeps complete `rpcFrozenReader.owners()` enumeration, exact equality with the independently sorted owner list, and the all-1,000-`DRK-` check. It no longer judges the byte cap.
+    - New required case **R2c** (before R3, inside the pre-R2/X8 fingerprint bracket). On the same frozen rebuild and SQL adapter, `runOwnerByteProbe` calls `list_reporting_owners` anchored at `('order', 'DRK-')` with limit 1,000, then once more from the exact last returned key.
+    - The pure `checkOwnerByteProbe` requires all of these:
+      - the independent suffix after the anchor begins with exactly the 1,000 fixture owners (an interleaved real owner fails, naming the first difference);
+      - the uncapped requested page (the first 1,000 suffix owners as compact JSON) exceeds 1 MiB;
+      - page 1 is non-empty and shorter than 1,000;
+      - page 2 is non-empty;
+      - both pages are the exact suffix in order (no missing, repeated or skipped owner);
+      - together they hold all 1,000 long keys;
+      - each page is at most 1 MiB.
+    - Evidence records `ownerByteProbe` (anchor, suffix size, uncapped bytes, per-page rows/bytes, coverage). Incidental pagination elsewhere cannot satisfy R2c.
+    - The six existing `capped(...)` checks are all kept. The owner one is now evaluated in R2c, after the probe, where its evidence is deterministic; left in R2 it would fail again by position. **Please confirm** this matches "all six existing cap checks unchanged". The probe's own direct page checks decide R2c regardless.
+  - **Regression (actual reader and adapter, over a fake `list_reporting_owners` with 0041's byte accounting):** 600 short owners before the 1,000 long keys and 50 after.
+    - Complete enumeration is exact, but `cappedContinuations` stays 0, so the old R2 assertion fails, reproducing the staging shape.
+    - The anchored probe caps page 1 short of 1,000 and continues exactly to cover all 1,000 (`cappedContinuations` becomes 1, two calls).
+    - Rejection cases: truncated continuation, owner missing from page 1, repeated owner, wrong (skipping) continuation, incorrectly full first page, empty first page, empty continuation, a page starting before the anchor, an owner interleaved in the long-key prefix, a fixture under 1 MiB, and a page over 1 MiB. The exact call arguments are asserted too, and there is no continuation after an empty first page.
+  - **Failing first:** against the `dcf9924` module, 15 of the new tests fail. The staging-shape regression passes there by design, because it demonstrates the old check's zero byte-capped pages.
+  - **Mutations: 14/14 caught.** They broke: the full-page check, the continuation key, the anchor, the interleave check, the uncapped-size check, repeat detection, identity/order comparison, coverage, empty continuation, empty first page, page size, R2c as a required case, moving the owner cap check back into R2, and R2 parity.
+  - **Review of R3–R6 and F1 for the same positioning assumption: no concrete further defect found.**
+    - R3: members are read per single owner from that owner's start, and DR-BIG's 15 rows of about 90 KB each (about 1.36 MB) must cap.
+    - R4: by-id requests only the probe ids, including the 15 big rows.
+    - R5: children start at the sorted parent `dr-bp`, whose 15 big children come first.
+    - F1: the refresh has only about 21 changed keys (equal cutoffs, so no due keys). The 15 big keys carry base and frozen images of about 180 KB each, all in the first requested page.
+    - R6 is the only page-positioned walk (worker cs from FAR_PAST, 1,000-row pages). Its 30 big rows (15 owners plus 15 children, about 2.7 MB) are contiguous unless more than about 970 real cs rows fall between 2026-02-12 01:00 and 02:15 UTC. A boundary can split them only into two pages, and one page then holds at least 15 big rows, which is over 1 MiB, so it caps. I have not changed it. A direct anchored stream probe would make it unconditional; that is not done without authorization.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 119/119 focused; 1443/1443 tests (39 files); build OK.
+  - **Limitations:** a passing unit test is not PostgreSQL evidence. Root reviews before one new rehearsal.
