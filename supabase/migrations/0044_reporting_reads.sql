@@ -55,11 +55,24 @@ AS $fn$
           AND f.pid IN (SELECT w.event_id FROM win w WHERE w.event_type IN ('line_verified', 'completed', 'dispatched')))
 $fn$;
 
+-- The production date of an instant at a site: local wall clock (IANA zone), days start at 04:00
+-- (productionDateAt in src/lib/domain/productionPeriods.ts). Stored facts carry it only on verifications.
+CREATE FUNCTION reporting_private.production_date_at(p_site text, p_at timestamptz)
+RETURNS date
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT ((p_at AT TIME ZONE CASE p_site WHEN 'au' THEN 'Australia/Sydney' WHEN 'uk' THEN 'Europe/London' WHEN 'us' THEN 'America/Chicago' END) - interval '4 hours')::date
+$fn$;
+
 -- Selected facts with their selection-dependent state.
 CREATE FUNCTION reporting_private.sel_eval(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz)
 RETURNS TABLE (event_id text, role text, event_type text, created_at timestamptz, production_date date, staff_id uuid, department text, work_type text,
                order_key text, raw_order text, case_id text, line_key text, items bigint, item_status text, product_kind text,
-               item_issue_kind text, item_issue_detail text, invalid_detail text,
+               item_issue_kind text, item_issue_detail text, invalid_detail text, sku text, timing_stream boolean, timing_weight numeric,
                effective boolean, reversed boolean, qualification text)
 LANGUAGE sql
 STABLE
@@ -82,8 +95,8 @@ AS $fn$
       JOIN s p ON p.event_id = x.parent_event_id
      WHERE c.role = 'cancellation' AND NOT x.is_self AND p.role IN ('verification', 'terminal') AND p.created_at <= c.created_at AND x.pair = 'valid'
   )
-  SELECT s.event_id, s.role, s.event_type, s.created_at, s.production_date, s.staff_id, s.department, s.work_type, s.order_key, s.raw_order, s.case_id, s.line_key,
-         s.items, s.item_status, s.product_kind, s.item_issue_kind, s.item_issue_detail, s.invalid_detail,
+  SELECT s.event_id, s.role, s.event_type, s.created_at, coalesce(s.production_date, reporting_private.production_date_at(p_site, s.created_at)), s.staff_id, s.department, s.work_type, s.order_key, s.raw_order, s.case_id, s.line_key,
+         s.items, s.item_status, s.product_kind, s.item_issue_kind, s.item_issue_detail, s.invalid_detail, s.sku, s.timing_stream, s.timing_weight,
          s.role = 'verification' AND NOT EXISTS (SELECT 1 FROM valid v WHERE v.parent_id = s.event_id AND v.parent_role = 'verification'),
          s.role = 'terminal' AND EXISTS (SELECT 1 FROM valid v WHERE v.parent_id = s.event_id AND v.parent_role = 'terminal'),
          CASE WHEN s.role = 'terminal' THEN (
@@ -204,6 +217,155 @@ AS $fn$
        'overflow', (SELECT i.overflow FROM items_of i)))
 $fn$;
 
+-- UTF-16 code-unit order (JavaScript string `<`): the projector's tie-break for equal microseconds.
+CREATE FUNCTION reporting_private.utf16_key(p text)
+RETURNS bytea
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+  out bytea := ''::bytea;
+  cp  integer;
+  u   integer;
+  i   integer;
+BEGIN
+  FOR i IN 1 .. pg_catalog.length(p) LOOP
+    cp := pg_catalog.ascii(pg_catalog.substr(p, i, 1));
+    IF cp < 65536 THEN
+      out := out || pg_catalog.set_byte(pg_catalog.set_byte('\x0000'::bytea, 0, cp >> 8), 1, cp & 255);
+    ELSE
+      u := 55296 + ((cp - 65536) >> 10);
+      out := out || pg_catalog.set_byte(pg_catalog.set_byte('\x0000'::bytea, 0, u >> 8), 1, u & 255);
+      u := 56320 + ((cp - 65536) & 1023);
+      out := out || pg_catalog.set_byte(pg_catalog.set_byte('\x0000'::bytea, 0, u >> 8), 1, u & 255);
+    END IF;
+  END LOOP;
+  RETURN out;
+END
+$fn$;
+
+-- Frame timing lines of one selection, range and work-type choice (null = all types), every worker
+-- (callers narrow by staff AFTER the stream: a filtered-out worker still sets their own predecessor).
+-- Mirrors referenceTimingLines: effective, in range by millisecond, stream SKU; the predecessor is the
+-- previous line of the same worker in THIS selected stream; gaps > 0 and <= 30 min with weight > 0 are timed.
+CREATE FUNCTION reporting_private.sel_timing(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                             p_scope_start timestamptz, p_scope_end timestamptz, p_work_type text)
+RETURNS TABLE (event_id text, staff_id uuid, work_type text, order_key text, sku text, weight numeric, started_ms bigint, completed_ms bigint, duration_min numeric)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH v AS (
+    SELECT e.event_id, e.staff_id, e.work_type, e.order_key, e.sku, e.timing_weight, e.created_at,
+           pg_catalog.floor(EXTRACT(epoch FROM e.created_at) * 1000)::bigint AS ms
+      FROM reporting_private.sel_eval(p_site, p_ak, p_staff, p_seq, p_start, p_end) e
+     WHERE e.role = 'verification' AND e.effective AND e.timing_stream
+       AND e.created_at >= p_scope_start AND e.created_at < p_scope_end AND (p_work_type IS NULL OR e.work_type = p_work_type)
+  ), s AS (
+    SELECT v.*, pg_catalog.lag(v.ms) OVER (PARTITION BY v.staff_id ORDER BY v.created_at, reporting_private.utf16_key(v.event_id)) AS prev_ms FROM v
+  )
+  SELECT s.event_id, s.staff_id, s.work_type, s.order_key, s.sku, s.timing_weight, coalesce(s.prev_ms, s.ms), s.ms,
+         CASE WHEN s.prev_ms IS NOT NULL AND s.ms - s.prev_ms > 0 AND s.ms - s.prev_ms <= 30 * 60000 AND s.timing_weight > 0
+              THEN (s.ms - s.prev_ms)::numeric / 60000 ELSE 0 END
+    FROM s
+$fn$;
+
+-- The Reports view for one range (p_first_date..p_last_date = p_start..p_end) and display filters:
+-- tiles (staff + work type), page coverage (everyone, work type), leaderboard of every visible person
+-- (staff-days from per-production-date credit), timing totals per tile/person, per-SKU timing aggregates
+-- (the server groups them by size/variant with the shared SKU parser), and the tile's daily series for
+-- EVERY production date of the range (zero days included).
+CREATE FUNCTION reporting_private.sel_report(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz,
+                                             p_first_date date, p_last_date date, p_filter_staff uuid, p_work_type text)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH ev AS (SELECT * FROM reporting_private.sel_eval(p_site, p_ak, p_staff, p_seq, p_start, p_end)),
+  credit AS (
+    SELECT v.staff_id, v.production_date, v.case_id IS NOT NULL AS rework, CASE WHEN v.item_status = 'counted' THEN v.items ELSE 0 END::numeric AS items
+      FROM ev v
+     WHERE v.role = 'verification' AND v.effective AND v.created_at >= p_start AND v.created_at < p_end AND (p_work_type IS NULL OR v.work_type = p_work_type)
+  ), orders AS (
+    SELECT t.staff_id, t.production_date, t.case_id IS NOT NULL AS rework, t.order_key, t.case_id
+      FROM ev t
+     WHERE t.role = 'terminal' AND NOT t.reversed AND t.qualification <> 'excluded_only' AND t.created_at >= p_start AND t.created_at < p_end
+       AND (p_work_type IS NULL OR t.work_type = p_work_type)
+  ), people AS (
+    SELECT DISTINCT x.staff_id FROM (SELECT c.staff_id FROM credit c UNION SELECT o.staff_id FROM orders o) x
+  ), pday AS (
+    SELECT p.staff_id, d.production_date,
+           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.production_date = d.production_date), 0) AS items,
+           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.production_date = d.production_date) AS orders
+      FROM people p CROSS JOIN (SELECT DISTINCT c.production_date FROM credit c UNION SELECT o.production_date FROM orders o) d
+  ), timing AS (
+    SELECT * FROM reporting_private.sel_timing(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, p_work_type)
+  ), tt AS (
+    SELECT t.staff_id, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight FROM timing t GROUP BY t.staff_id
+  ), board AS (
+    SELECT p.staff_id,
+           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND NOT c.rework), 0) AS n_items,
+           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND NOT o.rework) AS n_orders,
+           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.rework), 0) AS r_items,
+           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.rework) AS r_orders,
+           (SELECT count(*) FROM pday d WHERE d.staff_id = p.staff_id AND (d.items > 0 OR d.orders > 0)) AS days_worked
+      FROM people p
+  ), tiles AS (
+    SELECT reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end,
+             CASE WHEN p_filter_staff IS NULL THEN NULL ELSE ARRAY[p_filter_staff] END, CASE WHEN p_work_type IS NULL THEN NULL ELSE ARRAY[p_work_type] END) AS j
+  ), everyone AS (
+    SELECT reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, NULL, CASE WHEN p_work_type IS NULL THEN NULL ELSE ARRAY[p_work_type] END) AS j
+  ), staff_days AS (
+    SELECT CASE WHEN p_filter_staff IS NULL THEN coalesce((SELECT sum(b.days_worked) FROM board b), 0)
+                ELSE coalesce((SELECT b.days_worked FROM board b WHERE b.staff_id = p_filter_staff), 0) END AS n
+  ), dates AS (
+    SELECT d::date AS production_date FROM pg_catalog.generate_series(p_first_date::timestamp, p_last_date::timestamp, interval '1 day') d
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'totals', (SELECT tl.j -> 'totals' FROM tiles tl),
+    'byWorkType', (SELECT tl.j -> 'byWorkType' FROM tiles tl),
+    'coverage', (SELECT e.j -> 'coverage' FROM everyone e),
+    'tileCoverage', (SELECT tl.j -> 'coverage' FROM tiles tl),
+    'activeStaff', (SELECT count(*) FROM people p WHERE p_filter_staff IS NULL OR p.staff_id = p_filter_staff),
+    'staffDays', (SELECT s.n FROM staff_days s),
+    'avgOrdersPerStaffDay', (SELECT CASE WHEN s.n > 0 THEN ((SELECT tl.j #>> '{totals,normal,orders}' FROM tiles tl)::numeric / s.n) ELSE 0 END FROM staff_days s),
+    'timing', (SELECT pg_catalog.jsonb_build_object('durationMin', coalesce(sum(x.duration), 0), 'timedWeight', coalesce(sum(x.weight), 0),
+                 'avgMinPerUnit', CASE WHEN coalesce(sum(x.weight), 0) > 0 THEN sum(x.duration) / sum(x.weight) ELSE 0 END)
+                 FROM tt x WHERE p_filter_staff IS NULL OR x.staff_id = p_filter_staff),
+    'people', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                 'staffId', b.staff_id, 'normal', pg_catalog.jsonb_build_object('items', b.n_items, 'orders', b.n_orders), 'rework', pg_catalog.jsonb_build_object('items', b.r_items, 'orders', b.r_orders),
+                 'daysWorked', b.days_worked, 'itemsPerDay', CASE WHEN b.days_worked > 0 THEN b.n_items / b.days_worked ELSE 0 END,
+                 'ordersPerDay', CASE WHEN b.days_worked > 0 THEN b.n_orders::numeric / b.days_worked ELSE 0 END,
+                 'timing', pg_catalog.jsonb_build_object('durationMin', coalesce(x.duration, 0), 'timedWeight', coalesce(x.weight, 0),
+                    'avgMinPerUnit', CASE WHEN coalesce(x.weight, 0) > 0 THEN x.duration / x.weight ELSE 0 END))
+                 ORDER BY b.n_orders DESC, b.n_items DESC, b.staff_id::text COLLATE "C"), '[]'::jsonb)
+                 FROM board b LEFT JOIN tt x ON x.staff_id = b.staff_id),
+    'skuTiming', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('sku', g.sku, 'durationMin', g.duration, 'weight', g.weight) ORDER BY g.sku COLLATE "C"), '[]'::jsonb)
+                    FROM (SELECT t.sku, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight
+                            FROM timing t WHERE t.sku IS NOT NULL AND t.weight > 0 AND (p_filter_staff IS NULL OR t.staff_id = p_filter_staff) GROUP BY t.sku) g),
+    'daily', (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('productionDate', d.production_date, 'totals', pg_catalog.jsonb_build_object(
+                 'normal', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0),
+                                                         'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff))),
+                 'rework', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0),
+                                                         'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff)))))
+                 ORDER BY d.production_date) FROM dates d))
+$fn$;
+
+REVOKE ALL ON FUNCTION reporting_private.utf16_key(text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_timing(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz, text) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.utf16_key(text) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_timing(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz, text) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text) TO service_role;
+
+REVOKE ALL ON FUNCTION reporting_private.production_date_at(text, timestamptz) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.production_date_at(text, timestamptz) TO service_role;
 REVOKE ALL ON FUNCTION reporting_private.sel_rows(text, text, uuid, bigint, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION reporting_private.sel_eval(text, text, uuid, bigint, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION reporting_private.sel_anchored(text, text, uuid, bigint, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;

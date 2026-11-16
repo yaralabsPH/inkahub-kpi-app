@@ -2883,3 +2883,28 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - Two survivors are equivalent and kept as defensive clauses: non-counted lines are stored with 0 items, and duplicate (kind, event) issues cannot arise from distinct paths.
   - One pinned test updated: the migration list includes 0044.
   - **Gate:** `npx tsc -b` OK; full suite run; build OK.
+- 2026-11-16 — **Task 16: 0044 layer 2 (Reports view), executed offline in PGlite** (Claude). This is a draft, not applied. Task 16 stays open: the public RPCs (`read_reporting_generation` with `read_mode`, `read_reporting_summary`, `read_reporting_detail`), the Welcome view and the staging harness remain.
+  - **New SQL:**
+    - `production_date_at`: the site zone with the 04:00 rule. The materializer stores `production_date` only on verifications, so terminals had none and daily Orders and staff-days came out short; this was found by parity and fixed.
+    - `utf16_key`: JavaScript's UTF-16 code-unit order for same-microsecond tie-breaks, which differs from `COLLATE "C"` for non-BMP vs U+E000–U+FFFF.
+    - `sel_timing`: `referenceTimingLines` — effective stream lines in range by millisecond, a per-worker predecessor inside the selected stream, gaps > 0 and ≤ 30 min with weight > 0.
+    - `sel_report`: the Reports view —
+      - tiles, and page coverage for everyone;
+      - a leaderboard with days worked from per-production-date credit, ordered as the app orders it;
+      - active staff, staff-days, average Orders per staff-day;
+      - tile and per-person timing;
+      - per-SKU timing aggregates;
+      - the tile's daily series for every date in the range, zero days included.
+  - **New `api/_lib/production-reporting-sku.ts`:** groups those bounded aggregates into the top-20 variant board with the SAME shared `parseSku` and ordering.
+  - **Parity (`tests/reporting/pg/report-view-parity.test.ts`, 42 cases):** compared with the EXISTING app reducer `buildProductionReportView` over the four-family snapshot of the same source.
+    - Coverage: 5 ranges × site/self × 4 filters (none, staff, work type, staff + type).
+    - Compared: tiles, by work type, coverage, active staff, staff-days, average, timing, the full leaderboard, the SKU board and the person daily series.
+    - Fixture additions: a cancelled timing line between two of one worker's lines.
+    - A direct `utf16_key` order test against JS sort.
+    - Layer-1 parity still passes (73).
+  - **SQL mutations: 14/14 caught**, after the cancelled-stream-line fixture closed the one first survivor:
+    - per-worker predecessor; 30-min cap; zero weight; stream and effective filters;
+    - timed-weight denominator; days-worked rule; derived production date; 04:00 start;
+    - staff-days for a selected person; leaderboard order; active-staff filter; page vs tile coverage;
+    - surrogate encoding.
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK (includes the SKU module); 1765/1765 tests (48 files); build OK.
