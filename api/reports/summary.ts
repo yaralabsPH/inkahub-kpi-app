@@ -24,8 +24,8 @@ export function queryRecord(q: MinimalRequest["query"], allowed: readonly string
   return out;
 }
 
-export interface SummaryDeps { auth(): AuthDeps | null; reader(): PublishedReader | null; now(): number }
-const defaults = (): SummaryDeps => ({ auth: () => supabaseAuthDeps(), reader: () => { const c = serviceRpcClient(); return c ? rpcPublishedReader(c) : null; }, now: () => Date.now() });
+export interface SummaryDeps { auth(): AuthDeps | null; reader(): PublishedReader | null; now(): number; cursorSecret?(): string | undefined }
+const defaults = (): SummaryDeps => ({ auth: () => supabaseAuthDeps(), reader: () => { const c = serviceRpcClient(); return c ? rpcPublishedReader(c) : null; }, now: () => Date.now(), cursorSecret: () => process.env.REPORTING_CURSOR_SECRET });
 
 export function createSummaryHandler(deps: SummaryDeps = defaults()) {
   return async function handler(req: MinimalRequest, res: MinimalResponse) {
@@ -46,7 +46,7 @@ export function createSummaryHandler(deps: SummaryDeps = defaults()) {
         ...(q.staffId !== undefined ? { staffId: q.staffId } : {}), ...(q.workType !== undefined ? { workType: q.workType as SummaryRequest["workType"] } : {}), ...(q.generationId !== undefined ? { generationId: q.generationId } : {}) };
       const reader = deps.reader();
       if (!reader) throw new ReportingHttpError(500, "CONFIG", "Report service configuration missing");
-      res.status(200).json(await readPublishedSummary(principal, request, { reader, now: deps.now, cursorSecret: undefined }));
+      res.status(200).json(await readPublishedSummary(principal, request, { reader, now: deps.now, cursorSecret: deps.cursorSecret?.() }));
     } catch (e) {
       const { status, body } = errorResponse(e);
       res.status(status).json(body);

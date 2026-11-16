@@ -2936,3 +2936,13 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - A page whose base changed meanwhile is never appended; dispose clears in-flight requests.
     - Tests: switching orderNumber never reuses another selector's cursor or rows (fails on the old controller); concurrent calls send one request and append one page (fails on the old one); a late page after an identity change is discarded (already correct, now pinned).
   - **Gate:** tsc -b OK; typecheck:digest OK; 1821/1821 tests (50 files); build OK.
+- 2026-11-16 — Review repair item 2 (Task 16 count safety): implemented; runtime gate pending.
+  - **0044:** every Items sum (totals, byWorkType, daily, people, Welcome cells) goes through `safe_items` and becomes the overflow null outside 0..2^53−1. Every count (Orders, staff-days, active staff, issue rows, totalRows) goes through `safe_count`, which raises outside the safe range.
+  - **0044 public reads:** appended `read_reporting_generation` and `read_reporting_summary`. Both are service_role only. They check the audience shape, the view, the work type, the limits, that the window matches the production-day starts, and that the generation is a retained, complete publication for that site.
+  - **API:** new `api/_lib/production-reporting-dto.ts` strictly parses the response: exact key sets, safe-integer counts, Items as a safe integer or null, finite rates, work types in order, and Welcome present only on the Welcome view.
+    - `rpcPublishedReader` uses the parser; the server overlays trusted visibility on coverage and signs continuation cursors when a page holds fewer than totalRows (no secret → 500 CONFIG).
+    - Added the DTO module to `typecheck:digest`.
+  - **Tests:** 17 response mutations plus paging/cursor cases in `tests/api/reporting-reads.test.ts`. New `tests/reporting/pg/summary-api-e2e.test.ts` (PGlite): the real worker publishes, then the real RPCs feed the real reader.
+    - Two-valid-quantities overflow fixture: 9007199254740990 + 5. Items are null in totals, the work type, the day, the person and Welcome; Orders stay exact; the other person is unaffected.
+    - SQL refusals: a forged window, a wrong-site generation, a malformed audience, and the authenticated role.
+  - **Gate:** tsc -b OK; typecheck:digest OK; 1846/1846 tests (51 files); build OK. No SQL was run against any real database.

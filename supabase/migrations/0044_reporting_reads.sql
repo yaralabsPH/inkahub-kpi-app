@@ -23,6 +23,30 @@
 
 BEGIN;
 
+-- Contract count safety: Items above Number.MAX_SAFE_INTEGER are the overflow state (null, never a
+-- rounded number); an Orders/count aggregate above it is an explicit error (no rounding, no clipping).
+CREATE FUNCTION reporting_private.safe_items(p numeric)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT CASE WHEN p IS NULL THEN NULL WHEN p < 0 OR p > 9007199254740991 OR p <> pg_catalog.trunc(p) THEN NULL ELSE p END
+$fn$;
+CREATE FUNCTION reporting_private.safe_count(p bigint)
+RETURNS bigint
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+BEGIN
+  IF p IS NULL OR p < 0 OR p > 9007199254740991 THEN RAISE EXCEPTION 'report count % is outside the exact safe-integer range', p; END IF;
+  RETURN p;
+END
+$fn$;
+
 -- The four families (window rows, pre-window qualification verifications and cancelled
 -- parents, post-window cancellations of window targets) over facts UNION source issues.
 CREATE FUNCTION reporting_private.sel_rows(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz)
@@ -188,7 +212,7 @@ AS $fn$
   ), grp AS (
     SELECT g.rework,
            (SELECT sum(c.items) FROM credit c WHERE c.rework = g.rework) AS items,
-           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.rework = g.rework) AS orders
+           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.rework = g.rework)) AS orders
       FROM (VALUES (false), (true)) g(rework)
   ), items_of AS (
     SELECT bool_or(coalesce(g.items, 0) > 9007199254740991) AS overflow FROM grp g
@@ -197,23 +221,23 @@ AS $fn$
     'totals', (SELECT pg_catalog.jsonb_object_agg(CASE WHEN g.rework THEN 'rework' ELSE 'normal' END,
                  pg_catalog.jsonb_build_object('items', CASE WHEN coalesce(g.items, 0) > 9007199254740991 THEN NULL ELSE coalesce(g.items, 0) END, 'orders', g.orders)) FROM grp g),
     'byWorkType', (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('workType', w.wt, 'totals', pg_catalog.jsonb_build_object(
-                     'normal', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.work_type = w.wt AND NOT c.rework), 0), 'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.work_type = w.wt AND NOT o.rework)),
-                     'rework', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.work_type = w.wt AND c.rework), 0), 'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.work_type = w.wt AND o.rework))))
+                     'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.work_type = w.wt AND NOT c.rework), 0)), 'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.work_type = w.wt AND NOT o.rework))),
+                     'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.work_type = w.wt AND c.rework), 0)), 'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.work_type = w.wt AND o.rework)))))
                      ORDER BY w.n)
                      FROM (VALUES (1, 'a0_framed'), (2, 'framed'), (3, 'unframed'), (4, 'dispatch')) w(n, wt)),
     'daily', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('productionDate', d.production_date, 'totals', pg_catalog.jsonb_build_object(
-                     'normal', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework), 0), 'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework)),
-                     'rework', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework), 0), 'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework))))
+                     'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework), 0)), 'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework))),
+                     'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework), 0)), 'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework)))))
                      ORDER BY d.production_date), '[]'::jsonb)
                 FROM (SELECT DISTINCT c.production_date FROM credit c UNION SELECT DISTINCT o.production_date FROM orders o) d),
     'coverage', pg_catalog.jsonb_build_object(
-       'issueCounts', (SELECT pg_catalog.jsonb_object_agg(k.k, (SELECT count(*) FROM cov c WHERE c.kind = 'issue' AND c.name = k.k))
+       'issueCounts', (SELECT pg_catalog.jsonb_object_agg(k.k, reporting_private.safe_count((SELECT count(*) FROM cov c WHERE c.kind = 'issue' AND c.name = k.k)))
                          FROM pg_catalog.unnest(ARRAY['invalid_event', 'unclassified_sku', 'invalid_quantity', 'unresolved_parent', 'missing_completion_detail', 'ambiguous_repeat']) k(k)),
-       'notes', (SELECT pg_catalog.jsonb_object_agg(k.k, (SELECT count(*) FROM reporting_private.sel_anchored(p_site, p_ak, p_staff, p_seq, p_start, p_end) a
+       'notes', (SELECT pg_catalog.jsonb_object_agg(k.k, reporting_private.safe_count((SELECT count(*) FROM reporting_private.sel_anchored(p_site, p_ak, p_staff, p_seq, p_start, p_end) a
                          WHERE a.kind = 'note' AND a.name = k.k AND a.created_at >= p_scope_start AND a.created_at < p_scope_end
-                           AND (p_staff_ids IS NULL OR a.staff_id = ANY (p_staff_ids)) AND (p_work_types IS NULL OR a.work_type = ANY (p_work_types))))
+                           AND (p_staff_ids IS NULL OR a.staff_id = ANY (p_staff_ids)) AND (p_work_types IS NULL OR a.work_type = ANY (p_work_types)))))
                    FROM pg_catalog.unnest(ARRAY['expected_exclusion', 'corrected_verification', 'reversed_terminal', 'excluded_only_completion']) k(k)),
-       'issueRows', (SELECT count(*) FROM cov c WHERE c.kind = 'issue'),
+       'issueRows', reporting_private.safe_count((SELECT count(*) FROM cov c WHERE c.kind = 'issue')),
        'overflow', (SELECT i.overflow FROM items_of i)))
 $fn$;
 
@@ -301,8 +325,8 @@ AS $fn$
     SELECT DISTINCT x.staff_id FROM (SELECT c.staff_id FROM credit c UNION SELECT o.staff_id FROM orders o) x
   ), pday AS (
     SELECT p.staff_id, d.production_date,
-           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.production_date = d.production_date), 0) AS items,
-           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.production_date = d.production_date) AS orders
+           reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.production_date = d.production_date), 0)) AS items,
+           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.production_date = d.production_date)) AS orders
       FROM people p CROSS JOIN (SELECT DISTINCT c.production_date FROM credit c UNION SELECT o.production_date FROM orders o) d
   ), timing AS (
     SELECT * FROM reporting_private.sel_timing(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, p_work_type)
@@ -310,10 +334,10 @@ AS $fn$
     SELECT t.staff_id, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight FROM timing t GROUP BY t.staff_id
   ), board AS (
     SELECT p.staff_id,
-           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND NOT c.rework), 0) AS n_items,
-           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND NOT o.rework) AS n_orders,
-           coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.rework), 0) AS r_items,
-           (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.rework) AS r_orders,
+           reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND NOT c.rework), 0)) AS n_items,
+           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND NOT o.rework)) AS n_orders,
+           reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.staff_id = p.staff_id AND c.rework), 0)) AS r_items,
+           reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.staff_id = p.staff_id AND o.rework)) AS r_orders,
            (SELECT count(*) FROM pday d WHERE d.staff_id = p.staff_id AND (d.items > 0 OR d.orders > 0)) AS days_worked
       FROM people p
   ), tiles AS (
@@ -332,28 +356,28 @@ AS $fn$
     'byWorkType', (SELECT tl.j -> 'byWorkType' FROM tiles tl),
     'coverage', (SELECT e.j -> 'coverage' FROM everyone e),
     'tileCoverage', (SELECT tl.j -> 'coverage' FROM tiles tl),
-    'activeStaff', (SELECT count(*) FROM people p WHERE p_filter_staff IS NULL OR p.staff_id = p_filter_staff),
-    'staffDays', (SELECT s.n FROM staff_days s),
+    'activeStaff', reporting_private.safe_count((SELECT count(*) FROM people p WHERE p_filter_staff IS NULL OR p.staff_id = p_filter_staff)),
+    'staffDays', reporting_private.safe_count((SELECT s.n FROM staff_days s)::bigint),
     'avgOrdersPerStaffDay', (SELECT CASE WHEN s.n > 0 THEN ((SELECT tl.j #>> '{totals,normal,orders}' FROM tiles tl)::numeric / s.n) ELSE 0 END FROM staff_days s),
     'timing', (SELECT pg_catalog.jsonb_build_object('durationMin', coalesce(sum(x.duration), 0), 'timedWeight', coalesce(sum(x.weight), 0),
                  'avgMinPerUnit', CASE WHEN coalesce(sum(x.weight), 0) > 0 THEN sum(x.duration) / sum(x.weight) ELSE 0 END)
                  FROM tt x WHERE p_filter_staff IS NULL OR x.staff_id = p_filter_staff),
     'people', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
-                 'staffId', b.staff_id, 'normal', pg_catalog.jsonb_build_object('items', b.n_items, 'orders', b.n_orders), 'rework', pg_catalog.jsonb_build_object('items', b.r_items, 'orders', b.r_orders),
-                 'daysWorked', b.days_worked, 'itemsPerDay', CASE WHEN b.days_worked > 0 THEN b.n_items / b.days_worked ELSE 0 END,
+                 'staffId', b.staff_id, 'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(b.n_items), 'orders', b.n_orders), 'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(b.r_items), 'orders', b.r_orders),
+                 'daysWorked', b.days_worked, 'itemsPerDay', CASE WHEN b.days_worked > 0 THEN coalesce(reporting_private.safe_items(b.n_items), 0) / b.days_worked ELSE 0 END,
                  'ordersPerDay', CASE WHEN b.days_worked > 0 THEN b.n_orders::numeric / b.days_worked ELSE 0 END,
                  'timing', pg_catalog.jsonb_build_object('durationMin', coalesce(x.duration, 0), 'timedWeight', coalesce(x.weight, 0),
                     'avgMinPerUnit', CASE WHEN coalesce(x.weight, 0) > 0 THEN x.duration / x.weight ELSE 0 END))
-                 ORDER BY b.n_orders DESC, b.n_items DESC, b.staff_id::text COLLATE "C"), '[]'::jsonb)
+                 ORDER BY b.n_orders DESC, coalesce(reporting_private.safe_items(b.n_items), 0) DESC, b.staff_id::text COLLATE "C"), '[]'::jsonb)
                  FROM board b LEFT JOIN tt x ON x.staff_id = b.staff_id),
     'skuTiming', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('sku', g.sku, 'durationMin', g.duration, 'weight', g.weight) ORDER BY g.sku COLLATE "C"), '[]'::jsonb)
                     FROM (SELECT t.sku, sum(t.duration_min) AS duration, coalesce(sum(t.weight) FILTER (WHERE t.duration_min > 0), 0) AS weight
                             FROM timing t WHERE t.sku IS NOT NULL AND t.weight > 0 AND (p_filter_staff IS NULL OR t.staff_id = p_filter_staff) GROUP BY t.sku) g),
     'daily', (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('productionDate', d.production_date, 'totals', pg_catalog.jsonb_build_object(
-                 'normal', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0),
-                                                         'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff))),
-                 'rework', pg_catalog.jsonb_build_object('items', coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0),
-                                                         'orders', (SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff)))))
+                 'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND NOT c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0)),
+                                                         'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND NOT o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff)))),
+                 'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(coalesce((SELECT sum(c.items) FROM credit c WHERE c.production_date = d.production_date AND c.rework AND (p_filter_staff IS NULL OR c.staff_id = p_filter_staff)), 0)),
+                                                         'orders', reporting_private.safe_count((SELECT count(DISTINCT (o.order_key, o.case_id)) FROM orders o WHERE o.production_date = d.production_date AND o.rework AND (p_filter_staff IS NULL OR o.staff_id = p_filter_staff))))))
                  ORDER BY d.production_date) FROM dates d))
 $fn$;
 
@@ -395,7 +419,7 @@ AS $fn$
   SELECT pg_catalog.jsonb_build_object(
     'cells', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
                 'date', c.d, 'workType', CASE WHEN c.g_wt = 0 THEN c.wt END, 'staffId', CASE WHEN c.g_who = 0 THEN c.who END,
-                'normal', pg_catalog.jsonb_build_object('items', c.n_items, 'orders', c.n_orders), 'rework', pg_catalog.jsonb_build_object('items', c.r_items, 'orders', c.r_orders))
+                'normal', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(c.n_items), 'orders', reporting_private.safe_count(c.n_orders)), 'rework', pg_catalog.jsonb_build_object('items', reporting_private.safe_items(c.r_items), 'orders', reporting_private.safe_count(c.r_orders)))
                 ORDER BY c.d, c.g_wt, c.wt, c.g_who, c.who), '[]'::jsonb) FROM cells c),
     'coverage', reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, NULL, NULL) -> 'coverage',
     'todayCoverage', reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_today_start, p_today_end, NULL, NULL) -> 'coverage')
@@ -404,6 +428,10 @@ $fn$;
 REVOKE ALL ON FUNCTION reporting_private.sel_welcome(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION reporting_private.sel_welcome(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz) TO service_role;
 
+REVOKE ALL ON FUNCTION reporting_private.safe_items(numeric) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION reporting_private.safe_count(bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.safe_items(numeric) TO service_role;
+GRANT EXECUTE ON FUNCTION reporting_private.safe_count(bigint) TO service_role;
 REVOKE ALL ON FUNCTION reporting_private.production_date_at(text, timestamptz) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION reporting_private.production_date_at(text, timestamptz) TO service_role;
 REVOKE ALL ON FUNCTION reporting_private.sel_rows(text, text, uuid, bigint, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;
@@ -414,5 +442,88 @@ GRANT EXECUTE ON FUNCTION reporting_private.sel_rows(text, text, uuid, bigint, t
 GRANT EXECUTE ON FUNCTION reporting_private.sel_eval(text, text, uuid, bigint, timestamptz, timestamptz) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.sel_anchored(text, text, uuid, bigint, timestamptz, timestamptz) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.sel_totals(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz, uuid[], text[]) TO service_role;
+
+-- 04:00 local on a production date at a site, as an instant.
+CREATE FUNCTION reporting_private.production_day_start(p_site text, p_date date)
+RETURNS timestamptz
+LANGUAGE sql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT (p_date + time '04:00') AT TIME ZONE CASE p_site WHEN 'au' THEN 'Australia/Sydney' WHEN 'uk' THEN 'Europe/London' WHEN 'us' THEN 'America/Chicago' END
+$fn$;
+
+-- The site's active published generation (p_generation null) or the named one of that site, with the
+-- site's CURRENT effective read mode. Times are exact UTC microsecond text.
+CREATE FUNCTION public.read_reporting_generation(p_site text, p_generation uuid)
+RETURNS TABLE (generation_id uuid, site text, state text, complete boolean, rule_version text, source_cutoff text, verified_at text, published_at text, expires_at text, read_mode text)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  SELECT g.generation_id, g.site, g.state, g.complete, g.rule_version,
+         pg_catalog.to_char(g.source_cutoff AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+         pg_catalog.to_char(g.verified_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+         pg_catalog.to_char(g.published_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+         pg_catalog.to_char(g.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+         s.read_mode
+    FROM reporting_private.generations g
+    JOIN reporting_private.site_state s ON s.site = g.site
+   WHERE g.site = p_site
+     AND CASE WHEN p_generation IS NULL THEN g.state = 'published' ELSE g.generation_id = p_generation END
+$fn$;
+
+-- One published summary for a trusted audience (chosen by the server, never the client): the Reports
+-- view parts and, for Welcome, the Welcome cells. Refuses anything malformed or not published/retained.
+CREATE FUNCTION public.read_reporting_summary(p_site text, p_audience_kind text, p_audience_staff uuid, p_generation uuid,
+                                              p_first_date date, p_last_date date, p_start timestamptz, p_end timestamptz,
+                                              p_staff uuid, p_work_type text, p_view text, p_daily_limit integer, p_people_limit integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+DECLARE
+  g reporting_private.generations;
+BEGIN
+  IF p_site IS NULL OR p_site NOT IN ('au', 'uk', 'us') THEN RAISE EXCEPTION 'read_reporting_summary: unsupported site'; END IF;
+  IF p_audience_kind = 'site' THEN
+    IF p_audience_staff IS NOT NULL THEN RAISE EXCEPTION 'read_reporting_summary: a site audience has no staff'; END IF;
+  ELSIF p_audience_kind = 'self' THEN
+    IF p_audience_staff IS NULL THEN RAISE EXCEPTION 'read_reporting_summary: a self audience needs its staff'; END IF;
+  ELSE
+    RAISE EXCEPTION 'read_reporting_summary: unsupported audience';
+  END IF;
+  IF p_view IS NULL OR p_view NOT IN ('reports', 'welcome') THEN RAISE EXCEPTION 'read_reporting_summary: unsupported view'; END IF;
+  IF p_work_type IS NOT NULL AND p_work_type NOT IN ('a0_framed', 'framed', 'unframed', 'dispatch') THEN RAISE EXCEPTION 'read_reporting_summary: unsupported work type'; END IF;
+  IF p_first_date IS NULL OR p_last_date IS NULL OR p_first_date > p_last_date THEN RAISE EXCEPTION 'read_reporting_summary: invalid date range'; END IF;
+  IF p_start IS DISTINCT FROM reporting_private.production_day_start(p_site, p_first_date)
+     OR p_end IS DISTINCT FROM reporting_private.production_day_start(p_site, p_last_date + 1) THEN
+    RAISE EXCEPTION 'read_reporting_summary: the window does not match the production dates';
+  END IF;
+  IF p_daily_limit IS NULL OR p_daily_limit < 1 OR p_daily_limit > 1000 OR p_people_limit IS NULL OR p_people_limit < 1 OR p_people_limit > 1000 THEN
+    RAISE EXCEPTION 'read_reporting_summary: page limits must be 1..1000';
+  END IF;
+  SELECT * INTO g FROM reporting_private.generations x WHERE x.generation_id = p_generation;
+  IF NOT FOUND OR g.site <> p_site OR g.state NOT IN ('published', 'superseded') OR NOT g.complete THEN
+    RAISE EXCEPTION 'read_reporting_summary: generation % is not a retained complete publication of %', p_generation, p_site;
+  END IF;
+  RETURN pg_catalog.jsonb_build_object(
+    'report', reporting_private.sel_report(p_site, p_audience_kind, p_audience_staff, g.generation_seq, p_start, p_end, p_first_date, p_last_date, p_staff, p_work_type),
+    'welcome', CASE WHEN p_view = 'welcome' THEN reporting_private.sel_welcome(p_site, p_audience_kind, p_audience_staff, g.generation_seq, p_start, p_end,
+                                                    reporting_private.production_day_start(p_site, p_last_date), p_end) END);
+END
+$fn$;
+
+REVOKE ALL ON FUNCTION reporting_private.production_day_start(text, date) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.production_day_start(text, date) TO service_role;
+REVOKE ALL ON FUNCTION public.read_reporting_generation(text, uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.read_reporting_summary(text, text, uuid, uuid, date, date, timestamptz, timestamptz, uuid, text, text, integer, integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.read_reporting_generation(text, uuid) TO service_role;
+GRANT EXECUTE ON FUNCTION public.read_reporting_summary(text, text, uuid, uuid, date, date, timestamptz, timestamptz, uuid, text, text, integer, integer) TO service_role;
 
 COMMIT;

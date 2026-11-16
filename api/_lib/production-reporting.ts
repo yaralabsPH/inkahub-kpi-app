@@ -254,7 +254,18 @@ export async function readPublishedSummary(p: ReportingPrincipal, request: Summa
   const now = deps.now();
   const g = await resolveGeneration(deps.reader, request.site, request.generationId ?? null, now);
   const { scope, visibility } = scopeOf(p, request, request.view, g.generationId);
-  const body = await deps.reader.summary(scope, request.view, { dailyLimit: DETAIL_PAGE_MAX, peopleLimit: 200 });
+  const raw = await deps.reader.summary(scope, request.view, { dailyLimit: DETAIL_PAGE_MAX, peopleLimit: 200 });
+  // Coverage carries the trusted audience's visibility; a limited view is always incomplete.
+  const cover = (c: SummaryBody["coverage"]) => ({ ...c, visibility, incomplete: c.incomplete || visibility.kind === "limited" });
+  const body: SummaryBody = { ...raw, coverage: cover(raw.coverage), ...(raw.welcome ? { welcome: { ...raw.welcome, coverage: cover(raw.welcome.coverage), todayCoverage: cover(raw.welcome.todayCoverage) } } : {}) };
+  // A page that does not hold every row continues through a signed detail cursor (only a null cursor ends a sequence).
+  const continuation = (kind: "days" | "people", shown: number, total: number) => {
+    if (total <= shown) return null;
+    if (!deps.cursorSecret) throw new ReportingHttpError(500, "CONFIG", "Report paging is not configured");
+    return signCursor(deps.cursorSecret, { v: 1, site: request.site, audience: audienceKey(scope.audience), filter: filterKey(request), generationId: g.generationId, kind }, shown);
+  };
+  body.dailyPage = { ...body.dailyPage, nextCursor: continuation("days", body.dailyPage.rows.length, body.dailyPage.totalRows) };
+  body.peoplePage = { ...body.peoplePage, nextCursor: continuation("people", body.peoplePage.rows.length, body.peoplePage.totalRows) };
   if (request.view === "welcome") {
     // Welcome returns only its existing shape: no people, SKU board or person-level detail.
     return { ...body, meta: meta(g, visibility, now), peoplePage: { rows: [], nextCursor: null, pageComplete: true, totalRows: 0 }, skuBoard: [] };

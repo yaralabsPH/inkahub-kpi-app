@@ -12,10 +12,10 @@ import { shiftProductionDate } from "../../src/lib/domain/productionPeriods.js";
 import type { CoverageCounts, PublishedWelcomeView } from "../../src/lib/domain/productionReporting.js";
 import type { WelcomeDepartment, WelcomeMostImproved, WelcomeTopWorker } from "../../src/lib/domain/productionWelcomeView.js";
 
-interface G { items: number; orders: number }
+interface G { items: number | null; orders: number }
 export interface WelcomeCell { date: string; workType: WorkType | null; staffId: string | null; normal: G; rework: G }
 const ZERO = (): { normal: G; rework: G } => ({ normal: { items: 0, orders: 0 }, rework: { items: 0, orders: 0 } });
-const num = (g: G): G => ({ items: Number(g.items), orders: Number(g.orders) });
+const num = (g: G): G => ({ items: g.items === null ? null : Number(g.items), orders: Number(g.orders) });
 
 export function welcomeFrom(cells: readonly WelcomeCell[], today: string, todayCoverage: CoverageCounts, coverage: CoverageCounts): PublishedWelcomeView {
   const key = (d: string, wt: WorkType | null, who: string | null) => `${d}|${wt ?? ""}|${who ?? ""}`;

@@ -12,6 +12,7 @@ import type { ReportSite } from "../../src/lib/domain/productionPeriods.js";
 import { DETAIL_PAGE_MAX, DETAIL_RESPONSE_MAX_BYTES, type PublishedDetailRow } from "../../src/lib/domain/productionReporting.js";
 import type { AuthDeps, GenerationMeta, PublishedReader, ReaderScope, SummaryBody } from "./production-reporting.js";
 import { ReportingHttpError } from "./production-reporting.js";
+import { parseSummaryResponse } from "./production-reporting-dto.js";
 import type { RpcClient } from "./reporting-jobs.js";
 
 const STATES = ["published", "superseded", "expired", "building", "failed"] as const;
@@ -51,13 +52,8 @@ export function rpcPublishedReader(client: RpcClient): PublishedReader {
     },
     async summary(scope, view, pages) {
       const v = await one(client, "read_reporting_summary", { ...scopeArgs(scope), p_view: view, p_daily_limit: pages.dailyLimit, p_people_limit: pages.peopleLimit });
-      if (!v || typeof v !== "object" || Array.isArray(v)) throw new ReportingHttpError(503, "UNAVAILABLE", "read_reporting_summary returned no object");
-      const o = v as Record<string, unknown>;
-      for (const k of ["totals", "byWorkType", "dailyPage", "coverage", "timing", "peoplePage", "activeStaff", "staffDays", "avgOrdersPerStaffDay", "skuBoard"]) {
-        if (!(k in o)) throw new ReportingHttpError(503, "UNAVAILABLE", `read_reporting_summary is missing ${k}`);
-      }
-      if (view === "welcome" && !o.welcome) throw new ReportingHttpError(503, "UNAVAILABLE", "read_reporting_summary is missing the Welcome view");
-      return o as unknown as SummaryBody;
+      // Deep, strict validation: safe-integer counts, null-or-safe Items, finite rates, exact key sets.
+      return parseSummaryResponse(v, view, scope.lastDate, pages) as SummaryBody;
     },
     async detail(scope, kind, orderNumber, after, limit) {
       if (!Number.isInteger(limit) || limit < 1 || limit > DETAIL_PAGE_MAX) throw new ReportingHttpError(400, "BAD_REQUEST", "invalid limit");
