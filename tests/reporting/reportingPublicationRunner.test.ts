@@ -270,8 +270,10 @@ describe("T13B2b-3: report persistence never skips cleanup or the fresh audit", 
     expect(errors).toEqual(["report persistence failed (after the run): EIO"]);
     expect(out).toEqual(["REPORT TEXT"]);
     const runner = readFileSync("tests/staging/reporting-jobs.ts", "utf8");
-    // Every mode writes its report before connecting.
-    expect(runner.match(/if \(!initialReport\(save\)\) return 1;/g)).toHaveLength(2);
+    // Every mode writes its report before connecting (fence, publication and the Task 15 worker harness entry points).
+    expect(runner.match(/if \(!initialReport\(save\)\) return 1;/g)).toHaveLength(3);
+    const worker = runner.slice(runner.indexOf("async function workerMain"), runner.indexOf("async function main()"));
+    expect(worker.indexOf("if (!initialReport(save)) return 1;")).toBeLessThan(worker.indexOf("open = () => openGuarded"));
     expect(readFileSync("tests/staging/reporting-capture.ts", "utf8")).toContain("if (!initialReport(save)) return 1;");
   });
 });

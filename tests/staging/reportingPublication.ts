@@ -429,7 +429,7 @@ export function reducerDaily(site: Site, events: ProductionEvidenceEvent[], cuto
   return [...groups.entries()].map(([k, g]) => `${k}|${g.items}|${g.lines}`).sort();
 }
 
-async function sqlDaily(c: Db, site: Site, staff: string | null): Promise<string[]> {
+export async function sqlDaily(c: Db, site: Site, staff: string | null): Promise<string[]> {
   const r = await c.query(
     `select production_date::text || '|' || staff_id::text || '|' || work_type || '|' || rework::text || '|' || coalesce(items::text, 'overflow') || '|' || line_count::text as k
        from reporting_private.daily_totals
@@ -1145,9 +1145,10 @@ export async function surface(c: Db, name: string, sql: string): Promise<string>
   }
 }
 
-export async function fullState(c: Db): Promise<FullState> {
+/** `queries` defaults to every fixed surface; only offline tests pass a subset (PGlite lacks the stock/membership tables). */
+export async function fullState(c: Db, queries: ReadonlyArray<readonly [string, string]> = STATE_QUERIES): Promise<FullState> {
   const surfaces: Record<string, string> = {};
-  for (const [k, sql] of STATE_QUERIES) surfaces[k] = await surface(c, k, sql);
+  for (const [k, sql] of queries) surfaces[k] = await surface(c, k, sql);
   const privateTables: Record<string, string> = {};
   let control: Record<string, unknown> | null = null;
   let siteState: Array<Record<string, unknown>> = [];

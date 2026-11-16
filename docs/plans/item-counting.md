@@ -190,7 +190,7 @@ The old `76f74d2` denied-after row still displayed in the later reports' phase-h
 - Done when: `npm run test -- --run tests/reporting/reportingJobs.test.ts`, common gate and CJ-run interleaving/rollback tests pass; exact fresh source-vs-mirror identity/hash equality holds after backfill/catch-up. Completion metadata cannot be written when one partition/chunk is missing. No statement timeout waiver.
 - Commit: `task 13: add resumable snapshot and publication jobs`.
 
-### [ ] Task 14: Materialize affected audiences, order identities and timing
+### [x] Task 14: Materialize affected audiences, order identities and timing
 
 - Files: create `api/_lib/production-reporting-materialize.ts`, `tests/reporting/reportingMaterialize.test.ts`; extend Task 11 projector and Task 13 partition work adapter; create `supabase/migrations/0040_reporting_dependency_reads.sql` for bounded service-only input/dependency RPCs/indexes where required (0039 is allocated to the Task 13 rebuild-insert repair below).
 - Implement `materializePartition(input, audience) -> PartitionResult` using shared primitives. Enumerate changed old/new order partitions, parent and inverse-child dependencies, invalid-identity events, future-due keys, and adjacent timing streams. Build site/self results separately from immutable input; source staff filtering happens before preparation. Store original facts and exact terminal identities, scope-sensitive coverage inputs, additive Items and timing edge/weight facts. Do not write global ambiguity flags as final per-range answers.
@@ -3235,3 +3235,68 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Stream reads stay ≈ 1,000 per probe; refresh members stay 7 batch_events + 8 source_current.
     - Judge the overlay reads against the expected refresh overlay size.
     - Only then install 0040 → 0041 → 0042. No SQL was run; nothing was installed, deployed or merged; Task 19 was not started.
+- **Task 14 COMPLETE — staging only (recorded 2026-11-17 by the coder from root's evidence; checkbox ticked).**
+  - CI: the exact-head run 43912513408 at 64b45be passed.
+  - **Repaired diagnostic (root ran it once):** ignored report `staging-results-reporting-publication-diagnose-access-paths-20261116T165609312Z-5d4fbadc.md`, SHA-256 `0BBA07EE206E0010472152534582D60AC5C5C0B9C51E9B7782CA5799A148D789`. The coder re-hashed the local file and the hash matches; it is not committed.
+    - STATUS COMPLETE; fresh rollback restoration verified.
+    - A2: `en_US.UTF-8`, deterministic.
+    - Acceptance: ACCEPTED.
+    - 0042 rebuild member candidate reads: exactly 7 for the first/later/normal probes (0.131 / 0.139 / 0.145 ms), against 84,686 for 0041.
+    - Streams: exactly 1,000 candidate rows per probe.
+    - Refresh members: 4 batch_events + 8 source_current in this run.
+  - **Installation (root, Inka Staging `ybrzhrgfrnvtcwymjdrq` only, Supabase `apply_migration`, in order):**
+    - `20261116165846` / `0040_reporting_dependency_reads`
+    - `20261116165854` / `0041_reporting_dependency_read_bounds`
+    - `20261116165901` / `0042_reporting_access_paths`
+  - **Post-install state (root):**
+    - 7 functions and 4 indexes; SECURITY INVOKER, empty search_path, service-only (anon/authenticated false).
+    - 0 active batches; capture OFF at epoch 19.
+    - AU/UK/US: processors off, read legacy, no active ids.
+  - Production is untouched. Release to production remains CJ's step in the controlled rollout (Task 20).
+- **Task 15 protected staging harness for 0043 (2026-11-17, prepared offline; NOT run; Task 15 stays unchecked pending CJ's runtime run and the entitlement record)** — commit "task 15: add protected worker staging harness".
+  - **Mode 1, `npm run staging:reporting-jobs -- --rehearse-worker-state --site=X`** (`tests/staging/reportingWorkerHarness.ts`): rollback-only.
+    - Before any SQL: 0043 LF pin `156ee4d5…`; additive shape only (no DROP / OR REPLACE / TRUNCATE / definer / timeout; no table or function already in 0037–0042).
+    - Before BEGIN: history has exactly root's 0040/0041/0042 rows and no 0043; the 7 installed dependency bodies and their security match; no 0043 object; no active batch.
+    - Inside ONE rolled-back transaction: the exact parsed body through the deny-list guard; every 0043 table (RLS, service-only), index and function (body, invoker, empty search_path, service-only) checked; savepoint behaviour (run log as service_role, refusals, client roles refused).
+    - After ROLLBACK: no 0043 object, nothing active; the fresh audit allows ZERO change.
+  - **Mode 2, `npm run staging:reporting-jobs -- --worker-runtime --site=X [--pace-calls=N] [--max-invocations=N] [--max-lease-wait-ms=N]`** (`reportingWorkerScenario.ts`, `reportingWorkerRuntime.ts`, `serviceRpc.ts`): after 0043 is installed.
+    - The REAL `runReportingCycle` runs over a direct-pg service RpcClient that behaves like PostgREST service_role calls (one transaction per call; request claims; `SET LOCAL ROLE service_role`; only the role's own configured settings; named typed args; errors returned). No service key is needed. One fresh guarded connection per invocation.
+    - R0 refuses before any write on: wrong 0043 file; history or identities not 0040–0043; capture on; any active batch; the site not processor-off/legacy or not clean (batch, generation, derived/mirror or pending journal row); fixture collision. Ownership and both baselines are saved BEFORE the first commit; R0b refuses on drift.
+    - R1 processor-disabled no-work (refresh and rebuild: failed/processor_disabled, no batch).
+    - R2 owned capture enable (the fence runner's receipt-before-COMMIT toggle) and processor on.
+    - R3a paced rebuild stops pending with durable copy progress; R3b immediate busy (live lease); R3c a REAL lease-expiry wait, takeover with a newer fence that continues the saved copy, a lost publish response (committed, then reported lost) replayed to exactly one generation; R3d the old fence is refused and changes nothing.
+    - R4 exact parity: mirror = source; daily totals (site and self) = the independent reducer.
+    - R5 run-owned fixtures `rw-<run>-v1/v2/c1` (3 inserts, 1 update, 1 delete): 5 journal rows, all acknowledged by the refresh batch; one more generation; parity.
+    - R6 one numeric-count run row per invocation; worker catalog unchanged; authenticated refused.
+    - R7a capture disable → refresh failed/capture_disabled, no batch; R7b re-enable → refresh failed/rebuild_required; R7c rebuild recovery publishes with parity.
+    - Cleanup ALWAYS runs, every step independent and every failure kept: abandon this run's live batch (only after a real lease expiry; 0038 refuses to abandon a live batch, so no resume); capture back to its start; delete exactly the fixture ids (only with capture off: no unowned journal row); processor/read mode back.
+    - Fresh audit (separate connection): every surface, catalog, other site and other-site private row identical; the run site's pre-existing journal/run-log rows identical; control epoch = start + this run's CONFIRMED increments only; on the run site only source_epoch, active_generation_id (must be the run's), lease bookkeeping and verified cutoff may differ; every new run-site row must belong to the run's batches/generations/fixture ids; exactly one run-log row per invocation. Unknown tables are compared in full.
+    - **Declared final intended state:** capture off; the site processor off, read legacy, no active batch, pointing at the run's last generation. Retained: the run's generations, batches, mirror and facts, the 5 fixture journal rows and its run-log rows. The report records these with the epoch increments.
+  - **Tests (offline, real 0037–0044 SQL in PGlite; hosted execution is NOT faked):**
+    - `tests/reporting/reportingWorkerHarness.test.ts` (16): pin and shape mutations; history; catalog drift; COMPLETE rehearsal leaving the catalog unchanged; refusals before any SQL or before BEGIN (bad pin, history, 0043 installed, active batch); a mid-transaction failure rolls back; redaction; argument parsing; STATUS; runner wiring; wrong target.
+    - `tests/reporting/serviceRpc.test.ts` (5): PostgREST-shaped transactions and roles; errors and unknown arguments; client role refused; the real worker publishes through it; a lost publish response replays the same generation.
+    - `tests/reporting/reportingWorkerRuntime.test.ts` (5): every private table attributed; parity and parity drift; the audit accepts exactly the owned changes and names unowned batches/generations/mirror rows, a missing run-log row, a wrong epoch and another site's change.
+    - `tests/reporting/reportingWorkerScenario.test.ts` (8): R0–R4 + cleanup; preflight refusals with zero writes (processor on, collision, drift); an injected permanent worker failure (cleanup abandons the owned batch and restores capture/processor); a failing cleanup step does not stop later steps; full R0–R7 COMPLETE, clean cleanup and a problem-free fresh audit with the final state; the audit reports a leftover fixture and another site's change; runtime redaction; no audit without a baseline.
+    - The lease-expiry wait is shimmed ONLY in these offline tests (expiring the lease row); the runner never edits a lease.
+  - **Findings from real SQL while building it:** each capture toggle (enable and disable) advances the epoch; a live batch cannot be abandoned; after a capture disable the refresh fails `capture_disabled`, and after re-enable `rebuild_required`.
+  - **Performance finding (offline; for the planner — see Open question below):** the Task 14 materializer reads `read_reporting_children` one parent per RPC for every member and every consumed stream line, per audience, at plan AND stage. A whole-site rebuild therefore issues about one sequential children RPC per line per pass. An unrealistic fixture (every order spread across one worker's whole history) made each order walk the entire stream (78,882 children RPCs for 1,100 rows, 146 s). The tests now use time-clustered orders (4,400 RPCs, 15 s). That was a test-fixture fault, not a harness or worker loop.
+  - **Process notes:** two earlier attempts stalled (a long single write; a bash heredoc that failed on quoting); work then proceeded in small Write/Edit increments with focused, time-bounded test runs. A few mechanical one-line edits were made with `sed`, reviewed in the diff. Temporary probe/debug code was removed before the commit.
+  - The existing runner test that counts "report before connecting" guards now expects 3 entry points (fence, publication, worker) and checks the worker writes its report before opening a connection.
+  - **Gate:**
+
+    | Check | Result |
+    |---|---|
+    | Focused harness files (each run alone, time-bounded) | 16 + 5 + 5 + 8, all pass (5–30 s per file) |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 70 files, 2,202/2,202 (105 s) |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Remaining gates (root/CJ only):**
+    1. Review this commit.
+    2. Root runs `--rehearse-worker-state --site=<smallest site>`; it must be STATUS COMPLETE.
+    3. Root alone applies 0043 to staging.
+    4. Root runs `--worker-runtime --site=<smallest site>` (a real run with lease waits, about 6 minutes each); it must be STATUS COMPLETE with the declared final state.
+    5. CJ records the Task 10 entitlement. Only then can Task 15 be ticked.
+  - **Open question (planner):** at hosted latency, a whole-site rebuild of a large site (uk ≈ 42k rows) costs roughly one sequential `read_reporting_children` RPC per line per pass. Should the runtime gate run on the smallest site only, and should batching children reads (the reader already accepts many parent ids) become an evidence-backed follow-up before Task 19's growth gate? No product code was changed here.
