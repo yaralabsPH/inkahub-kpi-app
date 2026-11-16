@@ -2927,3 +2927,12 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - **Regressions:** 9 comment-hidden executing forms and 4 nested/unterminated DDL or empty forms are refused before sending. Strings, identifiers and dollar quotes holding comment markers or 'analyze' do not trip it. All 31 reviewed migration statements and the 3 diagnostic statements still pass.
   - **Checked against real PostgreSQL** (`tests/reporting/pg/explain-guard.test.ts`): 16 forms run inside rolled-back transactions. Whenever PostgreSQL actually executed the DELETE, `executesExplain` is true — no false negatives; the only conservative positive is `ANALYZE false`. The `ed66c5c` guard fails 8 of these real-PG cases.
   - **Gate:** tsc -b, typecheck:digest and the strict runners OK; 1812/1812 tests (50 files); build OK.
+- 2026-11-16 — **Planner review items 3 and 4 (Task 16 auth precedence, Task 17 detail selectors), OFFLINE** (Claude).
+  - **Item 3:** `api/reports/summary.ts` and `detail.ts` now reject a missing, malformed or duplicated bearer header with 401 BEFORE creating any auth, environment, reader or cursor-secret dependency.
+    - Missing header plus missing configuration is 401, with zero calls (5 header shapes, both handlers).
+    - A well-formed token with missing configuration is still the documented 500.
+  - **Item 4:** the controller keys detail pages by the complete selector (`detailKey(kind, orderNumber)`), and the hook's `nextPage` takes `orderNumber`.
+    - One in-flight request per selector: a concurrent call joins it.
+    - A page whose base changed meanwhile is never appended; dispose clears in-flight requests.
+    - Tests: switching orderNumber never reuses another selector's cursor or rows (fails on the old controller); concurrent calls send one request and append one page (fails on the old one); a late page after an identity change is discarded (already correct, now pinned).
+  - **Gate:** tsc -b OK; typecheck:digest OK; 1821/1821 tests (50 files); build OK.

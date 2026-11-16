@@ -274,3 +274,28 @@ describe("Task 16 handlers", () => {
     expect((p.body as { nextCursor: string }).nextCursor).toMatch(/\./);
   });
 });
+
+describe("Task 16 review: bearer auth is parsed before any configuration or client work", () => {
+  const bad: Array<Record<string, string>> = [{}, { authorization: "Bearer" }, { authorization: "Basic abc" }, { authorization: `Bearer ${JWT}`, Authorization: `Bearer ${JWT}` }, { authorization: `Bearer ${JWT} extra` }];
+  for (const headers of bad) {
+    it(`401 with zero auth/env/reader calls even when misconfigured: ${JSON.stringify(Object.keys(headers))} ${JSON.stringify(Object.values(headers)[0] ?? "").slice(0, 20)}`, async () => {
+      const calls: string[] = [];
+      for (const h of [
+        createSummaryHandler({ auth: () => (calls.push("auth"), null), reader: () => (calls.push("reader"), null), now: () => (calls.push("now"), NOW) }),
+        createDetailHandler({ auth: () => (calls.push("auth"), null), reader: () => (calls.push("reader"), null), now: () => (calls.push("now"), NOW), cursorSecret: () => (calls.push("secret"), undefined) }),
+      ]) {
+        const { r, res: out } = res();
+        await h({ method: "GET", headers, query: { site: "uk" } }, out);
+        expect(r.status).toBe(401);
+        expect(r.headers["Cache-Control"]).toBe("no-store");
+      }
+      expect(calls).toEqual([]);
+    });
+  }
+  it("a well-formed token with missing configuration is the documented 500 (after the header check)", async () => {
+    const h = createSummaryHandler({ auth: () => null, reader: () => null, now: () => NOW });
+    const { r, res: out } = res();
+    await h({ method: "GET", headers: { authorization: `Bearer ${JWT}` }, query: {} }, out);
+    expect(r.status).toBe(500);
+  });
+});

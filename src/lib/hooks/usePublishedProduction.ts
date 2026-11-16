@@ -25,10 +25,12 @@ export interface PublishedState {
   identityKey: string | null;
   summary: SummaryResult | null;
   error: string | null;
-  /** Loaded detail pages per kind (same generation as `summary`). */
-  details: Partial<Record<DetailKind, { rows: PublishedDetailRow[]; nextCursor: string | null; totalRows: number }>>;
+  /** Loaded detail pages per complete selector (`detailKey`), all in the generation of `summary`. */
+  details: Partial<Record<string, { rows: PublishedDetailRow[]; nextCursor: string | null; totalRows: number }>>;
 }
 
+/** A detail table's complete selector within a view: kind plus every detail-only filter (order number). */
+export const detailKey = (kind: DetailKind, orderNumber?: string | null) => JSON.stringify([kind, orderNumber ?? null]);
 export const identityKey = (i: PublishedIdentity) => JSON.stringify([i.userId, i.site, i.view, i.firstDate, i.lastDate, i.staffId ?? null, i.workType ?? null]);
 const EMPTY: PublishedState = { status: "idle", identityKey: null, summary: null, error: null, details: {} };
 
@@ -43,6 +45,8 @@ export class PublishedViewController {
   private seq = 0;
   private abort: AbortController | null = null;
   private listeners = new Set<() => void>();
+  /** One in-flight page request per selector (a concurrent call joins it: no duplicate page). */
+  private inflight = new Map<string, Promise<void>>();
   constructor(private readonly deps: ControllerDeps) {}
   get(): PublishedState {
     return this.state;
@@ -93,11 +97,22 @@ export class PublishedViewController {
     }
   }
   /** Load the next page of one detail table in the summary's generation. A 410 reloads the whole view. */
-  async nextPage(identity: PublishedIdentity, kind: DetailKind, limit = 200, orderNumber?: string): Promise<void> {
+  nextPage(identity: PublishedIdentity, kind: DetailKind, limit = 200, orderNumber?: string): Promise<void> {
+    const dk = `${identityKey(identity)}|${String(this.state.summary?.meta.generationId)}|${detailKey(kind, orderNumber)}`;
+    const running = this.inflight.get(dk);
+    if (running) return running;
+    const p = this.fetchPage(identity, kind, limit, orderNumber).finally(() => {
+      if (this.inflight.get(dk) === p) this.inflight.delete(dk);
+    });
+    this.inflight.set(dk, p);
+    return p;
+  }
+  private async fetchPage(identity: PublishedIdentity, kind: DetailKind, limit: number, orderNumber?: string): Promise<void> {
     const key = identityKey(identity);
+    const dkey = detailKey(kind, orderNumber);
     const s = this.state;
     if (s.identityKey !== key || !s.summary) return;
-    const prev = s.details[kind];
+    const prev = s.details[dkey];
     if (prev && prev.nextCursor === null) return; // complete
     const token = await this.deps.token();
     if (!token) return void this.set({ ...this.state, status: "stale", error: "Sign in again to load reports" });
@@ -115,12 +130,14 @@ export class PublishedViewController {
       return void this.set({ ...this.state, status: "stale", error: e instanceof Error ? e.message : String(e) });
     }
     if (mine !== this.seq || this.state.identityKey !== key || this.state.summary?.meta.generationId !== s.summary.meta.generationId) return;
+    if (this.state.details[dkey] !== prev) return; // another page landed meanwhile: never append on a stale cursor
     const rows = [...(prev?.rows ?? []), ...page.rows];
-    this.set({ ...this.state, details: { ...this.state.details, [kind]: { rows, nextCursor: page.nextCursor, totalRows: page.totalRows } } });
+    this.set({ ...this.state, details: { ...this.state.details, [dkey]: { rows, nextCursor: page.nextCursor, totalRows: page.totalRows } } });
   }
   dispose(): void {
     this.abort?.abort();
     this.seq++;
+    this.inflight.clear();
     this.listeners.clear();
   }
 }
@@ -129,7 +146,7 @@ export class PublishedViewController {
  * React binding. `identity` null = nothing to load (unsupported site, signed
  * out, Dexie mode). The token comes from the caller's signed-in client.
  */
-export function usePublishedProduction(identity: PublishedIdentity | null, deps: ControllerDeps | null, refreshKey = 0): PublishedState & { nextPage: (kind: DetailKind, limit?: number) => void; refresh: () => void } {
+export function usePublishedProduction(identity: PublishedIdentity | null, deps: ControllerDeps | null, refreshKey = 0): PublishedState & { nextPage: (kind: DetailKind, limit?: number, orderNumber?: string) => void; refresh: () => void } {
   const ctrl = useMemo(() => (deps ? new PublishedViewController(deps) : null), [deps]);
   const [state, setState] = useState<PublishedState>(EMPTY);
   const idRef = useRef(identity);
@@ -149,7 +166,7 @@ export function usePublishedProduction(identity: PublishedIdentity | null, deps:
   }, [ctrl, key, refreshKey]);
   return {
     ...state,
-    nextPage: (kind, limit) => void (ctrl && idRef.current && ctrl.nextPage(idRef.current, kind, limit)),
+    nextPage: (kind, limit, orderNumber) => void (ctrl && idRef.current && ctrl.nextPage(idRef.current, kind, limit, orderNumber)),
     refresh: () => void (ctrl && idRef.current && ctrl.load(idRef.current)),
   };
 }

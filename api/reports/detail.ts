@@ -7,7 +7,7 @@
  * site, audience, filter, generation and kind (altered/mismatched → 400).
  * Precedence: 401 → 405 → 400 → 403 → 410/503 → 200. No-store.
  */
-import { authorizeReportingRequest, errorResponse, readPublishedDetail, ReportingHttpError, type AuthDeps, type PublishedReader } from "../_lib/production-reporting.js";
+import { authorizeReportingRequest, bearerToken, errorResponse, readPublishedDetail, ReportingHttpError, type AuthDeps, type PublishedReader } from "../_lib/production-reporting.js";
 import { rpcPublishedReader, supabaseAuthDeps } from "../_lib/production-reporting-rpc.js";
 import { serviceRpcClient, type MinimalRequest, type MinimalResponse } from "../_lib/reporting-auth.js";
 import type { DetailRequest } from "../../src/lib/domain/productionReporting.js";
@@ -26,6 +26,9 @@ const defaults = (): DetailDeps => ({
 export function createDetailHandler(deps: DetailDeps = defaults()) {
   return async function handler(req: MinimalRequest, res: MinimalResponse) {
     res.setHeader("Cache-Control", "no-store");
+    // 401 first: a missing, malformed or duplicated bearer header is refused before ANY configuration,
+    // client, auth or reader work (even when the server is also misconfigured).
+    if (!bearerToken(req.headers)) return void res.status(401).json({ error: "A valid app session is required", code: "UNAUTHENTICATED" });
     try {
       const auth = deps.auth();
       if (!auth) throw new ReportingHttpError(500, "CONFIG", "Report service configuration missing");

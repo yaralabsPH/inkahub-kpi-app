@@ -7,7 +7,7 @@
  * 403 (membership / nav) → 410/503 (generation) → 200. Every request
  * re-authorizes. No-store. No raw-history fallback.
  */
-import { authorizeReportingRequest, errorResponse, readPublishedSummary, ReportingHttpError, type AuthDeps, type PublishedReader } from "../_lib/production-reporting.js";
+import { authorizeReportingRequest, bearerToken, errorResponse, readPublishedSummary, ReportingHttpError, type AuthDeps, type PublishedReader } from "../_lib/production-reporting.js";
 import { rpcPublishedReader, supabaseAuthDeps } from "../_lib/production-reporting-rpc.js";
 import { serviceRpcClient, type MinimalRequest, type MinimalResponse } from "../_lib/reporting-auth.js";
 import type { SummaryRequest } from "../../src/lib/domain/productionReporting.js";
@@ -30,6 +30,9 @@ const defaults = (): SummaryDeps => ({ auth: () => supabaseAuthDeps(), reader: (
 export function createSummaryHandler(deps: SummaryDeps = defaults()) {
   return async function handler(req: MinimalRequest, res: MinimalResponse) {
     res.setHeader("Cache-Control", "no-store");
+    // 401 first: a missing, malformed or duplicated bearer header is refused before ANY configuration,
+    // client, auth or reader work (even when the server is also misconfigured).
+    if (!bearerToken(req.headers)) return void res.status(401).json({ error: "A valid app session is required", code: "UNAUTHENTICATED" });
     try {
       const auth = deps.auth();
       if (!auth) throw new ReportingHttpError(500, "CONFIG", "Report service configuration missing");

@@ -4,7 +4,7 @@
  * management loads only the authorized published endpoints (no raw history).
  */
 import { describe, expect, it } from "vitest";
-import { identityKey, PublishedViewController, type PublishedIdentity } from "../../src/lib/hooks/usePublishedProduction";
+import { detailKey, identityKey, PublishedViewController, type PublishedIdentity } from "../../src/lib/hooks/usePublishedProduction";
 import { fetchPublishedSummary, PublishedReadError, type FetchLike } from "../../src/lib/repository/supabase/productionPublished";
 import type { SummaryResult } from "../../src/lib/domain/productionReporting";
 
@@ -77,7 +77,7 @@ describe("Task 17: published view controller", () => {
     });
     await ctrl.load(ID);
     await ctrl.nextPage(ID, "orders");
-    expect(ctrl.get().details.orders?.rows).toHaveLength(1);
+    expect(ctrl.get().details[detailKey("orders")]?.rows).toHaveLength(1);
     await ctrl.load(ID);
     expect(ctrl.get()).toMatchObject({ status: "current", summary: { meta: { generationId: "g2" }, totals: { normal: { items: 9 } } }, details: {} });
     expect(ctrl.get().details).toEqual({}); // no page of the old generation survives
@@ -94,7 +94,7 @@ describe("Task 17: published view controller", () => {
     await ctrl.load(ID);
     await ctrl.nextPage(ID, "orders", 1);
     await ctrl.nextPage(ID, "orders", 1);
-    expect(ctrl.get().details.orders).toMatchObject({ totalRows: 5, nextCursor: "c2" });
+    expect(ctrl.get().details[detailKey("orders")]).toMatchObject({ totalRows: 5, nextCursor: "c2" });
     expect(ctrl.get().summary?.totals.normal.items).toBe(40);
     const details = urls.filter((u) => u.startsWith("/api/reports/detail"));
     expect(details.map((u) => [param(u, "generationId"), param(u, "cursor")])).toEqual([["g1", null], ["g1", "c1"]]);
@@ -128,5 +128,58 @@ describe("Task 17: browser fetch layer", () => {
     expect(urls[0]).toBe("/api/reports/summary?site=uk&firstDate=2026-11-01&lastDate=2026-11-02&view=welcome&workType=framed");
     const bad: FetchLike = async () => ({ status: 500, ok: false, json: async () => { throw new Error("html"); } });
     await expect(fetchPublishedSummary(bad, "t", { site: "uk", firstDate: "2026-11-01", lastDate: "2026-11-02", view: "reports" })).rejects.toMatchObject({ status: 500, code: "HTTP_500" });
+  });
+});
+
+describe("Task 17 review: detail pages are keyed by the complete selector and guarded in flight", () => {
+  it("switching orderNumber never reuses another selector's cursor or rows", async () => {
+    const { urls, ctrl } = scripted((url) => {
+      if (url.startsWith("/api/reports/summary")) return { status: 200, body: summary("g1") };
+      const o = param(url, "orderNumber");
+      const c = param(url, "cursor");
+      return { status: 200, body: { rows: [{ kind: "events", row: { o, c } }], nextCursor: c ? null : `next-${o}`, pageComplete: true, totalRows: 2 } };
+    });
+    await ctrl.load(ID);
+    await ctrl.nextPage(ID, "events", 1, "A");
+    await ctrl.nextPage(ID, "events", 1, "A");
+    await ctrl.nextPage(ID, "events", 1, "B");
+    const det = urls.filter((u) => u.startsWith("/api/reports/detail")).map((u) => [param(u, "orderNumber"), param(u, "cursor")]);
+    expect(det).toEqual([["A", null], ["A", "next-A"], ["B", null]]);
+    expect(ctrl.get().details[detailKey("events", "A")]?.rows).toHaveLength(2);
+    expect(ctrl.get().details[detailKey("events", "B")]?.rows).toHaveLength(1);
+    await ctrl.nextPage(ID, "events", 1, "A"); // A is complete (null cursor): nothing fetched
+    expect(urls.filter((u) => u.startsWith("/api/reports/detail"))).toHaveLength(3);
+  });
+  it("concurrent nextPage calls for one selector send ONE request and append ONE page", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { urls, ctrl } = scripted(async (url) => {
+      if (url.startsWith("/api/reports/summary")) return { status: 200, body: summary("g1") };
+      await gate;
+      return { status: 200, body: { rows: [{ kind: "orders", row: { n: 1 } }], nextCursor: "c1", pageComplete: true, totalRows: 3 } };
+    });
+    await ctrl.load(ID);
+    const a = ctrl.nextPage(ID, "orders", 1);
+    const b = ctrl.nextPage(ID, "orders", 1);
+    release();
+    await Promise.all([a, b]);
+    expect(urls.filter((u) => u.startsWith("/api/reports/detail"))).toHaveLength(1);
+    expect(ctrl.get().details[detailKey("orders")]?.rows).toHaveLength(1);
+  });
+  it("a page that lands after the identity changed is discarded", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { ctrl } = scripted(async (url) => {
+      if (url.startsWith("/api/reports/summary")) return { status: 200, body: summary(param(url, "site") === "uk" ? "g-uk" : "g-au") };
+      await gate;
+      return { status: 200, body: { rows: [{ kind: "orders", row: {} }], nextCursor: null, pageComplete: true, totalRows: 1 } };
+    });
+    await ctrl.load(ID);
+    const late = ctrl.nextPage(ID, "orders");
+    await ctrl.load({ ...ID, site: "au" });
+    release();
+    await late;
+    expect(ctrl.get().summary?.meta.generationId).toBe("g-au");
+    expect(ctrl.get().details).toEqual({});
   });
 });
