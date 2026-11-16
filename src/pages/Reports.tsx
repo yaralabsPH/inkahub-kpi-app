@@ -20,6 +20,8 @@ import { PackageHistoryCard } from "@/components/PackageHistoryCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
 import { ProductionCountStatus } from "@/components/ProductionCountStatus";
 import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
+import { usePublishedManagement } from "@/lib/hooks/usePublishedManagement";
+import { managementSource, publishedCsv, publishedDetailList, publishedOrders, publishedStatusLine, rawRangeFor, reportViewFromSummary } from "@/lib/domain/productionPublishedView";
 import {
   isProductionDate,
   isReportSite,
@@ -196,7 +198,12 @@ function SupabaseReports() {
     return packageWindow(preset, cf, ct);
   }, [preset, customFrom, customTo]);
 
-  const evidence = useProductionEvidence({ client: supabase, site: location, range, refreshKey: refreshTick });
+  const staffId = selectedStaff === ALL_STAFF ? null : selectedStaff;
+  const workType = selectedDepartment === ALL_DEPARTMENTS ? null : (selectedDepartment as WorkType);
+  // Published first: the raw-history read runs ONLY for a site that answered READ_MODE_LEGACY (no dual read, no fallback).
+  const pub = usePublishedManagement({ supabase, view: "reports", site: location, range, staffId, workType, refreshKey: refreshTick });
+  const source = managementSource(pub.status);
+  const evidence = useProductionEvidence({ client: supabase, site: location, range: rawRangeFor(pub.status, range), refreshKey: refreshTick });
 
   const [staffLookup, setStaffLookup] = useState<Map<string, StaffLookup>>(new Map());
   const [staffError, setStaffError] = useState<string | null>(null);
@@ -269,12 +276,18 @@ function SupabaseReports() {
     [staffLookup],
   );
 
-  const staffId = selectedStaff === ALL_STAFF ? null : selectedStaff;
-  const workType = selectedDepartment === ALL_DEPARTMENTS ? null : (selectedDepartment as WorkType);
-  const view = useMemo(
-    () => (evidence.prepared && range ? buildProductionReportView(evidence.prepared, { range, staffId, workType }) : null),
-    [evidence.prepared, range, staffId, workType],
+  const legacyView = useMemo(
+    () => (source === "legacy" && evidence.prepared && range ? buildProductionReportView(evidence.prepared, { range, staffId, workType }) : null),
+    [source, evidence.prepared, range, staffId, workType],
   );
+  // The published status line (cutoff, 15/30/120-minute freshness, days the generation does not cover).
+  const line = isReportSite(location) && source !== "legacy" ? publishedStatusLine(pub, { site: location, range, nowMs: Date.now() }) : null;
+  const pubView = useMemo(
+    () => (source === "published" && pub.summary && line?.coveredThrough ? reportViewFromSummary(pub.summary, { staffId, details: pub.details, coveredThrough: line.coveredThrough }) : null),
+    [source, pub.summary, pub.details, staffId, line?.coveredThrough],
+  );
+  const view = source === "legacy" ? legacyView : pubView;
+  const statusState = line ? { ...line, refresh: pub.refresh } : evidence;
 
   // -------- staff dropdown options --------
   const staffOptions = useMemo(() => {
@@ -298,8 +311,9 @@ function SupabaseReports() {
 
   // -------- CSV export (respects all filters; raw saved values) --------
   const handleExport = useCallback(async () => {
-    if (!view || !range) return;
-    const rowsToExport = view.exportEvents;
+    // Published sites export from generation-pinned raw-export pages (next slice); the raw history read never runs here.
+    if (source !== "legacy" || !legacyView || !range) return;
+    const rowsToExport = legacyView.exportEvents;
     setExportError(null);
     setExporting(true);
     try {
@@ -365,7 +379,42 @@ function SupabaseReports() {
     } finally {
       setExporting(false);
     }
-  }, [view, range, supabase, location, staffLookup, selectedStaff, selectedDepartment]);
+  }, [source, legacyView, range, supabase, location, staffLookup, selectedStaff, selectedDepartment]);
+
+  // -------- published CSV export (opt-in; every raw-export page of the SHOWN generation and filters) --------
+  const handlePublishedExport = useCallback(async () => {
+    if (source !== "published" || !pub.summary || !range) return;
+    setExportError(null);
+    setExporting(true);
+    try {
+      // Complete pages or a typed refusal (view changed, page failure, no progress): never a partial file.
+      const rows = await pub.collectAll("raw-export", { limit: 1000 });
+      const csv = publishedCsv(rows, nameOf);
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const staffSuffix = staffId ? nameOf(staffId).replace(/[^a-z0-9]+/gi, "-").toLowerCase() : "all-staff";
+      const deptSuffix = workType ?? "all-depts";
+      a.download = `production-events_${staffSuffix}_${deptSuffix}_${range.firstDate}_to_${range.lastDate}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setExportError(`Export failed: ${(e as Error).message}`);
+    } finally {
+      setExporting(false);
+    }
+  }, [source, pub, range, nameOf, staffId, workType]);
+
+  // Selected person's published orders: loaded only on request, paged in the shown generation.
+  const pubOrders = pubView ? publishedOrders(pub.details) : null;
+  // Coverage issues and timing observations: published drill-downs loaded only on request.
+  const coverageList = pubView ? publishedDetailList(pub.details, "coverage") : null;
+  const timingList = pubView ? publishedDetailList(pub.details, "timing") : null;
+  const fmtUtc = (iso: string) => new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", ...(range ? { timeZone: range.timeZone } : {}) });
+  const orderRows = legacyView ? legacyView.staffOrders : pubOrders?.rows ?? [];
 
   /* ------------------------------------------------------------
    * Render
@@ -421,9 +470,9 @@ function SupabaseReports() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => void handleExport()}
-            disabled={!view || view.exportEvents.length === 0 || exporting}
-            title="Download raw event log as CSV"
+            onClick={() => void (source === "legacy" ? handleExport() : handlePublishedExport())}
+            disabled={exporting || (source === "legacy" ? !legacyView || legacyView.exportEvents.length === 0 : source !== "published" || !pub.summary)}
+            title={source === "legacy" ? "Download raw event log as CSV" : "Download the raw event log of this report version as CSV"}
           >
             <Download size={14} />
             {exporting ? "Exporting…" : "Export CSV"}
@@ -547,11 +596,13 @@ function SupabaseReports() {
           </div>
           <ProductionCountStatus
             className="basis-full"
-            state={evidence}
+            state={statusState}
             range={range}
             coverage={view?.coverage ?? null}
-            notes={disclosures}
+            notes={line ? [...disclosures, ...line.notes.filter((n) => !line.warnings.includes(n))] : disclosures}
+            warnings={line?.warnings}
           />
+
         </CardBody>
       </Card>
 
@@ -637,7 +688,7 @@ function SupabaseReports() {
         </CardHeader>
         <CardBody>
           {staffBoard.length === 0 ? (
-            <Empty label={evidence.status === "loading" ? "Loading…" : "No credited items or orders in this range."} />
+            <Empty label={statusState.status === "loading" ? "Loading…" : statusState.status === "error" ? "Counts unavailable." : "No credited items or orders in this range."} />
           ) : (
             <div style={{ width: "100%", height: 260 }}>
               <ResponsiveContainer>
@@ -688,8 +739,14 @@ function SupabaseReports() {
           </span>
         </CardHeader>
         <CardBody className="p-0">
+          {pubView && !pubView.people.complete ? (
+            <div className="px-4 py-2 text-xs text-amber-700 dark:text-amber-300 flex items-center gap-2" role="status">
+              Showing {pubView.people.shown.toLocaleString()} of {pubView.people.total.toLocaleString()} people.
+              <button type="button" className="underline" onClick={() => pub.nextPage("people")}>Load more</button>
+            </div>
+          ) : null}
           {staffBoard.length === 0 ? (
-            <Empty label="No credited production from staff in this range." />
+            <Empty label={statusState.status === "error" ? "Counts unavailable." : "No credited production from staff in this range."} />
           ) : (
             <div className="overflow-x-auto">
               <table className="min-w-full text-sm">
@@ -797,13 +854,26 @@ function SupabaseReports() {
       </Card>
       </CollapsibleSection>
 
+      {staffId && pubOrders && (!pubOrders.started || !pubOrders.complete) ? (
+        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400" role="status">
+          {pubOrders.started
+            ? `Showing ${pubOrders.shown.toLocaleString()} of ${pubOrders.total.toLocaleString()} orders handled by ${selectedStaffName}.`
+            : `Orders handled by ${selectedStaffName} load on request.`}
+          <Button variant="secondary" size="sm" onClick={() => pub.nextPage("orders")}>
+            {pubOrders.started ? "Load more" : "Load orders"}
+          </Button>
+        </div>
+      ) : null}
+
       {/* Per-staff order drill-down - only when a single staff is selected */}
-      {staffId && view && view.staffOrders.length > 0 ? (
+      {staffId && view && orderRows.length > 0 ? (
         <Card>
           <CardHeader>
             <CardTitle>Orders handled by {selectedStaffName}</CardTitle>
             <span className="text-xs text-slate-500 dark:text-slate-400">
-              {view.staffOrders.length.toLocaleString()} distinct order{view.staffOrders.length === 1 ? "" : "s"} touched in this range;{" "}
+              {legacyView
+                ? `${orderRows.length.toLocaleString()} distinct order${orderRows.length === 1 ? "" : "s"} touched in this range; `
+                : `${orderRows.length.toLocaleString()} of ${(pubOrders?.total ?? 0).toLocaleString()} order${pubOrders?.total === 1 ? "" : "s"} loaded; `}
               {view.summary.normal.orders.toLocaleString()} completed by {selectedStaffName}. Click an order # to look it up.
             </span>
           </CardHeader>
@@ -822,7 +892,7 @@ function SupabaseReports() {
                   </tr>
                 </thead>
                 <tbody>
-                  {view.staffOrders.map((r) => {
+                  {orderRows.map((r) => {
                     const fmt = (ms: number) => new Date(ms).toLocaleString(undefined, {
                       month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
                       ...(range ? { timeZone: range.timeZone } : {}),
@@ -870,12 +940,119 @@ function SupabaseReports() {
       ) : null}
 
       {/* Per-staff daily productivity chart */}
-      {staffId && view?.personDaily && view.personTotals && view.staffOrders.length > 0 ? (
+      {staffId && view?.personDaily && view.personTotals && (legacyView ? legacyView.staffOrders.length > 0 : view.personDaily.length > 0) ? (
         <StaffProductivityChart
           staffName={selectedStaffName ?? "Staff"}
           daily={view.personDaily}
           totals={view.personTotals.normal}
         />
+      ) : null}
+      {staffId && pubView && (!pubView.daily.complete || pubView.daily.unpublishedAfter) ? (
+        <div className="text-xs text-amber-700 dark:text-amber-300" role="status">
+          {!pubView.daily.complete ? `The chart shows ${pubView.daily.shown} of ${pubView.daily.total} production days. ` : ""}
+          {pubView.daily.unpublishedAfter ? `Days after ${pubView.daily.unpublishedAfter} are not published yet and are not shown.` : ""}
+          {!pubView.daily.complete ? (
+            <button type="button" className="ml-2 underline" onClick={() => pub.nextPage("days")}>Load more production days</button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* Coverage issues (published drill-down; loaded on request, only when there are issues) */}
+      {pubView && coverageList && pubView.coverage.issueRows > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Coverage issues</CardTitle>
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              {coverageList.started
+                ? `${coverageList.shown.toLocaleString()} of ${coverageList.total.toLocaleString()} issue${coverageList.total === 1 ? "" : "s"} loaded`
+                : `${pubView.coverage.issueRows.toLocaleString()} issue${pubView.coverage.issueRows === 1 ? "" : "s"} in this report`}
+            </span>
+          </CardHeader>
+          <CardBody className="p-0">
+            {coverageList.rows.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                    <tr>
+                      <th className="text-left px-4 py-2 font-semibold">Issue</th>
+                      <th className="text-left px-3 py-2 font-semibold">Event</th>
+                      <th className="text-left px-4 py-2 font-semibold">Detail</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {coverageList.rows.map((r) => (
+                      <tr key={`${r.kind}|${r.eventId}`} className="border-t border-slate-100 dark:border-slate-800">
+                        <td className="px-4 py-2 text-xs">{r.kind.replace(/_/g, " ")}</td>
+                        <td className="px-3 py-2 font-mono text-xs">{r.eventId}</td>
+                        <td className="px-4 py-2 text-xs text-slate-600 dark:text-slate-400">{r.detail ?? "--"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+            {!coverageList.complete ? (
+              <div className="px-4 py-2">
+                <Button variant="secondary" size="sm" onClick={() => pub.nextPage("coverage")}>
+                  {coverageList.started ? "Load more" : "Load coverage issues"}
+                </Button>
+              </div>
+            ) : null}
+          </CardBody>
+        </Card>
+      ) : null}
+
+      {/* Timing observations (published drill-down; loaded on request) */}
+      {pubView && timingList ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Timing observations</CardTitle>
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              {timingList.started
+                ? `${timingList.shown.toLocaleString()} of ${timingList.total.toLocaleString()} observation${timingList.total === 1 ? "" : "s"} loaded`
+                : "Each framed line with its gap since the worker's previous line"}
+            </span>
+          </CardHeader>
+          <CardBody className="p-0">
+            {timingList.rows.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                    <tr>
+                      <th className="text-left px-4 py-2 font-semibold">Completed</th>
+                      <th className="text-left px-3 py-2 font-semibold">Staff</th>
+                      <th className="text-left px-3 py-2 font-semibold">Dept</th>
+                      <th className="text-left px-3 py-2 font-semibold">Order #</th>
+                      <th className="text-left px-3 py-2 font-semibold">SKU</th>
+                      <th className="text-right px-3 py-2 font-semibold">Weight</th>
+                      <th className="text-right px-4 py-2 font-semibold">Minutes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {timingList.rows.map((r) => (
+                      <tr key={r.eventId} className="border-t border-slate-100 dark:border-slate-800">
+                        <td className="px-4 py-2 text-xs whitespace-nowrap">{fmtUtc(r.completedAtUtc)}</td>
+                        <td className="px-3 py-2 text-xs">{nameOf(r.staffId)}</td>
+                        <td className="px-3 py-2 text-xs">{PRODUCTION_DEPARTMENT_LABELS[r.workType as ProductionDepartment] ?? r.workType}</td>
+                        <td className="px-3 py-2 font-mono text-xs">#{r.orderNumber}</td>
+                        <td className="px-3 py-2 font-mono text-xs">{r.sku ?? "--"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{r.weight.toLocaleString()}</td>
+                        <td className="px-4 py-2 text-right tabular-nums">{formatMinutes(r.durationMin)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+            {!timingList.complete ? (
+              <div className="px-4 py-2">
+                <Button variant="secondary" size="sm" onClick={() => pub.nextPage("timing")}>
+                  {timingList.started ? "Load more" : "Load timing observations"}
+                </Button>
+              </div>
+            ) : null}
+          </CardBody>
+        </Card>
       ) : null}
 
       <CollapsibleSection storageKey="live-completions" title="Live order completions">

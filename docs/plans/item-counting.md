@@ -3016,3 +3016,47 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Each detail page counts its whole scope for `total_rows`; staging should measure this on long ranges.
   - **Runtime gate pending:** CJ installs 0044 on staging, then runs real-role read parity and authorization checks.
   - No SQL was run against any real database; no merge or deploy.
+- 2026-11-16 — **Task 17: published management views (offline checkpoint; runtime/staging browser gate pending)** (Claude). Task 17 stays UNCHECKED. Code integration is offline-complete and gated. Runtime and staging browser evidence are pending because migration 0044 is still unapplied. No SQL was run, nothing was deployed or merged.
+  - **Published path:**
+    - Reports and Welcome read the authorized published summary (`usePublishedManagement` → `PublishedViewController`). The identity is the signed-in user, site, view, production dates and staff/work type, and the bearer token is read per call.
+    - The raw-history path (`useProductionEvidence`) runs only after an explicit READ_MODE_LEGACY/SHADOW answer (`rawRangeFor`): there is no dual read and no fallback.
+    - Welcome consumes `summary.welcome`.
+    - Reports tiles, work types, timing, coverage and whole-scope figures come from the summary and are never summed from pages.
+    - The status line shows the source cutoff, the 15/30/120-minute freshness rules and the generation's day coverage. Uncovered days are announced, never shown as zero.
+  - **Controller:**
+    - A refresh is unpinned; detail pages are pinned to the displayed generation.
+    - A stale cursor or 410 reloads the whole view at the latest generation and drops pages, even if that reload fails.
+    - Days/people paging continues from the summary's own cursors.
+    - `reset()` runs when the identity becomes null.
+    - Late responses from an old identity are discarded.
+  - **Lazy, generation-pinned pages and export:**
+    - Detail pages load on demand via `nextPage`: people, production days, a selected person's orders, coverage issues (only when issueRows > 0), and timing observations. Nothing is requested on mount.
+    - The published CSV is opt-in. `collectAll("raw-export")` reads pages of at most 1,000 rows with a token per page and uses the DTO's note/station, with no production_events read. It refuses a partial file on a view/generation change, a page error or no progress, and an abort surfaces as the typed VIEW_CHANGED.
+    - The legacy CSV path is unchanged.
+  - **Side cards:**
+    - The package usage and package history cards load on request only, and a scope change clears them.
+    - The daily timesheet and currently-clocked-in reads page completely ordered by (created_at, id); the 16-hour window and 30-second refresh are kept.
+    - Live order completions uses 500-row pages under one frozen cutoff with a stable descending (created_at, id) keyset ("Load older"), and is never labelled complete after a full page.
+    - `fetchAllRows` validates its options and throws `PageThroughIncompleteError` at its safety cap instead of returning a partial array.
+    - The attendance/packaging definitions, permissions, order lookup and Dexie behaviour are unchanged.
+  - **Production:** the immediate Production/capture path (`useProductionEvidence` current-day) is unchanged.
+  - **Files:**
+    - new: `src/lib/domain/productionPublishedView.ts`, `productionPublishedState.ts`, `src/lib/hooks/usePublishedManagement.ts`, `src/lib/repository/supabase/keysetFilter.ts`; tests `tests/production/published-view-adapter.test.ts`, `side-cards.test.ts`, `keyset-cursor.test.ts`;
+    - modified: `src/pages/Reports.tsx`, `src/pages/Welcome.tsx`, `src/components/ProductionCountStatus.tsx`, the five side cards, `src/lib/hooks/usePublishedProduction.ts`, `src/lib/repository/supabase/pageThrough.ts`, `tests/production/published-reporting.test.ts`.
+  - **Gate (root, current tree):**
+
+    | Check | Result |
+    |---|---|
+    | Focused Task 17 tests | 71/71 |
+    | `npx tsc -b` | clean |
+    | `npm run typecheck:digest` | exit 0 |
+    | `npm run build` | success |
+    | Full suite | 62 files, 2,095 tests |
+    | `git diff --check` | clean |
+  - **Known differences, recorded for review:**
+    - Published per-person orders page in order-key order, not newest-touched first.
+    - Work-type pills follow work-type order.
+    - Items-per-day uses the raw rate on overflow.
+    - The legacy CSV over 100,000 rows now fails explicitly at the cap.
+    - There is no DOM test dependency; page wiring is pinned by source contracts and pure adapters.
+  - **Pending:** CJ applies 0044 on staging, then runs the staging browser checks (warnings, immediate worker confirmation with the worker job stopped, no new data exposure or false zeroes).

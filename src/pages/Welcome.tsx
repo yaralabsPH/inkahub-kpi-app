@@ -10,6 +10,8 @@ import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
 import { isReportSite, productionDateAt, productionRange } from "@/lib/domain/productionPeriods";
 import { buildProductionWelcomeView, welcomeRange } from "@/lib/domain/productionWelcomeView";
 import { snapshotCovers } from "@/lib/domain/productionCounts";
+import { usePublishedManagement } from "@/lib/hooks/usePublishedManagement";
+import { managementSource, publishedStatusLine, rawRangeFor, welcomeFromSummary } from "@/lib/domain/productionPublishedView";
 import {
   PRODUCTION_DEPARTMENT_LABELS,
   type ProductionDepartment,
@@ -21,7 +23,10 @@ import {
  * Shows ONLY motivational / operational data: today's per-department
  * orders + items (site production day from 04:00), top worker and streak,
  * most improved staff (yesterday), team-total sparkline. Counts come from
- * the shared F1 evidence snapshot (productionWelcomeView.ts).
+ * ONE published report generation (summary.welcome); only a site explicitly
+ * still on the existing reads (READ_MODE_LEGACY) uses the shared F1 evidence
+ * snapshot (productionWelcomeView.ts). Days the shown generation does not
+ * cover are announced, never shown as zero.
  *
  * No financial figures, no SKU stock counts, no customer data - safe to
  * leave open on a kiosk or any user role''s screen.
@@ -99,7 +104,10 @@ function SupabaseWelcome() {
       document.removeEventListener("visibilitychange", onReturn);
     };
   }, []);
-  const evidence = useProductionEvidence({ client: supabase, site: location, range, refreshKey: tick });
+  // Published first: the raw-history read runs ONLY for a site that answered READ_MODE_LEGACY.
+  const pub = usePublishedManagement({ supabase, view: "welcome", site: location, range, refreshKey: tick });
+  const source = managementSource(pub.status);
+  const evidence = useProductionEvidence({ client: supabase, site: location, range: rawRangeFor(pub.status, range), refreshKey: tick });
 
   const [staffNames, setStaffNames] = useState<Map<string, string>>(new Map());
   const [namesError, setNamesError] = useState<string | null>(null);
@@ -122,14 +130,25 @@ function SupabaseWelcome() {
   }, [supabase, location]);
   const nameOf = (id: string) => staffNames.get(id) ?? "User " + id.slice(0, 8);
 
-  const view = useMemo(
+  const legacyView = useMemo(
     () =>
-      evidence.prepared && evidence.snapshot && site && today && snapshotCovers(evidence.snapshot, range)
+      source === "legacy" && evidence.prepared && evidence.snapshot && site && today && snapshotCovers(evidence.snapshot, range)
         ? buildProductionWelcomeView(evidence.prepared, site, evidence.snapshot.asOfUtc, today)
         : null,
-    [evidence.prepared, evidence.snapshot, site, today, range],
+    [source, evidence.prepared, evidence.snapshot, site, today, range],
   );
+  const published = useMemo(
+    () => (source === "published" && pub.summary && site ? welcomeFromSummary(pub.summary, { site, nowMs: Date.now() }) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [source, pub.summary, site, tick],
+  );
+  const view = source === "legacy" ? legacyView : published?.view ?? null;
+  // Only figures the shown generation covers are displayed (an old generation after 04:00 says so instead of showing zeroes).
+  const todayShown = source === "legacy" ? !!legacyView : !!published?.todayPublished;
+  const yesterdayShown = source === "legacy" ? !!legacyView : !!published?.yesterdayPublished;
   const shownToday = view?.today ?? today;
+  const line = site && source !== "legacy" ? publishedStatusLine(pub, { site, range: shownToday ? { firstDate: shownToday, lastDate: shownToday } : null, nowMs: Date.now() }) : null;
+  const statusState = line ? { ...line, refresh: pub.refresh } : evidence;
 
   const dateStr = now.toLocaleDateString(undefined, {
     weekday: "long",
@@ -154,9 +173,10 @@ function SupabaseWelcome() {
       ) : null}
 
       <ProductionCountStatus
-        state={evidence}
+        state={statusState}
         range={site && shownToday ? productionRange(site, shownToday, shownToday) : null}
         coverage={view?.coverage ?? null}
+        warnings={line?.warnings}
         compact
       />
 
@@ -166,7 +186,12 @@ function SupabaseWelcome() {
           Today
           <span className="text-sm font-normal text-slate-500 ml-2">{todayStr}</span>
         </h2>
-        {view && ((view.todayTotals.rework.items ?? 0) > 0 || view.todayTotals.rework.orders > 0) ? (
+        {view && !todayShown ? (
+          <div className="text-xs text-amber-700 dark:text-amber-300" role="status">
+            Today's counts are not published yet{published ? ` (published through ${published.coveredThrough})` : ""}; they are not zero.
+          </div>
+        ) : null}
+        {view && todayShown && ((view.todayTotals.rework.items ?? 0) > 0 || view.todayTotals.rework.orders > 0) ? (
           <div className="text-xs text-slate-500 dark:text-slate-400">
             Plus CS/rework today: {itemsText(view.todayTotals.rework.items)}, {view.todayTotals.rework.orders} case order{view.todayTotals.rework.orders === 1 ? "" : "s"} (counted separately).
           </div>
@@ -174,7 +199,7 @@ function SupabaseWelcome() {
       </div>
 
       {/* ------------ Per-department cards ------------ */}
-      {view ? (
+      {view && todayShown ? (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {DEPARTMENTS.map((dep) => {
           const d = view.perDepartment[dep];
@@ -244,7 +269,7 @@ function SupabaseWelcome() {
       ) : null}
 
       {/* ------------ Most improved ------------ */}
-      {view?.mostImproved ? (
+      {view?.mostImproved && yesterdayShown ? (
         <Card>
           <CardBody className="flex items-center gap-3">
             <Sparkles size={20} className="text-amber-500 shrink-0" />
@@ -261,7 +286,7 @@ function SupabaseWelcome() {
       ) : null}
 
       {/* ------------ Team total + sparkline ------------ */}
-      {view ? (
+      {view && yesterdayShown ? (
       <Card>
         <CardBody>
           <div className="flex items-center justify-between gap-4 flex-wrap">

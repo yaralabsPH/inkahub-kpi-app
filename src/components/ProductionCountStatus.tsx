@@ -31,16 +31,19 @@ function fmtTime(iso: string | undefined, timeZone?: string): string {
 }
 
 export interface ProductionCountStatusProps {
-  state: Pick<ProductionEvidenceState, "status" | "updating" | "error" | "unavailableReason" | "snapshot" | "refresh">;
+  /** Raw-evidence state, or a published view's line (snapshot = its source cutoff / verified instant). */
+  state: Pick<ProductionEvidenceState, "status" | "updating" | "error" | "unavailableReason" | "refresh"> & { snapshot: { asOfUtc: string; loadedAtUtc: string } | null };
   range: ProductionRange | null;
-  coverage?: ProductionCoverage | null;
+  coverage?: Pick<ProductionCoverage, "issueCounts" | "notes" | "visibility"> | null;
   /** Extra disclosures (overlapping Orders, processed work…). */
   notes?: string[];
+  /** Warnings shown even in compact mode (published freshness, days not yet published). */
+  warnings?: string[];
   className?: string;
   compact?: boolean;
 }
 
-export function ProductionCountStatus({ state, range, coverage, notes, className, compact }: ProductionCountStatusProps) {
+export function ProductionCountStatus({ state, range, coverage, notes, warnings, className, compact }: ProductionCountStatusProps) {
   const { status, updating, error, unavailableReason, snapshot, refresh } = state;
   const issueEntries = coverage ? (Object.entries(coverage.issueCounts) as [CoverageIssueKind, number][]).filter(([, n]) => n > 0) : [];
   const noteEntries = coverage ? (Object.entries(coverage.notes) as [CoverageNoteKind, number][]).filter(([, n]) => n > 0) : [];
@@ -92,6 +95,7 @@ export function ProductionCountStatus({ state, range, coverage, notes, className
           {snapshot ? ` · cutoff ${fmtTime(snapshot.asOfUtc, range.timeZone)}` : ""}
         </div>
       ) : null}
+      {warnings?.length ? warnings.map((w) => <div key={w} className="text-amber-700 dark:text-amber-300" role="status">{w}</div>) : null}
       {limited ? <div className="text-amber-700 dark:text-amber-300">{limited} Coverage is limited.</div> : null}
       {issueEntries.length ? (
         <div className="text-amber-700 dark:text-amber-300">
