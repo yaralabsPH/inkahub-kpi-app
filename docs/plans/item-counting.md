@@ -2425,3 +2425,104 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - **Cost record (planner answer 2):** on the 300-line fan-out fixture: owners=10, works=40, maxInput=156, totalInput=1,560, requests=1,704 (was 96), heap delta ≈54 MiB (GC-dependent). The request rise is the per-candidate incremental cancellation reads that T14R3 requires; batching them must keep equivalent bounded consumption and is a Task 15/19 measurement item, not done here.
   - **Remaining limitations:** request count and the real wire-size/plan behaviour need PostgreSQL evidence in the reviewed 0040+0041 rollback rehearsal. Task 15 still owns durable cross-invocation enumeration.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1324/1324 tests (38 files); build OK.
+- 2026-11-16 — T14S1 dependency-read rehearsal PREPARED, OFFLINE (Claude). No SQL was executed, no staging mode was run, nothing was installed, no production access, no Task 15+ work, and no limit or timeout was changed. `api/` and every file in `supabase/migrations/` are unchanged: 0037 `531bb2c5…`, 0038 `14a808ea…`, 0039 `05d7eff1…`, 0040 `4e39243e…` and 0041 `dfa49d59…` are byte-identical. Task 14 stays unchecked.
+  - **Prepared command (root runs it; I did not):** `npm run staging:reporting-jobs -- --rehearse-dependency-reads --sites=uk,us`. It refuses `--site`, unknown flags and combined modes. It runs inside the existing guarded lifecycle: staging URL assert, the `ybrzhrgfrnvtcwymjdrq` target checked before every SQL, staging test-user sign-in, full-state baseline first, a fresh ZERO-change (ROLLBACK_ONLY) audit last, and a unique git-ignored `staging-results-reporting-publication-rehearse-dependency-reads-…md` report. The report records the commit, the five migration identities, every observation, the per-read evidence, timings and plans. It holds no credentials, JWTs or source payloads.
+  - **Files:**
+    - new `tests/staging/reportingDependencyRehearsal.ts` (coordinator, cases, fixtures, SQL adapter, pure checks);
+    - new `tests/reporting/reportingDependencyRehearsal.test.ts` (103 tests);
+    - minimal wiring in `tests/staging/reportingPublication.ts`: mode, a `dependency` report field and section, and a status rule. This mode is never COMPLETE unless `dependency.complete === true`;
+    - minimal wiring in `tests/staging/reporting-jobs.ts`: dispatch, flag list, usage and header;
+    - `package.json`: both new files added to `typecheck:digest`.
+  - **Before mutation:**
+    - D0: file identities. 0037/0038/0039 must be the installed identities and 0040/0041 the reviewed drafts. 0040 parses to 25 statements; 0041 to the six replacements, in order.
+    - D1, read-only before BEGIN: the installed publisher is 0039 (invoker, service-only); NO 0040 helper, reads or indexes exist; no active/frozen/publishing batch; the staging marker is present; no `dr-` ids exist.
+  - **One outer transaction that always rolls back:**
+    - D2 applies the parsed 0040 then 0041 bodies (31 statements).
+    - D3 checks the effective functions: 0041 prosrc md5s plus the 0040 helper, SECURITY INVOKER, `search_path=""`, anon/authenticated denied, service_role allowed, and the four indexes present.
+    - The cases follow; then ROLLBACK; then D9.
+    - A rollback failure is kept beside the first error.
+    - Every recorded failure stops at once (`failFast`).
+    - Missing required cases throw, so the evidence is never complete.
+  - **Statement guard (deny-list):**
+    - It refuses COMMIT/END/ABORT, VACUUM/ANALYZE/CHECKPOINT/COPY/LISTEN/NOTIFY, timeout and planner SET or set_config, roles other than anon/authenticated/service_role, migration-history writes, http/dblink/file reads, EXPLAIN ANALYZE, and any DDL (incl. DO) that is not one of the 31 reviewed statements.
+    - Found while writing tests: a DDL statement that starts with a `--` comment bypassed the first-token check. The guard now strips leading comments before classifying.
+  - **Actual SQL adapter:**
+    - `sqlRpcClient` calls only the six allowlisted functions, with exact argument names and 0041-header types (`$n::type` in declared order), on the rehearsal transaction as service_role.
+    - Each call returns `json_agg` text from PostgreSQL. It records calls, rows, max rows, max PostgreSQL bytes, max compact client bytes and time.
+    - It FAILS on more than 1,000 rows or more than 1 MiB compact; it never slices.
+    - It feeds the ACTUAL `rpcFrozenReader` and materializer.
+    - Labelled SQL-serialization evidence, not PostgREST HTTP.
+  - **Cases:**
+    - Sites A=uk, B=us. Workers are the staff, manager, cs and owner staging users.
+    - S0 turns capture and both processors on, inside the transaction.
+    - S1 inserts admissibility-checked named fixtures:
+      - the T14R2 tied pair `dr-😀`/`dr-�` with any-type and same-type predecessors;
+      - the T14R1 prev/next pair;
+      - hidden-worker blank-order and own cancellations;
+      - an orphan whose parent arrives later;
+      - re-owner/re-staff, delete and site-move rows;
+      - a 2099 future row and timestamp ties;
+      - a cross-site duplicate id, plus B's child of an A parent id;
+      - 1,000 owners with 1,200-byte keys;
+      - 15 multibyte/escaped/non-BMP ~90 KB rows with long ids, and 15 big children;
+      - `dr-huge`, padded to an image of exactly 1 MiB − 16 bytes (copyable, but no read row can fit);
+      - `dr-due`.
+    - R0–R9, on a rebuild of A with the ORIGINAL full volume plus fixtures:
+      - R1: candidate = source by count and a per-id image md5 aggregate;
+      - R2: owners exact;
+      - R3–R6: members, by-id, children and before/after streams exact against an independent `to_jsonb(production_events)` view;
+      - R7/R7m/R7s: single-row refusals;
+      - R8: rebuild materialization of 17 controlled owners through the real reader, compared with the in-memory reader and the full-view oracle, including the T14R2 predecessors;
+      - R9: every response ≤ 1,000 rows and ≤ 1 MiB.
+    - X1–X7, each in a savepoint: obsolete fence, wrong batch kind, anon and authenticated permission denied, expired lease, capture disabled, capture epoch changed, and a non-frozen batch.
+    - T1–T2, timed on the full volume:
+      - first and later pages of the largest real owner, and of the busiest real worker in both directions (dr-huge's worker excluded);
+      - `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON)` of the effective 0041 statements, with variables bound as `$n`. A test proves that un-binding gives back the exact migration text.
+    - P0 (setup only) publishes the rebuild with zero work.
+    - F0 makes the source changes and begins a refresh. F1 checks changed keys; F2 checks overlay members, by-id, children and streams; F3 checks refresh materialization (`materializeBatch`, RPC vs memory vs oracle, T14R1, old-owner empty replacements); F4 refuses the wrong kind.
+    - F5 (setup) publishes the refresh, changes `dr-huge` (same length) and refuses the oversized changed key (F5x).
+  - **Planner early review (5 items), all incorporated:**
+    1. Expected changed keys now come from FULL raw images (`rawView` and `expectedChangedKeys`), then images are reduced for the projector. The 15 note-only changes are now expected in F1 and given to F3's in-memory reader.
+    2. `requiredWorks` projects the full before and after views per audience (site, plus each worker in a changed image) and requires every (audience, owner) whose rows differ. `missingRequired` fails a work missing from either path, so a work missing from both fails. F3 also asserts that the requirement itself contains dr-orph, DR-X and DR-N. R8 requires every non-empty audience of the controlled owners.
+    3. The rebuild fingerprint is now taken before R2; X8 is checked right after R9 and X8t after T2. The refresh fingerprint is taken before F1 and X9 is checked right after F3; the extra read inside X9 was removed.
+    4. R7s is now anchored at dr-huge's exact instant (`after`, empty id, limit 1), so the oversized row comes first.
+    5. `shortPages` is renamed `nonEmptyUnderLimit` (a raw count). The new `cappedContinuations` counts only a non-empty under-limit page that is followed by its EXACT keyset continuation returning rows. R2–R6 and F1 require at least one.
+    - Other fixes: cutoffs are read as exact microsecond UTC text via `to_char` (a JavaScript Date would round to ms), and self-audience oracles see only that worker's events (as the materializer's input does).
+  - **Due probe (planner-approved setup):**
+    - `dr-due` is inserted in S1 at `transaction_timestamp() - 500 ms`.
+    - After T2/X8t and before P0, inside SAVEPOINT `dr_due`:
+      - U1 changes ONLY `source_cutoff` of this run's still-frozen, unsealed rebuild to `transaction_timestamp() - 1 s`, then seals zero work and publishes through the existing RPCs. There is no source edit afterwards. It asserts no pending journal entry for dr-due; the rebuild freeze puts every pending change in its `batch_changes`, and publication gives the receipt.
+      - U2 runs `begin_reporting_batch` at now(). Its changed keys must equal the independent due set; dr-due must be present with identical raw base and frozen images, and inside `base cutoff < created_at <= refresh cutoff` (SQL-checked); the 2099 `dr-fut` must be absent.
+    - The savepoint is rolled back and released on success or failure. A cleanup failure is kept beside the first error.
+    - U3 proves the original frozen rebuild is back (state, cutoff, fence, pre-R2 fingerprint) before P0 continues.
+    - No extra copy, no edit of a published generation, no production-function change.
+    - Labelled in the evidence as a controlled rollback-only time transition, not a wall-clock observation.
+    - I found no conflict with an invariant offline.
+  - **Required cases (never COMPLETE without all):** D0–D3, S0–S1, R0–R9 (with R7m and R7s), U1–U3, P0, F0–F5 (with F5x), X1–X9 (with X6d and X8t), T1–T2, D9.
+  - **Offline outcomes:**
+    - Written failing first: the typecheck-inclusion test (package.json not yet updated) and four first-run failures that exposed real defects: the long keys were 1,199 bytes rather than ≥1,200, and the comment-prefixed-DDL guard bypass; the other two were mistakes in my own assertions.
+    - The 103 focused tests cover:
+      - wiring and status;
+      - identities and bodies;
+      - all six bindings against the 0041 headers;
+      - the adapter's role switch, counts and fail rules;
+      - continuation detection;
+      - the real reader and materializer through the adapter;
+      - plan statement equality;
+      - 30 guard refusals;
+      - comparison sensitivity;
+      - the raw diff, including note-only changes;
+      - required works, including a late parent and missing-on-both;
+      - fixtures;
+      - structural ordering of fingerprints, R7s and the due probe;
+      - the coordinator: refusals before BEGIN, inside failures, recorded-failure fail-fast, an emit failure, a rollback failure kept beside the first error, incomplete evidence, and a real-cases early stop;
+      - the actual lifecycle with a fresh audit (COMPLETE only with complete evidence; FAILED on an audit mismatch).
+  - **Mutations: 16/16 caught.** Two first SURVIVED and were closed with new assertions: counting a full page's continuation as byte-capped, and U2 dropping out of the required cases. The list: guard comment strip; raw membership; missing-on-memory; stream direction in continuation; capped without a short page; >1 MiB accepted; argument order; status without evidence; skipped evidenceProblems; active batch tolerated; X8 moved before R9; R7s from FAR_FUTURE; due cutoff ignoring sealed state; EXPLAIN ANALYZE; U2 not required; rollback skipped.
+  - **Limitations:**
+    - Nothing here has run against PostgreSQL. Function errors, SQL texts and plan binding are checked against the migration text only.
+    - The due probe's savepoint cleanup is proven structurally and by the coordinator tests, not by executing `runDependencyCases` end to end offline.
+    - Full-volume timings are single observations, not a scale certification.
+    - The SQL byte counts are PostgreSQL `json_agg` text, not PostgREST wire bytes.
+    - The `requiredWorks` oracle projects the full UK view once per audience, which is CPU-heavy but finite.
+  - **Request-cost concern (still open, explicit):** T14R3's per-candidate incremental cancellation reads raised the 300-line fan-out fixture from 96 to 1,704 requests. This rehearsal records `sqlCalls` and the per-function call counts for R8/F3, but that is a measurement only. Batching while keeping equivalent bounded consumption remains a Task 15/19 item.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (includes both new files); strict ES2020 tsc on both runners OK; 1427/1427 tests (39 files); build OK.
