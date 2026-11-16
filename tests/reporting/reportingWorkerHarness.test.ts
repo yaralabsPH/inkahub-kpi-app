@@ -171,6 +171,25 @@ describe("worker harness arguments, STATUS and wiring", () => {
     expect(wm).not.toMatch(/\bset\s+(local\s+|session\s+)?(statement|lock|idle_in_transaction_session)_timeout|set_config\('(statement|lock|idle_in_transaction_session)_timeout/i);
     expect(wm).toContain("current_setting('statement_timeout')");
   });
+  it("recovery arguments: a plain run-report file name is required (no directories or traversal); limits are refused", () => {
+    const name = "staging-results-reporting-worker-worker-runtime-20261117T101500000Z-0a1b2c3d.md";
+    expect(parseWorkerArgs(["--recover-worker-run", "--site=uk", `--report=${name}`])).toMatchObject({ mode: "recover-worker-run", site: "uk", report: name, problems: [] });
+    expect(parseWorkerArgs(["--recover-worker-run", "--site=uk"]).problems.join(";")).toMatch(/needs --report=/);
+    expect(parseWorkerArgs(["--recover-worker-run", "--site=uk", `--report=../${name}`]).problems.join(";")).toMatch(/needs --report=/);
+    expect(parseWorkerArgs(["--recover-worker-run", "--site=uk", "--report=staging-results-reporting-worker-rehearse-worker-state-1-0a1b2c3d.md"]).problems.join(";")).toMatch(/needs --report=/);
+    expect(parseWorkerArgs(["--recover-worker-run", "--site=uk", `--report=${name}`, "--pace-calls=4"]).problems.join(";")).toMatch(/only apply to --worker-runtime/);
+    expect(parseWorkerArgs(["--worker-runtime", "--site=uk", `--report=${name}`]).problems.join(";")).toMatch(/only applies to --recover-worker-run/);
+  });
+  it("recovery wiring: the report is parsed before any connection; recovery never waits for a lease; the audit uses the original baseline", () => {
+    const main = read("tests/staging/reporting-jobs.ts");
+    const wm = main.slice(main.indexOf("async function workerMain"), main.indexOf("async function main()"));
+    expect(wm.indexOf("recovered = parseRunReport(readFileSync(args.report!, \"utf8\"), site);")).toBeGreaterThan(0);
+    expect(wm.indexOf("recovered = parseRunReport(")).toBeLessThan(wm.indexOf("await runCaptureLifecycle("));
+    expect(wm).toContain('awaitLeaseExpiry: async () => { throw new Error("recovery never waits for a lease"); }');
+    expect(wm).toMatch(/if \(mode === "recover-worker-run" && recoveryWrote\) \{[\s\S]*?auditRuntime\(fresh, \{ state: \(c\) => fullState\(c\) \}, own, rev\)/);
+    const rec = read("tests/staging/reportingWorkerRecovery.ts");
+    expect(rec).not.toMatch(/resume_reporting_batch|renew_reporting_lease|resumeReportingBatch|renewReportingLease|awaitLeaseExpiry\(/);
+  });
   it("wrong target: a non-staging database URL is refused before any connection", () => {
     expect(() => stagingTarget("postgresql://postgres:x@db.lkboboagiikvozvbcpvg.supabase.co:5432/postgres")).toThrow(/not the staging project ybrzhrgfrnvtcwymjdrq/);
     expect(() => stagingTarget("postgresql://postgres.ybrzhrgfrnvtcwymjdrq:x@aws-0.pooler.supabase.com:6543/postgres")).not.toThrow();

@@ -53,6 +53,7 @@ import { diagnoseAccessPaths, diagnoseDependencyPlans } from "./reportingDepende
 import { HISTORY_SQL, MIGRATION_0043, newWorkerReport, parseWorkerArgs, rehearseWorkerState, sha256Lf, WORKER_FLAGS, workerMarkdown, workerStatus } from "./reportingWorkerHarness";
 import { newRuntimeOwnership } from "./reportingWorkerRuntime";
 import { auditRuntime, cleanupRuntime, newRuntimeEvidence, runWorkerRuntime, type RuntimeCtx } from "./reportingWorkerScenario";
+import { parseRunReport, recoverWorkerRun, type RecoveredRun } from "./reportingWorkerRecovery";
 import { serviceRpcClient } from "./serviceRpc";
 import {
   compareFullState,
@@ -474,6 +475,20 @@ async function workerMain(argv: string[]): Promise<number> {
     console.log(workerStatus(report));
     return 1;
   }
+  // --recover-worker-run: the interrupted run's own report is parsed and validated BEFORE any connection (refusal first).
+  let recovered: RecoveredRun | null = null;
+  if (mode === "recover-worker-run") {
+    try {
+      recovered = parseRunReport(readFileSync(args.report!, "utf8"), site);
+      report.evidence = { sourceReport: args.report, sourceReportSha256: recovered.reportSha256, runId: recovered.own.runId, recorded: [] };
+    } catch (e) {
+      report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
+      report.finishedAt = new Date().toISOString();
+      save();
+      console.log(workerStatus(report));
+      return 1;
+    }
+  }
   const record = (o: Observation) => {
     report.observations.push(o);
     console.log(redactSecrets(`${o.ok ? "ok " : "NO "} ${o.id} ${o.what}: ${o.result}`));
@@ -489,9 +504,11 @@ async function workerMain(argv: string[]): Promise<number> {
   };
   let before: FullState | null = null;
   // --worker-runtime ownership/evidence: in the report (saved) before the first commit.
-  const own = newRuntimeOwnership(site, randomBytes(4).toString("hex"));
-  const rev = newRuntimeEvidence();
-  if (mode === "worker-runtime") report.ownership = own as unknown as Record<string, unknown>;
+  // Recovery reuses the interrupted run's ownership and baseline; its own receipts are appended to that ownership.
+  const own = recovered?.own ?? newRuntimeOwnership(site, randomBytes(4).toString("hex"));
+  const rev = recovered?.ev ?? newRuntimeEvidence();
+  let recoveryWrote = false;
+  if (mode !== "rehearse-worker-state") report.ownership = own as unknown as Record<string, unknown>;
   const runtimeCtx = (staff: string): RuntimeCtx => ({
     site, staff, record, redact: redactSecrets, asRole,
     open: () => open(),
@@ -540,9 +557,15 @@ async function workerMain(argv: string[]): Promise<number> {
         });
         return;
       }
-      // --worker-runtime: COMMITS only its declared, owned state; cleanup ALWAYS runs before the fresh audit.
       const staff = String((await main.query("select id::text as id from auth.users where email = 'staff@inka-staging.test'")).rows[0]?.id ?? "");
       if (!staff) throw new Error("staff test user not found");
+      if (mode === "recover-worker-run") {
+        // Never waits, resumes or renews: refuses (writing nothing) unless the lease has already expired.
+        recoveryWrote = (await recoverWorkerRun(main, { ...runtimeCtx(staff), awaitLeaseExpiry: async () => { throw new Error("recovery never waits for a lease"); } }, recovered!, report.cleanup)).wrote;
+        report.evidence = { ...(report.evidence ?? {}), recorded: rev.recorded };
+        return;
+      }
+      // --worker-runtime: COMMITS only its declared, owned state; cleanup ALWAYS runs before the fresh audit.
       try {
         await runWorkerRuntime(main, runtimeCtx(staff), own, rev);
       } finally {
@@ -550,6 +573,12 @@ async function workerMain(argv: string[]): Promise<number> {
       }
     },
     audit: async (fresh) => {
+      if (mode === "recover-worker-run" && recoveryWrote) {
+        // Against the ORIGINAL run's persisted baseline, with the same scoped ownership rules.
+        const a = await auditRuntime(fresh, { state: (c) => fullState(c) }, own, rev);
+        report.evidence = { ...(report.evidence ?? {}), finalState: a.finalState, complete: true };
+        return a.problems;
+      }
       if (mode === "worker-runtime") {
         if (!own.committedAnything) {
           // refused before the first commit: nothing may differ at all

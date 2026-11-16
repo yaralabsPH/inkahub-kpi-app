@@ -24,13 +24,18 @@ import type { LifecycleReport } from "./reportingCapture";
 // Arguments, report and STATUS
 // ---------------------------------------------------------------------------
 
-export type WorkerMode = "rehearse-worker-state" | "worker-runtime";
-export const WORKER_FLAGS = ["--rehearse-worker-state", "--worker-runtime"] as const;
-export interface WorkerArgs { mode: WorkerMode | null; site: Site | null; paceCalls: number; maxInvocations: number; maxLeaseWaitMs: number; problems: string[] }
+export type WorkerMode = "rehearse-worker-state" | "worker-runtime" | "recover-worker-run";
+export const WORKER_FLAGS = ["--rehearse-worker-state", "--worker-runtime", "--recover-worker-run"] as const;
+/** The interrupted run's own report: a plain file name in the repo root (no directories, no traversal). */
+export const RUN_REPORT_NAME = /^staging-results-reporting-worker-worker-runtime-[0-9TZ]+-[0-9a-f]{8}\.md$/;
+export interface WorkerArgs { mode: WorkerMode | null; site: Site | null; paceCalls: number; maxInvocations: number; maxLeaseWaitMs: number; report: string | null; problems: string[] }
 export function parseWorkerArgs(argv: readonly string[]): WorkerArgs {
   const problems: string[] = [];
   const modes = argv.filter((a) => (WORKER_FLAGS as readonly string[]).includes(a));
-  if (modes.length !== 1) problems.push("exactly one of --rehearse-worker-state or --worker-runtime is required");
+  if (modes.length !== 1) problems.push("exactly one of --rehearse-worker-state, --worker-runtime or --recover-worker-run is required");
+  const report = argv.find((a) => a.startsWith("--report="))?.slice(9) ?? null;
+  if (modes[0] === "--recover-worker-run" && (!report || !RUN_REPORT_NAME.test(report))) problems.push("--recover-worker-run needs --report=<the interrupted run's staging-results-reporting-worker-worker-runtime-*.md file name>");
+  if (modes[0] !== "--recover-worker-run" && report !== null) problems.push("--report only applies to --recover-worker-run");
   const mode = modes.length === 1 ? (modes[0].slice(2) as WorkerMode) : null;
   const siteArg = argv.find((a) => a.startsWith("--site="))?.slice(7);
   const site = siteArg === "au" || siteArg === "uk" || siteArg === "us" ? siteArg : null;
@@ -48,10 +53,10 @@ export function parseWorkerArgs(argv: readonly string[]): WorkerArgs {
   const paceCalls = int("pace-calls", 3, 2, 50);
   const maxInvocations = int("max-invocations", 12, 3, 60);
   const maxLeaseWaitMs = int("max-lease-wait-ms", 420_000, 1_000, 900_000);
-  const known = new Set([...WORKER_FLAGS, "--site", "--pace-calls", "--max-invocations", "--max-lease-wait-ms"]);
+  const known = new Set([...WORKER_FLAGS, "--site", "--pace-calls", "--max-invocations", "--max-lease-wait-ms", "--report"]);
   for (const a of argv) if (!known.has(a.split("=")[0])) problems.push(`unknown argument ${a}`);
-  if (mode === "rehearse-worker-state" && argv.some((a) => /^--(pace-calls|max-invocations|max-lease-wait-ms)=/.test(a))) problems.push("runtime limits only apply to --worker-runtime");
-  return { mode, site, paceCalls, maxInvocations, maxLeaseWaitMs, problems };
+  if (mode !== "worker-runtime" && argv.some((a) => /^--(pace-calls|max-invocations|max-lease-wait-ms)=/.test(a))) problems.push("runtime limits only apply to --worker-runtime");
+  return { mode, site, paceCalls, maxInvocations, maxLeaseWaitMs, report, problems };
 }
 
 export interface WorkerReport extends LifecycleReport {
