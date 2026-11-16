@@ -2845,3 +2845,16 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - the side-card audit and changes (PackageHistory/Usage historical drill-down lazy; DailyTimesheet/CurrentlyClockedIn/LiveOrderCompletions never presenting truncated totals);
     - the staging browser check.
   - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK; 1644/1644 tests (44 files); build OK.
+- 2026-11-16 — **Offline PostgreSQL for reporting SQL (CJ approved the PGlite proposal in chat)** (Claude).
+  - **Dependency:** `@electric-sql/pglite` **0.5.13**, an exact devDependency released 2026-10-28; the newest is 0.5.16, but the pinned version is at least two weeks old. It is used only by vitest under `tests/reporting/pg/`; nothing in `src/` or `api/` imports it and it is not in the app bundle. The reason, recorded per guardrail 7: there is no local PostgreSQL, and the reporting SQL must be executed and compared with the TypeScript references before staging.
+  - **Harness (`tests/reporting/pg/harness.ts`):** it stubs only what 0037+ reference outside `reporting_private`:
+    - the roles anon, authenticated and service_role (BYPASSRLS, as in Supabase);
+    - `auth.users`, `public.locations`;
+    - `public.production_events` as of 0030 (columns, checks, PK, RLS on, service_role SELECT).
+    - It then applies the REAL migration files 0037–0043 unchanged. All seven apply.
+  - **`tests/reporting/pg/rpc.ts`:** a PostgREST-like RpcClient (named typed arguments, SET ROLE per call, json_agg result).
+  - **Results, from first execution of 0043 SQL:** the REAL Task 15 worker ran rebuild, then refresh after an insert, a deletion, a re-owner/re-staff and a new cancellation, then a no-change refresh, then cleanup, all over the real SQL.
+    - The published current `event_facts` (site and self audiences) equal the whole-batch in-memory reference exactly. Non-vacuity is asserted: deleted e005 is absent, e007 is in W2's self audience, n-1 is present.
+    - anon/authenticated get `permission denied` on the worker RPCs.
+  - **Limits:** PGlite is one in-process PostgreSQL 17. It proves SQL semantics and parity, not hosted roles, PostgREST, concurrency, timeouts or performance. Staging remains the runtime gate.
+  - **Gate:** `npx tsc -b` OK; 1650/1650 tests (46 files, 27 s); build OK.
