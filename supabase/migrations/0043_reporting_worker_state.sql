@@ -514,10 +514,20 @@ BEGIN
     SELECT y.ctid FROM reporting_private.worker_owners y JOIN reporting_private.batches b ON b.batch_id = y.batch_id
      WHERE b.site = p_site AND b.state IN ('published', 'abandoned', 'failed') AND b.updated_at < now() - interval '30 days' LIMIT p_limit);
   GET DIAGNOSTICS v_owners = ROW_COUNT; v_more := v_more OR v_owners >= p_limit;
+  DELETE FROM reporting_private.worker_seen t WHERE t.ctid IN (
+    SELECT y.ctid FROM reporting_private.worker_seen y JOIN reporting_private.batches b ON b.batch_id = y.batch_id
+     WHERE b.site = p_site AND b.state IN ('published', 'abandoned', 'failed') AND b.updated_at < now() - interval '30 days' LIMIT p_limit);
+  GET DIAGNOSTICS v_n = ROW_COUNT; v_owners := v_owners + v_n; v_more := v_more OR v_n >= p_limit;
+  DELETE FROM reporting_private.worker_walk_line t WHERE t.ctid IN (
+    SELECT y.ctid FROM reporting_private.worker_walk_line y JOIN reporting_private.batches b ON b.batch_id = y.batch_id
+     WHERE b.site = p_site AND b.state IN ('published', 'abandoned', 'failed') AND b.updated_at < now() - interval '30 days' LIMIT p_limit);
+  GET DIAGNOSTICS v_n = ROW_COUNT; v_owners := v_owners + v_n; v_more := v_more OR v_n >= p_limit;
   DELETE FROM reporting_private.worker_progress t WHERE t.ctid IN (
     SELECT y.ctid FROM reporting_private.worker_progress y JOIN reporting_private.batches b ON b.batch_id = y.batch_id
      WHERE b.site = p_site AND b.state IN ('published', 'abandoned', 'failed') AND b.updated_at < now() - interval '30 days'
-       AND NOT EXISTS (SELECT 1 FROM reporting_private.worker_owners o WHERE o.batch_id = y.batch_id) LIMIT p_limit);
+       AND NOT EXISTS (SELECT 1 FROM reporting_private.worker_owners o WHERE o.batch_id = y.batch_id)
+       AND NOT EXISTS (SELECT 1 FROM reporting_private.worker_seen s WHERE s.batch_id = y.batch_id)
+       AND NOT EXISTS (SELECT 1 FROM reporting_private.worker_walk_line k WHERE k.batch_id = y.batch_id) LIMIT p_limit);
   GET DIAGNOSTICS v_prog = ROW_COUNT; v_more := v_more OR v_prog >= p_limit;
   RETURN QUERY SELECT v_exp, v_del, v_runs, v_owners + v_prog, v_more;
 END
@@ -550,5 +560,160 @@ GRANT EXECUTE ON FUNCTION public.list_reporting_work_descriptors(uuid, bigint, j
 GRANT EXECUTE ON FUNCTION public.set_reporting_site_mode(text, text, boolean) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_reporting_run(text, text, text, text, uuid, uuid, timestamptz, integer, jsonb, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.cleanup_reporting_history(text, integer) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- Task 15 review repair: durable, exact per-seed dependency budgets for the
+-- resumable changed-key walk.
+--
+--   worker_seen       every DISTINCT source/dependency event id a successor
+--                     seed of a changed key has consumed (stream events and
+--                     the cancellations read for its stream lines). The
+--                     primary key deduplicates an id met through both paths,
+--                     in any invocation; count(*) is the exact input to the
+--                     approved 50,001-ID bound. Never a numeric-only counter.
+--   worker_walk_line  at most ONE row per batch: the frozen image of the
+--                     stream line whose own cancellations are being paged, so
+--                     a resume judges the remaining pages without rereading
+--                     the line or its earlier pages. Whether earlier pages
+--                     cancelled the line is a monotonic flag in the cursor
+--                     (each cancellation is judged only against its parent).
+--
+-- save_reporting_walk applies ONE checkpoint atomically: the cursor advance
+-- and owner discoveries (through save_reporting_enumeration, so the fence,
+-- lease, expected-cursor and identical-replay rules are the same), the seed's
+-- newly consumed ids and the paged line's image. More than 50,000 distinct
+-- ids for one key/seed raises partition_too_large INSIDE the transaction, so
+-- that checkpoint (cursor, owners, ids) rolls back as a whole. The checkpoint
+-- that completes a key (p_key_complete, advancing the OUTER changed-key
+-- cursor) deletes that key's scratch rows in the same transaction, so an
+-- active batch holds scratch state for at most its one in-progress key.
+-- cleanup_reporting_history also removes any left by failed/abandoned batches.
+-- ---------------------------------------------------------------------------
+CREATE TABLE reporting_private.worker_seen (
+  batch_id  uuid     NOT NULL REFERENCES reporting_private.batches (batch_id),
+  key_id    text     NOT NULL CHECK (key_id <> ''),
+  seed      smallint NOT NULL CHECK (seed >= 0 AND seed < 16),
+  event_id  text     NOT NULL CHECK (event_id <> ''),
+  PRIMARY KEY (batch_id, key_id, seed, event_id)
+);
+CREATE TABLE reporting_private.worker_walk_line (
+  batch_id  uuid     PRIMARY KEY REFERENCES reporting_private.batches (batch_id),
+  key_id    text     NOT NULL CHECK (key_id <> ''),
+  seed      smallint NOT NULL CHECK (seed >= 0 AND seed < 16),
+  line_id   text     NOT NULL CHECK (line_id <> ''),
+  image     jsonb    NOT NULL CHECK (pg_catalog.jsonb_typeof(image) = 'object' AND image ->> 'id' = line_id AND pg_catalog.octet_length(image::text) <= 1048576)
+);
+ALTER TABLE reporting_private.worker_seen ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reporting_private.worker_walk_line ENABLE ROW LEVEL SECURITY;
+
+CREATE FUNCTION public.save_reporting_walk(p_batch uuid, p_fence bigint, p_expected_cursor jsonb, p_next_cursor jsonb, p_owners jsonb,
+                                           p_key text, p_seed integer, p_seen text[], p_line_image jsonb, p_key_complete boolean)
+RETURNS TABLE (owners_discovered integer, enum_cursor jsonb, enum_complete boolean, replay boolean, seen_count integer)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  e   record;
+  v_n integer;
+BEGIN
+  IF p_key IS NULL OR p_key = '' THEN RAISE EXCEPTION 'save_reporting_walk: p_key is required'; END IF;
+  IF p_key_complete IS NULL THEN RAISE EXCEPTION 'save_reporting_walk: p_key_complete is required'; END IF;
+  -- A checkpoint continues the key the saved cursor is inside (never a switch to another key).
+  IF p_expected_cursor ? 'key' AND p_expected_cursor #>> '{key,id}' IS DISTINCT FROM p_key THEN
+    RAISE EXCEPTION 'save_reporting_walk: the saved cursor is inside another changed key';
+  END IF;
+  IF p_key_complete AND (p_next_cursor IS NULL OR p_next_cursor ? 'key' OR p_next_cursor ->> 'after' IS DISTINCT FROM p_key) THEN
+    RAISE EXCEPTION 'save_reporting_walk: completing a key advances the outer cursor to exactly that key';
+  END IF;
+  IF NOT p_key_complete AND (p_next_cursor IS NULL OR p_next_cursor -> 'key' ->> 'id' IS DISTINCT FROM p_key) THEN
+    RAISE EXCEPTION 'save_reporting_walk: an in-key checkpoint carries that key''s progress';
+  END IF;
+  IF p_seed IS NOT NULL AND (p_seed < 0 OR p_seed >= 16) THEN RAISE EXCEPTION 'save_reporting_walk: p_seed must be 0..15'; END IF;
+  IF p_seen IS NULL OR pg_catalog.cardinality(p_seen) > 2000 OR pg_catalog.octet_length(p_seen::text) > 1048576
+     OR EXISTS (SELECT 1 FROM pg_catalog.unnest(p_seen) s(x) WHERE s.x IS NULL OR s.x = '') THEN
+    RAISE EXCEPTION 'save_reporting_walk: p_seen must be at most 2000 non-empty ids and 1 MiB';
+  END IF;
+  IF p_seed IS NULL AND pg_catalog.cardinality(p_seen) > 0 THEN RAISE EXCEPTION 'save_reporting_walk: consumed ids need their seed'; END IF;
+  -- Ids go only into the budget of the seed the cursor is on: children phase none; seeds phase exactly
+  -- {key,seed}; the key-completing checkpoint may carry only the seed the expected cursor was on.
+  IF NOT p_key_complete THEN
+    IF p_next_cursor #>> '{key,phase}' = 'children' AND p_seed IS NOT NULL THEN
+      RAISE EXCEPTION 'save_reporting_walk: the children phase consumes no seed budget';
+    END IF;
+    IF p_next_cursor #>> '{key,phase}' = 'seeds' AND (pg_catalog.jsonb_typeof(p_next_cursor #> '{key,seed}') IS DISTINCT FROM 'number' OR p_seed IS DISTINCT FROM (p_next_cursor #>> '{key,seed}')::integer) THEN
+      RAISE EXCEPTION 'save_reporting_walk: p_seed must be the cursor''s seed';
+    END IF;
+    IF coalesce(p_next_cursor #>> '{key,phase}', '') NOT IN ('children', 'seeds') THEN
+      RAISE EXCEPTION 'save_reporting_walk: unknown key phase';
+    END IF;
+  ELSIF p_seed IS NOT NULL AND (p_expected_cursor #>> '{key,phase}' IS DISTINCT FROM 'seeds' OR p_seed IS DISTINCT FROM (p_expected_cursor #>> '{key,seed}')::integer) THEN
+    RAISE EXCEPTION 'save_reporting_walk: a completing checkpoint carries only the seed it was on';
+  END IF;
+  IF p_line_image IS NOT NULL THEN
+    IF p_seed IS NULL OR p_key_complete THEN RAISE EXCEPTION 'save_reporting_walk: a paged line belongs to a seed of an in-progress key'; END IF;
+    IF pg_catalog.jsonb_typeof(p_line_image) <> 'object' OR coalesce(p_line_image ->> 'id', '') = '' OR pg_catalog.octet_length(p_line_image::text) > 1048576 THEN
+      RAISE EXCEPTION 'save_reporting_walk: the line image must be an object with an id, at most 1 MiB';
+    END IF;
+    IF p_next_cursor #>> '{key,walk,line,id}' IS DISTINCT FROM p_line_image ->> 'id' THEN
+      RAISE EXCEPTION 'save_reporting_walk: the line image is not the cursor''s paged line';
+    END IF;
+  END IF;
+  -- Fence, lease, frozen/unsealed state, cursor advance or identical replay, owner rules: exactly the enumeration checkpoint's.
+  SELECT * INTO e FROM public.save_reporting_enumeration(p_batch, p_fence, p_expected_cursor, p_next_cursor, p_owners, false);
+  -- Idempotent on replay: the primary key keeps every id once.
+  INSERT INTO reporting_private.worker_seen (batch_id, key_id, seed, event_id)
+  SELECT p_batch, p_key, p_seed, s.x FROM pg_catalog.unnest(p_seen) s(x)
+  ON CONFLICT DO NOTHING;
+  IF p_line_image IS NOT NULL THEN
+    INSERT INTO reporting_private.worker_walk_line AS w (batch_id, key_id, seed, line_id, image)
+    VALUES (p_batch, p_key, p_seed, p_line_image ->> 'id', p_line_image)
+    ON CONFLICT (batch_id) DO UPDATE SET key_id = EXCLUDED.key_id, seed = EXCLUDED.seed, line_id = EXCLUDED.line_id, image = EXCLUDED.image;
+  END IF;
+  IF p_seed IS NOT NULL THEN
+    SELECT count(*)::integer INTO v_n FROM reporting_private.worker_seen w WHERE w.batch_id = p_batch AND w.key_id = p_key AND w.seed = p_seed;
+    -- The approved bound: the 50,001st distinct id fails this whole checkpoint (nothing above commits).
+    IF v_n > 50000 THEN
+      RAISE EXCEPTION 'partition_too_large: successor seed % of a changed key consumed % distinct dependency ids (more than 50000)', p_seed, v_n;
+    END IF;
+  END IF;
+  IF p_key_complete THEN
+    DELETE FROM reporting_private.worker_seen w WHERE w.batch_id = p_batch AND w.key_id = p_key;
+    DELETE FROM reporting_private.worker_walk_line w WHERE w.batch_id = p_batch;
+  END IF;
+  RETURN QUERY SELECT e.owners_discovered, e.enum_cursor, e.enum_complete, e.replay, v_n;
+END
+$fn$;
+
+-- The saved image of the paged stream line (worker state, not a source read); no row = none saved.
+CREATE FUNCTION public.read_reporting_walk_line(p_batch uuid, p_fence bigint, p_key text, p_seed integer, p_line text)
+RETURNS TABLE (image jsonb)
+LANGUAGE plpgsql
+VOLATILE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+#variable_conflict use_column
+DECLARE
+  b reporting_private.batches;
+BEGIN
+  b := reporting_private.worker_batch(p_batch, p_fence, true);
+  IF p_key IS NULL OR p_seed IS NULL OR p_line IS NULL THEN RAISE EXCEPTION 'p_key, p_seed and p_line are required'; END IF;
+  RETURN QUERY
+    SELECT w.image FROM reporting_private.worker_walk_line w
+     WHERE w.batch_id = p_batch AND w.key_id = p_key AND w.seed = p_seed AND w.line_id = p_line;
+END
+$fn$;
+
+REVOKE ALL ON TABLE reporting_private.worker_seen FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON TABLE reporting_private.worker_walk_line FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE reporting_private.worker_seen TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE reporting_private.worker_walk_line TO service_role;
+REVOKE ALL ON FUNCTION public.save_reporting_walk(uuid, bigint, jsonb, jsonb, jsonb, text, integer, text[], jsonb, boolean) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.read_reporting_walk_line(uuid, bigint, text, integer, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.save_reporting_walk(uuid, bigint, jsonb, jsonb, jsonb, text, integer, text[], jsonb, boolean) TO service_role;
+GRANT EXECUTE ON FUNCTION public.read_reporting_walk_line(uuid, bigint, text, integer, text) TO service_role;
 
 COMMIT;

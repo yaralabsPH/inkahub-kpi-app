@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { diffFrozenViews, materializeBatch, memoryFrozenReader, ownerKey, ownerOfEvent, type ChangedKey, type Owner } from "../../api/_lib/production-reporting-materialize";
 import type { EnumerationPages, FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
-import { CHECKPOINT_KEYS, failureKind, isTransient, runReportingCycle, type CycleResult, type WorkerEnv } from "../../api/_lib/production-reporting-worker";
+import { failureKind, isTransient, runReportingCycle, type CycleResult, type WorkerEnv } from "../../api/_lib/production-reporting-worker";
 import { bearerMatches } from "../../api/_lib/reporting-auth";
 import { REPORTING_SITES, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { compareUtf8, reportingManifestHash, sortDescriptors, type WorkDescriptor } from "../../api/_lib/reporting-stage";
@@ -70,6 +70,9 @@ class FakeDb implements RpcClient {
   runs: Array<Record<string, unknown>> = [];
   cleanupPasses = 2;
   saves = 0;
+  /** 0043 worker_seen (distinct ids per key|seed) and worker_walk_line (one paged line per batch). */
+  seen = new Map<string, Set<string>>();
+  walkLine: { key: string; seed: number; line: string; image: unknown } | null = null;
   transientLeft: number;
   constructor(public kind: "refresh" | "rebuild", public fail: Fail = {}, public tick = 50) {
     this.transientLeft = fail.transientTimes ?? 0;
@@ -103,7 +106,42 @@ class FakeDb implements RpcClient {
   private batchRow(b: Batch) {
     return { batch_id: b.id, lease_fence: b.fence, base_generation_id: null, capture_epoch: 2, rule_version: "item-counting-summary-v1", source_cutoff: b.cutoff, state: b.state };
   }
-  private handle(fn: string, a: Record<string, unknown>) {
+  private saveWalk(a: Record<string, unknown>): { data: unknown; error: { message: string; code: string } | null } {
+    const key = a.p_key as string;
+    const seed = a.p_seed as number | null;
+    const next = a.p_next_cursor as Record<string, unknown>;
+    const expected = a.p_expected_cursor as Record<string, unknown> | null;
+    const nk = next.key as { id?: string; phase?: string; seed?: number; walk?: { line?: { id?: string } | null } | null } | undefined;
+    if (a.p_key_complete ? "key" in next || next.after !== key : nk?.id !== key) throw new Error("save_reporting_walk: the cursor does not match the key");
+    if (!a.p_key_complete && nk?.phase === "children" && seed !== null) throw new Error("save_reporting_walk: the children phase consumes no seed budget");
+    if (!a.p_key_complete && nk?.phase === "seeds" && seed !== nk.seed) throw new Error("save_reporting_walk: p_seed must be the cursor's seed");
+    const ek = expected?.key as { id?: string; phase?: string; seed?: number } | undefined;
+    if (ek && ek.id !== key) throw new Error("save_reporting_walk: the saved cursor is inside another changed key");
+    if (a.p_key_complete && seed !== null && (ek?.phase !== "seeds" || ek.seed !== seed)) throw new Error("save_reporting_walk: a completing checkpoint carries only the seed it was on");
+    const ids = a.p_seen as string[];
+    if (ids.length && seed === null) throw new Error("consumed ids need their seed");
+    const r = this.handle("save_reporting_enumeration", { ...a, p_complete: false });
+    if (r.error && r.error.code !== "08006") return r;
+    let n: number | null = null;
+    if (seed !== null) {
+      const s = this.seen.get(`${key}|${seed}`) ?? this.seen.set(`${key}|${seed}`, new Set()).get(`${key}|${seed}`)!;
+      for (const id of ids) s.add(id);
+      n = s.size;
+      const img = a.p_line_image as { id: string } | null;
+      if (img) {
+        if (nk?.walk?.line?.id !== img.id) throw new Error("the line image is not the cursor's paged line");
+        this.walkLine = { key, seed, line: img.id, image: img };
+      }
+      if (n > 50_000) throw new Error(`partition_too_large: successor seed ${seed} consumed ${n} distinct dependency ids`);
+    }
+    if (a.p_key_complete) {
+      for (const k of [...this.seen.keys()]) if (k.startsWith(`${key}|`)) this.seen.delete(k);
+      this.walkLine = null;
+    }
+    if (r.error) return r; // committed, response lost
+    return this.ok([{ ...(r.data as Array<Record<string, unknown>>)[0], seen_count: n }]);
+  }
+  private handle(fn: string, a: Record<string, unknown>): { data: unknown; error: { message: string; code: string } | null } {
     switch (fn) {
       case "get_reporting_job_status": {
         const b = this.batch && ["active", "frozen", "publishing"].includes(this.batch.state) ? this.batch : null;
@@ -182,6 +220,21 @@ class FakeDb implements RpcClient {
         const row = { owners_discovered: p.discovered, enum_cursor: p.cursor, enum_complete: p.complete, replay: false };
         if (this.fail.lostSaveResponse === this.saves) return this.err("socket hang up", "08006"); // committed, response lost
         return this.ok([row]);
+      }
+      case "save_reporting_walk": {
+        // ONE transaction, like the SQL: any failure restores cursor, owners, counters and scratch state together.
+        const snap = { progress: this.progress && { ...this.progress }, owners: new Map([...this.owners].map(([k, v]) => [k, { ...v, staff: [...v.staff] }])), seen: new Map([...this.seen].map(([k, v]) => [k, new Set(v)])), walkLine: this.walkLine, saves: this.saves };
+        try {
+          return this.saveWalk(a);
+        } catch (err) {
+          Object.assign(this, snap);
+          throw err;
+        }
+      }
+      case "read_reporting_walk_line": {
+        this.live(a);
+        const w = this.walkLine;
+        return this.ok(w && w.key === a.p_key && w.seed === a.p_seed && w.line === a.p_line ? [{ image: w.image }] : []);
       }
       case "list_reporting_worker_owners": {
         this.live(a);
@@ -347,7 +400,8 @@ describe("Task 15 worker: complete refresh and rebuild cycles", () => {
     expect(db.lastPublished()).toEqual(await reference("refresh", after, changed));
     expect(r.counts.changedKeys).toBe(changed.length);
     expect(db.progress!.complete).toBe(true);
-    expect(db.saves).toBeGreaterThanOrEqual(Math.ceil(changed.length / CHECKPOINT_KEYS)); // bounded checkpoints, not one whole-batch save
+    expect(db.saves).toBeGreaterThanOrEqual(changed.length); // every key completes with its own checkpoint (no whole-batch save)
+    expect(db.seen.size).toBe(0); // completed keys leave no scratch state
     expect(db.runs.at(-1)).toMatchObject({ p_outcome: "published", p_mode: "refresh", p_failure_kind: null });
   });
   it("a rebuild copies, freezes, enumerates owner keysets in pages and publishes the same work as the whole-batch path", async () => {
@@ -377,7 +431,7 @@ describe("Task 15 worker: durable resume, fences and recovery", () => {
   it("stops at its budget mid-enumeration, then a later invocation takes over (new fence) and continues from the SAVED cursor, never from zero", async () => {
     const db = new FakeDb("refresh", {}, 400);
     const counters = { keyPages: [] as Array<string | null>, ownerPages: [] as Array<string | null> };
-    const first = await runReportingCycle(env(db, memorySource(after, changed, counters)), { site: "uk", mode: "refresh", deadlineMs: 2_000 });
+    const first = await runReportingCycle(env(db, memorySource(after, changed, counters)), { site: "uk", mode: "refresh", deadlineMs: 12_000 });
     expect(first.state).toBe("pending");
     const saved = db.progress!.cursor as { after: string };
     expect(db.progress!.complete).toBe(false);
@@ -388,11 +442,19 @@ describe("Task 15 worker: durable resume, fences and recovery", () => {
     expect(busy.state).toBe("busy");
     db.clock += 400_000; // the lease expired
     counters.keyPages.length = 0;
-    const second = await runReportingCycle(env(db, memorySource(after, changed, counters)), { site: "uk", mode: "refresh" });
-    expect(second.state).toBe("published");
+    // Each later invocation resumes from the cursor the previous one saved (never from zero), until publication.
+    let resumeFrom = saved.after;
+    let second: CycleResult | null = null;
+    for (let run = 0; run < 10 && second?.state !== "published"; run++) {
+      counters.keyPages.length = 0;
+      second = await runReportingCycle(env(db, memorySource(after, changed, counters)), { site: "uk", mode: "refresh" });
+      if (counters.keyPages.length) expect(counters.keyPages[0]).toBe(resumeFrom); // resumed from the checkpoint
+      expect(counters.keyPages).not.toContain(null);
+      resumeFrom = (db.progress!.cursor as { after: string }).after;
+      db.clock += 400_000;
+    }
+    expect(second!.state).toBe("published");
     expect(db.batch!.fence).toBeGreaterThan(fence1);
-    expect(counters.keyPages[0]).toBe(saved.after); // resumed from the checkpoint
-    expect(counters.keyPages).not.toContain(null);
     expect(db.lastPublished()).toEqual(await reference("refresh", after, changed));
   });
   it("the deadline is enforced INSIDE a page of changed keys: the checkpoint is the last processed key, not the page end", async () => {
@@ -667,7 +729,7 @@ describe("Task 15 schedule and migration", () => {
     expect(v.functions).toEqual({ "api/reports/refresh-summaries.ts": { maxDuration: 300 }, "api/reports/reporting-admin.ts": { maxDuration: 300 } });
   });
   const sql = read("supabase/migrations/0043_reporting_worker_state.sql");
-  const fns = ["save_reporting_enumeration(uuid, bigint, jsonb, jsonb, jsonb, boolean)", "read_reporting_worker_progress(uuid, bigint)", "list_reporting_worker_owners(uuid, bigint, boolean, text, text, integer)", "plan_reporting_owner(uuid, bigint, text, text, jsonb)", "verify_reporting_plan(uuid, bigint)", "list_reporting_work_descriptors(uuid, bigint, jsonb, integer)", "set_reporting_site_mode(text, text, boolean)", "record_reporting_run(text, text, text, text, uuid, uuid, timestamptz, integer, jsonb, text)", "cleanup_reporting_history(text, integer)"];
+  const fns = ["save_reporting_enumeration(uuid, bigint, jsonb, jsonb, jsonb, boolean)", "read_reporting_worker_progress(uuid, bigint)", "list_reporting_worker_owners(uuid, bigint, boolean, text, text, integer)", "plan_reporting_owner(uuid, bigint, text, text, jsonb)", "verify_reporting_plan(uuid, bigint)", "list_reporting_work_descriptors(uuid, bigint, jsonb, integer)", "set_reporting_site_mode(text, text, boolean)", "record_reporting_run(text, text, text, text, uuid, uuid, timestamptz, integer, jsonb, text)", "cleanup_reporting_history(text, integer)", "save_reporting_walk(uuid, bigint, jsonb, jsonb, jsonb, text, integer, text[], jsonb, boolean)", "read_reporting_walk_line(uuid, bigint, text, integer, text)"];
   it("0043 is one transaction; every public function is service-only, SECURITY INVOKER with an empty search_path", () => {
     expect(sql.trimStart().startsWith("-- 0043_reporting_worker_state.sql")).toBe(true);
     expect(sql.match(/^BEGIN;$/gm)).toHaveLength(1);
@@ -713,7 +775,7 @@ describe("Task 15 schedule and migration", () => {
     expect(d).toContain("IF v_bytes + v_size > 1048576 THEN");
   });
   it("cleanup protects retained generations, journal, receipts and active work: only versions no published/superseded generation can see", () => {
-    const c = sql.slice(sql.indexOf("CREATE FUNCTION public.cleanup_reporting_history("));
+    const c = sql.slice(sql.indexOf("CREATE FUNCTION public.cleanup_reporting_history("), sql.indexOf("-- Task 15 review repair: durable"));
     expect(c).toContain("SELECT min(g.generation_seq) INTO v_min FROM reporting_private.generations g WHERE g.site = p_site AND g.state IN ('published', 'superseded');");
     expect(c.match(/valid_to_seq IS NOT NULL AND y\.valid_to_seq <= v_min LIMIT p_limit/g)).toHaveLength(7);
     expect(c).toContain("g.state = 'superseded' AND g.expires_at <= now()");

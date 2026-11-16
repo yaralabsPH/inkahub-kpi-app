@@ -8,11 +8,13 @@
  * pending). Every phase is DURABLE and resumable within its batch/fence:
  *
  *   copy       (rebuild) bounded candidate pages; cursor saved by the database
- *   enumerate  refresh: changed keys in keyset order, each key's complete
- *              dependency closure (old/new owners, parents, inverse children,
- *              timing successors); rebuild: owner keysets. Discoveries are
- *              saved WITH the cursor advance (0043); a crash replays one
- *              bounded unit, never the completed part of the batch.
+ *   enumerate  refresh: changed keys in keyset order; each key's dependency
+ *              closure (old/new owners, parents, inverse children, timing
+ *              successors) is a resumable walk (walkChangedKey) checkpointed
+ *              after every bounded source page, with each seed's DISTINCT
+ *              consumed ids in durable storage (0043 save_reporting_walk); the
+ *              outer cursor advances only when the key is complete. Rebuild:
+ *              owner keysets. A crash replays at most the in-flight page.
  *   plan       one owner at a time: materialize every required audience
  *              (incl. old self audiences) and save its descriptors + planned
  *              mark atomically
@@ -32,19 +34,16 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { changedKeyDependencies, isoOfMicros, materializeOwnerWorks, ownerKey, PartitionTooLargeError, type FrozenReader, type MaterializeStats, type Owner } from "./production-reporting-materialize.js";
-import { rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
+import { isoOfMicros, KEY_WALK_PAGES, materializeOwnerWorks, ownerKey, PartitionTooLargeError, walkChangedKey, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner } from "./production-reporting-materialize.js";
+import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
 import { buildChunks, claimReportingWork, packStageRequests, stageReportingResults, type StageEntry } from "./reporting-stage.js";
-import { cleanupHistory, listWorkerOwners, manifestFromSaved, planOwner, readWorkerProgress, recordRun, saveEnumeration, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery } from "./reporting-worker-state.js";
+import { cleanupHistory, listWorkerOwners, manifestFromSaved, planOwner, readWalkLine, readWorkerProgress, recordRun, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
 export const HEARTBEAT_MS = 30_000;
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const;
-/** A refresh enumeration checkpoint: at most this many changed keys or discovered owners. */
-export const CHECKPOINT_KEYS = 50;
-export const CHECKPOINT_OWNERS = 500;
 export const PLAN_PAGE = 100;
 export const CLAIM_PAGE = 100;
 
@@ -70,6 +69,8 @@ export interface WorkerEnv {
   sleep(ms: number): Promise<void>;
   /** Frozen reads for a batch (default: the 0040/0041 RPCs). */
   source?: (ref: FrozenBatchRef) => { reader: FrozenReader; pages: EnumerationPages };
+  /** Resumable-walk page sizes (tests use small pages; default KEY_WALK_PAGES). */
+  walkPages?: KeyWalkPages;
   /** Redaction for problem text (default: strip anything that looks like a secret). */
   redact?: (s: string) => string;
 }
@@ -78,6 +79,7 @@ const TRANSIENT_CODES = new Set(["57014", "55P03", "40001", "40P01", "53300", "5
 /** A transient failure may succeed on retry; everything else is permanent for this batch. */
 export function isTransient(e: unknown): boolean {
   if (e instanceof PartitionTooLargeError) return false;
+  if (/partition_too_large/i.test(e instanceof Error ? e.message : String(e))) return false;
   const code = (e as { code?: unknown }).code;
   if (typeof code === "string" && TRANSIENT_CODES.has(code)) return true;
   const m = e instanceof Error ? e.message : String(e);
@@ -87,6 +89,7 @@ export function isTransient(e: unknown): boolean {
 export function failureKind(e: unknown): string {
   if (e instanceof PartitionTooLargeError) return "partition_too_large";
   const m = e instanceof Error ? e.message : String(e);
+  if (/partition_too_large/i.test(m)) return "partition_too_large";
   if (/no continuous published base|a rebuild is required/i.test(m)) return "rebuild_required";
   if (/no longer valid|cannot be resumed: /i.test(m)) return "invalidated";
   if (/fence .* is obsolete/i.test(m)) return "fence_obsolete";
@@ -219,45 +222,39 @@ async function enumerate(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: Froz
       await save({ kind: "rebuild", after }, owners.map((o) => ({ owner: o, oldStaff: [] })), false);
     }
   }
+  // Refresh: one changed key at a time, each a resumable walk (checkpoint after every bounded source page).
   let after = cursor?.kind === "refresh" ? cursor.after : null;
+  let resume = cursor?.kind === "refresh" ? cursor.key ?? null : null;
   for (;;) {
     b.need();
     await b.beat(a.batchId, a.fence);
     const keys = await b.retry(() => pages.changedKeyPage(after));
-    if (!keys.length) return void (await save({ kind: "refresh", after, end: true }, [], true));
-    let found = new Map<string, OwnerDiscovery>();
-    let unitKeys = 0;
-    let unitLast: string | null = null;
-    const flush = async () => {
-      if (unitLast === null) return;
-      await save({ kind: "refresh", after: unitLast }, [...found.values()], false);
-      after = unitLast;
-      found = new Map();
-      unitKeys = 0;
-      unitLast = null;
-    };
-    for (const k of keys) {
-      if (!b.hasTime()) {
-        await flush();
-        throw new OutOfTime();
-      }
-      await b.beat(a.batchId, a.fence);
-      const deps = await b.retry(() => changedKeyDependencies(reader, k));
-      counts.changedKeys = (counts.changedKeys ?? 0) + 1;
-      const add = new Map<string, OwnerDiscovery>();
-      for (const o of deps.owners) add.set(ownerKey(o), { owner: o, oldStaff: deps.oldStaff.filter(([ok]) => ok === ownerKey(o)).map(([, s]) => s) });
-      if (add.size > 1000) throw new ReportingJobError("one changed key discovered more than 1,000 owners (an enumeration unit must fit one checkpoint)");
-      const merged = new Set([...found.keys(), ...add.keys()]).size;
-      if (merged > 1000) await flush();
-      for (const [key, d] of add) {
-        const prev = found.get(key);
-        found.set(key, prev ? { owner: d.owner, oldStaff: [...new Set([...prev.oldStaff, ...d.oldStaff])] } : d);
-      }
-      unitKeys++;
-      unitLast = k.id;
-      if (unitKeys >= CHECKPOINT_KEYS || found.size >= CHECKPOINT_OWNERS) await flush();
+    if (!keys.length) {
+      if (resume) throw new ReportingJobError("the saved in-progress changed key is no longer a changed key of this batch");
+      return void (await save({ kind: "refresh", after, end: true }, [], true));
     }
-    await flush();
+    for (const k of keys) {
+      if (resume && resume.id !== k.id) throw new ReportingJobError("the saved in-progress changed key is not the next changed key of this batch");
+      await walkChangedKey(reader, k, resume, {
+        checkpoint: async (next, step) => {
+          await b.beat(a.batchId, a.fence);
+          const nextCursor: EnumCursor = next ? { kind: "refresh", after, key: next } : { kind: "refresh", after: k.id };
+          const r = await b.retry(() => saveWalk(env.client, a.batchId, a.fence, cursor, nextCursor, k.id, step, next === null));
+          cursor = nextCursor;
+          counts.checkpoints = (counts.checkpoints ?? 0) + 1;
+          counts.ownersDiscovered = r.ownersDiscovered;
+          if (!b.hasTime()) throw new OutOfTime(); // saved first: the next invocation continues from here
+          return r.seenCount;
+        },
+        lineImage: async (seed, line) => {
+          const image = await b.retry(() => readWalkLine(env.client, a.batchId, a.fence, k.id, seed, line));
+          return image === null ? null : imageToEvent(image, reader.site, line);
+        },
+      }, env.walkPages ?? KEY_WALK_PAGES);
+      resume = null;
+      after = k.id;
+      counts.changedKeys = (counts.changedKeys ?? 0) + 1;
+    }
   }
 }
 

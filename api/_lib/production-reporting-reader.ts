@@ -173,6 +173,19 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenR
         }
       }
     },
+    async childPage(parentId, afterId, limit) {
+      if (!parentId) throw new ReportingJobError("a child page needs its parent");
+      const rows = await call("read_reporting_children", { p_parent_ids: [parentId], p_after_parent_id: afterId === null ? null : parentId, p_after_event_id: afterId, p_limit: Math.min(Math.max(1, limit), 1000) });
+      let prev = afterId;
+      return rows.map((r) => {
+        const id = str(r.event_id, "event_id");
+        const e = imageToEvent(r.image, ref.site, id);
+        if (str(r.parent_event_id, "parent_event_id") !== parentId || e.parent_event_id !== parentId) throw new ReportingJobError("read_reporting_children returned a row for another parent");
+        if (prev !== null && compareUtf8(id, prev) <= 0) throw new ReportingJobError("read_reporting_children is not in keyset order");
+        prev = id;
+        return e;
+      });
+    },
     async stream(staff, direction, from: StreamPosition, limit) {
       if (!UUID.test(staff)) throw new ReportingJobError("staff must be a uuid");
       const rows = await call("read_reporting_staff_stream", { p_staff: staff, p_direction: direction, p_at: from.createdAt, p_at_event_id: from.id, p_limit: Math.min(limit, 1000) });

@@ -158,6 +158,8 @@ export interface FrozenReader {
   byIds(ids: readonly string[]): Promise<Map<string, Ev>>;
   /** Frozen events whose parent_event_id is one of `parentIds`, streamed lazily (a consumer that stops reads no more pages). */
   children(parentIds: readonly string[]): AsyncIterable<Ev>;
+  /** One bounded page of ONE parent's frozen children strictly after `afterId` (bytewise id); only an empty page ends them. */
+  childPage(parentId: string, afterId: string | null, limit: number): Promise<Ev[]>;
   /** One page of a worker's events strictly before/after `from` (ordered away from it). */
   stream(staff: string, direction: "before" | "after", from: StreamPosition, limit: number): Promise<Ev[]>;
   requests(): number;
@@ -236,6 +238,11 @@ export function memoryFrozenReader(o: { site: string; cutoff: string; kind: "ref
       n++;
       for (const p of [...new Set(parentIds)].sort(compareUtf8)) yield* byParent.get(p) ?? [];
     },
+    async childPage(parentId, afterId, limit) {
+      n++;
+      const size = Math.min(limit, o.maxPage ?? limit);
+      return (byParent.get(parentId) ?? []).filter((e) => afterId === null || compareUtf8(e.id, afterId) > 0).slice(0, size);
+    },
     async stream(staff, direction, from, limit) {
       n++;
       const list = byStaff.get(staff) ?? [];
@@ -306,6 +313,13 @@ export class DependencyBudget {
   get size(): number {
     return this.ids.size;
   }
+}
+
+/** Whether ONE page of a line's cancellations cancels it (the shared projector over [line, ...page]; each edge depends only on the cancellation and its parent). */
+function pageCancels(reader: FrozenReader, l: StreamLine, page: readonly Ev[]): boolean {
+  const r = projectReportingPartition({ site: reader.site, audience: { kind: "site" }, ruleVersion: REPORTING_RULE_VERSION, sourceCutoffUtc: reader.cutoff, events: [l.ev, ...page.filter((k) => k.id !== l.ev.id)] });
+  const f = r.facts.find((x) => x.id === l.ev.id);
+  return !!f && f.cancelledBy.length > 0;
 }
 
 /** Read the cancellations of ONE consumed line incrementally, charging each to the budget as it arrives. */
@@ -527,6 +541,253 @@ export async function changedKeyDependencies(reader: FrozenReader, k: ChangedKey
     for (const l of lines) add(ownerOfEvent(l.ev));
   }
   return { owners: [...owners.values()].sort((x, y) => compareUtf8(ownerKey(x), ownerKey(y))), oldStaff };
+}
+
+// ---------------------------------------------------------------------------
+// Task 15 review repair: the RESUMABLE dependency closure of one changed key
+// ---------------------------------------------------------------------------
+
+/** A successor seed of a changed key (its old/new stream position or a parent's), compactly. */
+export interface KeyAnchor { staff: string; at: string; id: string; wt: string | null; owner: [Owner["partitionKind"], string] }
+/**
+ * A successor walk in progress: the last CONSUMED stream event, the stop
+ * instant, the unmet types, and a stream line whose own cancellations are
+ * being paged. `cancelled` is monotonic: the shared projector judges each
+ * cancellation only against its parent, so "some earlier page cancelled the
+ * line" carries forward exactly and earlier pages are never needed again.
+ */
+export interface KeyWalk { at: StreamPosition | null; stop: string | null; need: string[]; line: { id: string; kidsAfter: string | null; cancelled: boolean } | null; done: boolean }
+/** Saved progress inside one changed key (the outer cursor advances only when the key is complete). */
+export interface KeyProgress { id: string; phase: "children" | "seeds"; kidsAfter: string | null; anchors: KeyAnchor[]; seed: number; walk: KeyWalk | null }
+export interface WalkDiscovery { owner: Owner; oldStaff: string[] }
+/** What one checkpoint persists besides the cursor: owners found since the last one, the seed's newly consumed ids, and (once per paged line) that line's image. */
+export interface KeyCheckpoint { found: WalkDiscovery[]; seed: number | null; seen: string[]; lineImage: Ev | null }
+export interface KeyWalkIo {
+  /**
+   * Persist one checkpoint atomically (null = the key is complete) and return
+   * the seed's exact DISTINCT consumed-id count from durable storage (null
+   * when `seed` is null). Also the place to beat the lease and stop at the
+   * deadline (after saving).
+   */
+  checkpoint(next: KeyProgress | null, step: KeyCheckpoint): Promise<number | null>;
+  /** The saved image of the interrupted paged line (worker state; never a source reread), or null. */
+  lineImage(seed: number, line: string): Promise<Ev | null>;
+}
+export interface KeyWalkPages { keyChildren: number; lineKids: number; stream: number }
+/** Page sizes: ≤500 inverse children per page keeps a checkpoint within 1,000 owners; ≤1,000 cancellations per line page; the stream page as elsewhere. */
+export const KEY_WALK_PAGES: KeyWalkPages = { keyChildren: 500, lineKids: 1000, stream: STREAM_PAGE };
+const KEY_PROGRESS_MAX_BYTES = 7000;
+
+const isOwnerKind = (v: unknown): v is Owner["partitionKind"] => v === "order" || v === "event";
+const isStr = (v: unknown): v is string => typeof v === "string" && v !== "";
+const isPos = (v: unknown): v is StreamPosition => !!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).sort().join(",") === "createdAt,id" && isStr((v as StreamPosition).createdAt) && exactInstant((v as StreamPosition).createdAt) !== null && typeof (v as StreamPosition).id === "string";
+const keysAre = (v: object, want: string) => Object.keys(v).sort().join(",") === want;
+
+/** Strict validation of saved key progress (a malformed cursor is a permanent error, never a guess). */
+export function parseKeyProgress(v: unknown): KeyProgress {
+  const bad = (what: string): never => {
+    throw new RangeError(`key progress: ${what}`);
+  };
+  if (!v || typeof v !== "object" || Array.isArray(v) || !keysAre(v, "anchors,id,kidsAfter,phase,seed,walk")) bad("unexpected shape");
+  const o = v as Record<string, unknown>;
+  if (!isStr(o.id)) bad("id");
+  if (o.phase !== "children" && o.phase !== "seeds") bad("phase");
+  if (o.kidsAfter !== null && !isStr(o.kidsAfter)) bad("kidsAfter");
+  if (!Array.isArray(o.anchors) || o.anchors.length > 4) bad("anchors");
+  for (const a of o.anchors as unknown[]) {
+    if (!a || typeof a !== "object" || Array.isArray(a) || !keysAre(a, "at,id,owner,staff,wt")) bad("anchor shape");
+    const x = a as Record<string, unknown>;
+    if (!isStr(x.staff) || !isStr(x.id) || !isStr(x.at) || exactInstant(x.at as string) === null || (x.wt !== null && !isStr(x.wt))) bad("anchor fields");
+    if (!Array.isArray(x.owner) || x.owner.length !== 2 || !isOwnerKind(x.owner[0]) || !isStr(x.owner[1])) bad("anchor owner");
+  }
+  const anchors = o.anchors as KeyAnchor[];
+  if (!Number.isSafeInteger(o.seed) || (o.seed as number) < 0 || (o.seed as number) > anchors.length) bad("seed");
+  if (o.phase === "children" && (o.seed !== 0 || o.walk !== null)) bad("children phase carries no walk");
+  if (o.walk !== null) {
+    const w = o.walk as Record<string, unknown>;
+    if (!w || typeof w !== "object" || Array.isArray(w) || !keysAre(w, "at,done,line,need,stop") || typeof w.done !== "boolean") bad("walk shape");
+    if (w.done && w.line !== null) bad("a finished walk pages no line");
+    if ((o.seed as number) >= anchors.length) bad("walk past the last seed");
+    if (w.at !== null && !isPos(w.at)) bad("walk.at");
+    if (w.stop !== null && !(typeof w.stop === "string" && /^-?\d+$/.test(w.stop))) bad("walk.stop");
+    if (!Array.isArray(w.need) || !w.need.every(isStr)) bad("walk.need");
+    if (w.line !== null) {
+      const l = w.line as Record<string, unknown>;
+      if (!l || typeof l !== "object" || Array.isArray(l) || !keysAre(l, "cancelled,id,kidsAfter") || !isStr(l.id) || (l.kidsAfter !== null && !isStr(l.kidsAfter)) || typeof l.cancelled !== "boolean") bad("walk.line");
+      if (w.at === null || (w.at as StreamPosition).id !== l.id) bad("a paged line is the last consumed event");
+    }
+  }
+  return o as unknown as KeyProgress;
+}
+
+/**
+ * The dependency closure of ONE changed key as a resumable walk — the same
+ * owners as `changedKeyDependencies` (tested), but with no in-memory set:
+ *
+ *  - the key's images and parents (one bounded read) give its first owners and
+ *    its successor seeds;
+ *  - its inverse children are paged (≤500 per page), each page checkpointed;
+ *  - each seed's successor walk pages the worker's stream and, for every
+ *    consumed stream line, pages that line's own cancellations, judging each
+ *    page with the shared projector over [line, ...page] into a monotonic
+ *    `cancelled` flag; a checkpoint precedes EVERY source read, so an
+ *    interruption replays at most the one in-flight page (plus unconsumed
+ *    lookahead of an interrupted stream page) and never rereads earlier pages
+ *    or the line (its image is saved once with the first line checkpoint);
+ *  - every consumed id of a seed goes to durable storage with its checkpoint;
+ *    the returned exact DISTINCT count enforces the 50,001-ID bound before
+ *    the next read (an id met as a cancellation and as a stream event, in any
+ *    invocation, counts once).
+ *
+ * The caller advances the outer changed-key cursor only on the final
+ * `checkpoint(null, …)`.
+ */
+export async function walkChangedKey(reader: FrozenReader, k: ChangedKey, resume: KeyProgress | null, io: KeyWalkIo, pages: KeyWalkPages = KEY_WALK_PAGES): Promise<void> {
+  if (reader.kind !== "refresh") throw new Error("walkChangedKey is a refresh closure");
+  const cutoffUs = exactInstant(reader.cutoff);
+  if (cutoffUs === null) throw new RangeError("the frozen cutoff is not an exact instant");
+  if (resume && resume.id !== k.id) throw new RangeError("the saved key progress is for another changed key");
+  let found = new Map<string, WalkDiscovery>();
+  const addOwner = (o: Owner, staff?: string) => {
+    const key = ownerKey(o);
+    const prev = found.get(key) ?? found.set(key, { owner: o, oldStaff: [] }).get(key)!;
+    if (staff && !prev.oldStaff.includes(staff)) prev.oldStaff.push(staff);
+  };
+  let seen: string[] = [];
+  let seenSeed: number | null = null;
+  let lineImage: Ev | null = null;
+  let dirty = false;
+  let st: KeyProgress;
+  const snapshot = (): KeyProgress => {
+    const s = JSON.parse(JSON.stringify(st)) as KeyProgress;
+    if (JSON.stringify(s).length > KEY_PROGRESS_MAX_BYTES) throw new RangeError("the key progress does not fit one checkpoint cursor");
+    return s;
+  };
+  const flush = async (next: KeyProgress | null) => {
+    const n = await io.checkpoint(next, { found: [...found.values()], seed: seenSeed, seen, lineImage });
+    if (seenSeed !== null) {
+      if (n === null) throw new RangeError("a seed checkpoint returned no consumed count");
+      const a = st.anchors[seenSeed];
+      if (n > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError({ partitionKind: a.owner[0], partitionKey: a.owner[1] }, n);
+    }
+    found = new Map();
+    seen = [];
+    lineImage = null;
+    dirty = false;
+  };
+  const beforeRead = async () => {
+    if (dirty) await flush(snapshot());
+  };
+
+  if (resume) st = JSON.parse(JSON.stringify(resume)) as KeyProgress;
+  else {
+    st = { id: k.id, phase: "children", kidsAfter: null, anchors: [], seed: 0, walk: null };
+    const parentIds = new Set<string>();
+    const anchorOf = (l: StreamLine): KeyAnchor => {
+      const o = ownerOfEvent(l.ev);
+      return { staff: l.ev.staff_id!, at: isoOfMicros(l.us), id: l.ev.id, wt: l.workType, owner: [o.partitionKind, o.partitionKey] };
+    };
+    for (const img of [k.before, k.after]) {
+      if (!img) continue;
+      addOwner(ownerOfEvent(img));
+      if (img.parent_event_id) parentIds.add(img.parent_event_id);
+      const l = streamLine(img, cutoffUs);
+      if (l) st.anchors.push(anchorOf(l));
+    }
+    if (k.before?.staff_id) addOwner(ownerOfEvent(k.before), k.before.staff_id);
+    const parents = [...parentIds].sort(compareUtf8);
+    if (parents.length) {
+      for (const p of (await reader.byIds(parents)).values()) {
+        addOwner(ownerOfEvent(p));
+        const l = streamLine(p, cutoffUs);
+        if (l) st.anchors.push(anchorOf(l));
+      }
+    }
+    dirty = true;
+  }
+
+  // Inverse children of the key: owners only.
+  while (st.phase === "children") {
+    await beforeRead();
+    const page = await reader.childPage(k.id, st.kidsAfter, pages.keyChildren);
+    for (const c of page) addOwner(ownerOfEvent(c));
+    if (page.length) st.kidsAfter = page[page.length - 1].id;
+    else {
+      st.phase = "seeds";
+      st.kidsAfter = null;
+    }
+    dirty = true;
+  }
+
+  // Successor walks, one seed at a time.
+  while (st.seed < st.anchors.length) {
+    const a = st.anchors[st.seed];
+    const aUs = exactInstant(a.at)!;
+    seenSeed = st.seed;
+    if (!st.walk) {
+      st.walk = { at: null, stop: null, need: ["*", ...(a.wt ? [a.wt] : [])], line: null, done: false };
+      dirty = true;
+    }
+    const w = st.walk;
+    /** Page one consumed stream line's own cancellations (checkpoint before each page; each page judged once), then judge the line. */
+    const finishLine = async (l: StreamLine) => {
+      const line = w.line!;
+      for (;;) {
+        await beforeRead();
+        const page = await reader.childPage(l.ev.id, line.kidsAfter, pages.lineKids);
+        if (!page.length) break;
+        for (const c of page) seen.push(c.id);
+        if (!line.cancelled && pageCancels(reader, l, page)) line.cancelled = true;
+        line.kidsAfter = page[page.length - 1].id;
+        dirty = true;
+      }
+      addOwner(ownerOfEvent(l.ev));
+      if (!line.cancelled && siteEffective(reader, l, []) && projectorOrder(lineOrder(l), { us: aUs, id: a.id }) > 0) {
+        w.need = w.need.filter((t) => t !== "*" && t !== l.workType);
+      }
+      if (w.need.length === 0 && w.stop === null) w.stop = l.us.toString();
+      w.line = null;
+      dirty = true;
+    };
+    if (!w.done && w.line) {
+      // Resume inside a line's cancellation paging: its saved image and flag, then only the remaining pages.
+      const ev = await io.lineImage(st.seed, w.line.id);
+      const l = ev && ev.id === w.line.id ? streamLine(ev, cutoffUs) : null;
+      if (!l || l.ev.staff_id !== a.staff) throw new RangeError("the interrupted stream line has no valid saved image");
+      await finishLine(l);
+    }
+    let done = w.done;
+    while (!done) {
+      await beforeRead();
+      const page = await reader.stream(a.staff, "after", w.at ?? { createdAt: a.at, id: "" }, pages.stream);
+      if (!page.length) break;
+      for (const e of page) {
+        if (w.stop !== null && micros(e) > BigInt(w.stop)) {
+          done = true;
+          break;
+        }
+        seen.push(e.id);
+        w.at = { createdAt: e.created_at, id: e.id };
+        dirty = true;
+        const l = streamLine(e, cutoffUs);
+        if (!l) continue;
+        w.line = { id: e.id, kidsAfter: null, cancelled: false };
+        lineImage = e; // saved with the first checkpoint that carries this line
+        await finishLine(l);
+      }
+    }
+    // The seed's last consumed ids are counted under ITS cursor now (the bound holds even without a further
+    // read); the last seed's go with the key-completing checkpoint.
+    if (!w.done) {
+      w.done = true;
+      dirty = true;
+      if (st.seed + 1 < st.anchors.length) await flush(snapshot());
+    }
+    st.seed++;
+    st.walk = null;
+    dirty = true;
+  }
+  await flush(null);
 }
 
 // ---------------------------------------------------------------------------

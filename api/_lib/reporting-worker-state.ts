@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { ReportingJobError, type RpcClient } from "./reporting-jobs.js";
 import { compareUtf8, descriptorProblem, manifestLine, type WorkDescriptor } from "./reporting-stage.js";
-import type { Owner } from "./production-reporting-materialize.js";
+import { parseKeyProgress, type KeyCheckpoint, type KeyProgress, type Owner } from "./production-reporting-materialize.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_ROWS = 1000;
@@ -41,12 +41,24 @@ const batchArgs = (batchId: string, fence: number) => {
 };
 
 /** A saved enumeration position: refresh = last changed-key id; rebuild = last owner keyset; `end` once complete. */
-export type EnumCursor = { kind: "refresh"; after: string | null; end?: true } | { kind: "rebuild"; after: [Owner["partitionKind"], string] | null; end?: true };
+/** Refresh: `key` is the saved progress INSIDE the next changed key (the outer `after` advances only when that key is complete). */
+export type EnumCursor = { kind: "refresh"; after: string | null; end?: true; key?: KeyProgress } | { kind: "rebuild"; after: [Owner["partitionKind"], string] | null; end?: true };
 export function parseEnumCursor(v: unknown): EnumCursor | null {
   if (v === null || v === undefined) return null;
   if (typeof v !== "object" || Array.isArray(v)) throw new ReportingJobError("enum_cursor is not an object");
   const o = v as Record<string, unknown>;
   const keys = Object.keys(o).sort().join(",");
+  if (keys === "after,key,kind") {
+    if (o.kind !== "refresh" || !(o.after === null || (typeof o.after === "string" && o.after !== ""))) throw new ReportingJobError("enum_cursor is malformed");
+    let key: KeyProgress;
+    try {
+      key = parseKeyProgress(o.key);
+    } catch (e) {
+      throw new ReportingJobError(`enum_cursor: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (o.after !== null && compareUtf8(key.id, o.after as string) <= 0) throw new ReportingJobError("enum_cursor: the in-progress key must follow the completed ones");
+    return { kind: "refresh", after: o.after as string | null, key };
+  }
   if (keys !== "after,kind" && keys !== "after,end,kind") throw new ReportingJobError("enum_cursor has unexpected keys");
   if (o.end !== undefined && o.end !== true) throw new ReportingJobError("enum_cursor.end must be true");
   const end = o.end === true ? ({ end: true } as const) : {};
@@ -186,4 +198,33 @@ export interface CleanupPass { expiredGenerations: number; deletedVersions: numb
 export async function cleanupHistory(client: RpcClient, site: string, limit = 5000): Promise<CleanupPass> {
   const [r] = await rows(client, "cleanup_reporting_history", { p_site: site, p_limit: limit }, true);
   return { expiredGenerations: int(r.expired_generations, "expired_generations"), deletedVersions: int(r.deleted_versions, "deleted_versions"), deletedRuns: int(r.deleted_runs, "deleted_runs"), deletedWorkerRows: int(r.deleted_worker_rows, "deleted_worker_rows"), more: bool(r.more, "more") };
+}
+
+export interface WalkCheckpoint extends EnumerationCheckpoint { seenCount: number | null }
+/**
+ * One resumable-walk checkpoint (0043 save_reporting_walk), atomically: the
+ * cursor advance, owners, the seed's newly consumed ids (deduplicated and
+ * counted by the database; >50,000 distinct raises partition_too_large and
+ * rolls the whole checkpoint back) and, once per paged line, its image.
+ * `keyComplete` advances the outer cursor past the key and drops its scratch rows.
+ */
+export async function saveWalk(client: RpcClient, batchId: string, fence: number, expected: EnumCursor | null, next: EnumCursor, keyId: string, step: KeyCheckpoint, keyComplete: boolean): Promise<WalkCheckpoint> {
+  const owners = checkpointOwners(step.found);
+  if (owners.length > MAX_ROWS) throw new ReportingJobError("a walk checkpoint holds at most 1,000 owners");
+  if (step.seen.length > 2 * MAX_ROWS) throw new ReportingJobError("a walk checkpoint holds at most one stream and one child page of ids");
+  const [r] = await rows(client, "save_reporting_walk", {
+    ...batchArgs(batchId, fence), p_expected_cursor: expected, p_next_cursor: next, p_owners: owners,
+    p_key: keyId, p_seed: step.seed, p_seen: step.seen, p_line_image: step.lineImage, p_key_complete: keyComplete,
+  }, true);
+  return {
+    ownersDiscovered: int(r.owners_discovered, "owners_discovered"), cursor: parseEnumCursor(r.enum_cursor), complete: bool(r.enum_complete, "enum_complete"), replay: bool(r.replay, "replay"),
+    seenCount: r.seen_count === null ? null : int(r.seen_count, "seen_count"),
+  };
+}
+
+/** The saved image of an interrupted paged stream line (worker state, not a source read); null when none is saved. */
+export async function readWalkLine(client: RpcClient, batchId: string, fence: number, keyId: string, seed: number, line: string): Promise<unknown | null> {
+  const out = await rows(client, "read_reporting_walk_line", { ...batchArgs(batchId, fence), p_key: keyId, p_seed: seed, p_line: line }, false);
+  if (out.length > 1) throw new ReportingJobError("read_reporting_walk_line returned more than one line");
+  return out.length ? out[0].image : null;
 }

@@ -2946,3 +2946,37 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Two-valid-quantities overflow fixture: 9007199254740990 + 5. Items are null in totals, the work type, the day, the person and Welcome; Orders stay exact; the other person is unaffected.
     - SQL refusals: a forged window, a wrong-site generation, a malformed audience, and the authenticated role.
   - **Gate:** tsc -b OK; typecheck:digest OK; 1846/1846 tests (51 files); build OK. No SQL was run against any real database.
+- 2026-11-16 — Review repair item 1 (Task 15 durability): implemented; runtime gate pending.
+  - **0043 (draft, unapplied; 0037–0041 unchanged):**
+    - `worker_seen` is the exact per-key, per-seed DISTINCT dependency-ID budget; its primary key deduplicates an id met through the stream and child paths in any invocation.
+    - `worker_walk_line` is one row per batch holding the paged line's image.
+    - `save_reporting_walk` checkpoints atomically through `save_reporting_enumeration`, so the fence, lease, expected-cursor and replay rules are unchanged. It:
+      - raises partition_too_large when one key/seed passes 50,000 distinct ids, rolling back the cursor, owners, ids and line together;
+      - binds the ids to the cursor's seed;
+      - refuses a switch to another key while the saved cursor is inside one;
+      - bounds `p_seen` to 2,000 ids and 1 MiB;
+      - deletes the key's scratch rows in the transaction that advances the outer changed-key cursor.
+    - Added `read_reporting_walk_line`. Cleanup also removes scratch rows of finished batches.
+  - **TS:**
+    - `walkChangedKey` replaces the whole-key enumeration unit. The key's images and parents come first, then inverse-children pages (500), then each successor seed's stream pages (200) and each line's cancellation pages (1,000).
+    - A checkpoint precedes every source read, with a heartbeat and a stop at the deadline after the save. The outer cursor advances only when the key is complete. Owner saves are at most 1,000 per checkpoint.
+    - Whether a line is cancelled is a monotonic flag OR-ed per page with the shared projector. This is exact because each cancellation is judged only against its own parent (productionReportingProjection.ts:185).
+    - Removed the 1,000-owners-per-key cap and the CHECKPOINT_KEYS/CHECKPOINT_OWNERS batching.
+    - Added `FrozenReader.childPage`, `parseKeyProgress` (strict), `saveWalk` and `readWalkLine`.
+  - **Bounded replay:** resuming inside a seed re-segments that seed's stream pages after the saved consumed position. Unconsumed lookahead rows may be requested again, but a consumed row never is. There are no point rereads and no completed child pages are fetched again.
+  - **Tests:**
+    - `tests/reporting/keyWalk.test.ts`:
+      - equivalence with changedKeyDependencies for every changed key;
+      - interruption at EVERY checkpoint, with a strict multiset no-reread check for byIds and child pages and a semantic stream check;
+      - a multi-page line resume from kidsAfter;
+      - cross-path duplicates counted once;
+      - a first-page-only cancellation fixture;
+      - no read after an over-budget checkpoint;
+      - strict cursor parsing.
+    - `tests/reporting/pg/walk-resume.test.ts` (real SQL):
+      - an interruption after page 2 of a line's cancellations, then a resume with zero byIds and zero earlier child pages, publishing exactly the reference;
+      - k-s1 is one budget row;
+      - the atomic 50,001 rollback, seed binding and cross-key refusal.
+    - FakeDb `save_reporting_walk` is now atomic.
+    - The pg RPC shim now returns single-column TABLE rows as objects, as PostgREST does.
+  - No SQL was run against any real database.

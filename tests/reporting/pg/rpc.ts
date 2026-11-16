@@ -43,7 +43,8 @@ export function pgRpc(db: PGlite, opts: { role?: string } = {}): RpcClient & { c
         });
         await db.exec(`SET ROLE ${opts.role ?? "service_role"}`);
         try {
-          const sql = s.set ? `select coalesce(json_agg(t), '[]'::json) as v from ${call} t` : `select to_json(${call}) as v`;
+          // PostgREST returns RETURNS TABLE rows as objects even with ONE column (a bare alias would unwrap it).
+          const sql = s.set ? `select coalesce(json_agg(to_json(t)), '[]'::json) as v from (select * from ${call}) t` : `select to_json(${call}) as v`;
           const r = await db.query<{ v: unknown }>(sql, params);
           return { data: r.rows[0]?.v ?? null, error: null };
         } finally {
