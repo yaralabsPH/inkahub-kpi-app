@@ -24,9 +24,21 @@ export function pgRpc(db: PGlite, opts: { role?: string } = {}): RpcClient & { c
     sigs.set(fn, s);
     return s;
   };
+  // One PGlite session: concurrent calls (grouped owner materialization) are serialized so SET ROLE / RESET ROLE never interleave.
+  let queue: Promise<unknown> = Promise.resolve();
+  const serialize = <T>(f: () => Promise<T>): Promise<T> => {
+    const next = queue.then(f);
+    queue = next.catch(() => undefined);
+    return next;
+  };
   return {
     calls,
-    async rpc(fn, args) {
+    rpc(fn, args) {
+      return serialize(() => call(fn, args));
+    },
+  };
+  async function call(fn: string, args: Record<string, unknown>): Promise<{ data: unknown; error: { message: string; code?: string } | null }> {
+    {
       calls.push(fn);
       try {
         const s = await sig(fn);
@@ -54,6 +66,6 @@ export function pgRpc(db: PGlite, opts: { role?: string } = {}): RpcClient & { c
         const err = e as { message?: string; code?: string };
         return { data: null, error: { message: err.message ?? String(e), code: err.code } };
       }
-    },
-  };
+    }
+  }
 }

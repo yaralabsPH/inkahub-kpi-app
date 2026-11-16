@@ -125,5 +125,13 @@ export function serviceRpcClient(c: SqlConn, opts: ServiceRpcOptions = {}): Serv
       return { data: null, error: { message: err.message ?? String(e), code: err.code } };
     }
   };
-  return { rpc, calls, injected, roleSettings };
+  // ONE connection: calls from concurrently materialized owners are serialized so each stays its own
+  // transaction (PostgREST runs each request on its own pooled connection; this keeps the same atomicity).
+  let queue: Promise<unknown> = Promise.resolve();
+  const serialized: ServiceRpcClient["rpc"] = (fn, args) => {
+    const next = queue.then(() => rpc(fn, args));
+    queue = next.catch(() => undefined);
+    return next;
+  };
+  return { rpc: serialized, calls, injected, roleSettings };
 }

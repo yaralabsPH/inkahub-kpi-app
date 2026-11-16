@@ -99,6 +99,11 @@ describe("recovery of a really interrupted run (PGlite, real SQL)", () => {
     expect(st.s).not.toMatch(/active|frozen|publishing/);
     const a = await auditRuntime(pgDb(db), ctx, run2.own, run2.ev);
     expect(a.problems).toEqual([]);
+    // A recovered site keeps the abandoned batch and its candidate rows (evidence): a NEW runtime run refuses it at R0.
+    const next = newRuntimeOwnership("uk", "0b0b0b0b");
+    const fresh = pgCtx(db, next);
+    await expect(preflightRuntime(pgDb(db), fresh.ctx, next, newRuntimeEvidence())).rejects.toThrow(/R0 failed/);
+    expect(fresh.observations[0].result).toMatch(/batch\(es\) and 0 generation\(s\) exist|derived\/mirror rows exist/);
   }, 180_000);
   it("refuses a report whose ownership does not include the site's active batch (foreign batch), writing nothing", async () => {
     const { md } = await interrupted(db);

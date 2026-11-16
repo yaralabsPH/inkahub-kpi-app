@@ -420,8 +420,10 @@ export async function buildOwnerInput(reader: FrozenReader, owner: Owner, member
   // Parents of members (a cancellation's edge needs its parent's role/time/sides).
   const parentIds = [...new Set(members.map((e) => e.parent_event_id).filter((p): p is string => !!p && !context.has(p)))].sort(compareUtf8);
   for (let i = 0; i < parentIds.length; i += 500) for (const e of (await reader.byIds(parentIds.slice(i, i + 500))).values()) keep(e);
-  // Inverse children of members, incrementally and budgeted (they decide a member's effectiveness).
-  for (const m of [...members].sort((x, y) => compareUtf8(x.id, y.id))) for await (const k of reader.children([m.id])) keep(k);
+  // Inverse children of members, incrementally and budgeted (they decide a member's effectiveness). Every
+  // member's children are required, so ONE lazy multi-parent read serves them in the same order the per-member
+  // loop charged them (members bytewise, each member's children bytewise); an overflow still stops reading at once.
+  for await (const k of reader.children(members.map((m) => m.id))) keep(k);
   // Stream predecessors: per worker, from the worker's LATEST member line down past an effective predecessor
   // (all types and each member type) below its EARLIEST member line — boundaries in the PROJECTOR's order (T14R2).
   const byWorker = new Map<string, StreamLine[]>();
@@ -838,6 +840,117 @@ export async function materializeOwnerWorks(reader: FrozenReader, owner: Owner, 
       inputRows: pin.events.length,
     };
   });
+}
+
+/**
+ * Task 15 scale fix: coalesce the children requests that several concurrently
+ * materialized owners make (an owner's members, and each stream line only when
+ * it is consumed: nothing is prefetched). Requests pending together are served
+ * by ONE multi-parent read (at most one in flight; requests arriving meanwhile
+ * join the next), of which at most `maxRows` rows are buffered. A parent whose
+ * children are proven complete inside that window is answered from it; from
+ * the first unproven parent of a request on, the existing lazy read serves the
+ * rest. Each consumer therefore sees exactly the same children, in the same
+ * order, as before; budget charging and overflow attribution stay with the
+ * consuming owner, and memory stays at one window.
+ */
+export function coalescingChildren(reader: FrozenReader, opts: { maxRows?: number } = {}): FrozenReader {
+  const maxRows = Math.max(1, Math.min(opts.maxRows ?? 1000, 1000));
+  type Waiter = { resolve: (kids: Ev[] | null) => void; reject: (e: unknown) => void };
+  let pending: Map<string, Waiter[]> | null = null;
+  const flush = async (batch: Map<string, Waiter[]>) => {
+    const ids = [...batch.keys()].sort(compareUtf8);
+    const got = new Map<string, Ev[]>(ids.map((id) => [id, []]));
+    let complete = false;
+    let last: string | null = null;
+    let n = 0;
+    const it = reader.children(ids)[Symbol.asyncIterator]();
+    try {
+      while (n < maxRows) {
+        const r = await it.next();
+        if (r.done) {
+          complete = true;
+          break;
+        }
+        const parent = r.value.parent_event_id;
+        const list = parent === null ? undefined : got.get(parent);
+        if (!list) throw new Error("a coalesced children read returned a row for a parent that was not requested");
+        list.push(r.value);
+        last = parent;
+        n++;
+      }
+      if (!complete) await it.return?.(undefined);
+    } catch (e) {
+      for (const ws of batch.values()) for (const w of ws) w.reject(e);
+      return;
+    }
+    for (const id of ids) {
+      const proven = complete || (last !== null && compareUtf8(id, last) < 0);
+      for (const w of batch.get(id)!) w.resolve(proven ? got.get(id)! : null);
+    }
+  };
+  // At most ONE coalesced read in flight: requests made while it runs join the next one (only consumed lines ever ask).
+  // setImmediate (no timer clamp: setTimeout(0) waits ~15 ms per flush on some platforms) collects every request of this turn.
+  const soon: (f: () => void) => void = typeof setImmediate === "function" ? (f) => void setImmediate(f) : (f) => void setTimeout(f, 0);
+  let inflight = false;
+  let scheduled = false;
+  const kick = () => {
+    if (inflight || scheduled || !pending) return;
+    scheduled = true;
+    soon(() => {
+      scheduled = false;
+      const batch = pending;
+      if (!batch) return;
+      pending = null;
+      inflight = true;
+      void flush(batch).finally(() => {
+        inflight = false;
+        kick();
+      });
+    });
+  };
+  const request = (id: string) =>
+    new Promise<Ev[] | null>((resolve, reject) => {
+      const batch = pending ?? (pending = new Map<string, Waiter[]>());
+      (batch.get(id) ?? batch.set(id, []).get(id)!).push({ resolve, reject });
+      kick();
+    });
+  return {
+    ...reader,
+    children(parentIds) {
+      const ids = [...new Set(parentIds)].sort(compareUtf8);
+      if (!ids.length) return reader.children(ids);
+      return (async function* () {
+        // All of this request's parents join the SAME pending window (requested synchronously); the proven ones are a
+        // bytewise prefix of `ids`. From the first unproven parent on, the existing lazy read serves the rest in order.
+        const lists = await Promise.all(ids.map(request));
+        for (let i = 0; i < ids.length; i++) {
+          const kids = lists[i];
+          if (!kids) {
+            yield* reader.children(ids.slice(i));
+            return;
+          }
+          yield* kids;
+        }
+      })();
+    },
+  };
+}
+
+/**
+ * Materialize a bounded group of owners concurrently (over a coalescing
+ * reader); results come back in the given order, each settled on its own, so a
+ * caller can apply them strictly in order and stop at the first failure
+ * exactly as a sequential loop would. Memory: at most the group's inputs.
+ */
+export async function materializeOwnerGroup(
+  reader: FrozenReader,
+  items: ReadonlyArray<{ owner: Owner; oldStaff: Iterable<string> }>,
+  stats?: MaterializeStats,
+  /** Per-owner wrapper (the worker's bounded transient retry). */
+  run: <T>(f: () => Promise<T>) => Promise<T> = (f) => f(),
+): Promise<Array<PromiseSettledResult<MaterializedWork[]>>> {
+  return Promise.allSettled(items.map((i) => run(() => materializeOwnerWorks(reader, i.owner, i.oldStaff, stats))));
 }
 
 /** Whole batch in memory (tests and small refreshes): every affected (refresh) or every (rebuild) owner and audience. */

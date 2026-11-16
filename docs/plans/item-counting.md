@@ -3308,3 +3308,39 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - X2–X5 (each independent, failures kept): abandon ONLY the owned expired batch with its CURRENT fence (no resume, renew or wait; 0038 refuses a live batch); capture off by an owned receipt; delete exactly the fixture ids (only with capture off); processor off + legacy.
     - The fresh audit compares against the ORIGINAL run's persisted baseline with the same scoped ownership rules. A new, separate report is written; the original report is only read.
     - Tests (`tests/reporting/reportingWorkerRecovery.test.ts`, 6, real SQL in PGlite): pure refusals; report validation (mode, site, prefix, fixtures, baseline, never committed); a really interrupted run (driver stopped after R3a with a live owned batch) is refused while the lease is live with zero writes, and after expiry recovers to a clean audit with no resume/renew call; a foreign batch is refused; an injected step failure is kept while later steps still run.
+  - **Recovery result (root, staging):** report `staging-results-reporting-worker-recover-worker-run-20261116T184747388Z-af5fac38.md`, SHA-256 `1F18F95EF2E427C5479917EB449022397ABB64F8C41D6132EA0D3CFC8BC5DDA6`, STATUS COMPLETE.
+    - It recovered run `442b8497` from report `staging-results-reporting-worker-worker-runtime-20261116T181622238Z-150545b0.md` (SHA-256 `0670b7da…dc741b`, verified offline by the coder before the run).
+    - The owned batch `3843f2e4…` (fence 12, 252 owners planned, lease expired 18:42:20Z) was abandoned. Capture off, processor off, legacy, 0 fixture rows.
+    - The abandoned batch and its candidate rows stay at uk as evidence, so a NEW `--worker-runtime --site=uk` refuses at R0 (site not clean); this is pinned by a test.
+- **Task 15 scale fix: batched child reads (2026-11-17, TDD, offline; planner direction).**
+  - **Cause (from the hosted evidence):** each owner read its members' children one RPC per member, and each consumed stream line's children one RPC per line, strictly one owner at a time.
+  - **Decision and design (smallest correct):**
+    - (1) An owner's members' children are all required (no early stop), so they are ONE lazy multi-parent read. The reader already accepts many parent ids and yields them in the same bytewise parent-then-id order the old loop charged, so the budget charge sequence and overflow proof are identical.
+    - (2) `coalescingChildren`: the children requests of a bounded group of concurrently materialized owners (members, and each stream line only when it is CONSUMED: nothing is prefetched) are served by one multi-parent read, at most one in flight, at most 1,000 buffered rows. Parents proven complete in that window are answered from it; from a request's first unproven parent on, the existing lazy read serves the rest in order.
+    - (3) `materializeOwnerGroup` + the worker: plan and stage materialize `OWNER_GROUP` (8) owners concurrently over that reader, then plan/stage strictly in list/claim order, raising the first failure in that order after the owners before it, exactly as one at a time. Memory: at most 8 owner inputs (each ≤ 50,000 events) plus one 1,000-row window. Lease heartbeats run before every group and before every plan/stage call; the 240 s budget check is per group.
+    - Unchanged: outputs, descriptors, input hashes, per-owner 50,000 budget and overflow attribution, byte/row-capped pagination, replay/checkpoint behaviour, enumeration (still sequential) and the installed DB contracts (no SQL or migration change).
+    - The single-connection test/harness RPC clients now serialize calls so each stays its own transaction (PostgREST runs requests on separate pooled connections).
+  - **Tests (`tests/reporting/reportingMaterializeBatching.test.ts`, 6; failing first: 1,500 member-path calls, coalescer missing):**
+    - Member batching: identical outputs and child rows, < 60% of the calls.
+    - Grouped + coalesced: identical outputs in owner order, every site row equal to the complete-history oracle; children calls 1,500 → 116.
+    - No lookahead: an unconsumed candidate's 60,000 cancellations are never read, also across a group.
+    - Overflow inside a group: the failing owner reports size 50,001 and earlier owners stay intact.
+    - Page sizes 1 / 3 / 1000 give identical outputs.
+    - Real SQL (PGlite), the worker's plan AND stage over a rebuild then a refresh, `ownerGroup` 1 vs 8: identical work rows (audience, partition, chunk count, result digest, state) and identical published facts. `read_reporting_children` RPCs: rebuild 960 → 225, refresh 79 → 43. (Input hashes embed each database's own frozen cutoff, so they are compared at equal cutoffs by the materializer tests and re-proven per owner by the stage path's planned-hash check.)
+    - The existing Task 14 materializer/budget/walk suites (61) pass unchanged.
+  - **Expected hosted effect (estimate, not measured):** children RPCs per owner drop roughly 4–8×. Members, stream and plan calls are unchanged in count. The harness's single serialized connection gains only from the call reduction; the HTTP worker also overlaps a group's other reads.
+  - The coalescer schedules its flush with `setImmediate`. A first full run with `setTimeout(0)` timed out 10 worker tests at 5 s, because the timer clamp (~15 ms per flush on Windows) accumulated over hundreds of flushes. After the change the worker file passed 41/41 in 17 s at the default timeout.
+  - **Gate:**
+
+    | Check | Result |
+    |---|---|
+    | Batching + materializer suites | 47/47 |
+    | Worker + harness + real-SQL suites (bounded run) | 21 files, 320/320 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 72 files, 2,216/2,216 |
+    | `npm run build` | 0 |
+    | `git diff --check` | clean |
+  - uk's retained abandoned batch and its candidate rows are evidence and are NOT cleaned (planner decision).
+  - **Remaining staging gate (root):** `npm run staging:reporting-jobs -- --worker-runtime --site=<au|us>` at this commit, on a site root chooses that passes R0. uk is refused by R0 while its abandoned evidence is retained.

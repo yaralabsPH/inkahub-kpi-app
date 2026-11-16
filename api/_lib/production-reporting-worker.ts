@@ -34,7 +34,7 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { isoOfMicros, KEY_WALK_PAGES, materializeOwnerWorks, ownerKey, PartitionTooLargeError, walkChangedKey, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner } from "./production-reporting-materialize.js";
+import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner } from "./production-reporting-materialize.js";
 import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
@@ -46,6 +46,8 @@ export const HEARTBEAT_MS = 30_000;
 export const RETRY_DELAYS_MS = [30_000, 60_000, 120_000] as const;
 export const PLAN_PAGE = 100;
 export const CLAIM_PAGE = 100;
+/** Owners materialized concurrently in plan/stage: bounds memory (at most this many owner inputs, each <= 50,000 events). */
+export const OWNER_GROUP = 8;
 
 export type CycleMode = "refresh" | "rebuild" | "cleanup";
 export type CycleState = "published" | "pending" | "busy" | "idle" | "failed" | "done";
@@ -73,6 +75,8 @@ export interface WorkerEnv {
   walkPages?: KeyWalkPages;
   /** Redaction for problem text (default: strip anything that looks like a secret). */
   redact?: (s: string) => string;
+  /** Owners materialized together in plan/stage (default OWNER_GROUP; 1 = one at a time). */
+  ownerGroup?: number;
 }
 
 const TRANSIENT_CODES = new Set(["57014", "55P03", "40001", "40P01", "53300", "57P01", "08000", "08001", "08003", "08006"]);
@@ -258,21 +262,34 @@ async function enumerate(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: Froz
   }
 }
 
-/** Plan every discovered, unplanned owner (one owner per atomic call). */
+/**
+ * Plan every discovered, unplanned owner (one owner per atomic call). Owners
+ * are materialized in bounded groups (concurrently, over the coalescing
+ * reader) and planned strictly in list order; the first failure in that order
+ * is raised after the owners before it are planned, exactly as one at a time.
+ */
 async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>): Promise<void> {
+  const size = ownerGroupSize(env);
   for (;;) {
     b.need();
     const owners = await b.retry(() => listWorkerOwners(env.client, a.batchId, a.fence, true, null, PLAN_PAGE));
     if (!owners.length) return;
-    for (const o of owners) {
+    for (let i = 0; i < owners.length; i += size) {
       b.need();
       await b.beat(a.batchId, a.fence);
-      const works = await b.retry(() => materializeOwnerWorks(reader, o.owner, o.oldStaff, stats));
-      await b.retry(() => planOwner(env.client, a.batchId, a.fence, o.owner, works.map((w) => w.desc)));
-      counts.ownersPlanned = (counts.ownersPlanned ?? 0) + 1;
+      const group = owners.slice(i, i + size);
+      const settled = await materializeOwnerGroup(reader, group, stats, (f) => b.retry(f));
+      for (let k = 0; k < group.length; k++) {
+        const s = settled[k];
+        if (s.status === "rejected") throw s.reason;
+        await b.beat(a.batchId, a.fence);
+        await b.retry(() => planOwner(env.client, a.batchId, a.fence, group[k].owner, s.value.map((w) => w.desc)));
+        counts.ownersPlanned = (counts.ownersPlanned ?? 0) + 1;
+      }
     }
   }
 }
+const ownerGroupSize = (env: WorkerEnv) => Math.max(1, Math.min(env.ownerGroup ?? OWNER_GROUP, 32));
 
 /** Seal only with the exact completeness proof and the saved-descriptor manifest. */
 async function seal(env: WorkerEnv, b: Budget, a: ActiveBatch, counts: Record<string, number>): Promise<void> {
@@ -297,20 +314,32 @@ async function stage(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenRe
       const k = ownerKey({ partitionKind: c.partitionKind, partitionKey: c.partitionKey });
       (groups.get(k) ?? groups.set(k, []).get(k)!).push(c);
     }
-    for (const group of groups.values()) {
+    // Owners in bounded groups: materialized concurrently (coalescing reader), staged strictly in claim order.
+    const all = [...groups.values()];
+    const size = ownerGroupSize(env);
+    for (let i = 0; i < all.length; i += size) {
       if (!b.hasTime()) return false; // unstaged claimed work returns to pending on the next takeover
       await b.beat(a.batchId, a.fence);
-      const owner: Owner = { partitionKind: group[0].partitionKind, partitionKey: group[0].partitionKey };
-      const selfStaff = group.filter((c) => c.audienceKind === "self").map((c) => c.audienceStaff!);
-      const works = await b.retry(() => materializeOwnerWorks(reader, owner, selfStaff, stats));
-      const entries: StageEntry[] = [];
-      for (const c of group) {
-        const w = works.find((x) => x.desc.audienceKind === c.audienceKind && x.desc.audienceStaff === c.audienceStaff);
-        if (!w || w.desc.inputHash !== c.inputHash) throw new ReportingJobError(`claimed work ${c.workId}: the frozen input hash differs from the planned descriptor`);
-        for (const chunk of buildChunks(w.rows)) entries.push({ partition: c.workId, chunk });
+      const part = all.slice(i, i + size);
+      const items = part.map((group) => ({
+        owner: { partitionKind: group[0].partitionKind, partitionKey: group[0].partitionKey } as Owner,
+        oldStaff: group.filter((c) => c.audienceKind === "self").map((c) => c.audienceStaff!),
+      }));
+      const settled = await materializeOwnerGroup(reader, items, stats, (f) => b.retry(f));
+      for (let k = 0; k < part.length; k++) {
+        const group = part[k];
+        const s = settled[k];
+        if (s.status === "rejected") throw s.reason;
+        await b.beat(a.batchId, a.fence);
+        const entries: StageEntry[] = [];
+        for (const c of group) {
+          const w = s.value.find((x) => x.desc.audienceKind === c.audienceKind && x.desc.audienceStaff === c.audienceStaff);
+          if (!w || w.desc.inputHash !== c.inputHash) throw new ReportingJobError(`claimed work ${c.workId}: the frozen input hash differs from the planned descriptor`);
+          for (const chunk of buildChunks(w.rows)) entries.push({ partition: c.workId, chunk });
+        }
+        for (const req of packStageRequests(entries)) await b.retry(() => stageReportingResults(env.client, a.batchId, a.fence, req));
+        counts.staged = (counts.staged ?? 0) + group.length;
       }
-      for (const req of packStageRequests(entries)) await b.retry(() => stageReportingResults(env.client, a.batchId, a.fence, req));
-      counts.staged = (counts.staged ?? 0) + group.length;
     }
   }
 }
@@ -345,13 +374,15 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         if (a.cutoff === null) throw new ReportingJobError("the batch has no frozen cutoff");
         const ref: FrozenBatchRef = { batchId: a.batchId, fence: a.fence, site: req.site, cutoff: canonicalInstant(a.cutoff), kind: a.kind };
         const src = env.source ? env.source(ref) : { reader: rpcFrozenReader(env.client, ref), pages: rpcEnumerationPages(env.client, ref) };
+        // Planning and staging materialize owner groups over ONE coalescing view of the frozen reads (enumeration stays sequential).
+        const coalesced = coalescingChildren(src.reader);
         const prog = await b.retry(() => readWorkerProgress(env.client, a.batchId, a.fence));
         if (!prog.sealed) {
           if (!prog.complete) await enumerate(env, b, a, src.reader, src.pages, prog.cursor, counts);
-          await plan(env, b, a, src.reader, stats, counts);
+          await plan(env, b, a, coalesced, stats, counts);
           await seal(env, b, a, counts);
         }
-        if (await stage(env, b, a, src.reader, stats, counts)) {
+        if (await stage(env, b, a, coalesced, stats, counts)) {
           b.need();
           const p = await b.retry(() => publishReportingBatch(env.client, a.batchId, a.fence));
           out.generationId = p.generationId;
