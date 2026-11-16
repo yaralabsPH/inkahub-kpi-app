@@ -322,6 +322,48 @@ function pageCancels(reader: FrozenReader, l: StreamLine, page: readonly Ev[]): 
   return !!f && f.cancelledBy.length > 0;
 }
 
+/** Charge an already-read list of ONE consumed line's children in order, exactly as consumeChildren would. */
+function chargeChildren(list: readonly Ev[], budget: DependencyBudget, onKid: (k: Ev) => void): Ev[] {
+  const kids: Ev[] = [];
+  for (const k of list) {
+    budget.take(k);
+    onKid(k);
+    kids.push(k);
+  }
+  return kids;
+}
+
+/**
+ * Children of several parents in ONE bounded window (at most `maxRows` rows):
+ * only parents whose children are PROVEN complete inside the window are
+ * returned (all of them when the read ended; otherwise those bytewise before
+ * the last parent seen). The caller reads any other parent the usual way.
+ */
+async function provenChildren(reader: FrozenReader, parentIds: readonly string[], maxRows = 1000): Promise<Map<string, Ev[]>> {
+  const ids = [...new Set(parentIds)].sort(compareUtf8);
+  const got = new Map<string, Ev[]>(ids.map((id) => [id, []]));
+  let last: string | null = null;
+  let complete = false;
+  let n = 0;
+  const it = reader.children(ids)[Symbol.asyncIterator]();
+  while (n < maxRows) {
+    const r = await it.next();
+    if (r.done) {
+      complete = true;
+      break;
+    }
+    const list = r.value.parent_event_id === null ? undefined : got.get(r.value.parent_event_id);
+    if (!list) throw new Error("a children read returned a row for a parent that was not requested");
+    list.push(r.value);
+    last = r.value.parent_event_id;
+    n++;
+  }
+  if (!complete) await it.return?.(undefined);
+  const out = new Map<string, Ev[]>();
+  for (const id of ids) if (complete || (last !== null && compareUtf8(id, last) < 0)) out.set(id, got.get(id)!);
+  return out;
+}
+
 /** Read the cancellations of ONE consumed line incrementally, charging each to the budget as it arrives. */
 async function consumeChildren(reader: FrozenReader, id: string, budget: DependencyBudget, onKid: (k: Ev) => void): Promise<Ev[]> {
   const kids: Ev[] = [];
@@ -352,12 +394,28 @@ async function exactWalk(
   budget: DependencyBudget,
   onEvent: (e: Ev) => void,
   onLine: (l: StreamLine, effective: boolean) => boolean,
+  /** Lines that can NEVER satisfy the walk (onLine cannot return true for them): certain to be consumed. */
+  cannotStop?: (l: StreamLine) => boolean,
 ): Promise<void> {
   let stopAt: bigint | null = null;
   let cursor = from;
   for (;;) {
     const page = await reader.stream(staff, direction, cursor, STREAM_PAGE);
     if (!page.length) return;
+    // Task 15 (hosted AU): the page's leading lines that cannot stop the walk WILL be consumed, so their own
+    // children are already required: read them in one bounded multi-parent read. The first line that could stop
+    // the walk, and everything after it on the page, keeps the one-line-at-a-time read (no lookahead).
+    let pre: Map<string, Ev[]> = new Map();
+    if (stopAt === null && cannotStop) {
+      const certain: string[] = [];
+      for (const e of page) {
+        const l = streamLine(e, cutoffUs);
+        if (!l) continue;
+        if (!cannotStop(l)) break;
+        certain.push(e.id);
+      }
+      if (certain.length > 1) pre = await provenChildren(reader, certain);
+    }
     for (const e of page) {
       const us = micros(e);
       if (stopAt !== null && (direction === "before" ? us < stopAt : us > stopAt)) return;
@@ -365,7 +423,8 @@ async function exactWalk(
       onEvent(e);
       const l = streamLine(e, cutoffUs);
       if (!l) continue;
-      const kids = await consumeChildren(reader, e.id, budget, onEvent);
+      const known = pre.get(e.id);
+      const kids = known ? chargeChildren(known, budget, onEvent) : await consumeChildren(reader, e.id, budget, onEvent);
       if (onLine(l, siteEffective(reader, l, kids)) && stopAt === null) stopAt = l.us;
     }
     const last = page[page.length - 1];
@@ -445,7 +504,7 @@ export async function buildOwnerInput(reader: FrozenReader, owner: Owner, member
         if (l.workType !== null) need.delete(l.workType);
       }
       return need.size === 0;
-    });
+    }, (l) => projectorOrder(lineOrder(l), lineOrder(earliest)) >= 0); // only a line BELOW the earliest member can satisfy
   }
   const events = [...context.values()].sort((x, y) => compareUtf8(x.id, y.id));
   return { owner, members: [...members].sort((x, y) => compareUtf8(x.id, y.id)), events };

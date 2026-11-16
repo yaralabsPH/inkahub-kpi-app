@@ -3344,3 +3344,26 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     | `git diff --check` | clean |
   - uk's retained abandoned batch and its candidate rows are evidence and are NOT cleaned (planner decision).
   - **Remaining staging gate (root):** `npm run staging:reporting-jobs -- --worker-runtime --site=<au|us>` at this commit, on a site root chooses that passes R0. uk is refused by R0 while its abandoned evidence is retained.
+- **Task 15 second hosted blocker: long-span owners starve the heartbeat (2026-11-17; offline, TDD).**
+  - **Hosted evidence (root, AU at 3d57bec):** clean preflight; 55,620 owners discovered. After the paced copy and a real takeover, only 72 owners / 144 descriptors were planned after about two lease periods. Progress moved 56 → 72 while heartbeat/lease moved 19:21:03/19:27:03 → 19:27:07/19:33:07 UTC, so ONE owner group took about 6 minutes and starved the 30 s heartbeat. Root interrupted after a durable checkpoint and will recover after lease expiry. AU/UK evidence is not touched.
+  - **Diagnosis (code):**
+    - The predecessor walk of an owner whose member lines are far apart in its worker's stream consumes EVERY line between its latest and earliest member, and `exactWalk` read each consumed line's children one round trip at a time. The walk's chain of round trips is as long as the span, even with cross-owner coalescing.
+    - Heartbeats ran only between owner groups, so one long owner held the lease unrenewed and ran past the 240 s budget.
+    - Reproduced offline: one long owner (2,500 in-span lines) made 2,504 sequential children reads; a real-SQL worker group made NO lease renewal for 511 simulated seconds.
+  - **Fix (no SQL, RPC or migration change):**
+    - (1) In the predecessor walk only a line BELOW the earliest member can satisfy the stop, so every line above it on a stream page WILL be consumed and its children are already required. `exactWalk` takes a `cannotStop` predicate; for each page, the leading lines that cannot stop are read in ONE bounded multi-parent read (at most 1,000 rows; only parents proven complete in the window are used, others read as before) and charged in exactly the original order. The first line that could stop, and everything after it on the page, keep the one-line-at-a-time read. Lines beyond the stop are never read. In an overflow inside the span, at most one 1,000-row window is read beyond the proof; attribution (owner, size 50,001) is unchanged.
+    - (2) `guardedReader`: inside owner materialization (plan and stage) every frozen read first checks the 240 s budget (OutOfTime → pending; owners before it in order are kept) and renews the lease when 30 s have passed. `Budget.beat` is single-flight, so concurrently materialized owners never send duplicate renewals.
+  - **Tests (`tests/reporting/reportingWalkBatching.test.ts`, 6; failing first: 2,504 calls; 1,504 calls for a group; a 511 s renewal gap):**
+    - One long owner: identical output and child rows; children reads 2,504 → ≤ 18 (one per 200-line stream page).
+    - A group of 8 long owners over the coalescing reader: identical outputs; under 1/50 of the reference calls.
+    - No lookahead: a line below the predecessor with 60,000 cancellations is never read, at page sizes 1, 7 and 200.
+    - Overflow inside the span: owner and size 50,001 unchanged; reading stops within one window.
+    - Real SQL, simulated 1 s per RPC: renewal gaps ≤ 30 s plus the group's queued reads (31–40 s measured, against one 511 s gap before) and no budget overrun beyond the in-flight calls.
+    - Real SQL, full rebuild of 4 workers × 250 in-span lines: published exactly (mirror = source; daily totals = the reducer for the site and every worker). `read_reporting_children` 1,280 → 360 and all RPCs 2,994 → 2,074 against 3d57bec on identical data.
+  - **Hosted bound (honest status):**
+    - Heartbeat and budget safety now hold by construction: every read checks both, independent of owner size.
+    - The per-owner sequential chain drops from one round trip per in-span line to about three per 200-line page.
+    - AU's total runtime is NOT measured offline. It is root's rerun gate (resumable over many 240 s invocations).
+  - **Gate:** full suite 73 files, 2,222/2,222; `npx tsc -b`, `npm run typecheck:digest` and strict ES2020 tsc all 0; build 0; `git diff --check` clean. Focused worker/materializer/harness/real-SQL suites: 24 files, 387/387, once the test-only timeout was set on the slow in-memory reference.
+  - **Remaining staging gate (root):** after AU's guarded recovery, run `--worker-runtime` at this commit on a site root chooses that passes R0.
+  - **Contingency (only if the hosted rerun still cannot progress; NOT implemented):** a reviewed, read-only, service-only RPC in a new migration that returns, for one frozen batch and ONE worker stream range, the stream page WITH each line's children (same 1,000-row / 1 MiB accounting, keyset by (created_at, event_id C) then child id). That would make the walk one round trip per page.

@@ -125,10 +125,20 @@ class Budget {
   need(): void {
     if (!this.hasTime()) throw new OutOfTime();
   }
+  private beating: Promise<void> | null = null;
+  /** Renew when 30 s have passed; single-flight, so concurrently materialized owners never send duplicate renewals. */
   async beat(batchId: string, fence: number): Promise<void> {
+    if (this.beating) return this.beating;
     if (this.env.now() - this.lastBeat < HEARTBEAT_MS) return;
-    await this.retry(() => renewReportingLease(this.env.client, batchId, fence));
-    this.lastBeat = this.env.now();
+    this.beating = (async () => {
+      try {
+        await this.retry(() => renewReportingLease(this.env.client, batchId, fence));
+        this.lastBeat = this.env.now();
+      } finally {
+        this.beating = null;
+      }
+    })();
+    return this.beating;
   }
   /** Retry a transient failure after 30/60/120 s while the budget allows; otherwise defer to the next tick. */
   async retry<T>(fn: () => Promise<T>): Promise<T> {
@@ -152,6 +162,25 @@ const canonicalInstant = (s: string): string => {
   if (us === null) throw new ReportingJobError("the frozen cutoff is not an exact instant");
   return isoOfMicros(us);
 };
+
+/** A frozen reader whose every read first awaits `guard` (budget check + due heartbeat). Results are untouched. */
+export function guardedReader(r: FrozenReader, guard: () => Promise<void>): FrozenReader {
+  const it = <T>(f: () => AsyncIterable<T>): AsyncIterable<T> =>
+    (async function* () {
+      await guard();
+      yield* f();
+    })();
+  return {
+    ...r,
+    changedKeys: () => it(() => r.changedKeys()),
+    owners: () => it(() => r.owners()),
+    children: (ids) => it(() => r.children(ids)),
+    members: async (owners, cap) => (await guard(), r.members(owners, cap)),
+    byIds: async (ids) => (await guard(), r.byIds(ids)),
+    childPage: async (p, after, limit) => (await guard(), r.childPage(p, after, limit)),
+    stream: async (staff, direction, from, limit) => (await guard(), r.stream(staff, direction, from, limit)),
+  };
+}
 
 /** Take over the site's active batch, or start one for `mode`; null = busy. */
 async function acquire(env: WorkerEnv, b: Budget, site: ReportingSite, mode: "refresh" | "rebuild", counts: Record<string, number>): Promise<ActiveBatch | null> {
@@ -375,7 +404,12 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         const ref: FrozenBatchRef = { batchId: a.batchId, fence: a.fence, site: req.site, cutoff: canonicalInstant(a.cutoff), kind: a.kind };
         const src = env.source ? env.source(ref) : { reader: rpcFrozenReader(env.client, ref), pages: rpcEnumerationPages(env.client, ref) };
         // Planning and staging materialize owner groups over ONE coalescing view of the frozen reads (enumeration stays sequential).
-        const coalesced = coalescingChildren(src.reader);
+        // Every read inside an owner's materialization first checks the budget and renews the lease when due, so one long
+        // owner can neither starve the 30 s heartbeat nor run past the 240 s budget (OutOfTime -> pending, owners before it kept).
+        const coalesced = guardedReader(coalescingChildren(src.reader), async () => {
+          b.need();
+          await b.beat(a.batchId, a.fence);
+        });
         const prog = await b.retry(() => readWorkerProgress(env.client, a.batchId, a.fence));
         if (!prog.sealed) {
           if (!prog.complete) await enumerate(env, b, a, src.reader, src.pages, prog.cursor, counts);
