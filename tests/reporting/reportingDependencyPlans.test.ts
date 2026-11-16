@@ -12,7 +12,7 @@ import {
   comparePages, DIAG_PREFIX, diagnoseDependencyPlans, diagnosticStatements, EXPLAIN_CASES, expectedMembers, expectedStreamCount, explainAllowlist, MAX_EXPLAINS, memberPage, newPlanEvidence, OR_CANDIDATE, OR_MIRROR,
   PLAN_SQL, planEvidenceProblems, REQUIRED_PLAN_CASES, runPlanCases, smallLimit, SPLIT_CANDIDATE, SPLIT_MIRROR, splitMembersSql, summarizePlan, type MemberRow, type PlanCtx, type PlanDeps, type PlanEvidence,
 } from "../staging/reportingDependencyPlans";
-import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, executesExplain, planSql, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
+import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, executesExplain, planSql, stripSqlComments, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
 import { compareFullState, migrationBody, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type Observation } from "../staging/reportingPublication";
 import { bodyHashes, FUNCTION_SQL, publishBody } from "../staging/reportingRebuildRepair";
 
@@ -409,5 +409,54 @@ describe("T14S3 review: the owner choice tie-breaks on the text key", () => {
     expect(PLAN_SQL.owner).toContain('order by count(*) desc, reporting_private.order_key(pe.order_number) collate "C" limit 1');
     expect(PLAN_SQL.owner).not.toMatch(/,\s*1\s+collate/i);
     expect(PLAN_SQL.owner).toContain("group by 1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Planner review: comment-hidden statement keywords (T14S3 guard)
+// ---------------------------------------------------------------------------
+
+describe("T14S3 review 2: comments can never hide ANALYZE or a statement's kind", () => {
+  const body = [...migrationBody(read(MIGRATION_0040)), ...migrationBody(T41)];
+  const allow = explainAllowlist(T41);
+  const hidden = [
+    "EXPLAIN /* select */ ANALYZE DELETE FROM x",
+    "EXPLAIN -- select\nANALYZE DELETE FROM x",
+    "EXPLAIN /* a /* nested select */ still comment */ ANALYZE UPDATE x SET y = 1",
+    "EXPLAIN /**/ANALYZE/**/DELETE FROM x",
+    "EXPLAIN (/* select */ ANALYZE) DELETE FROM x",
+    "EXPLAIN (FORMAT JSON, -- with\n ANALYZE) INSERT INTO x VALUES (1)",
+    "EXPLAIN (\"analyze\") SELECT 1",
+    "EXPLAIN /* unterminated ANALYZE DELETE FROM x",
+    "/* lead */ EXPLAIN /* select */ ANALYZE DELETE FROM x",
+  ];
+  for (const sql of hidden) {
+    it(`refuses before sending: ${JSON.stringify(sql).slice(0, 70)}`, async () => {
+      expect(executesExplain(sql)).toBe(true);
+      const sent: string[] = [];
+      const db: Db = { query: async (q: string) => (sent.push(q), { rows: [], rowCount: 0 }) };
+      await expect(dependencyGuard(db, new Set(body), [], allow).query(sql)).rejects.toThrow(/dependency-read rehearsal refuses/);
+      expect(sent).toEqual([]);
+    });
+  }
+  const ddl = ["/* a /* b */ c */ DROP TABLE reporting_private.batches", "/* x */ -- y\n/* z */ CREATE TABLE x (a int)", "/* unterminated DROP TABLE x", "-- only a comment\n"];
+  for (const sql of ddl) {
+    it(`a nested/unterminated leading comment cannot hide DDL: ${JSON.stringify(sql).slice(0, 60)}`, async () => {
+      const sent: string[] = [];
+      const db: Db = { query: async (q: string) => (sent.push(q), { rows: [], rowCount: 0 }) };
+      await expect(dependencyGuard(db, new Set(body), [], allow).query(sql)).rejects.toThrow(/dependency-read rehearsal refuses/);
+      expect(sent).toEqual([]);
+    });
+  }
+  it("keywords inside strings, identifiers or dollar quotes are not comments and not ANALYZE options; allowed statements still pass", async () => {
+    for (const q of ["EXPLAIN SELECT '/* ANALYZE */'", "EXPLAIN SELECT $x$ -- ANALYZE $x$", "EXPLAIN (VERBOSE) SELECT \"analyze\" FROM t", planSql(T41, "read_reporting_staff_stream")]) expect(executesExplain(q)).toBe(false);
+    expect(stripSqlComments("select 1 /* a /* b */ c */ + 2 -- x\n")).toBe("select 1   + 2  \n");
+    expect(stripSqlComments("select '--x' /* y */")).toBe("select '--x'  ");
+    expect(stripSqlComments("select 1 /* open")).toBeNull();
+    const sent: string[] = [];
+    const db: Db = { query: async (q: string) => (sent.push(q), { rows: [], rowCount: 0 }) };
+    const g = dependencyGuard(db, new Set(body), [], allow);
+    for (const q of [...allow, ...body]) await g.query(q);
+    expect(sent).toHaveLength(allow.size + body.length);
   });
 });

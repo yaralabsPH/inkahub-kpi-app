@@ -296,24 +296,149 @@ export function missingRequired(required: Iterable<string>, viaRpc: readonly Mat
 // ---------------------------------------------------------------------------
 
 /**
- * Does this EXPLAIN execute its statement? Any ANALYZE/ANALYSE option before the
- * explained statement, in either syntax: `EXPLAIN ANALYZE [VERBOSE] ...` or
- * `EXPLAIN (... ANALYZE [true|on|false] ...) ...` (an explicit false is denied
- * too: conservative). Non-executing plans (no ANALYZE option) are not affected.
+ * PostgreSQL text with every comment replaced by one space, or null when a
+ * comment, string, quoted identifier or dollar quote is unterminated. Block
+ * comments NEST (as in PostgreSQL); `--` runs to the end of the line. Comment
+ * markers inside '…' / E'…' strings, "…" identifiers and $tag$…$tag$ quotes are
+ * text, not comments.
+ */
+export function stripSqlComments(sql: string): string | null {
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  const ident = (c: string | undefined) => !!c && /[A-Za-z0-9_$\u0080-￿]/.test(c);
+  while (i < n) {
+    const c = sql[i];
+    const d = sql[i + 1];
+    if (c === "-" && d === "-") {
+      while (i < n && sql[i] !== "\n") i++;
+      out += " ";
+      continue;
+    }
+    if (c === "/" && d === "*") {
+      let depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (sql[i] === "/" && sql[i + 1] === "*") {
+          depth++;
+          i += 2;
+        } else if (sql[i] === "*" && sql[i + 1] === "/") {
+          depth--;
+          i += 2;
+        } else i++;
+      }
+      if (depth > 0) return null;
+      out += " ";
+      continue;
+    }
+    if (c === "'") {
+      const escapes = (sql[i - 1] === "E" || sql[i - 1] === "e") && !ident(sql[i - 2]);
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) return null;
+        if (escapes && sql[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      out += sql.slice(i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) return null;
+        if (sql[j] === '"') {
+          if (sql[j + 1] === '"') {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      out += sql.slice(i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (c === "$" && !ident(sql[i - 1])) {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
+      if (m) {
+        const tag = m[0];
+        const end = sql.indexOf(tag, i + tag.length);
+        if (end < 0) return null;
+        out += sql.slice(i, end + tag.length);
+        i = end + tag.length;
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/** Word, quoted-identifier (dequoted, lowercased) and punctuation tokens of comment-free SQL; a string is one "'" token. */
+function sqlTokens(s: string): string[] {
+  const toks: string[] = [];
+  const re = /\s+|"((?:[^"]|"")*)"|'(?:[^']|'')*'|[A-Za-z_][A-Za-z0-9_$]*|[\s\S]/gy;
+  let m: RegExpExecArray | null;
+  while (re.lastIndex < s.length && (m = re.exec(s))) {
+    if (/^\s+$/.test(m[0])) continue;
+    if (m[1] !== undefined) toks.push(m[1].replace(/""/g, '"').toLowerCase());
+    else if (m[0][0] === "'") toks.push("'");
+    else toks.push(m[0].toLowerCase());
+  }
+  return toks;
+}
+
+/**
+ * Does this EXPLAIN execute its statement? Comments (including nested ones) are
+ * removed by a real lexer first, so no comment can hide an option or the
+ * statement start. `EXPLAIN ( … )`: any option named analyze/analyse, quoted or
+ * not, with any value (an explicit false is denied too: conservative).
+ * `EXPLAIN [ANALYZE] [VERBOSE] …`: a leading ANALYZE/ANALYSE word. Anything the
+ * lexer cannot close is treated as executing.
  */
 export function executesExplain(sql: string): boolean {
-  const s = sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/, "");
-  if (!/^explain\b/i.test(s)) return false;
-  const m = /^explain\b([\s\S]*?)\b(select|with|insert|update|delete|merge|values|table|execute|create|declare|refresh)\b/i.exec(s);
-  return /\banaly[sz]e\b/i.test(m ? m[1] : s);
+  const s = stripSqlComments(sql);
+  if (s === null) return /explain/i.test(sql);
+  const toks = sqlTokens(s);
+  if (toks[0] !== "explain") return false;
+  const ANALYZE = new Set(["analyze", "analyse"]);
+  if (toks[1] === "(") {
+    let depth = 0;
+    for (let i = 1; i < toks.length; i++) {
+      if (toks[i] === "(") depth++;
+      else if (toks[i] === ")") {
+        depth--;
+        if (depth === 0) return false;
+      } else if (ANALYZE.has(toks[i])) return true;
+    }
+    return true; // unclosed option list: conservative
+  }
+  for (let i = 1; i < toks.length && (ANALYZE.has(toks[i]) || toks[i] === "verbose"); i++) if (ANALYZE.has(toks[i])) return true;
+  return false;
 }
 
 /** Deny-list (the flow's statements are many): no commit, history, maintenance, timeout/planner change, unrelated DDL, EXPLAIN ANALYZE or network. */
 export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: string[] = [], allowedExplainAnalyze: ReadonlySet<string> = new Set()): Db {
   return {
     query: async (sql: string, params?: unknown[]) => {
-      // Classify the first real token: leading whitespace and SQL comments cannot hide a statement's kind.
-      const s = sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/, "");
+      // Classify the first real token after a REAL comment strip (nested block comments, strings and
+      // dollar quotes respected): no comment can hide a statement's kind. Unterminated or empty is refused.
+      const stripped = stripSqlComments(sql);
+      if (stripped === null || !stripped.trim()) throw new Error("dependency-read rehearsal refuses: an unterminated or empty statement");
+      const s = stripped.replace(/^\s+/, "");
       const ddl = /^(create|alter|drop|grant|revoke|truncate|reindex|cluster|comment|security label|do)\b/i.test(s);
       const bad =
         /^(commit|end|abort|vacuum|analyze|checkpoint|prepare transaction|commit prepared|listen|notify|copy)\b/i.test(s) ||

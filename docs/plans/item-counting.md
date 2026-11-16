@@ -2912,3 +2912,18 @@ Coder adds one line per task with focused/full check results, CI evidence and re
   - `reporting_private.sel_welcome` returns per-production-date cells over ONE selection (the Welcome range): (date), (date, type), (date, type, person) and (date, person), with normal/rework Items and distinct (order, case) Orders, plus range and today coverage. New `api/_lib/production-reporting-welcome.ts` (`welcomeFrom`) assembles cards, top worker, streak, most improved, sparkline and team total with the exact rules of `buildProductionWelcomeView`.
   - Parity (`tests/reporting/pg/welcome-parity.test.ts`, 16): 5 todays × site/self ANNA/self BEN equal `buildProductionWelcomeView` over the same source's Welcome-range snapshot, including range and today coverage. A deterministic most-improved fixture was added, and non-vacuity is asserted.
   - Gate: tsc -b OK; typecheck:digest OK; 1781/1781 tests (49 files); build OK.
+- 2026-11-16 — **T14S3 guard review 2: comment-aware EXPLAIN/DDL detection, OFFLINE** (Claude). No SQL against any project; the staging diagnostic stays held until this is cleared.
+  - **Cause:** the head regex took a statement keyword inside an interstitial comment (`EXPLAIN /* select */ ANALYZE DELETE …`) as the explained statement. The leading-comment regex also mis-stripped NESTED block comments, so `/* a /* b */ c */ DROP …` could hide DDL from the classifier.
+  - **Fix:** new `stripSqlComments` — a real lexer:
+    - nested `/* */`, `--` to end of line;
+    - respects '…', E'…' escapes, "…" identifiers and $tag$ quotes;
+    - null when anything is unterminated.
+  - The guard classifies only the comment-free text and refuses unterminated or empty statements.
+  - `executesExplain` tokenizes the comment-free text:
+    - `EXPLAIN ( … )` executes if any option is named analyze/analyse, quoted or not, with any value (explicit false denied: conservative);
+    - otherwise a leading ANALYZE/ANALYSE word;
+    - unclosed lists or unterminated text count as executing.
+  - Exact allowlist matching is unchanged.
+  - **Regressions:** 9 comment-hidden executing forms and 4 nested/unterminated DDL or empty forms are refused before sending. Strings, identifiers and dollar quotes holding comment markers or 'analyze' do not trip it. All 31 reviewed migration statements and the 3 diagnostic statements still pass.
+  - **Checked against real PostgreSQL** (`tests/reporting/pg/explain-guard.test.ts`): 16 forms run inside rolled-back transactions. Whenever PostgreSQL actually executed the DELETE, `executesExplain` is true — no false negatives; the only conservative positive is `ANALYZE false`. The `ed66c5c` guard fails 8 of these real-PG cases.
+  - **Gate:** tsc -b, typecheck:digest and the strict runners OK; 1812/1812 tests (50 files); build OK.
