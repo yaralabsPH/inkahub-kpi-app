@@ -364,6 +364,46 @@ GRANT EXECUTE ON FUNCTION reporting_private.utf16_key(text) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.sel_timing(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz, text) TO service_role;
 GRANT EXECUTE ON FUNCTION reporting_private.sel_report(text, text, uuid, bigint, timestamptz, timestamptz, date, date, uuid, text) TO service_role;
 
+-- Welcome cells over one selection (the Welcome range): per production date, (date), (date, work type),
+-- (date, work type, person) and (date, person) normal/rework Items and distinct (order, case) Orders,
+-- plus the whole selection's coverage. The server assembles cards, top worker, streak, most improved and
+-- the sparkline from these cells with the existing Welcome rules.
+CREATE FUNCTION reporting_private.sel_welcome(p_site text, p_ak text, p_staff uuid, p_seq bigint, p_start timestamptz, p_end timestamptz, p_today_start timestamptz, p_today_end timestamptz)
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $fn$
+  WITH ev AS (SELECT * FROM reporting_private.sel_eval(p_site, p_ak, p_staff, p_seq, p_start, p_end)),
+  x AS (
+    SELECT v.production_date AS d, v.work_type AS wt, v.staff_id AS who, v.case_id IS NOT NULL AS rework,
+           CASE WHEN v.item_status = 'counted' THEN v.items ELSE 0 END::numeric AS items, NULL::text AS okey, NULL::text AS ocase, false AS is_order
+      FROM ev v WHERE v.role = 'verification' AND v.effective AND v.created_at >= p_start AND v.created_at < p_end
+    UNION ALL
+    SELECT t.production_date, t.work_type, t.staff_id, t.case_id IS NOT NULL, 0, t.order_key, t.case_id, true
+      FROM ev t WHERE t.role = 'terminal' AND NOT t.reversed AND t.qualification <> 'excluded_only' AND t.created_at >= p_start AND t.created_at < p_end
+  ), cells AS (
+    SELECT x.d, x.wt, x.who, GROUPING(x.wt) AS g_wt, GROUPING(x.who) AS g_who,
+           coalesce(sum(x.items) FILTER (WHERE NOT x.rework), 0) AS n_items,
+           count(DISTINCT (x.okey, x.ocase)) FILTER (WHERE x.is_order AND NOT x.rework) AS n_orders,
+           coalesce(sum(x.items) FILTER (WHERE x.rework), 0) AS r_items,
+           count(DISTINCT (x.okey, x.ocase)) FILTER (WHERE x.is_order AND x.rework) AS r_orders
+      FROM x
+     GROUP BY GROUPING SETS ((x.d), (x.d, x.wt), (x.d, x.wt, x.who), (x.d, x.who))
+  )
+  SELECT pg_catalog.jsonb_build_object(
+    'cells', (SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+                'date', c.d, 'workType', CASE WHEN c.g_wt = 0 THEN c.wt END, 'staffId', CASE WHEN c.g_who = 0 THEN c.who END,
+                'normal', pg_catalog.jsonb_build_object('items', c.n_items, 'orders', c.n_orders), 'rework', pg_catalog.jsonb_build_object('items', c.r_items, 'orders', c.r_orders))
+                ORDER BY c.d, c.g_wt, c.wt, c.g_who, c.who), '[]'::jsonb) FROM cells c),
+    'coverage', reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_start, p_end, NULL, NULL) -> 'coverage',
+    'todayCoverage', reporting_private.sel_totals(p_site, p_ak, p_staff, p_seq, p_start, p_end, p_today_start, p_today_end, NULL, NULL) -> 'coverage')
+$fn$;
+
+REVOKE ALL ON FUNCTION reporting_private.sel_welcome(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION reporting_private.sel_welcome(text, text, uuid, bigint, timestamptz, timestamptz, timestamptz, timestamptz) TO service_role;
+
 REVOKE ALL ON FUNCTION reporting_private.production_date_at(text, timestamptz) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION reporting_private.production_date_at(text, timestamptz) TO service_role;
 REVOKE ALL ON FUNCTION reporting_private.sel_rows(text, text, uuid, bigint, timestamptz, timestamptz) FROM PUBLIC, anon, authenticated;

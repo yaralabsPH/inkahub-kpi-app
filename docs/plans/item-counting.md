@@ -2908,3 +2908,7 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - staff-days for a selected person; leaderboard order; active-staff filter; page vs tile coverage;
     - surrogate encoding.
   - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK (includes the SKU module); 1765/1765 tests (48 files); build OK.
+- 2026-11-16 — **Task 16: 0044 layer 3 (Welcome), offline in PGlite** (Claude). Draft, not applied; Task 16 stays open.
+  - `reporting_private.sel_welcome` returns per-production-date cells over ONE selection (the Welcome range): (date), (date, type), (date, type, person) and (date, person), with normal/rework Items and distinct (order, case) Orders, plus range and today coverage. New `api/_lib/production-reporting-welcome.ts` (`welcomeFrom`) assembles cards, top worker, streak, most improved, sparkline and team total with the exact rules of `buildProductionWelcomeView`.
+  - Parity (`tests/reporting/pg/welcome-parity.test.ts`, 16): 5 todays × site/self ANNA/self BEN equal `buildProductionWelcomeView` over the same source's Welcome-range snapshot, including range and today coverage. A deterministic most-improved fixture was added, and non-vacuity is asserted.
+  - Gate: tsc -b OK; typecheck:digest OK; 1781/1781 tests (49 files); build OK.
