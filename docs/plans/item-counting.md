@@ -3097,3 +3097,20 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The browser CSV still holds the page chunks in memory until the download. There is no streaming file writer, and no page holds more than 1,000 rows.
     - Digest timing on real data is unmeasured: 10 summary RPCs per digest.
   - **Pending:** CJ applies 0044 on staging and puts a site in summary mode, downloads dry digests for three sites and verifies counts and cutoffs, then checks the negative auth and stale cases.
+- 2026-11-16 — **Task 18 review repair: digest/management parity proved** (Claude). Task 18 stays UNCHECKED; runtime/staging is still pending.
+  - `tests/reporting/pg/digest-published.test.ts` adds a real-SQL three-way assertion at ONE cutoff. It compares the app's live counter at the generation's exact cutoff, the management summary through `rpcPublishedReader.summary` pinned to the same generation id, and the digest workbook (the same generation id).
+  - Values compared, each non-vacuous and explicit:
+    - overall today: Items 4, Orders 2 (normal and rework);
+    - overall yesterday: Items 2, Orders 1;
+    - framed today: 3 / 1;
+    - one person (Ana) at framed today: 3 / 1.
+  - The newer-save-until-next-publication case is kept. No mismatch was found, so no runtime code changed.
+  - Gate:
+
+    | Check | Result |
+    |---|---|
+    | Real-SQL digest test | 7/7 |
+    | Focused Task 18 set | 10 files, 482/482 |
+    | `npx tsc -b` | 0 |
+  - The broader suite was not rerun: this commit changes only a test and the plan.
+  - No SQL was run, nothing was deployed or merged.

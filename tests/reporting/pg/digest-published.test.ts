@@ -15,6 +15,8 @@ import * as XLSX from "xlsx";
 import { createDigestHandler, type DigestDeps } from "../../../api/reports/daily-digest";
 import { runReportingCycle } from "../../../api/_lib/production-reporting-worker";
 import { imageToEvent } from "../../../api/_lib/production-reporting-reader";
+import { rpcPublishedReader } from "../../../api/_lib/production-reporting-rpc";
+import type { ReaderScope } from "../../../api/_lib/production-reporting";
 import { prepareProductionEvidence, summarizeProduction, type ProductionEvidenceEvent, type WorkType } from "../../../src/lib/domain/productionCounts";
 import { productionRange } from "../../../src/lib/domain/productionPeriods";
 import { fourFamilySnapshot } from "../../fixtures/reporting-history";
@@ -182,6 +184,42 @@ describe("Task 18: the digest for a summary-mode site is one published generatio
     expect(lookups.map(([c]) => c.args.p_generation)).toEqual([null]);
     expect(lookups[0][1]).toBeLessThan(rpcCalls.findIndex((c) => c.fn === "read_reporting_summary"));
     expect(rpcCalls.map((c) => c.fn)).not.toContain("load_production_evidence_v2"); // no raw-history count read
+  }, 120_000);
+  it("three-way parity at ONE cutoff: the live counter, the management summary (same pinned generation) and the digest agree", async () => {
+    const g = await generation();
+    const reader = rpcPublishedReader(pgRpc(db));
+    // The management summary exactly as Reports reads it, pinned to the digest's generation.
+    const management = async (day: string, workType: WorkType | null) => {
+      const range = productionRange(SITE, day, day);
+      const scope: ReaderScope = { site: SITE, audience: { kind: "site" }, generationId: g.g, firstDate: day, lastDate: day, startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive, staffId: null, workType };
+      return reader.summary(scope, "reports", { dailyLimit: 1, peopleLimit: 1000 });
+    };
+    const s = sheets((await digest({ location: SITE, date: DAY, dry: "1" })).sent!);
+    expect(s.Summary[0].generation_id).toBe(g.g);
+    const io = (x: { items: number | null; orders: number }) => [x.items, x.orders];
+
+    // overall: today and yesterday
+    for (const [day, digestCols] of [[DAY, ["items_total", "orders_total"]], [PREV, ["items_yesterday", "orders_yesterday"]]] as const) {
+      const liveDay = await live(day, g.c);
+      const mgmt = await management(day, null);
+      const fromDigest = [s.Summary[0][digestCols[0]], s.Summary[0][digestCols[1]]];
+      expect([day, io(liveDay.normal), io(mgmt.totals.normal), fromDigest]).toEqual([day, io(liveDay.normal), io(liveDay.normal), io(liveDay.normal)]);
+      expect([day, io(mgmt.totals.rework)]).toEqual([day, io(liveDay.rework)]);
+    }
+    expect(io((await live(DAY, g.c)).normal)).toEqual([4, 2]); // non-vacuous: two completed orders, 3 + 1 Items
+    expect(io((await live(PREV, g.c)).normal)).toEqual([2, 1]);
+
+    // a work type: framed today
+    const liveFramed = await live(DAY, g.c, "framed");
+    const mgmtFramed = await management(DAY, "framed");
+    const digestFramed = s.Departments.find((r) => r.department === "Framed")!;
+    expect([io(liveFramed.normal), io(mgmtFramed.totals.normal), [digestFramed.items, digestFramed.orders]]).toEqual([[3, 1], [3, 1], [3, 1]]);
+
+    // a person in that work type: Ana (A) at framed today
+    const livePerson = liveFramed.byPerson[A];
+    const mgmtPerson = mgmtFramed.peoplePage.rows.find((p) => p.staffId === A)!;
+    const digestPerson = s.Staff.find((r) => r.staff_name === "Ana" && r.department === "Framed")!;
+    expect([io(livePerson.normal), io(mgmtPerson.normal), [digestPerson.items, digestPerson.orders]]).toEqual([[3, 1], [3, 1], [3, 1]]);
   }, 120_000);
   it("operational reads are labelled with their own cutoff, never as the frozen summary evidence", async () => {
     const out = await digest({ location: SITE, date: DAY, dry: "1" });
