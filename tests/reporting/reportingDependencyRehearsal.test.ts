@@ -52,7 +52,7 @@ describe("T14S1: argument and dispatch wiring", () => {
     expect(pub).toMatch(/if \(mode !== "rehearse-migration" && mode !== "baseline-smoke" && !installed\) throw/);
     expect(pub).toMatch(/const allow = mode === "committed-interleavings" && own \? committedAllowance\(own\) : ROLLBACK_ONLY;/);
     const main = runner.slice(runner.indexOf("async function main()"));
-    expect(main).toMatch(/f === "--rehearse-dependency-reads"\)\) return publicationMain\(flags\);/);
+    expect(main).toMatch(/f === "--rehearse-dependency-reads"( \|\| f === "--[a-z-]+")*\)\) return publicationMain\(flags\);/); // T14S3 appends one more mode after it
     expect(main).toMatch(/--rehearse-dependency-reads --sites=A,B \[--max-pages=N\]/);
   });
   it("is never COMPLETE without complete dependency evidence, even with every observation ok and a verified restoration", () => {
@@ -282,7 +282,7 @@ describe("T14S1: full-volume plan statements are the effective 0041 queries", ()
 
 describe("T14S1: the statement guard", () => {
   const body = [...migrationBody(read(MIGRATION_0040)), ...migrationBody(read(MIGRATION_0041))];
-  const forbidden = ["commit", "end", "abort", "vacuum reporting_private.source_candidate", "analyze", "checkpoint", "set statement_timeout = 0", "set session lock_timeout = '1h'", "set work_mem = '1GB'", "set enable_seqscan = off",
+  const forbidden = ["commit", "end", "abort", "vacuum reporting_private.source_candidate", "analyze", "checkpoint", "set statement_timeout = 0", "set session lock_timeout = '1h'", "set local statement_timeout = 0", "set local enable_seqscan = off", "set work_mem = '1GB'", "set enable_seqscan = off",
     "select set_config('statement_timeout', '0', true)", "select set_config('enable_seqscan', 'off', true)", "set local role postgres", "set role supabase_admin",
     "insert into supabase_migrations.schema_migrations (version) values ('0040')", "select net.http_get('https://example.com')", "select dblink('x', 'y')", "-- a comment first\ncreate table x (a int)", "/* c */ drop index reporting_private.source_current_staff_time", "  -- c\n  -- d\n  commit", "select pg_read_file('/etc/passwd')",
     "create index x on reporting_private.source_candidate (site)", "drop function public.read_reporting_children(uuid, bigint, text[], text, text, integer)", "do $$ begin end $$",

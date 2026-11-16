@@ -167,12 +167,16 @@ const PLAN_VARS: Record<string, ReadonlyArray<readonly [RegExp, string]>> = {
   read_reporting_owner_members: [[/\bp_owners\b/g, "$4::jsonb"], [/\bp_after_index\b/g, "$5::integer"], [/\bp_after_event_id\b/g, "$6::text"], [/\bp_limit\b/g, "$7::integer"]],
   read_reporting_staff_stream: [[/\bp_staff\b/g, "$4::uuid"], [/\bp_direction\b/g, "$5::text"], [/\bp_at_event_id\b/g, "$7::text"], [/\bp_at\b/g, "$6::timestamptz"], [/\bp_limit\b/g, "$8::integer"]],
 };
-/** The effective query with the batch's columns and the call's parameters bound ($1 batch, $2 site, $3 kind, then the parameters). */
-export function planSql(text0041: string, fn: "read_reporting_owner_members" | "read_reporting_staff_stream"): string {
+/** The effective SELECT with the batch's columns and the call's parameters bound ($1 batch, $2 site, $3 kind, then the parameters). */
+export function boundReadQuery(text0041: string, fn: "read_reporting_owner_members" | "read_reporting_staff_stream"): string {
   let q = effectiveReadQuery(text0041, fn).replace(/\bb\.batch_id\b/g, "$1::uuid").replace(/\bb\.site\b/g, "$2::text").replace(/\bb\.kind\b/g, "$3::text");
   for (const [re, to] of PLAN_VARS[fn]) q = q.replace(re, to);
   if (/\bp_\w+|\bb\.(batch_id|site|kind)\b|\bv_\w+/.test(q)) throw new Error(`${fn}: an unbound variable remains in the plan statement`);
-  return `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON) ${q}`;
+  return q;
+}
+/** The rehearsal's plan statement (never ANALYZE). */
+export function planSql(text0041: string, fn: "read_reporting_owner_members" | "read_reporting_staff_stream"): string {
+  return `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON) ${boundReadQuery(text0041, fn)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +296,7 @@ export function missingRequired(required: Iterable<string>, viaRpc: readonly Mat
 // ---------------------------------------------------------------------------
 
 /** Deny-list (the flow's statements are many): no commit, history, maintenance, timeout/planner change, unrelated DDL, EXPLAIN ANALYZE or network. */
-export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: string[] = []): Db {
+export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: string[] = [], allowedExplainAnalyze: ReadonlySet<string> = new Set()): Db {
   return {
     query: async (sql: string, params?: unknown[]) => {
       // Classify the first real token: leading whitespace and SQL comments cannot hide a statement's kind.
@@ -300,11 +304,12 @@ export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: st
       const ddl = /^(create|alter|drop|grant|revoke|truncate|reindex|cluster|comment|security label|do)\b/i.test(s);
       const bad =
         /^(commit|end|abort|vacuum|analyze|checkpoint|prepare transaction|commit prepared|listen|notify|copy)\b/i.test(s) ||
-        /^set\s+(session\s+)?(statement_timeout|lock_timeout|idle_in_transaction_session_timeout|work_mem|enable_\w+|jit|plan_cache_mode|random_page_cost)\b/i.test(s) ||
+        /^set\s+(session\s+|local\s+)?(statement_timeout|lock_timeout|idle_in_transaction_session_timeout|work_mem|enable_\w+|jit|plan_cache_mode|random_page_cost)\b/i.test(s) ||
         /^set\s+(local\s+)?role\s+(?!anon\b|authenticated\b|service_role\b)/i.test(s) ||
         /supabase_migrations|schema_migrations|\bhttp_(get|post|request)\b|\bnet\.http|\bdblink\b|pg_read_file|lo_import/i.test(s) ||
         /set_config\(\s*'(statement_timeout|lock_timeout|idle_in_transaction_session_timeout|work_mem|enable_\w+|jit|plan_cache_mode|random_page_cost)'/i.test(s) ||
-        /^explain\s*\([^)]*\banalyze\b/i.test(s) ||
+        // EXPLAIN ANALYZE executes its statement: only an exact allowlisted diagnostic SELECT (T14S3); the rehearsal allows none.
+        (/^explain\s*\([^)]*\banalyze\b/i.test(s) && !allowedExplainAnalyze.has(sql)) ||
         (ddl && !allowedDdl.has(sql));
       if (bad) throw new Error(`dependency-read rehearsal refuses: ${s.replace(/\s+/g, " ").slice(0, 120)}`);
       sent.push(sql);
@@ -1014,12 +1019,32 @@ export function functionBody(text: string, qualified: string): string {
  */
 export async function rehearseDependencyReads(raw: Db, ctxIn: DependencyCtx, deps: DependencyDeps = DEFAULT_DEPENDENCY_DEPS): Promise<DependencyEvidence> {
   const ev = newDependencyEvidence();
+  await dependencyTransaction(raw, ctxIn, deps.read, ev, new Set(), (c, ctx, t) => deps.cases(c, ctx, { text0041: t.text41, ev }), "the rehearsal transaction rolled back (0040/0041 not installed)");
+  const ctx = failFast(ctxIn);
+  const missing = evidenceProblems(ev);
+  if (missing.length) throw new Error(missing.join("; "));
+  ev.complete = true;
+  ctx.emit(ev);
+  return ev;
+}
+
+/** What every 0040+0041 rollback transaction records (T14S3: shared by the rehearsal and the plan diagnostic). */
+export interface DependencyBaseEvidence { files: Array<{ path: string; sha256: string; lf: string; crlf: string }>; statementsApplied: number; functions: Record<string, unknown>; recorded: string[] }
+export type EmitCtx<E> = FlowCtx & { emit(ev: E): void };
+/**
+ * The shared skeleton (T14S1 behavior, unchanged): D0/D1 refusals before BEGIN,
+ * D2/D3 inside, the caller's work, ALWAYS rollback (a rollback failure kept
+ * beside the first error), then D9. `allowedExplainAnalyze` is the exact
+ * diagnostic SELECT allowlist (empty for the rehearsal).
+ */
+export async function dependencyTransaction<E extends DependencyBaseEvidence>(raw: Db, ctxIn: EmitCtx<E>, read: (p: string) => Buffer, ev: E, allowedExplainAnalyze: ReadonlySet<string>, inside: (c: Db, ctx: EmitCtx<E>, texts: { text40: string; text41: string }) => Promise<void>, done: string): Promise<void> {
+  const deps = { read };
   const text40 = deps.read(MIGRATION_0040).toString("utf8");
   const text41 = deps.read(MIGRATION_0041).toString("utf8");
   const body40 = migrationBody(text40);
   const body41 = migrationBody(text41);
-  const c = dependencyGuard(raw, new Set([...body40, ...body41]));
-  const tracked: DependencyCtx = { ...ctxIn, record: (o) => { ctxIn.record(o); if (o.ok && !ev.recorded.includes(o.id)) ev.recorded.push(o.id); } };
+  const c = dependencyGuard(raw, new Set([...body40, ...body41]), [], allowedExplainAnalyze);
+  const tracked: EmitCtx<E> = { ...ctxIn, record: (o) => { ctxIn.record(o); if (o.ok && !ev.recorded.includes(o.id)) ev.recorded.push(o.id); } };
   const ctx = failFast(tracked);
   await step(c, ctx, "D0", "file identities: installed 0037/0038/0039 and the exact reviewed 0040/0041 drafts", async () => {
     ev.files = [MIGRATION_0037, MIGRATION_0038, MIGRATION_0039, MIGRATION_0040, MIGRATION_0041].map((p) => fileIdentity(p, deps.read));
@@ -1070,7 +1095,7 @@ export async function rehearseDependencyReads(raw: Db, ctxIn: DependencyCtx, dep
       if (p.length) throw new Error(p.join("; "));
       ctx.emit(ev);
     });
-    await deps.cases(c, ctx, { text0041: text41, ev });
+    await inside(c, ctx, { text40, text41 });
     ctx.emit(ev);
   } catch (e) {
     try {
@@ -1081,10 +1106,5 @@ export async function rehearseDependencyReads(raw: Db, ctxIn: DependencyCtx, dep
     throw e;
   }
   await c.query("rollback");
-  ctx.record({ id: "D9", what: "the rehearsal transaction rolled back (0040/0041 not installed)", expected: "rollback", result: "rolled back", ok: true, ms: 0 });
-  const missing = evidenceProblems(ev);
-  if (missing.length) throw new Error(missing.join("; "));
-  ev.complete = true;
-  ctx.emit(ev);
-  return ev;
+  ctx.record({ id: "D9", what: done, expected: "rollback", result: "rolled back", ok: true, ms: 0 });
 }

@@ -2603,3 +2603,71 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - R6 is the only page-positioned walk (worker cs from FAR_PAST, 1,000-row pages). Its 30 big rows (15 owners plus 15 children, about 2.7 MB) are contiguous unless more than about 970 real cs rows fall between 2026-02-12 01:00 and 02:15 UTC. A boundary can split them only into two pages, and one page then holds at least 15 big rows, which is over 1 MiB, so it caps. I have not changed it. A direct anchored stream probe would make it unconditional; that is not done without authorization.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 119/119 focused; 1443/1443 tests (39 files); build OK.
   - **Limitations:** a passing unit test is not PostgreSQL evidence. Root reviews before one new rehearsal.
+- 2026-11-16 — T14S3 access-path diagnostic PREPARED, OFFLINE (Claude). I did not run it; no SQL was executed. Nothing was installed; there was no production access and no Task 15+ work. `api/`, `src/`, every migration, the dependencies, timeouts, limits and fixture volume are unchanged. The failed (`dcf9924`) and passing (`f072c24`) reports are untouched.
+  - **Prepared command (root runs it once):** `npm run staging:reporting-jobs -- --diagnose-dependency-plans --sites=uk,us`.
+    - The command refuses `--site`, unknown flags and combined modes.
+    - It runs in the same guarded lifecycle as the rehearsal: staging target checked before every SQL, baseline first, a fresh ROLLBACK_ONLY audit last, and a unique ignored `staging-results-reporting-publication-diagnose-dependency-plans-…md` report.
+    - The status is never COMPLETE without complete `dependencyPlans` evidence. COMPLETE means the evidence was collected, not that performance is acceptable.
+  - **Files:**
+    - new `tests/staging/reportingDependencyPlans.ts`;
+    - new `tests/reporting/reportingDependencyPlans.test.ts` (55 tests);
+    - minimal mode, report-section and status wiring in `reportingPublication.ts`;
+    - dispatch, flag and usage in `reporting-jobs.ts`;
+    - both new files added to `typecheck:digest`.
+  - **Shared-helper extraction (allowed by item 1).**
+    - From `reportingDependencyRehearsal.ts`:
+      - `boundReadQuery`, which `planSql` now wraps, producing the identical text;
+      - `dependencyTransaction`, the unchanged D0/D1-before-BEGIN, D2/D3, caller work, always-rollback (failure kept beside), D9 skeleton, which `rehearseDependencyReads` now calls;
+      - an optional exact `allowedExplainAnalyze` set on `dependencyGuard`. The rehearsal passes none, so it still refuses every EXPLAIN ANALYZE.
+    - All 119 rehearsal tests still pass. The 16 T14S1 and 14 T14S2 mutations are all still caught against the refactored skeleton.
+    - One rehearsal assertion was relaxed only to allow a further mode after `--rehearse-dependency-reads` in `main()`'s flag list.
+    - **Guard defect found and fixed:** `SET LOCAL statement_timeout` (and other `SET LOCAL` timeout/planner settings) was not refused; only `SET` and `SET SESSION` were. Neither mode ever sends it. Two rehearsal guard cases were added.
+  - **Transaction (rolled back):**
+    - D0–D3 as in the rehearsal: 0040 and 0041 must be the reviewed drafts, and none of 0040 may be installed.
+    - S0 turns capture and both processors on.
+    - S1 chooses the largest real order owner and the busiest real worker at the first site from `production_events`, then adds three named rows: `dr-pm-1` and `dr-pm-3` in that owner, and `dr-pe` as an event owner.
+    - R0 copies and freezes a rebuild of the FULL original source; R1 checks exact candidate/source identity.
+    - Rebuild probes run next. P0 is a SETUP ONLY zero-work publication that builds the base mirror.
+    - F0 makes named-row changes only: `dr-pm-1` and `dr-pe` overlay replacements, `dr-pm-2` inserted, `dr-pm-3` deleted as a tombstone. It then freezes a refresh, and the refresh probes run.
+    - No materializer and no repeat of the correctness suite.
+  - **Exact SELECTs:**
+    - The bound 0041 member and stream SELECTs, with `$1` batch, `$2` site, `$3` kind, then the call's parameters. A test proves that un-binding gives back the migration text.
+    - ONE split-owner alternative (`splitMembersSql`) replaces ONLY the two OR joins: mirror and candidate. Each is split into mutually exclusive `o.kind = 'order'` (`order_key = o.key`) and `o.kind = 'event'` (`event_id = o.key AND coalesce(order_key,'') = ''`) branches.
+    - Everything else is the same text: equality semantics and collations, ordinality, the batch overlay branch and tombstone NOT EXISTS (duplicated into both mirror branches), the outer cursor, `ORDER BY` and `LIMIT`. Reversing the two replacements gives the original byte for byte.
+    - No COLLATE rewrite, index or setting. It is a diagnostic candidate, not an approved fix.
+  - **EXPLAIN ANALYZE allowlist:** exactly `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON, TIMING OFF) ` plus each of those three statements. The guard refuses, before sending: EXPLAIN ANALYZE of DML, maintenance ANALYZE/VACUUM, any other or altered SELECT, another EXPLAIN option set, a function scan, planner settings, timeout changes and index creation.
+  - **Fixed matrix: 20 explained executions (cap 24, enforced at run time), per batch, rebuild then refresh:**
+    - members original/split first and later at a small diagnostic limit;
+    - members original/split at the normal limit of 1,000;
+    - streams after/before, first and later, at 1,000 rows on the full-volume worker.
+    - Per batch these are preceded by plain SELECTs (as service_role, like the invoker functions):
+      - `M-*-small` and `M-*-normal` require the original and the split to equal the independent frozen pages exactly (identities, order and canonical image) from `to_jsonb(production_events)`;
+      - `C-*-stream` takes the exact later-page cursors and checks result counts.
+    - The small limit is `floor(members/2)`, so the later page is genuinely non-empty. It is labelled pagination diagnosis, not throughput.
+    - Each explain must return exactly the independently expected row count.
+    - Each probe records statement, batch, page, limit, cursor, expected and actual rows, server planning and execution time, settings, and per-node scan, index, index condition, filters, join filter, plan and actual rows, loops, rows removed, sort key and method, and buffers.
+    - Output column lists are dropped; there are no source payloads; at most 80 nodes are kept.
+    - No retries; the first failure stops the run, which then rolls back and closes.
+  - **Offline outcomes.** 55 diagnostic tests cover:
+    - wiring and status;
+    - statement extraction and binding;
+    - split-only-differs and its semantics;
+    - the allowlist and 16 forbidden statements;
+    - the case matrix and evidence completeness;
+    - the non-empty later page;
+    - member ordering;
+    - `comparePages` sensitivity (missing, duplicate, reordered, extra, wrong overlay image, wrong owner index);
+    - plan summaries;
+    - stream counts;
+    - END-TO-END `runPlanCases` over a scripted in-memory database, with exactly 20 allowlisted explains, both batches, rollback and no COMMIT;
+    - failures in parity, first-page-only parity, the explain cap, explain row count, candidate parity, stream count, already-applied 0040 and incomplete evidence;
+    - service_role for every diagnostic SELECT;
+    - an emit failure, and a rollback failure kept beside the first error;
+    - the actual lifecycle with a fresh audit.
+  - **Mutations: 18/19 caught.** The survivor deletes the defensive "later page would be empty" check, which cannot fire: `smallLimit` always leaves a non-empty later page, as tested for every total from 2 to 12. Three earlier survivors (the explain cap, split parity on the first page only, and the service role) were closed with new tests.
+  - **Limitations:**
+    - Nothing has run against PostgreSQL. Plans, estimates, scan counts and timings, and the split's real ordering parity, are only knowable from root's single staging run.
+    - EXPLAIN ANALYZE with TIMING OFF still executes each SELECT; on staging that is 20 bounded reads.
+    - The refresh member probe relies on the overlay holding only the named rows (the cutoffs are equal, so there are no due keys).
+    - A stream rewrite is deliberately not included.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1500/1500 tests (40 files); build OK.

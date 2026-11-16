@@ -8,6 +8,7 @@
  *   npm run staging:reporting-jobs -- --interleavings --sites=A,B [--max-pages=N]
  *   npm run staging:reporting-jobs -- --rehearse-rebuild-repair --sites=uk,us [--max-pages=N]   (T13B2b-19 0039 rollback rehearsal; reportingRebuildRepair.ts)
  *   npm run staging:reporting-jobs -- --rehearse-dependency-reads --sites=uk,us [--max-pages=N]  (T14S1 0040+0041 rollback rehearsal; reportingDependencyRehearsal.ts)
+ *   npm run staging:reporting-jobs -- --diagnose-dependency-plans --sites=uk,us [--max-pages=N]  (T14S3 access-path diagnostic; reportingDependencyPlans.ts)
  *   npm run staging:reporting-jobs -- --explain-source-versions --site=uk [--max-pages=N]   (plan-only I4 diagnostic; reportingPlanDiagnostic.ts)
  *
  * The last three are Task 13 Part B2b's publication evidence
@@ -45,6 +46,7 @@ import { committedAllowance, newOwnership, runCommitted, type Ownership } from "
 import { runPlanDiagnostic } from "./reportingPlanDiagnostic";
 import { rehearseRebuildRepair } from "./reportingRebuildRepair";
 import { rehearseDependencyReads } from "./reportingDependencyRehearsal";
+import { diagnoseDependencyPlans } from "./reportingDependencyPlans";
 import {
   compareFullState,
   durableEvidence,
@@ -380,6 +382,11 @@ async function publicationMain(argv: string[]): Promise<number> {
         await rehearseDependencyReads(main, { sites, maxPages, staff, as, record, redact: redactSecrets, now: () => performance.now(), emit: (ev) => { report.dependency = ev as unknown as Record<string, unknown>; save(); } });
         return;
       }
+      if (mode === "diagnose-dependency-plans") {
+        // T14S3: exact allowlisted SELECTs under EXPLAIN ANALYZE inside ONE always-rolled-back transaction; the audit below allows ZERO changes.
+        await diagnoseDependencyPlans(main, { sites, maxPages, staff, as, record, redact: redactSecrets, now: () => performance.now(), emit: (ev) => { report.dependencyPlans = ev as unknown as Record<string, unknown>; save(); } });
+        return;
+      }
       if (mode === "explain-source-versions") {
         // B2b I4 diagnostic: plan only, one transaction that always rolls back; the audit below allows ZERO changes.
         await runPlanDiagnostic(main, { site: sites[0], maxPages, as, record, redact: redactSecrets, now: () => performance.now(), emit: (d) => { report.diagnostic = d as unknown as Record<string, unknown>; save(); } });
@@ -419,9 +426,9 @@ async function publicationMain(argv: string[]): Promise<number> {
 
 async function main(): Promise<number> {
   const flags = process.argv.slice(2).filter((a) => a.startsWith("--"));
-  if (flags.some((f) => f === "--baseline-smoke" || f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings" || f === "--committed-interleavings" || f === "--explain-source-versions" || f === "--rehearse-rebuild-repair" || f === "--rehearse-dependency-reads")) return publicationMain(flags);
+  if (flags.some((f) => f === "--baseline-smoke" || f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings" || f === "--committed-interleavings" || f === "--explain-source-versions" || f === "--rehearse-rebuild-repair" || f === "--rehearse-dependency-reads" || f === "--diagnose-dependency-plans")) return publicationMain(flags);
   if (flags.join(" ") !== "--fence") {
-    console.error("usage: npm run staging:reporting-jobs -- --fence | --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N] | --explain-source-versions --site=X [--max-pages=N] | --rehearse-rebuild-repair --sites=A,B [--max-pages=N] | --rehearse-dependency-reads --sites=A,B [--max-pages=N]");
+    console.error("usage: npm run staging:reporting-jobs -- --fence | --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N] | --explain-source-versions --site=X [--max-pages=N] | --rehearse-rebuild-repair --sites=A,B [--max-pages=N] | --rehearse-dependency-reads --sites=A,B [--max-pages=N] | --diagnose-dependency-plans --sites=A,B [--max-pages=N]");
     return 2;
   }
   const revision = (() => {

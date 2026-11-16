@@ -1,0 +1,374 @@
+/**
+ * T14S3: the prepared (NOT run) bounded access-path diagnostic, without a
+ * database: wiring, exact extracted SELECTs and the split-owner alternative,
+ * the EXPLAIN ANALYZE allowlist, the fixed case matrix, parity sensitivity,
+ * plan summaries, and the coordinator end to end over a scripted database.
+ */
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { compareStream } from "../../api/_lib/production-reporting-materialize";
+import { runCaptureLifecycle } from "../staging/reportingCapture";
+import {
+  comparePages, DIAG_PREFIX, diagnoseDependencyPlans, diagnosticStatements, EXPLAIN_CASES, expectedMembers, expectedStreamCount, explainAllowlist, MAX_EXPLAINS, memberPage, newPlanEvidence, OR_CANDIDATE, OR_MIRROR,
+  PLAN_SQL, planEvidenceProblems, REQUIRED_PLAN_CASES, runPlanCases, smallLimit, SPLIT_CANDIDATE, SPLIT_MIRROR, splitMembersSql, summarizePlan, type MemberRow, type PlanCtx, type PlanDeps, type PlanEvidence,
+} from "../staging/reportingDependencyPlans";
+import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
+import { compareFullState, migrationBody, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type Observation } from "../staging/reportingPublication";
+import { bodyHashes, FUNCTION_SQL, publishBody } from "../staging/reportingRebuildRepair";
+
+const read = (p: string) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
+const T41 = read(MIGRATION_0041);
+const ST = diagnosticStatements(T41);
+const S = "11111111-1111-4111-8111-111111111111";
+const S2 = "22222222-2222-4222-8222-222222222222";
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+describe("T14S3: argument and dispatch wiring", () => {
+  it("--diagnose-dependency-plans takes exactly --sites=A,B (and --max-pages)", () => {
+    expect(parsePublicationArgs(["--diagnose-dependency-plans", "--sites=uk,us"])).toMatchObject({ mode: "diagnose-dependency-plans", sites: ["uk", "us"], problems: [] });
+    for (const argv of [["--diagnose-dependency-plans", "--site=uk"], ["--diagnose-dependency-plans", "--sites=uk,uk"], ["--diagnose-dependency-plans", "--rehearse-dependency-reads", "--sites=uk,us"], ["--diagnose-dependency-plans", "--sites=uk,us", "--analyze"]]) expect(parsePublicationArgs(argv).mode).toBeNull();
+  });
+  it("the runner dispatches it inside the guarded lifecycle (baseline first, ROLLBACK_ONLY audit); main() and usage know the flag", () => {
+    const runner = read("tests/staging/reporting-jobs.ts");
+    const pub = runner.slice(runner.indexOf("async function publicationMain"), runner.indexOf("async function main()"));
+    expect(pub.indexOf("before = await fullState(main);")).toBeLessThan(pub.indexOf('if (mode === "diagnose-dependency-plans") {'));
+    expect(pub).toMatch(/await diagnoseDependencyPlans\(main, \{ sites, maxPages, staff, as, record, redact: redactSecrets, now: \(\) => performance\.now\(\), emit: \(ev\) => \{ report\.dependencyPlans = ev as unknown as Record<string, unknown>; save\(\); \} \}\);\n\s+return;/);
+    expect(pub).toMatch(/const allow = mode === "committed-interleavings" && own \? committedAllowance\(own\) : ROLLBACK_ONLY;/);
+    expect(pub).toContain('const out = `staging-results-reporting-publication-${mode}-'); // unique per run; never overwrites the earlier reports
+    const main = runner.slice(runner.indexOf("async function main()"));
+    expect(main).toMatch(/f === "--diagnose-dependency-plans"\)\) return publicationMain\(flags\);/);
+    expect(main).toContain("--diagnose-dependency-plans --sites=A,B [--max-pages=N]");
+  });
+  it("is never COMPLETE without complete plan evidence; other modes unchanged", () => {
+    const r = newPublicationReport("diagnose-dependency-plans", ["uk", "us"], "rev", "t0", "sha");
+    Object.assign(r, { finishedAt: "t1", restorationVerified: true, observations: [{ id: "D0", what: "x", expected: "y", result: "ok", ok: true, ms: 0 }] });
+    expect(publicationStatus(r)).toBe("STATUS: FAILED – dependency-plan evidence is missing or incomplete");
+    r.dependencyPlans = { ...newPlanEvidence(), complete: true };
+    expect(publicationStatus(r)).toBe("STATUS: COMPLETE");
+    const d = newPublicationReport("rehearse-dependency-reads", ["uk", "us"], "rev", "t0", "sha");
+    Object.assign(d, { finishedAt: "t1", restorationVerified: true, observations: r.observations, dependency: { complete: true } });
+    expect(publicationStatus(d)).toBe("STATUS: COMPLETE");
+  });
+  it("the strict API typecheck includes the diagnostic module and this test", () => {
+    const s = (JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }).scripts["typecheck:digest"];
+    expect(s).toContain("tests/staging/reportingDependencyPlans.ts");
+    expect(s).toContain("tests/reporting/reportingDependencyPlans.test.ts");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Exact statements
+// ---------------------------------------------------------------------------
+
+describe("T14S3: exact extracted SELECTs and the ONE split-owner alternative", () => {
+  it("the original member and stream statements are the bound 0041 SELECTs (un-binding gives back the migration text)", () => {
+    expect(ST["members-original"]).toBe(boundReadQuery(T41, "read_reporting_owner_members"));
+    expect(ST.stream).toBe(boundReadQuery(T41, "read_reporting_staff_stream"));
+    const names = ["b.batch_id", "b.site", "b.kind", "p_owners", "p_after_index", "p_after_event_id", "p_limit"];
+    expect(ST["members-original"].replace(/\$(\d+)::[a-z]+/g, (_, n) => names[Number(n) - 1])).toBe(effectiveReadQuery(T41, "read_reporting_owner_members"));
+  });
+  it("the split differs from the original ONLY in its two OR joins (each replaced once; reversing gives the original exactly)", () => {
+    const split = splitMembersSql(T41);
+    expect(split).not.toBe(ST["members-original"]);
+    expect(split.replace(SPLIT_MIRROR, OR_MIRROR).replace(SPLIT_CANDIDATE, OR_CANDIDATE)).toBe(ST["members-original"]);
+    expect(split).not.toMatch(/OR \(o\.kind/);
+    expect(ST["members-original"].match(/OR \(o\.kind/g)).toHaveLength(2);
+    expect(split.match(/UNION ALL/g)!.length).toBe(ST["members-original"].match(/UNION ALL/g)!.length + 2);
+    for (const q of [split, ST["members-original"]]) expect([...new Set([...q.matchAll(/\$(\d+)/g)].map((m) => Number(m[1])))].sort()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+  });
+  it("the split keeps equality semantics, ordinality, overlay/tombstone rules, outer cursor, order and limit; no COLLATE rewrite or index", () => {
+    const split = splitMembersSql(T41);
+    for (const branch of [SPLIT_MIRROR, SPLIT_CANDIDATE]) {
+      expect(branch).toMatch(/order_key = o\.key\n/);
+      expect(branch).toMatch(/event_id = o\.key AND coalesce\(s?c?\.?order_key, ''\) = ''/);
+      expect(branch).not.toMatch(/COLLATE/);
+    }
+    expect(SPLIT_MIRROR.match(/NOT EXISTS \(SELECT 1 FROM reporting_private\.batch_events be WHERE be\.batch_id = \$1::uuid AND be\.site = \$2::text AND be\.event_id = s\.event_id\)/g)).toHaveLength(2);
+    expect(split).toContain("WITH ORDINALITY AS x(v, ord)");
+    expect(split).toContain('ORDER BY m.idx, m.event_id COLLATE "C"');
+    expect(split.trimEnd().endsWith("LIMIT $7::integer")).toBe(true);
+    expect(split).toContain("CROSS JOIN LATERAL reporting_private.owner_partition(be.image) op"); // the batch overlay branch is unchanged
+    expect(split).not.toMatch(/\bCREATE\b|\bINDEX\b|\bSET\b/);
+  });
+  it("refuses a 0041 text whose OR joins changed (no silent alternative)", () => {
+    expect(() => splitMembersSql(T41.replace("(o.kind = 'event' AND sc.event_id = o.key", "(o.kind = 'event' AND sc.event_id = o.key "))).toThrow(/exactly the two expected OR joins/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Allowlist / guard
+// ---------------------------------------------------------------------------
+
+describe("T14S3: EXPLAIN ANALYZE only for the exact allowlisted diagnostic SELECTs", () => {
+  const body = [...migrationBody(read(MIGRATION_0040)), ...migrationBody(T41)];
+  const allow = explainAllowlist(T41);
+  const raw = () => {
+    const sent: string[] = [];
+    return { sent, db: { query: async (q: string) => (sent.push(q), { rows: [], rowCount: 0 }) } as Db };
+  };
+  it("the allowlist is exactly the three statements with the diagnostic prefix (BUFFERS, SETTINGS, TIMING OFF)", () => {
+    expect([...allow].sort()).toEqual([DIAG_PREFIX + ST["members-original"], DIAG_PREFIX + ST["members-split"], DIAG_PREFIX + ST.stream].sort());
+    expect(DIAG_PREFIX).toBe("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON, TIMING OFF) ");
+  });
+  it("lets through the three allowlisted statements and their plain SELECTs", async () => {
+    const r = raw();
+    const g = dependencyGuard(r.db, new Set(body), [], allow);
+    for (const q of [...allow, ST["members-original"], ST["members-split"], ST.stream]) await g.query(q);
+    expect(r.sent).toHaveLength(6);
+  });
+  const forbidden = [
+    `EXPLAIN (ANALYZE) INSERT INTO public.production_events (id) VALUES ('x')`, `EXPLAIN (ANALYZE, BUFFERS) UPDATE reporting_private.batches SET state = 'failed'`, `EXPLAIN (ANALYZE, FORMAT JSON) DELETE FROM reporting_private.source_candidate`,
+    "analyze reporting_private.source_candidate", "ANALYZE", "vacuum reporting_private.source_candidate", `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON, TIMING OFF) select 1`,
+    `EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) ${ST["members-original"]}`, DIAG_PREFIX + ST["members-original"].replace("LIMIT", "LIMIT  "), DIAG_PREFIX + ST.stream + ";", `${DIAG_PREFIX}SELECT * FROM public.read_reporting_staff_stream($1, $2, $3, $4, $5, $6, $7)`,
+    "set enable_seqscan = off", "set local statement_timeout = 0", "select set_config('enable_nestloop', 'off', true)", "set random_page_cost = 1", "create index x on reporting_private.source_candidate (order_key)",
+  ];
+  for (const sql of forbidden) {
+    it(`refuses before sending: ${sql.slice(0, 70)}`, async () => {
+      const r = raw();
+      await expect(dependencyGuard(r.db, new Set(body), [], allow).query(sql)).rejects.toThrow(/dependency-read rehearsal refuses/);
+      expect(r.sent).toEqual([]);
+    });
+  }
+  it("the existing rehearsal (no allowlist) still cannot execute EXPLAIN ANALYZE, even of a diagnostic statement", async () => {
+    const r = raw();
+    for (const q of allow) await expect(dependencyGuard(r.db, new Set(body)).query(q)).rejects.toThrow(/refuses/);
+    expect(r.sent).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fixed matrix, pagination, comparisons, summaries
+// ---------------------------------------------------------------------------
+
+describe("T14S3: fixed case matrix and evidence", () => {
+  it("20 explained executions (at most 24): rebuild and refresh x members original/split first/later/normal + streams before/after first/later", () => {
+    expect(EXPLAIN_CASES).toHaveLength(20);
+    expect(EXPLAIN_CASES.length).toBeLessThanOrEqual(MAX_EXPLAINS);
+    expect(MAX_EXPLAINS).toBe(24);
+    for (const id of ["D0", "D1", "D2", "D3", "R0", "R1", "M-rb-small", "M-rb-normal", "C-rb-stream", "P0", "F0", "M-rf-small", "M-rf-normal", "C-rf-stream", "D9"]) expect(REQUIRED_PLAN_CASES).toContain(id);
+    for (const id of EXPLAIN_CASES) expect(REQUIRED_PLAN_CASES).toContain(id);
+  });
+  it("planEvidenceProblems: missing case, missing probe or a wrong explain count is never complete", () => {
+    const ev = newPlanEvidence();
+    ev.recorded = [...REQUIRED_PLAN_CASES];
+    ev.explains = 20;
+    for (const id of EXPLAIN_CASES) ev.probes[id] = {} as PlanEvidence["probes"][string];
+    expect(planEvidenceProblems(ev)).toEqual([]);
+    expect(planEvidenceProblems({ ...ev, recorded: ev.recorded.filter((x) => x !== "M-rf-small") }).join()).toMatch(/not recorded: M-rf-small/);
+    const { "E-rf-sb-2": _gone, ...rest } = ev.probes;
+    void _gone;
+    expect(planEvidenceProblems({ ...ev, probes: rest }).join()).toMatch(/plan evidence is missing for: E-rf-sb-2/);
+    expect(planEvidenceProblems({ ...ev, explains: 21 }).join()).toMatch(/21 explained executions, expected exactly 20/);
+    expect(ev.label).toMatch(/not acceptable performance/);
+    expect(ev.label).toMatch(/not an approved fix/);
+  });
+  it("smallLimit makes the later page genuinely non-empty; fewer than 2 members is refused", () => {
+    for (let n = 2; n <= 12; n++) {
+      const all: MemberRow[] = Array.from({ length: n }, (_, i) => ({ idx: 0, event_id: `e${String(i).padStart(2, "0")}`, img: {} }));
+      const L = smallLimit(n);
+      const p1 = memberPage(all, null, L);
+      const p2 = memberPage(all, { idx: 0, id: p1[p1.length - 1].event_id }, L);
+      expect(p1.length).toBe(L);
+      expect(p2.length).toBeGreaterThan(0);
+    }
+    expect(() => smallLimit(1)).toThrow(/at least 2/);
+  });
+  it("expectedMembers keeps owner ordinality and bytewise ids; an event owner only for its blank-order event; absent rows (tombstones) are not members", () => {
+    const img = (id: string, order: string | null) => ({ img: { id, location: "uk", event_type: "started", created_at: "2026-02-10T08:00:00+00:00", order_number: order, staff_id: S } });
+    const v = rawView([img("b", "O-1"), img("a", "O-1"), img("e1", "   "), img("e2", "O-2"), img("\u{1F600}", "O-1")], "uk");
+    const got = expectedMembers(v, [{ partitionKind: "event", partitionKey: "e1" }, { partitionKind: "order", partitionKey: "O-1" }]);
+    expect(got.map((r) => [r.idx, r.event_id])).toEqual([[0, "e1"], [1, "a"], [1, "b"], [1, "\u{1F600}"]]);
+  });
+  describe("comparePages catches missing, duplicate, reordered, extra and wrong-image rows", () => {
+    const want: MemberRow[] = [{ idx: 0, event_id: "a", img: { n: 1 } }, { idx: 0, event_id: "b", img: { n: 2 } }, { idx: 1, event_id: "c", img: { n: 3 } }];
+    const row = (r: MemberRow, img: unknown = r.img) => ({ idx: r.idx, event_id: r.event_id, image: img });
+    it("accepts the exact page", () => expect(comparePages("x", want, want.map((r) => row(r)))).toEqual([]));
+    it("missing", () => expect(comparePages("x", want, [row(want[0]), row(want[2])]).join()).toMatch(/2 rows, expected 3/));
+    it("duplicate", () => expect(comparePages("x", want, [row(want[0]), row(want[0]), row(want[2])]).join()).toMatch(/returned twice/));
+    it("reordered", () => expect(comparePages("x", want, [row(want[1]), row(want[0]), row(want[2])]).join()).toMatch(/position 0/));
+    it("extra", () => expect(comparePages("x", want, [...want.map((r) => row(r)), { idx: 1, event_id: "d", image: {} }]).join()).toMatch(/4 rows, expected 3/));
+    it("incorrect overlay image", () => expect(comparePages("x", want, [row(want[0]), row(want[1], { n: 9 }), row(want[2])]).join()).toMatch(/"b" image differs/));
+    it("wrong owner index", () => expect(comparePages("x", want, [row(want[0]), row(want[1]), { ...row(want[2]), idx: 0 }]).join()).toMatch(/position 2/));
+  });
+  it("summarizePlan keeps scans, conditions, actual/estimated rows, loops, removed rows, sort, buffers and server times; never Output; bounded", () => {
+    const plan = [{ Plan: { "Node Type": "Limit", "Plan Rows": 1, "Actual Rows": 3, "Actual Loops": 1, Output: ["m.image"], Plans: [{ "Node Type": "Sort", "Sort Key": ["m.idx"], "Sort Method": "quicksort", "Sort Space Used": 25, "Actual Rows": 3, Plans: [{ "Node Type": "Index Scan", "Index Name": "source_candidate_pkey", "Relation Name": "source_candidate", "Index Cond": "(batch_id = $1)", "Join Filter": "(...)", "Rows Removed by Join Filter": 43387, "Plan Rows": 1, "Actual Rows": 3, "Actual Loops": 2, "Shared Hit Blocks": 900, "Shared Read Blocks": 12, Output: ["sc.image"] }] }] }, "Planning Time": 0.4, "Execution Time": 88.1, Settings: { work_mem: "4MB" } }];
+    const s = summarizePlan(plan);
+    expect(s).toMatchObject({ planningMs: 0.4, executionMs: 88.1, rootRows: 3, settings: { work_mem: "4MB" }, truncated: false });
+    expect(s.nodes[2]).toMatchObject({ depth: 2, "Index Name": "source_candidate_pkey", "Rows Removed by Join Filter": 43387, "Actual Loops": 2, "Shared Read Blocks": 12, "Plan Rows": 1 });
+    expect(s.nodes[1]).toMatchObject({ "Sort Method": "quicksort" });
+    expect(JSON.stringify(s)).not.toContain("Output");
+    const deep: Record<string, unknown> = { "Node Type": "Result" };
+    let n = deep;
+    for (let i = 0; i < 100; i++) { const k = { "Node Type": "Result" }; n.Plans = [k]; n = k; }
+    const t = summarizePlan([{ Plan: deep }]);
+    expect(t.nodes).toHaveLength(80);
+    expect(t.truncated).toBe(true);
+    expect(() => summarizePlan([])).toThrow(/no JSON plan/);
+  });
+  it("expectedStreamCount uses the exact instant and bytewise id, away from the cursor, capped at the limit", () => {
+    const img = (id: string, at: string, s = S) => ({ img: { id, location: "uk", event_type: "started", created_at: at, order_number: "O", staff_id: s } });
+    const v = rawView([img("a", "2026-02-10T08:00:00+00:00"), img("b", "2026-02-10T08:00:00+00:00"), img("c", "2026-02-10T08:00:00.000001+00:00"), img("d", "2026-02-10T09:00:00+00:00", S2)], "uk");
+    expect(expectedStreamCount(v, S, "after", { at: "2026-02-10T08:00:00Z", id: "a" }, 1000)).toBe(2);
+    expect(expectedStreamCount(v, S, "before", { at: "2026-02-10T08:00:00.000001Z", id: "c" }, 1000)).toBe(2);
+    expect(expectedStreamCount(v, S, "after", { at: "2000-01-01T00:00:00Z", id: "" }, 1)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// End to end over a scripted database
+// ---------------------------------------------------------------------------
+
+type Img = Record<string, unknown> & { id: string; location: string; order_number: string | null; staff_id: string | null; created_at: string };
+type Fail = Partial<Record<"splitFirstDrop" | "splitReordered" | "explainRows" | "rollbackFails" | "alreadyApplied" | "candidateDiffers" | "streamShort", boolean>>;
+function scriptedDb(fail: Fail = {}) {
+  const sent: string[] = [];
+  const t40 = read(MIGRATION_0040);
+  const b39 = bodyHashes(publishBody(read("supabase/migrations/0039_reporting_rebuild_insert.sql")))[0];
+  const src = new Map<string, Img>();
+  const mk = (id: string, order: string | null, staff: string, at: string): Img => ({ id, location: "uk", order_number: order, staff_id: staff, created_at: at, event_type: "started", department: "framed", line_sku: null, line_quantity: null, parent_event_id: null, cs_case_id: null, note: "", station_id: "s" });
+  for (let i = 0; i < 4; i++) src.set(`r-o${i}`, mk(`r-o${i}`, "O-1", S, `2026-02-0${i + 1}T08:00:00+00:00`));
+  for (let i = 0; i < 30; i++) src.set(`r-s${String(i).padStart(2, "0")}`, mk(`r-s${String(i).padStart(2, "0")}`, `O-${100 + i}`, S2, `2026-01-0${(i % 9) + 1}T0${i % 10}:00:00+00:00`));
+  const view = () => rawView([...src.values()].map((img) => ({ img })), "uk");
+  const members = (params: unknown[]) => {
+    const owners = (JSON.parse(String(params[3])) as Array<[string, string]>).map(([k, key]) => ({ partitionKind: k as "order" | "event", partitionKey: key }));
+    const after = params[4] === null ? null : { idx: Number(params[4]), id: String(params[5]) };
+    return memberPage(expectedMembers(view(), owners), after, Number(params[6])).map((r) => ({ idx: r.idx, event_id: r.event_id, image: r.img }));
+  };
+  const stream = (params: unknown[]) => {
+    const [staff, dir, at, atId, limit] = [String(params[3]), String(params[4]), String(params[5]), String(params[6]), Number(params[7])];
+    const anchor = { created_at: at, id: atId };
+    const xs = view().events.filter((e) => e.staff_id === staff && (dir === "after" ? compareStream(e, anchor) > 0 : compareStream(e, anchor) < 0)).sort(compareStream);
+    if (dir === "before") xs.reverse();
+    return xs.slice(0, fail.streamShort ? Math.max(0, limit - 995) : limit).map((e) => ({ event_id: e.id, image: src.get(e.id) }));
+  };
+  let batch = 0;
+  const db: Db = {
+    query: async (sql: string, params: unknown[] = []) => {
+      sent.push(sql);
+      const rows = (r: Array<Record<string, unknown>>) => ({ rows: r, rowCount: r.length });
+      if (sql === "rollback" && fail.rollbackFails) throw new Error("connection terminated");
+      if (sql === FUNCTION_SQL) return rows([{ body_md5: b39, security_definer: false, service_exec: true, authenticated_exec: false, anon_exec: false }]);
+      if (sql === CASE_SQL.absent) return rows([{ functions: fail.alreadyApplied ? 7 : 0, indexes: 0, active: 0, marker: 1 }]);
+      if (sql === CASE_SQL.collisions) return rows([{ n: 0 }]);
+      if (sql === CASE_SQL.effective) return rows(["frozen_read_batch", "list_reporting_owners", "read_reporting_changed_keys", "read_reporting_children", "read_reporting_events_by_id", "read_reporting_owner_members", "read_reporting_staff_stream"].map((name) => ({ name, body_md5: bodyHashes(name === "frozen_read_batch" ? functionBody(t40, "reporting_private.frozen_read_batch") : functionBody(T41, `public.${name}`))[0], definer: false, config: 'search_path=""', anon: false, authenticated: false, service: true })));
+      if (sql === CASE_SQL.indexes) return rows([{ n: 4 }]);
+      if (sql === PLAN_SQL.owner) return rows([{ k: "O-1", raw: "O-1", n: 4 }]);
+      if (sql === PLAN_SQL.staff) return rows([{ s: S2, n: 30 }]);
+      if (sql.startsWith("insert into public.production_events")) {
+        for (const x of JSON.parse(String(params[1])) as Array<Record<string, unknown>>) src.set(String(x.id), { ...mk(String(x.id), x.order_number as string, String(x.staff_id), String(x.created_at)), note: String(x.note) });
+        return rows([]);
+      }
+      if (sql.startsWith("update public.production_events set note")) { for (const id of ["dr-pm-1", "dr-pe"]) src.set(id, { ...src.get(id)!, note: "diagnostic overlay" }); return rows([]); }
+      if (sql.startsWith("delete from public.production_events")) { src.delete("dr-pm-3"); return rows([]); }
+      if (sql.includes("begin_reporting_rebuild") || sql.includes("begin_reporting_batch")) return rows([{ batch_id: `aaaaaaaa-aaaa-4aaa-8aaa-00000000000${++batch}`, lease_fence: 1 }]);
+      if (sql.includes("copy_reporting_source_page")) return rows([{ complete: true, pages: 1, total_rows: src.size }]);
+      if (sql === CASE_SQL.batch) return rows([{ batch_id: params[0], fence: "1", cutoff: "2026-03-01T00:00:00.000000Z", state: "frozen", kind: batch === 1 ? "rebuild" : "refresh" }]);
+      if (sql === CASE_SQL.view) return rows([...src.values()].map((img) => ({ img })));
+      if (sql === CASE_SQL.candidateEquality) return rows([{ candidate_rows: String(src.size), source_rows: String(src.size), candidate_md5: fail.candidateDiffers ? "x" : "m", source_md5: "m" }]);
+      if (sql.includes("publish_reporting_batch")) return rows([{ generation_seq: "1" }]);
+      if (sql === ST["members-original"]) return rows(members(params));
+      if (sql === ST["members-split"]) { const r = members(params); const first = params[4] === null && Number(params[6]) < 1000; return rows(fail.splitReordered ? [...r].reverse() : fail.splitFirstDrop && first ? r.slice(0, -1) : r); }
+      if (sql === ST.stream) return rows(stream(params));
+      if (sql.startsWith(DIAG_PREFIX)) {
+        const q = sql.slice(DIAG_PREFIX.length);
+        const n = q === ST.stream ? stream(params).length : members(params).length;
+        return rows([{ "QUERY PLAN": [{ Plan: { "Node Type": "Limit", "Actual Rows": fail.explainRows ? n + 1 : n, "Plan Rows": 1, Plans: [{ "Node Type": "Index Scan", "Index Name": "x", "Actual Rows": n, Output: ["image"] }] }, "Planning Time": 0.1, "Execution Time": 2 }] }]);
+      }
+      return rows([]);
+    },
+  };
+  return { db, sent };
+}
+function planCtx(over: Partial<PlanCtx> = {}): { ctx: PlanCtx; recorded: Observation[]; emitted: PlanEvidence[] } {
+  const recorded: Observation[] = [];
+  const emitted: PlanEvidence[] = [];
+  return { recorded, emitted, ctx: { sites: ["uk", "us"], maxPages: 200, staff: S, as: async () => undefined, record: (o) => void recorded.push(o), redact: (s) => s, now: () => 0, emit: (e) => void emitted.push(JSON.parse(JSON.stringify(e)) as PlanEvidence), ...over } };
+}
+const realDeps = (over: Partial<PlanDeps> = {}): PlanDeps => ({ read: (p) => readFileSync(p), cases: runPlanCases, ...over });
+
+describe("T14S3: the diagnostic end to end (real cases over a scripted database)", () => {
+  it("success: refusals before BEGIN, the reviewed bodies, exactly 20 allowlisted explains, parity on both batches, ROLLBACK, never COMMIT; COMPLETE evidence", async () => {
+    const s = scriptedDb();
+    const t = planCtx();
+    const ev = await diagnoseDependencyPlans(s.db, t.ctx, realDeps());
+    const begin = s.sent.indexOf("begin");
+    expect(s.sent.slice(0, begin)).toEqual([FUNCTION_SQL, CASE_SQL.absent, CASE_SQL.collisions]);
+    expect(s.sent.at(-1)).toBe("rollback");
+    expect(s.sent.some((q) => /^\s*(commit|end)\b/i.test(q))).toBe(false);
+    const explains = s.sent.filter((q) => /^\s*explain/i.test(q));
+    expect(explains).toHaveLength(20);
+    const allow = explainAllowlist(T41);
+    expect(explains.every((q) => allow.has(q))).toBe(true);
+    expect(ev.complete).toBe(true);
+    expect(ev.explains).toBe(20);
+    expect(Object.keys(ev.probes).sort()).toEqual([...EXPLAIN_CASES].sort());
+    expect(t.recorded.map((o) => o.id)).toEqual([...REQUIRED_PLAN_CASES.slice(0, 8), "M-rb-small", "M-rb-normal", ...EXPLAIN_CASES.slice(0, 6), "C-rb-stream", ...EXPLAIN_CASES.slice(6, 10), "P0", "F0", "M-rf-small", "M-rf-normal", ...EXPLAIN_CASES.slice(10, 16), "C-rf-stream", ...EXPLAIN_CASES.slice(16), "D9"]);
+    expect(t.recorded.every((o) => o.ok)).toBe(true);
+    expect(ev.comparisons).toMatchObject({ "rb-small": "exact (3 + 3 of 7)", "rf-small": "exact (3 + 3 of 7)" }); // 4 real + 2 order fixtures + 1 event owner; refresh: +dr-pm-2, -dr-pm-3
+    expect(ev.probes["E-rb-mo-2"]).toMatchObject({ statement: "members-original", batch: "rebuild", page: "later (small)", limit: 3, expectedRows: 3, actualRows: 3, cursor: { idx: 0, id: "r-o0" } });
+    expect(ev.probes["E-rf-sa-2"].expectedRows).toBe(0); // 30 rows: the later 1,000-row page is empty (recorded, not forced)
+    expect(JSON.stringify(ev)).not.toMatch(/diagnostic overlay|"note"/); // no source payloads in evidence
+    expect(t.emitted.at(-1)!.complete).toBe(true);
+  });
+  const failures: Array<[string, Fail, Partial<PlanDeps>, RegExp]> = [
+    ["the split returns reordered rows (parity)", { splitReordered: true }, {}, /M-rb-small failed/],
+    ["the split drops a row on the small FIRST page only (parity)", { splitFirstDrop: true }, {}, /M-rb-small failed/],
+    ["the fixed explain cap is reached", {}, { cases: async (c, ctx, env) => { env.ev.explains = MAX_EXPLAINS - 1; await runPlanCases(c, ctx, env); } }, /E-rb-mo-2 failed/],
+    ["an explained execution returns a different row count", { explainRows: true }, {}, /E-rb-mo-1 failed/],
+    ["the candidate is not the full source", { candidateDiffers: true }, {}, /R1 failed/],
+    ["a stream first page does not match the independent count", { streamShort: true }, {}, /C-rb-stream failed/],
+    ["0040 is already applied", { alreadyApplied: true }, {}, /D1 failed/],
+    ["the cases record nothing (incomplete evidence)", {}, { cases: async () => undefined }, /not recorded: S0/],
+  ];
+  for (const [name, fail, dep, re] of failures) {
+    it(`stops, rolls back (if begun) and is never complete when ${name}`, async () => {
+      const s = scriptedDb(fail);
+      const t = planCtx();
+      await expect(diagnoseDependencyPlans(s.db, t.ctx, realDeps(dep))).rejects.toThrow(re);
+      if (s.sent.includes("begin")) expect(s.sent.at(-1)).toBe("rollback");
+      expect(s.sent.some((q) => /^\s*commit\b/i.test(q))).toBe(false);
+      expect(t.emitted.every((e) => !e.complete)).toBe(true);
+    });
+  }
+  it("every diagnostic SELECT, plain or explained, runs as service_role (as the invoker functions would)", async () => {
+    const s = scriptedDb();
+    let service = false;
+    const roles: Array<[boolean, string]> = [];
+    const db: Db = { query: async (q: string, p?: unknown[]) => (roles.push([service, q]), s.db.query(q, p)) };
+    await diagnoseDependencyPlans(db, planCtx({ as: async (_c, sv) => void (service = sv) }).ctx, realDeps());
+    const diag = roles.filter(([, q]) => q === ST["members-original"] || q === ST["members-split"] || q === ST.stream || q.startsWith(DIAG_PREFIX));
+    expect(diag.length).toBe(20 + 2 * (4 + 2 + 2)); // 20 explains + per batch: 4 small and 2 normal plain member pages, 2 plain stream first pages
+    expect(diag.every(([sv]) => sv)).toBe(true);
+    expect(service).toBe(false); // reset after each
+  });
+  it("an evidence (emit) failure stops and still rolls back", async () => {
+    const s = scriptedDb();
+    let n = 0;
+    await expect(diagnoseDependencyPlans(s.db, planCtx({ emit: () => { if (++n === 3) throw new Error("ENOSPC"); } }).ctx, realDeps())).rejects.toThrow(/D3 failed/);
+    expect(s.sent.at(-1)).toBe("rollback");
+  });
+  it("a rollback failure after an earlier failure is kept BESIDE it", async () => {
+    await expect(diagnoseDependencyPlans(scriptedDb({ splitReordered: true, rollbackFails: true }).db, planCtx().ctx, realDeps())).rejects.toThrow(/^M-rb-small failed; later steps depend on it; cleanup failed: rehearsal rollback: connection terminated$/);
+  });
+  for (const [name, dep, change] of [["success", {}, false], ["incomplete evidence", { cases: async () => undefined }, false], ["an unexpected change", {}, true]] as const) {
+    it(`inside the actual lifecycle (${name}): rolled back and closed, a fresh ZERO-change audit, COMPLETE only with complete evidence`, async () => {
+      const report = newPublicationReport("diagnose-dependency-plans", ["uk", "us"], "rev", "t0", "sha");
+      const st = (x: string): FullState => ({ surfaces: { "index:reporting_private.source_candidate_owner_order": x }, privateTables: {}, control: { capture_epoch: "21", capture_enabled: false, rule_version: "r", updated_at: "t" }, siteState: [] });
+      const conns: Array<{ s: ReturnType<typeof scriptedDb>; ended: boolean }> = [];
+      await runCaptureLifecycle(report, {
+        open: async () => { const s = scriptedDb(); const o = { s, ended: false }; conns.push(o); return { query: s.db.query, end: async () => void (o.ended = true) }; },
+        body: async (main) => { await diagnoseDependencyPlans(main as unknown as Db, planCtx({ record: (o) => void report.observations.push(o), emit: (e) => void (report.dependencyPlans = e as unknown as Record<string, unknown>) }).ctx, realDeps(dep as Partial<PlanDeps>)); },
+        audit: async () => compareFullState(st("absent"), st(change ? "present" : "absent"), ROLLBACK_ONLY),
+        save: () => undefined, now: () => "t1", redact: (x) => x, stderr: () => undefined,
+      });
+      expect(conns).toHaveLength(2);
+      expect(conns.every((o) => o.ended)).toBe(true);
+      expect(conns[0].s.sent.includes("rollback")).toBe(true);
+      if (name === "success") expect(publicationStatus(report)).toBe("STATUS: COMPLETE");
+      else expect(publicationStatus(report)).toMatch(/^STATUS: FAILED/);
+    });
+  }
+});
