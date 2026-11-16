@@ -1578,6 +1578,8 @@ Coder writes here when it hits something this plan did not foresee; stop the aff
   Decide whether a follow-up should move them to the shared evidence. No change is made under F1.
 - **Task 8/9 (coder, for CJ): `docs/RELEASING.md` digest status table is now incomplete.** The digest adds 400 `Invalid date` and 500 `Full-site report needs SUPABASE_SERVICE_ROLE_KEY`, and no longer falls back to the anon key. The plan does not list RELEASING.md, so I documented these in `docs/releases/item-counting.md` only. Release prerequisite: `SUPABASE_SERVICE_ROLE_KEY` must be set in Production and Preview before deploy.
 
+- **Task 16 (coder, for root/CJ): dev-only embedded PostgreSQL for SQL parity tests.** No local PostgreSQL is available, so the 0044 summary/detail SQL can otherwise be validated only textually and by root's staging harness. Proposal: add `@electric-sql/pglite` as a **devDependency** used only by vitest. It would run the reporting migrations (with the Supabase roles/`auth.users` stubbed) and compare 0044's results with `referenceSummary`/`referenceTimingLines` over the Task 11 fixtures. It changes no app, API or runtime code and adds nothing to the browser bundle. Not added; awaiting a decision. Task 16's server layer and the staging harness proceed independently.
+
 ## Implementation log
 
 Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. (Written before implementation started; the entries below record what was actually done, including failed runs and amendments.)
@@ -2787,3 +2789,33 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Cleanup's `valid_to_seq` deletes rely on existing validity indexes; their cost at scale is a Task 19 item.
     - Retention is not scheduled automatically; it is the operator `cleanup` action (a schedule can be added once entitlement is known).
   - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK (includes all new modules); strict runners OK; 1554/1554 tests (41 files); build OK.
+- 2026-11-16 — **Task 16 checkpoint 1: authorized summary/detail server layer, OFFLINE** (Claude). Not complete: the 0044 SQL reader and the staging parity harness are still to be written. No SQL; nothing applied. Task 16 stays unchecked.
+  - **Files:**
+    - new `api/_lib/production-reporting.ts`: principal, audience, freshness, signed cursors, generation checks, `readPublishedSummary`/`readPublishedDetail`, error mapping;
+    - new `api/_lib/production-reporting-rpc.ts`: the 0044 RPC reader contract and Supabase auth/caller-JWT dependencies;
+    - new handlers `api/reports/summary.ts`, `api/reports/detail.ts`;
+    - new `tests/api/reporting-reads.test.ts` (74 tests);
+    - API modules added to `typecheck:digest`. The test is left out because it imports the app's `permissions.ts` through the `@/` alias, which the CLI typecheck does not resolve; vitest runs it.
+  - **Authorization on every request and page:**
+    - The app JWT is verified via `auth.getUser(token)`. The current profile (role, `allowed_nav`) and `user_locations` are read with the CALLER's JWT. Nothing comes from request fields or JWT metadata.
+    - `effectiveNav` is a server mirror of `effectiveNavAccess`, proven equal over 6 roles × 7 overrides.
+    - Audience: owner/manager/kiosk/CS → site; staff → self (limited "own work only"), even when explicitly granted Reports, and even with another worker's `staffId`, which is only a filter inside self.
+    - Reports needs the `reports` nav; Welcome needs `welcome`. No membership → 403; unknown role → 403.
+  - **Generations:**
+    - missing → 503; a missing pinned generation → 410 (reload the whole view);
+    - building, failed or incomplete → 503;
+    - expired, or past `expires_at` → 410;
+    - another site's generation → 400.
+    - Freshness is measured from verified coverage: ≤30 min current, ≤120 min delayed, else outdated. A stale generation is labelled, never zeroed.
+  - **Detail pages and responses:**
+    - Pages are ≤1,000 rows and ≤1 MiB; an oversized page or summary is an explicit 503 TOO_LARGE, never clipped.
+    - Cursors are opaque and HMAC-signed (`REPORTING_CURSOR_SECRET`), binding version, site, audience, filter, generation and kind. Altered, forged or rebound → 400; a site cursor cannot be replayed under a self audience. Only a null cursor ends a sequence.
+    - Welcome returns no people list or SKU board.
+    - 5xx bodies are generic.
+  - **Handler precedence:** 401 (nothing read) → 405 → 400 (unknown or repeated parameters, selectors) → 403 → 410/503 → 200. No-store.
+  - **Mutations: 14/14 caught.** The 5xx-leak check first survived and was closed with a typed-500 case.
+  - **Next (Task 16 remaining):**
+    - `supabase/migrations/0044_reporting_reads.sql`: service-only `read_reporting_generation`, `read_reporting_summary` and `read_reporting_detail`, exactly as the reader contract calls them, aggregating classified facts per `selectFactFamilies`/`evaluateSelection`/`referenceSummary`/`referenceTimingLines` and the Welcome view;
+    - `tests/staging/reporting-read-parity.ts`.
+  - **Proposal for root (recorded under Open questions):** add `@electric-sql/pglite` as a dev-only test dependency to run 0037–0044 in vitest and prove 0044 SQL parity against the TypeScript reference before staging. There is no local PostgreSQL. Without it, the complex 0044 SQL can only be validated textually and by root's staging harness. It changes no app or runtime code. I have not added it.
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK; 1627/1627 tests (42 files); build OK.
