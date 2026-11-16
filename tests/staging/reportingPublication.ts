@@ -195,6 +195,14 @@ export function publicationStatus(r: PublicationReport): string {
   return all.length ? `STATUS: FAILED – ${all[0]}${all.length > 1 ? ` (+${all.length - 1} more)` : ""}` : "STATUS: COMPLETE";
 }
 
+/** The 0042 structural acceptance verdict (separate from STATUS, which only says the evidence was collected). */
+export function accessAcceptanceLines(a: unknown): string[] {
+  const v = a as { accepted?: unknown; problems?: unknown } | null | undefined;
+  if (!v || typeof v.accepted !== "boolean") return ["- acceptance: not evaluated"];
+  const problems = Array.isArray(v.problems) ? v.problems.map(String) : [];
+  return v.accepted ? ["- acceptance: ACCEPTED (every 0042 rebuild member probe read the candidate by owner-keyed index conditions)"] : ["- acceptance: REJECTED", ...problems.map((p) => `  - ${p}`)];
+}
+
 export function publicationMarkdown(r: PublicationReport): string {
   const esc = (s: string) => s.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
   const lines = [
@@ -221,7 +229,7 @@ export function publicationMarkdown(r: PublicationReport): string {
     ...(r.repair ? ["## 0039 rebuild-repair rehearsal (rolled back; not installed)", "", "```json", JSON.stringify(r.repair, null, 2), "```", ""] : []),
     ...(r.dependency ? ["## 0040 + 0041 dependency-read rehearsal (rolled back; not installed)", "", `- ${String(r.dependency.label)}`, "", "```json", JSON.stringify(r.dependency, null, 2), "```", ""] : []),
     ...(r.dependencyPlans ? ["## 0040 + 0041 access-path diagnostic (rolled back; not installed)", "", `- ${String(r.dependencyPlans.label)}`, "", "```json", JSON.stringify(r.dependencyPlans, null, 2), "```", ""] : []),
-    ...(r.accessPaths ? ["## 0040 + 0041 + 0042 access-path follow-up (rolled back; not installed)", "", `- ${String(r.accessPaths.label)}`, "", "```json", JSON.stringify(r.accessPaths, null, 2), "```", ""] : []),
+    ...(r.accessPaths ? ["## 0040 + 0041 + 0042 access-path follow-up (rolled back; not installed)", "", `- ${String(r.accessPaths.label)}`, ...accessAcceptanceLines(r.accessPaths.acceptance), "", "```json", JSON.stringify(r.accessPaths, null, 2), "```", ""] : []),
     ...(r.diagnostic ? ["## Plan diagnostic (source_versions INSERT; plan only, rolled back)", "", `- ${String(r.diagnostic.label)}`, "", "```json", JSON.stringify(r.diagnostic, null, 2), "```", ""] : []),
     ...(r.restorationProblems.length ? ["## Restoration problems", ...r.restorationProblems.map((p) => `- ${p}`), ""] : []),
     publicationStatus(r),

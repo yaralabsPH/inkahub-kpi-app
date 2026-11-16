@@ -10,6 +10,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import { migrationBody } from "../staging/reportingPublication";
 import { effectiveReadQuery, functionBody, stripSqlComments } from "../staging/reportingDependencyRehearsal";
 import { reportingDb } from "./pg/harness";
+import { COLLATION_INVARIANT_SQL, collationInvariantProblems } from "../staging/reportingDependencyPlans";
 
 const lfOf = (p: string) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -59,12 +60,24 @@ describe("0042 allocation and immutability", () => {
       expect(q42).not.toBe(q41);
     }
   });
-  it("owner equality keeps the default collation (no COLLATE on an equality); only keyset comparisons and ordering are bytewise", () => {
+  it("owner equality keeps the default collation; the only bytewise equalities are the two access-path twins, each ANDed right after its default-collation equality", () => {
     const q = effectiveReadQuery(T42, "read_reporting_owner_members");
-    expect(q).toContain("sc.order_key = o.key");
-    expect(q).toContain("sc.event_id = o.key AND coalesce(sc.order_key, '') = ''");
-    expect(q).not.toMatch(/=\s*o\.key\s+COLLATE|COLLATE "C"\s*=/);
+    expect(q).toContain(`sc.order_key = o.key AND sc.order_key COLLATE "C" = o.key COLLATE "C"`);
+    expect(q).toContain(`sc.event_id = o.key AND sc.event_id COLLATE "C" = o.key COLLATE "C" AND coalesce(sc.order_key, '') = ''`);
+    // exactly two bytewise equalities, and none anywhere else (refresh branches and the stream have none)
+    expect([...q.matchAll(/COLLATE "C"\s*=/g)]).toHaveLength(2);
+    expect([...q.matchAll(/(\w+\.\w+) = o\.key AND \1 COLLATE "C" = o\.key COLLATE "C"/g)]).toHaveLength(2);
+    expect(q).not.toMatch(/COLLATE "C"\s*<>|<>\s*\S+\s+COLLATE "C"/);
     expect([...effectiveReadQuery(T42, "read_reporting_staff_stream").matchAll(/COLLATE "C"\s*(=|<>)/g)]).toHaveLength(0);
+  });
+  it("the rebuild members are two per-kind LATERAL lookups: the order lookup orders bytewise and stops at p_limit; the event lookup has no ordering and LIMIT 1", () => {
+    const q = effectiveReadQuery(T42, "read_reporting_owner_members");
+    const rebuild = q.slice(q.indexOf("-- the frozen candidate (rebuild), order owners"));
+    const [order, event] = rebuild.split("-- the frozen candidate (rebuild), event owners");
+    expect(order).toMatch(/CROSS JOIN LATERAL \([\s\S]*o\.kind = 'order'[\s\S]*ORDER BY sc\.event_id COLLATE "C"\s+LIMIT p_limit\s+\) c/);
+    expect(event).toMatch(/CROSS JOIN LATERAL \([\s\S]*o\.kind = 'event'[\s\S]*LIMIT 1\s+\) c/);
+    expect(event).not.toMatch(/ORDER BY sc\./);
+    expect(rebuild).not.toMatch(/\) u\s+ORDER BY/); // no shared ordering across owner kinds any more
   });
   it("every stream branch has its own direction guard, ORDER BY and LIMIT p_limit before the merge; no OFFSET", () => {
     const q = effectiveReadQuery(T42, "read_reporting_staff_stream");
@@ -100,5 +113,22 @@ describe("0042 effective definitions (the real catalog after 0037–0044)", () =
       expect(md5(x.src.replace(/\r\n/g, "\n")), x.name).toBe(md5(want));
       expect({ definer: x.definer, config: x.config, anon: x.anon, auth: x.auth, service: x.service, pub: x.pub }, x.name).toEqual({ definer: false, config: 'search_path=""', anon: false, auth: false, service: true, pub: false });
     }
+  });
+  it("collation invariant (the same query as the hosted A2 step): default-collation owner columns and key, deterministic default, equality agrees bytewise", async () => {
+    const row = (await db.query<Record<string, unknown>>(COLLATION_INVARIANT_SQL)).rows[0];
+    expect(collationInvariantProblems(row)).toEqual([]);
+    expect(row.columns).toEqual(["event_id=100", "order_key=100"]);
+  });
+});
+
+describe("collation invariant check (pure)", () => {
+  const good = { columns: ["event_id=100", "order_key=100"], key_collation: '"default"', default_deterministic: true, database_locale: "c:C.UTF-8", equality_agrees: true };
+  it("accepts the invariant and names every way it can break", () => {
+    expect(collationInvariantProblems(good)).toEqual([]);
+    expect(collationInvariantProblems(undefined)).toEqual(["the collation invariant query returned no row"]);
+    expect(collationInvariantProblems({ ...good, columns: ["event_id=100", "order_key=950"] })[0]).toMatch(/not the database default collation/);
+    expect(collationInvariantProblems({ ...good, key_collation: '"und-x-icu"' })[0]).toMatch(/owner key is not the default collation/);
+    expect(collationInvariantProblems({ ...good, default_deterministic: false })).toEqual(["the database default collation is not deterministic"]);
+    expect(collationInvariantProblems({ ...good, equality_agrees: false })[0]).toMatch(/disagree/);
   });
 });

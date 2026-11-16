@@ -3178,3 +3178,60 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Accept 0042 only if the rebuild member reads are bounded by owner rows and the stream reads are about one page per branch.
     - Judge the overlay (`batch_events`) reads against the expected refresh overlay size.
     - After that, install 0040 → 0041 → 0042 in order. No SQL was run; nothing was deployed or merged.
+- **Task 14 owner-member keying follow-up (2026-11-17, unchecked; implemented, hosted gate pending)** — commit "task 14: key reporting owner member reads".
+  - **Hosted evidence (CJ run of `--diagnose-access-paths --sites=uk,us` at 3f21c17; STATUS COMPLETE, staging restored; acceptance FAILED).** Ignored report `staging-results-reporting-publication-diagnose-access-paths-20261116T161904522Z-4b20535e.md`, SHA-256 `07234C7D…027DF81C2`, not committed.
+    - 0042 rebuild members (E-rb-ms-1/2/n): 43,804 candidate rows read to return 3–7, about 14–16 ms (0041: 84,686 rows, 37–41 ms). Fast but NOT bounded, so rejected.
+      - Order branch: Index Scan `source_candidate_owner_order`, Index Cond only (batch_id, site), Filter `order_key = o.key`, 42,337 rows removed.
+      - Event branch: Index Scan `source_candidate_owner_event`, Index Cond only (batch_id, site), Filter `event_id = o.key`, 1,460 rows removed.
+    - Cause, from the report's own estimates: the fresh candidate's (batch_id, site) range was estimated at 1 row (actual 42,343). Every candidate index led by (batch_id, site) then cost the same, and the planner kept the bytewise 0040 owner indexes, which cannot serve a default-collation equality.
+    - Stream fix passes: source_candidate/source_current reads exactly 1,000 per probe. Refresh overlay reads 11 (acceptable for this fixture). Refresh members read 7 batch_events + 8 source_current, unchanged.
+  - **Offline reproduction (PGlite, no statistics, which is the hosted condition):** the 3f21c17 0042 gives exactly the hosted plan (both bytewise owner indexes keyed only on (batch_id, site)).
+    - The suggested default-collation-only design was tried first: a new page index `(batch_id, site, order_key, event_id COLLATE "C")` partial on non-blank orders, plus a primary-key event lookup. It flipped with volume:
+      - 3,000 rows: the event lookup used `owner_order` unkeyed (2,900 rows removed);
+      - 45,000 rows: the order lookup skipped the new index (sorted `source_candidate_order` instead).
+    - It was not adopted, and no index was added.
+  - **Decision (CJ, 2026-11-17, in chat):** keep default-collation equality and add the redundant bytewise equality, with the collation invariant proven and locked in tests. CJ's constraint: a C-collated term may narrow nothing versus default-collation equality.
+  - **0042 repair (members only; stream and refresh text unchanged):**
+    - The rebuild members are now two per-kind LATERAL lookups (no shared ordering).
+      - Order owner: `sc.order_key = o.key AND sc.order_key COLLATE "C" = o.key COLLATE "C"`, `ORDER BY sc.event_id COLLATE "C" LIMIT p_limit`.
+      - Event owner: `sc.event_id = o.key AND sc.event_id COLLATE "C" = o.key COLLATE "C" AND coalesce(sc.order_key, '') = ''`, then `LIMIT 1`. The primary key allows at most one row; the LIMIT keeps the lookup per owner instead of letting it be flattened into a join.
+    - With the bytewise twin, the 0040 bytewise owner indexes are keyed too. The cheapest access path at every tested size and statistics state is then owner-keyed.
+    - Why it narrows nothing: the columns and the key use the database default collation; PostgreSQL requires that collation to be deterministic; deterministic text equality is bytewise.
+    - The new LF pin is `e38aba76…`. Statement shape, ACLs, security, locks/fence/lease, keysets, ≤1,000 rows and the 1 MiB accounting are unchanged.
+  - **Invariant lock:**
+    - `COLLATION_INVARIANT_SQL` / `collationInvariantProblems` require:
+      - candidate `order_key`/`event_id` attcollation = 100;
+      - the owner key (`jsonb ->>`) collation `"default"`;
+      - the default collation is deterministic;
+      - default and bytewise equality agree on NFC/NFD, case, ß/ss, ligature, padding and empty pairs.
+    - It runs in PGlite (`reportingAccessPaths.test.ts`) and as the new required hosted step A2, before any probe. A2 failing rolls back and is never complete.
+    - A PGlite parity test shows that case, padding, NFD and look-alike owner keys match nothing extra.
+  - **Structural regression:** `ownerKeyProblems` (whole plan) rejects any candidate scan whose Index Cond / Recheck Cond lacks the owner key, however fast it ran.
+    - Unit-tested on the verbatim hosted nodes (14 ms, rejected).
+    - The diagnostic records `ownerKey` per member probe. A separate `acceptance` verdict (ACCEPTED/REJECTED) is shown in the report; STATUS COMPLETE still only means the evidence was collected.
+    - A scripted run of the hosted shape is COMPLETE but REJECTED.
+    - In PGlite, before ANALYZE (asserted: no pg_stats rows) and after, 0042 first and later pages pass under default settings and with bitmap scans off. The same split without the bytewise twin, and 0041, are rejected.
+    - The regression was confirmed failing against the 3f21c17 0042 (both hosted-shape nodes reported).
+  - **Process notes:**
+    - TDD order was not strict: the 0042 query was edited during the plan experiments, before the regression tests. The regression was then run against the previous draft and failed as intended.
+    - The harness test's import and flag lines were edited with sed (mechanical, reviewed in the diff).
+    - A temporary experiment test was deleted before the commit.
+  - **Gate:** see the table below.
+
+    | Check | Result |
+    |---|---|
+    | `access-paths.test.ts` (real SQL) | 15/15 |
+    | Focused: diagnostic + access paths + jobs + rehearsal | 280/280 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 66 files, 2,169/2,169 |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Remaining hosted gate (CJ):** review, then rerun `npm run staging:reporting-jobs -- --diagnose-access-paths --sites=uk,us` once at this commit.
+    - A2 must pass.
+    - The report's acceptance line must read ACCEPTED: every E-rb-ms probe's candidate scans have the owner key in their Index Cond.
+    - Rebuild member reads of `source_candidate` must be about the owners' rows (E-rb-ms-n ≈ 7 + owners, not 43,804).
+    - Stream reads stay ≈ 1,000 per probe; refresh members stay 7 batch_events + 8 source_current.
+    - Judge the overlay reads against the expected refresh overlay size.
+    - Only then install 0040 → 0041 → 0042. No SQL was run; nothing was installed, deployed or merged; Task 19 was not started.

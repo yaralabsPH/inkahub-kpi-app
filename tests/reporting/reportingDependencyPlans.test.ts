@@ -11,11 +11,11 @@ import { runCaptureLifecycle } from "../staging/reportingCapture";
 import {
   comparePages, DIAG_PREFIX, diagnoseDependencyPlans, diagnosticStatements, EXPLAIN_CASES, expectedMembers, expectedStreamCount, explainAllowlist, MAX_EXPLAINS, memberPage, newPlanEvidence, OR_CANDIDATE, OR_MIRROR,
   PLAN_SQL, planEvidenceProblems, REQUIRED_PLAN_CASES, runPlanCases, smallLimit, SPLIT_CANDIDATE, SPLIT_MIRROR, splitMembersSql, summarizePlan, type MemberRow, type PlanCtx, type PlanDeps, type PlanEvidence,
-  ACCESS_FUNCTIONS, ACCESS_NAMES, accessAllowlist, accessBodyProblems, accessStatements, diagnoseAccessPaths, MIGRATION_0042, relationReads, REQUIRED_ACCESS_CASES, REVIEWED_0042_LF,
+  ACCESS_FUNCTIONS, ACCESS_NAMES, accessAcceptanceProblems, accessAllowlist, accessBodyProblems, accessStatements, COLLATION_INVARIANT_SQL, diagnoseAccessPaths, MIGRATION_0042, ownerKeyProblems, relationReads, REQUIRED_ACCESS_CASES, REVIEWED_0042_LF,
 } from "../staging/reportingDependencyPlans";
 import { fileIdentity } from "../staging/reportingRebuildRepair";
 import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, executesExplain, planSql, stripSqlComments, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
-import { compareFullState, migrationBody, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type Observation } from "../staging/reportingPublication";
+import { accessAcceptanceLines, compareFullState, migrationBody, newPublicationReport, parsePublicationArgs, publicationMarkdown, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type Observation } from "../staging/reportingPublication";
 import { bodyHashes, FUNCTION_SQL, publishBody } from "../staging/reportingRebuildRepair";
 
 const read = (p: string) => readFileSync(p, "utf8").replace(/\r\n/g, "\n");
@@ -227,7 +227,7 @@ describe("T14S3: fixed case matrix and evidence", () => {
 // ---------------------------------------------------------------------------
 
 type Img = Record<string, unknown> & { id: string; location: string; order_number: string | null; staff_id: string | null; created_at: string };
-type Fail = Partial<Record<"splitFirstDrop" | "splitReordered" | "explainRows" | "rollbackFails" | "alreadyApplied" | "candidateDiffers" | "streamShort" | "stale42", boolean>>;
+type Fail = Partial<Record<"splitFirstDrop" | "splitReordered" | "explainRows" | "rollbackFails" | "alreadyApplied" | "candidateDiffers" | "streamShort" | "stale42" | "unkeyed42" | "collation", boolean>>;
 function scriptedDb(fail: Fail = {}) {
   const sent: string[] = [];
   const t40 = read(MIGRATION_0040);
@@ -259,8 +259,16 @@ function scriptedDb(fail: Fail = {}) {
         const r = ["frozen_read_batch", "list_reporting_owners", "read_reporting_changed_keys", "read_reporting_children", "read_reporting_events_by_id", "read_reporting_owner_members", "read_reporting_staff_stream"].map((name) => ({ name, body_md5: bodyHashes(name === "frozen_read_batch" ? functionBody(t40, "reporting_private.frozen_read_batch") : functionBody((ACCESS_FUNCTIONS as readonly string[]).includes(name) && !fail.stale42 ? T42 : T41, `public.${name}`))[0], definer: false, config: 'search_path=""', anon: false, authenticated: false, service: true }));
         return { rows: r, rowCount: r.length };
       }
+      if (sql === COLLATION_INVARIANT_SQL) return { rows: [{ columns: ["event_id=100", "order_key=100"], key_collation: '"default"', default_deterministic: !fail.collation, database_locale: "c:C.UTF-8", equality_agrees: true }], rowCount: 1 };
       if (sql === AS["members-split"]) return { rows: members(params), rowCount: 0 };
       if (sql === AS.stream) return { rows: stream(params), rowCount: 0 };
+      if (sql.startsWith(DIAG_PREFIX) && sql.slice(DIAG_PREFIX.length) === AS["members-split"] && batch === 1) {
+        // the rebuild 0042 member plan: owner-keyed, or (unkeyed42) the hosted failure shape that still runs fast
+        const n = members(params).length;
+        const cond = fail.unkeyed42 ? "((sc.batch_id = 'b'::uuid) AND (sc.site = 'uk'::text))" : "((sc.batch_id = 'b'::uuid) AND (sc.site = 'uk'::text) AND ((sc.order_key)::text = (o.key)::text))";
+        const scan = { "Node Type": "Index Scan", "Relation Name": "source_candidate", "Index Name": "source_candidate_owner_order", "Index Cond": cond, "Actual Rows": n, "Rows Removed by Filter": fail.unkeyed42 ? 42337 : 0, "Actual Loops": 1 };
+        return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Limit", "Actual Rows": n, Plans: [scan] }, "Planning Time": 0.1, "Execution Time": 2 }] }], rowCount: 1 };
+      }
       if (sql.startsWith(DIAG_PREFIX) && sql.slice(DIAG_PREFIX.length) === AS.stream) {
         const n = stream(params).length;
         return { rows: [{ "QUERY PLAN": [{ Plan: { "Node Type": "Limit", "Actual Rows": n, Plans: [{ "Node Type": "Index Scan", "Relation Name": "source_candidate", "Actual Rows": n, "Actual Loops": 1 }, { "Node Type": "Seq Scan", "Relation Name": "batch_events", "Actual Rows": 1, "Rows Removed by Filter": 3, "Actual Loops": 1 }] }, "Planning Time": 0.1, "Execution Time": 2 }] }], rowCount: 1 };
@@ -529,6 +537,37 @@ describe("Task 14 0042 follow-up: wiring, pin, statements and allowlist", () => 
     expect(relationReads(plan)).toEqual({ source_candidate: 19, batch_events: 42, source_current: 0 });
     expect(() => relationReads([{}])).toThrow(/no JSON plan/);
   });
+  it("ownerKeyProblems is structural: the exact hosted 0042 nodes (14 ms) are rejected; keyed default, bytewise and bitmap accesses pass", () => {
+    const wrap = (...scans: Array<Record<string, unknown>>) => [{ Plan: { "Node Type": "Limit", Plans: scans }, "Execution Time": 14.424 }];
+    const bs = "(sc.batch_id = '068ae6dc-a61a-49aa-b9ec-447db65df4f8'::uuid) AND (sc.site = 'uk'::text)";
+    // verbatim from the hosted report (E-rb-ms-1): fast, but keyed only on (batch_id, site)
+    const hosted = wrap(
+      { "Node Type": "Index Scan", "Relation Name": "source_candidate", "Index Name": "source_candidate_owner_order", "Index Cond": `(${bs})`, Filter: "(sc.order_key = o.key)", "Actual Rows": 6, "Rows Removed by Filter": 42337, "Actual Loops": 1 },
+      { "Node Type": "Index Scan", "Relation Name": "source_candidate", "Index Name": "source_candidate_owner_event", "Index Cond": `(${bs.replace(/sc\./g, "sc_1.")})`, Filter: "(sc_1.event_id = o.key)", "Actual Rows": 1, "Rows Removed by Filter": 1460, "Actual Loops": 1 },
+    );
+    const p = ownerKeyProblems(hosted);
+    expect(p).toHaveLength(2);
+    expect(p[0]).toBe(`Index Scan source_candidate_owner_order on source_candidate: the index condition lacks the owner key ((${bs}))`);
+    expect(ownerKeyProblems(wrap(
+      { "Node Type": "Index Scan", "Relation Name": "source_candidate", "Index Cond": `(${bs} AND ((sc.order_key)::text = (o.key)::text))` },
+      { "Node Type": "Index Scan", "Relation Name": "source_candidate", "Index Cond": `(${bs} AND (sc_1.event_id = o_1.key))` },
+      { "Node Type": "Bitmap Heap Scan", "Relation Name": "source_candidate", "Recheck Cond": `(${bs} AND (sc.order_key = o.key))`, Plans: [{ "Node Type": "Bitmap Index Scan", "Index Cond": "x" }] },
+      { "Node Type": "Seq Scan", "Relation Name": "source_current" }, // other relations are not judged here
+    ))).toEqual([]);
+    expect(ownerKeyProblems(wrap({ "Node Type": "Seq Scan", "Relation Name": "source_candidate", Filter: "(sc.order_key = o.key)" }))).toEqual(["Seq Scan on source_candidate is not an index access"]);
+    // a keyset comparison on event_id is not an owner key
+    expect(ownerKeyProblems(wrap({ "Node Type": "Index Scan", "Relation Name": "source_candidate", "Index Cond": `(${bs} AND ((sc.event_id)::text > 'v'::text))` }))).toHaveLength(1);
+  });
+  it("acceptance needs owner-key evidence on every 0042 rebuild member probe, and renders as its own line", () => {
+    const ev = newPlanEvidence();
+    expect(accessAcceptanceProblems(ev)).toEqual(["no 0042 rebuild member probe was recorded"]);
+    const probe = { statement: "members-0042", batch: "rebuild" as const, page: "p", limit: 3, cursor: null, expectedRows: 3, actualRows: 3, reads: {}, plan: { planningMs: 0, executionMs: 1, rootRows: 3, settings: {}, nodes: [], truncated: false } };
+    ev.probes = { a: { ...probe, ownerKey: [] }, b: { ...probe }, c: { ...probe, statement: "members-0041", ownerKey: ["x"] }, d: { ...probe, batch: "refresh" } };
+    expect(accessAcceptanceProblems(ev)).toEqual(["b: owner-key evidence is missing"]);
+    expect(accessAcceptanceLines(undefined)).toEqual(["- acceptance: not evaluated"]);
+    expect(accessAcceptanceLines({ accepted: true, problems: [] })[0]).toMatch(/ACCEPTED/);
+    expect(accessAcceptanceLines({ accepted: false, problems: ["p1"] })).toEqual(["- acceptance: REJECTED", "  - p1"]);
+  });
 });
 
 describe("Task 14 0042 follow-up end to end (real cases over a scripted database)", () => {
@@ -549,7 +588,12 @@ describe("Task 14 0042 follow-up end to end (real cases over a scripted database
     expect(explains.every((q) => allow.has(q))).toBe(true);
     expect(ev.complete).toBe(true);
     expect(REQUIRED_ACCESS_CASES.every((id) => ev.recorded.includes(id))).toBe(true);
-    expect(t.recorded.map((o) => o.id).slice(0, 6)).toEqual(["D0", "D1", "D2", "D3", "A0", "A1"]);
+    expect(t.recorded.map((o) => o.id).slice(0, 7)).toEqual(["D0", "D1", "D2", "D3", "A0", "A1", "A2"]);
+    expect(s.sent.indexOf(COLLATION_INVARIANT_SQL)).toBeLessThan(s.sent.findIndex((q) => /^\s*explain/i.test(q))); // the invariant is checked before any probe
+    expect(ev.functions.collation0042).toMatchObject({ default_deterministic: true, equality_agrees: true });
+    expect(ev.probes["E-rb-ms-1"].ownerKey).toEqual([]);
+    expect(ev.probes["E-rf-sa-1"].ownerKey).toBeUndefined(); // stream probes carry no owner-key verdict
+    expect(ev.acceptance).toEqual({ accepted: true, problems: [] });
     expect(ev.files.map((f) => f.path).at(-1)).toBe(MIGRATION_0042);
     expect(ev.statementsApplied).toBe(25 + 6 + 6);
     expect(ev.probes["E-rb-ms-1"].statement).toBe("members-0042");
@@ -574,6 +618,26 @@ describe("Task 14 0042 follow-up end to end (real cases over a scripted database
     const s = scriptedDb();
     await expect(diagnoseAccessPaths(s.db, planCtx().ctx, realDeps({ cases: async () => undefined }))).rejects.toThrow(/not recorded/);
     expect(s.sent.at(-1)).toBe("rollback");
+  });
+  it("REJECTS the hosted failure shape (Index Cond only batch_id/site) even though it ran in 2 ms: evidence COMPLETE, acceptance REJECTED", async () => {
+    const s = scriptedDb({ unkeyed42: true });
+    const ev = await diagnoseAccessPaths(s.db, planCtx().ctx, realDeps());
+    expect(ev.complete).toBe(true); // evidence collected
+    expect(ev.probes["E-rb-ms-1"].plan.executionMs).toBe(2);
+    expect(ev.acceptance?.accepted).toBe(false);
+    expect(ev.acceptance?.problems).toHaveLength(3); // the three 0042 rebuild member probes
+    expect(ev.acceptance?.problems[0]).toMatch(/^E-rb-ms-1: Index Scan source_candidate_owner_order on source_candidate: the index condition lacks the owner key/);
+    const r = { ...newPublicationReport("diagnose-access-paths", ["uk", "us"], "x", "y", "z"), accessPaths: ev as unknown as Record<string, unknown> };
+    expect(publicationMarkdown(r)).toContain("- acceptance: REJECTED");
+  });
+  it("A2 refuses a non-deterministic default collation before any probe; rolls back and is never complete", async () => {
+    const s = scriptedDb({ collation: true });
+    const t = planCtx();
+    await expect(diagnoseAccessPaths(s.db, t.ctx, realDeps())).rejects.toThrow(/A2 failed/);
+    expect(JSON.stringify(t.recorded.find((o) => o.id === "A2"))).toMatch(/not deterministic/);
+    expect(s.sent.some((q) => /^\s*explain/i.test(q))).toBe(false);
+    expect(s.sent.at(-1)).toBe("rollback");
+    expect(t.emitted.every((e) => !e.complete)).toBe(true);
   });
   it("the functions under test are the two 0042 replacements", () => {
     expect(ACCESS_FUNCTIONS).toEqual(["read_reporting_owner_members", "read_reporting_staff_stream"]);

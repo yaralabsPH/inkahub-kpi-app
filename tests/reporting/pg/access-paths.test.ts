@@ -31,6 +31,7 @@ import type { FrozenReader } from "../../../api/_lib/production-reporting-materi
 import type { EnumerationPages, FrozenBatchRef } from "../../../api/_lib/production-reporting-reader";
 import { compareUtf8 } from "../../../api/_lib/reporting-stage";
 import { boundReadQuery } from "../../staging/reportingDependencyRehearsal";
+import { ownerKeyProblems } from "../../staging/reportingDependencyPlans";
 import { reportingDb } from "./harness";
 import { pgRpc } from "./rpc";
 
@@ -238,24 +239,33 @@ const scanned = (n: PlanNode) => ((n["Actual Rows"] ?? 0) + (n["Rows Removed by 
 const onRel = (nodes: PlanNode[], rel: string) => nodes.filter((n) => n["Relation Name"] === rel);
 const readOf = (nodes: PlanNode[], rel: string) => onRel(nodes, rel).reduce((s, n) => s + scanned(n), 0);
 
-async function explain(db: PGlite, text: string, fn: "read_reporting_owner_members" | "read_reporting_staff_stream", ref: FrozenBatchRef, params: unknown[], settings: string[] = []): Promise<PlanNode[]> {
+interface Explained extends Array<PlanNode> { raw: unknown }
+async function explain(db: PGlite, text: string, fn: "read_reporting_owner_members" | "read_reporting_staff_stream", ref: FrozenBatchRef, params: unknown[], settings: string[] = []): Promise<Explained> {
   const sql = `EXPLAIN (ANALYZE, FORMAT JSON) ${boundReadQuery(text, fn)}`;
   await db.exec("begin");
   try {
     for (const s of settings) await db.exec(s);
     const r = await db.query<{ "QUERY PLAN": Array<{ Plan: PlanNode }> }>(sql, [ref.batchId, "uk", ref.kind, ...params]);
-    return flat(r.rows[0]["QUERY PLAN"][0].Plan);
+    return Object.assign(flat(r.rows[0]["QUERY PLAN"][0].Plan), { raw: r.rows[0]["QUERY PLAN"] });
   } finally {
     await db.exec("rollback");
   }
 }
 
-/** The 0042 members bound: the candidate is read by keyed lookups and only about the owners' own rows are read. */
-function membersBounded(nodes: PlanNode[], memberRows: number, owners: number): boolean {
-  const sc = onRel(nodes, "source_candidate");
-  const keyed = sc.length > 0 && sc.every((n) => scanned(n) === 0 || /order_key = |event_id = /.test(n["Index Cond"] ?? ""));
-  return keyed && readOf(nodes, "source_candidate") <= memberRows + owners;
+/**
+ * The 0042 members bound: STRUCTURAL first (every candidate scan's index
+ * condition carries the owner key, the same check the hosted diagnostic's
+ * acceptance uses, independent of runtime), then only about the owners' rows read.
+ */
+function membersBounded(nodes: Explained, memberRows: number, owners: number): boolean {
+  return onRel(nodes, "source_candidate").length > 0 && ownerKeyProblems(nodes.raw).length === 0 && readOf(nodes, "source_candidate") <= memberRows + owners;
 }
+/** The pre-follow-up shape: the same split without the bytewise owner equality (default-collation keying only). */
+const defaultOnly = (t: string) => {
+  const out = t.replace(/ AND sc\.(order_key|event_id) COLLATE "C" = o\.key COLLATE "C"/g, "");
+  if (out === t) throw new Error("the bytewise owner equality was not found in 0042");
+  return out;
+};
 /** The stream bound for a mirror relation: each executed branch read at most about one page. */
 function streamBounded(nodes: PlanNode[], rel: string, limit: number): boolean {
   const s = onRel(nodes, rel);
@@ -278,7 +288,8 @@ describe("0042 rebuild dependency reads over a frozen candidate (PGlite)", () =>
     for (let i = 1; i <= 4; i++) await one(db, `big-${i}`, W3, "BIG", `2026-03-09T00:00:0${i}+00:00`, "x".repeat(400_000));
     ref = await holdAtFrozen(db, "rebuild");
     expect(ref.kind).toBe("rebuild");
-    await db.exec("analyze reporting_private.source_candidate");
+    // No ANALYZE: like the hosted diagnostic, the fresh candidate has no statistics for its batch
+    // (the hosted (batch_id, site) estimate was 1 row for 42,343). The plan test analyzes later.
     view = await frozenView(db, ref);
     expect(view.length).toBe(3008);
   }, 300_000);
@@ -300,6 +311,14 @@ describe("0042 rebuild dependency reads over a frozen candidate (PGlite)", () =>
     const owners: OwnerArg[] = [clock(50), clock(100), ["event", "v00001"], clock(2950)];
     const { all } = await walkMembers(db, ref, view, owners, 2);
     expect(all.map((m) => [m.owner_index, m.event_id])).toEqual([[0, "v00050"], [1, "v00100"], [3, "v02950"]]);
+  }, 60_000);
+  it("owner matching is exactly default-collation equality: case, padding, NFD and look-alike keys match nothing extra", async () => {
+    const owners: OwnerArg[] = [["order", "bulk-6"], ["order", "BULK-6 "], ["order", "BULK-6"], ["event", "V00050"], ["event", "v00050 "], ["event", "äq-1"], ["event", "äq-1"], ["order", "BULK‑6"]];
+    const { all } = await walkMembers(db, ref, view, owners, 1000);
+    expect([...new Set(all.map((m) => m.owner_index))]).toEqual([2]); // only the exact order key; "äq-1" has an order, so it is not an event owner
+    // the default collation itself agrees: none of the variants is equal to its target
+    const r = await db.query<{ eq: boolean }>(`select bool_or(a = b) as eq from (values ('bulk-6','BULK-6'),('BULK-6 ','BULK-6'),('V00050','v00050'),('a' || chr(776) || 'q-1','äq-1')) x(a,b)`);
+    expect(r.rows[0].eq).toBe(false);
   }, 60_000);
   it("mixed owners keep ordinality and bytewise order inside an owner, with first and later cursors", async () => {
     const owners: OwnerArg[] = [["order", "BULK-6"], clock(150), ["order", "BULK-10"], clock(200)];
@@ -366,26 +385,41 @@ describe("0042 rebuild dependency reads over a frozen candidate (PGlite)", () =>
     ok(await stream(db, ref, W1, "after", pos, 100));
     expect(await digest()).toBe(before);
   });
-  it("plans: 0042 members are per-owner keyed lookups; the 0041 OR join reads the whole candidate (fails the same bound)", async () => {
+  it("plans: 0042 members are owner-keyed with NO statistics (the hosted condition) and after ANALYZE; the default-only split and 0041 are rejected", async () => {
     const owners: OwnerArg[] = [...orderOwners([5, 11, 17, 23, 29, 35, 41, 47]), clock(250), clock(300)];
     const memberRows = memberOrder(view, owners).length;
     const params = [JSON.stringify(owners), null, null, 1000];
+    const laterParams = [JSON.stringify(owners), 3, "v00011", 1000];
     // PGlite's planner may serve the 0041 OR join with a BitmapOr; the hosted plan (T14S3) did not and
-    // scanned the whole (batch, site) range. With bitmap scans off the OR join has no keyed access left
-    // (the hosted shape), while the 0042 per-owner lookups stay keyed under either setting.
+    // scanned the whole (batch, site) range. With bitmap scans off the OR join has no keyed access left.
     const HOSTED = ["set local enable_bitmapscan = off"];
-    for (const settings of [[], HOSTED]) {
-      const p42 = await explain(db, T42, "read_reporting_owner_members", ref, params, settings);
-      expect(membersBounded(p42, memberRows, owners.length)).toBe(true);
-      expect(readOf(p42, "source_candidate")).toBeLessThanOrEqual(memberRows + owners.length);
-      // a later cursor keeps the 0042 bound
-      const later = await explain(db, T42, "read_reporting_owner_members", ref, [JSON.stringify(owners), 3, "v00011", 1000], settings);
-      expect(membersBounded(later, memberRows, owners.length)).toBe(true);
-    }
+    const check42 = async () => {
+      for (const settings of [[], HOSTED]) {
+        for (const p of [params, laterParams]) {
+          const p42 = await explain(db, T42, "read_reporting_owner_members", ref, p, settings);
+          expect(ownerKeyProblems(p42.raw)).toEqual([]);
+          expect(membersBounded(p42, memberRows, owners.length)).toBe(true);
+        }
+      }
+    };
+    // 1. no statistics for the fresh candidate: every candidate index led by (batch_id, site) costs the same.
+    expect((await db.query<{ n: number }>("select count(*)::int as n from pg_catalog.pg_stats where schemaname = 'reporting_private' and tablename = 'source_candidate'")).rows[0].n).toBe(0);
+    await check42();
+    // The same split with default-collation keying only is NOT keyed here (the hosted failure shape:
+    // a bytewise owner index keyed on (batch_id, site) and the owner key as a filter). It may run fast;
+    // the structural check rejects it anyway.
+    const dflt = await explain(db, defaultOnly(T42), "read_reporting_owner_members", ref, params);
+    expect(ownerKeyProblems(dflt.raw).length).toBeGreaterThan(0);
+    expect(ownerKeyProblems(dflt.raw).join("\n")).toMatch(/lacks the owner key/);
+    expect(membersBounded(dflt, memberRows, owners.length)).toBe(false);
+    // 2. analyzed: still keyed.
+    await db.exec("analyze reporting_private.source_candidate");
+    await check42();
     const p41 = await explain(db, T41, "read_reporting_owner_members", ref, params, HOSTED);
     expect(membersBounded(p41, memberRows, owners.length)).toBe(false);
+    expect(ownerKeyProblems(p41.raw).length).toBeGreaterThan(0);
     expect(readOf(p41, "source_candidate")).toBeGreaterThanOrEqual(view.length);
-  }, 120_000);
+  }, 180_000);
   it("plans: each 0042 candidate stream branch stops near one page; the 0041 outer sort reads every row of the worker", async () => {
     const limit = 50;
     for (const [dir, pos] of [["after", { at: "2026-03-01T00:01:00+00:00", id: "" }], ["before", { at: "2026-03-01T00:07:00+00:00", id: "" }]] as const) {

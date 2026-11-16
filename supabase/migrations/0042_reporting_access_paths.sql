@@ -14,10 +14,26 @@
 -- Two of the six dependency reads are replaced (same signature, same RETURNS
 -- TABLE; CREATE OR REPLACE keeps owner and privileges):
 --   read_reporting_owner_members  the rebuild candidate is read by PER-OWNER
---     keyed lookups (LATERAL): an order owner by order_key = key
---     (source_candidate_order), an event owner by event_id = key with a blank
---     order (the primary key), each bounded to the page after the keyset. The
---     refresh overlay and base-mirror branches are unchanged.
+--     keyed lookups, one LATERAL per owner kind (no shared ordering): an order
+--     owner bounded to the page after the keyset in bytewise event_id order, an
+--     event owner as one single-row lookup. The refresh overlay and base-mirror
+--     branches are unchanged.
+--     Follow-up evidence (0042 hosted plan diagnostic, rolled back): the fresh
+--     candidate's (batch_id, site) range was estimated at 1 row (actual 42,343),
+--     so every candidate index led by (batch_id, site) cost the same and the
+--     planner kept bytewise owner indexes that cannot serve a default-collation
+--     equality: Index Cond (batch_id, site) only, 42,337 + 1,460 rows removed by
+--     the key filter for 7 results (fast, but unbounded). Offline with no
+--     statistics, a default-collation-only design (new page index + primary
+--     key) flipped between keyed and unkeyed with volume. Each lookup therefore
+--     keeps the default-collation equality (order_key = key, event_id = key)
+--     AND adds the same equality bytewise (COLLATE "C"), which the 0040 owner
+--     indexes (source_candidate_owner_order / _owner_event) key on; every
+--     cheapest access path is then owner-keyed. The added term narrows nothing:
+--     the columns and the key use the database default collation, which
+--     PostgreSQL requires to be deterministic, and deterministic equality is
+--     bytewise. The rollback-only diagnostic checks that invariant (A2) before
+--     any probe, and the offline tests lock it. No index is added.
 --   read_reporting_staff_stream  each of the six branches (overlay, base mirror,
 --     candidate x after/before) has its own branch-local direction filter,
 --     ORDER BY and LIMIT p_limit BEFORE the merge; the final merge sorts at most
@@ -31,7 +47,8 @@
 --     Overlay exclusion of the base mirror (replacements and tombstones) is
 --     unchanged.
 --   Owner equality keeps the default collation of 0041 (order_key = key,
---   event_id = key); only the keyset comparisons are bytewise, as in 0041.
+--   event_id = key); the bytewise twin above is an access path only, and the
+--   keyset comparisons are bytewise, as in 0041.
 -- Everything else is exactly 0041: frozen_read_batch (lock_batch: control-
 -- before-site locks, fence, lease, drift), parameter checks, owner ordinality,
 -- bytewise (COLLATE "C") keyset order, <= 1,000 rows, the complete-response
@@ -84,22 +101,29 @@ BEGIN
        WHERE b.kind = 'refresh'
          AND NOT EXISTS (SELECT 1 FROM reporting_private.batch_events be WHERE be.batch_id = b.batch_id AND be.site = b.site AND be.event_id = s.event_id)
       UNION ALL
-      -- the frozen candidate (rebuild): PER-OWNER keyed lookups, each bounded to the page after the keyset
+      -- the frozen candidate (rebuild), order owners: one keyed lookup per owner, bounded to the page after the keyset
       SELECT o.idx, c.event_id, c.image
         FROM o CROSS JOIN LATERAL (
-          SELECT u.event_id, u.image FROM (
-            SELECT sc.event_id, sc.image
-              FROM reporting_private.source_candidate sc
-             WHERE o.kind = 'order' AND sc.batch_id = b.batch_id AND sc.site = b.site AND sc.order_key = o.key
-               AND (p_after_index IS NULL OR o.idx > p_after_index OR sc.event_id COLLATE "C" > p_after_event_id COLLATE "C")
-            UNION ALL
-            SELECT sc.event_id, sc.image
-              FROM reporting_private.source_candidate sc
-             WHERE o.kind = 'event' AND sc.batch_id = b.batch_id AND sc.site = b.site AND sc.event_id = o.key AND coalesce(sc.order_key, '') = ''
-               AND (p_after_index IS NULL OR o.idx > p_after_index OR sc.event_id COLLATE "C" > p_after_event_id COLLATE "C")
-          ) u
-           ORDER BY u.event_id COLLATE "C"
+          SELECT sc.event_id, sc.image
+            FROM reporting_private.source_candidate sc
+           WHERE o.kind = 'order' AND sc.batch_id = b.batch_id AND sc.site = b.site
+             AND sc.order_key = o.key AND sc.order_key COLLATE "C" = o.key COLLATE "C"
+             AND (p_after_index IS NULL OR o.idx > p_after_index OR sc.event_id COLLATE "C" > p_after_event_id COLLATE "C")
+           ORDER BY sc.event_id COLLATE "C"
            LIMIT p_limit
+        ) c
+       WHERE b.kind = 'rebuild' AND (p_after_index IS NULL OR o.idx >= p_after_index)
+      UNION ALL
+      -- the frozen candidate (rebuild), event owners: one keyed single-row lookup per owner (no shared ordering);
+      -- the primary key (batch_id, site, event_id) allows at most one row, so LIMIT 1 drops nothing and keeps the lookup per owner
+      SELECT o.idx, c.event_id, c.image
+        FROM o CROSS JOIN LATERAL (
+          SELECT sc.event_id, sc.image
+            FROM reporting_private.source_candidate sc
+           WHERE o.kind = 'event' AND sc.batch_id = b.batch_id AND sc.site = b.site
+             AND sc.event_id = o.key AND sc.event_id COLLATE "C" = o.key COLLATE "C" AND coalesce(sc.order_key, '') = ''
+             AND (p_after_index IS NULL OR o.idx > p_after_index OR sc.event_id COLLATE "C" > p_after_event_id COLLATE "C")
+           LIMIT 1
         ) c
        WHERE b.kind = 'rebuild' AND (p_after_index IS NULL OR o.idx >= p_after_index)
     )

@@ -128,6 +128,33 @@ export function relationReads(explain: unknown): Record<string, number> {
   return out;
 }
 
+/** An owner-key equality against the per-owner lateral key (default or bytewise rendering). */
+export const OWNER_KEY_COND = /(order_key|event_id)\)?(::text)? = \(?o(_\d+)?\.key\b/;
+/**
+ * Structural (runtime-independent) owner-key check over the WHOLE plan: every
+ * scan of the candidate must be an index access whose Index Cond (or, for a
+ * bitmap heap scan, Recheck Cond) carries the owner key. A scan keyed only on
+ * (batch_id, site) is rejected however fast it ran (T14 0042 hosted run:
+ * 14 ms, yet 43,804 candidate rows read for 7).
+ */
+export function ownerKeyProblems(explain: unknown): string[] {
+  const top = (Array.isArray(explain) ? explain[0] : explain) as Record<string, unknown> | undefined;
+  const root = top?.Plan as PlanNode | undefined;
+  if (!root) throw new Error("EXPLAIN returned no JSON plan");
+  const out: string[] = [];
+  const walk = (p: PlanNode) => {
+    if (p["Relation Name"] === "source_candidate") {
+      const type = String(p["Node Type"]);
+      const cond = String(p["Index Cond"] ?? p["Recheck Cond"] ?? "");
+      if (!/Index Scan|Index Only Scan|Bitmap Heap Scan/.test(type)) out.push(`${type} on source_candidate is not an index access`);
+      else if (!OWNER_KEY_COND.test(cond)) out.push(`${type}${p["Index Name"] ? ` ${String(p["Index Name"])}` : ""} on source_candidate: the index condition lacks the owner key (${cond || "none"})`);
+    }
+    for (const k of p.Plans ?? []) walk(k);
+  };
+  walk(root);
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Independent expectations and exact comparison
 // ---------------------------------------------------------------------------
@@ -184,7 +211,7 @@ export function expectedStreamCount(view: RawView, staff: string, direction: "be
 // Evidence and the fixed case matrix
 // ---------------------------------------------------------------------------
 
-export interface ProbeEvidence { statement: string; batch: "rebuild" | "refresh"; page: string; limit: number; cursor: unknown; expectedRows: number; actualRows: number | null; reads: Record<string, number>; plan: PlanSummary }
+export interface ProbeEvidence { statement: string; batch: "rebuild" | "refresh"; page: string; limit: number; cursor: unknown; expectedRows: number; actualRows: number | null; reads: Record<string, number>; ownerKey?: string[]; plan: PlanSummary }
 export interface PlanEvidence extends DependencyBaseEvidence {
   label: string;
   fullVolume: Record<string, unknown> | null;
@@ -193,6 +220,8 @@ export interface PlanEvidence extends DependencyBaseEvidence {
   comparisons: Record<string, string>;
   probes: Record<string, ProbeEvidence>;
   explains: number;
+  /** 0042 follow-up only: the structural acceptance verdict (separate from COMPLETE, which means evidence collected). */
+  acceptance?: { accepted: boolean; problems: string[] };
   complete: boolean;
 }
 export const newPlanEvidence = (): PlanEvidence => ({
@@ -257,7 +286,7 @@ export async function runPlanCases(c: Db, ctx: FlowCtx, env: PlanCaseEnv): Promi
       const r = await c.query(DIAG_PREFIX + st[s], params);
       await ctx.as(c, false);
       const plan = summarizePlan(r.rows[0]?.["QUERY PLAN"]);
-      ev.probes[id] = { statement: name(s), batch, page, limit, cursor, expectedRows, actualRows: plan.rootRows, reads: relationReads(r.rows[0]?.["QUERY PLAN"]), plan };
+      ev.probes[id] = { statement: name(s), batch, page, limit, cursor, expectedRows, actualRows: plan.rootRows, reads: relationReads(r.rows[0]?.["QUERY PLAN"]), ...(s === "stream" ? {} : { ownerKey: ownerKeyProblems(r.rows[0]?.["QUERY PLAN"]) }), plan };
       if (plan.rootRows !== expectedRows) throw new Error(`the explained statement returned ${String(plan.rootRows)} rows, expected ${expectedRows}`);
       return plan;
     }, (p) => `${String(p.rootRows)} rows; planning ${String(p.planningMs)} ms, execution ${String(p.executionMs)} ms`);
@@ -405,7 +434,7 @@ export async function diagnoseDependencyPlans(raw: Db, ctxIn: PlanCtx, deps: Pla
 
 export const MIGRATION_0042 = "supabase/migrations/0042_reporting_access_paths.sql";
 /** The exact reviewed 0042 draft (LF sha256); any edit must update this pin and its test. */
-export const REVIEWED_0042_LF = "94440fc06582c8c5c68455d8f7e59cb36f40bec4e0c1b2af1955e13dc56ecbf0";
+export const REVIEWED_0042_LF = "e38aba760a19a70fa3afdddd5155244fb94acb73a53362855d1f63b1a3536a1c";
 export const ACCESS_NAMES: Record<Statement, string> = { "members-original": "members-0041", "members-split": "members-0042", stream: "stream-0042" };
 export const ACCESS_FUNCTIONS = ["read_reporting_owner_members", "read_reporting_staff_stream"] as const;
 export function accessStatements(text0041: string, text0042: string): Record<Statement, string> {
@@ -425,7 +454,37 @@ export function accessBodyProblems(body: readonly string[]): string[] {
   if (body.length !== want.length) return [`0042 has ${body.length} statements, expected ${want.length}`];
   return body.flatMap((s, i) => ((stripSqlComments(s) ?? "").trimStart().startsWith(want[i]) ? [] : [`0042 statement ${i + 1} is not: ${want[i].slice(0, 80)}`]));
 }
-export const REQUIRED_ACCESS_CASES = [...REQUIRED_PLAN_CASES, "A0", "A1"] as const;
+/**
+ * 0042 keeps the default-collation owner equality AND adds a bytewise one
+ * (order_key/event_id COLLATE "C" = key COLLATE "C") so the 0040 bytewise owner
+ * indexes are keyed. That adds no narrowing only when the compared columns and
+ * the key use the database default collation and that collation is
+ * deterministic (PostgreSQL then compares equal text bytewise). Read-only.
+ */
+export const COLLATION_INVARIANT_SQL = `select
+  (select array_agg(a.attname::text || '=' || a.attcollation::text order by a.attname::text) from pg_catalog.pg_attribute a
+    where a.attrelid = 'reporting_private.source_candidate'::regclass and a.attname in ('order_key', 'event_id') and not a.attisdropped) as columns,
+  pg_catalog.pg_collation_for('["k"]'::jsonb ->> 0) as key_collation,
+  (select c.collisdeterministic from pg_catalog.pg_collation c where c.oid = 100) as default_deterministic,
+  (select d.datlocprovider::text || ':' || coalesce(d.datcollate, '') from pg_catalog.pg_database d where d.datname = pg_catalog.current_database()) as database_locale,
+  (select bool_and((x.a = x.b) IS NOT DISTINCT FROM (x.a COLLATE "C" = x.b COLLATE "C"))
+     from (values ('ä', 'a' || pg_catalog.chr(776)), ('A', 'a'), ('ß', 'ss'), ('ﬁ', 'fi'), ('a ', 'a'), ('', ''), ('BULK-1', 'BULK-1'), ('Zq-1', 'zq-1')) x(a, b)) as equality_agrees`;
+export function collationInvariantProblems(r: Record<string, unknown> | undefined): string[] {
+  if (!r) return ["the collation invariant query returned no row"];
+  const p: string[] = [];
+  if (JSON.stringify(r.columns) !== JSON.stringify(["event_id=100", "order_key=100"])) p.push(`candidate owner columns are not the database default collation: ${JSON.stringify(r.columns)}`);
+  if (r.key_collation !== '"default"') p.push(`the owner key is not the default collation: ${String(r.key_collation)}`);
+  if (r.default_deterministic !== true) p.push("the database default collation is not deterministic");
+  if (r.equality_agrees !== true) p.push("default-collation equality and bytewise equality disagree on a probe pair");
+  return p;
+}
+/** Structural acceptance of the 0042 follow-up: every 0042 rebuild member probe read the candidate only by owner-keyed index conditions. */
+export function accessAcceptanceProblems(ev: PlanEvidence): string[] {
+  const probes = Object.entries(ev.probes).filter(([, p]) => p.statement === ACCESS_NAMES["members-split"] && p.batch === "rebuild");
+  if (!probes.length) return ["no 0042 rebuild member probe was recorded"];
+  return probes.flatMap(([id, p]) => (p.ownerKey === undefined ? [`${id}: owner-key evidence is missing`] : p.ownerKey.map((x) => `${id}: ${x}`)));
+}
+export const REQUIRED_ACCESS_CASES = [...REQUIRED_PLAN_CASES, "A0", "A1", "A2"] as const;
 export const newAccessEvidence = (): PlanEvidence => ({
   ...newPlanEvidence(),
   label: "0042 access-path follow-up: 0040+0041+0042 applied inside a rolled-back transaction; slots members-original = 0041 members (baseline), members-split = 0042 members, stream = 0042 stream; EXPLAIN ANALYZE (TIMING OFF) single observations on the full original source; reads = rows read per relation; the refresh overlay (batch_events) branch is measured, not claimed bounded; COMPLETE means evidence collected, not accepted performance",
@@ -466,10 +525,19 @@ export async function diagnoseAccessPaths(raw: Db, ctxIn: PlanCtx, deps: AccessD
       if (p.length) throw new Error(p.join("; "));
       ctx.emit(ev);
     });
+    await step(c, ctx, "A2", "collation invariant: candidate owner columns and the owner key use the deterministic database default collation, so the added bytewise owner equality narrows nothing", async () => {
+      const row = (await c.query(COLLATION_INVARIANT_SQL)).rows[0];
+      ev.functions.collation0042 = row ?? null;
+      const p = collationInvariantProblems(row);
+      if (p.length) throw new Error(p.join("; "));
+      return row;
+    }, (r) => `${String(r?.database_locale)}; deterministic`);
     await deps.cases(c, ctx, { text0041: t.text41, ev, statements: accessStatements(t.text41, text42), names: ACCESS_NAMES });
   }, "the access-path transaction rolled back (0040/0041/0042 not installed)", body42);
   const missing = [...REQUIRED_ACCESS_CASES.filter((id) => !ev.recorded.includes(id)).map((id) => `required case ${id} was not recorded`), ...planEvidenceProblems(ev)];
   if (missing.length) throw new Error(missing.join("; "));
+  const rejected = accessAcceptanceProblems(ev);
+  ev.acceptance = { accepted: rejected.length === 0, problems: rejected };
   ev.complete = true;
   failFast(ctxIn).emit(ev);
   return ev;
