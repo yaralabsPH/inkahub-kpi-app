@@ -489,6 +489,46 @@ export async function affectedOwners(reader: FrozenReader): Promise<Affected> {
   return { owners: [...owners.values()].sort((x, y) => compareUtf8(ownerKey(x), ownerKey(y))), oldStaff };
 }
 
+/**
+ * Task 15: the dependency closure of ONE changed key (the bounded, resumable
+ * unit of a refresh enumeration). The union over every changed key equals
+ * `affectedOwners` exactly (tested): its old and new owners, the owners of its
+ * parents and their timing successors, its inverse children's owners and the
+ * timing successors of its old/new stream positions. Each successor seed keeps
+ * its own dependency budget. `oldStaff` lists [owner key, staff] base self
+ * audiences that may need an empty replacement.
+ */
+export async function changedKeyDependencies(reader: FrozenReader, k: ChangedKey): Promise<{ owners: Owner[]; oldStaff: Array<[string, string]> }> {
+  if (reader.kind !== "refresh") throw new Error("changedKeyDependencies is a refresh closure");
+  const cutoffUs = exactInstant(reader.cutoff);
+  if (cutoffUs === null) throw new RangeError("the frozen cutoff is not an exact instant");
+  const owners = new Map<string, Owner>();
+  const add = (o: Owner) => owners.set(ownerKey(o), o);
+  const parentIds = new Set<string>();
+  const anchors: StreamLine[] = [];
+  const oldStaff: Array<[string, string]> = [];
+  for (const img of [k.before, k.after]) {
+    if (!img) continue;
+    add(ownerOfEvent(img));
+    if (img.parent_event_id) parentIds.add(img.parent_event_id);
+    const l = streamLine(img, cutoffUs);
+    if (l) anchors.push(l);
+  }
+  if (k.before?.staff_id) oldStaff.push([ownerKey(ownerOfEvent(k.before)), k.before.staff_id]);
+  const parents = [...parentIds].sort(compareUtf8);
+  for (const p of (await reader.byIds(parents)).values()) {
+    add(ownerOfEvent(p));
+    const l = streamLine(p, cutoffUs);
+    if (l) anchors.push(l);
+  }
+  for await (const c of reader.children([k.id])) add(ownerOfEvent(c));
+  for (const a of anchors) {
+    const lines = await walkSuccessors(reader, a, new Set<string>(a.workType ? [a.workType] : []), cutoffUs, new DependencyBudget(ownerOfEvent(a.ev)));
+    for (const l of lines) add(ownerOfEvent(l.ev));
+  }
+  return { owners: [...owners.values()].sort((x, y) => compareUtf8(ownerKey(x), ownerKey(y))), oldStaff };
+}
+
 // ---------------------------------------------------------------------------
 // Work for every required audience
 // ---------------------------------------------------------------------------
@@ -504,26 +544,39 @@ function partitionInput(reader: FrozenReader, audience: ReportingAudience, event
 /** Materialize the given owners ONE AT A TIME (no multi-owner prefetch); `onWork` streams each audience's descriptor and owner rows. */
 export async function materializeOwners(reader: FrozenReader, owners: readonly Owner[], oldStaff: ReadonlyMap<string, ReadonlySet<string>>, onWork: (w: MaterializedWork) => void | Promise<void>, stats: MaterializeStats): Promise<void> {
   for (const owner of owners) {
-    const input = await buildOwnerInput(reader, owner);
-    stats.owners++;
-    stats.maxInput = Math.max(stats.maxInput, input.events.length);
-    stats.peakInput = Math.max(stats.peakInput, input.events.length);
-    stats.totalInput += input.events.length;
-    const staff = new Set<string>(input.members.map((e) => e.staff_id).filter((s): s is string => !!s));
-    for (const s of oldStaff.get(ownerKey(owner)) ?? []) staff.add(s);
-    const audiences: ReportingAudience[] = [{ kind: "site" }, ...[...staff].sort(compareUtf8).map((staffId) => ({ kind: "self" as const, staffId }))];
-    for (const audience of audiences) {
-      const pin = partitionInput(reader, audience, input.events);
-      const result = projectReportingPartition(pin);
-      await onWork({
-        desc: { audienceKind: audience.kind, audienceStaff: audience.kind === "self" ? audience.staffId : null, partitionKind: owner.partitionKind, partitionKey: owner.partitionKey, inputHash: sha256Hex(canonicalJson(pin)) },
-        rows: ownerRows(result, owner),
-        inputRows: pin.events.length,
-      });
+    for (const w of await materializeOwnerWorks(reader, owner, oldStaff.get(ownerKey(owner)) ?? new Set<string>(), stats)) {
+      await onWork(w);
       stats.works++;
     }
   }
   stats.requests = reader.requests();
+}
+
+/**
+ * Task 15: ONE owner's works for every required audience (site, each member's
+ * worker, each old self audience), from one input build. The unit the durable
+ * worker plans and later stages; `materializeOwners` is this per owner.
+ */
+export async function materializeOwnerWorks(reader: FrozenReader, owner: Owner, oldStaff: Iterable<string>, stats?: MaterializeStats): Promise<MaterializedWork[]> {
+  const input = await buildOwnerInput(reader, owner);
+  if (stats) {
+    stats.owners++;
+    stats.maxInput = Math.max(stats.maxInput, input.events.length);
+    stats.peakInput = Math.max(stats.peakInput, input.events.length);
+    stats.totalInput += input.events.length;
+  }
+  const staff = new Set<string>(input.members.map((e) => e.staff_id).filter((s): s is string => !!s));
+  for (const s of oldStaff) staff.add(s);
+  const audiences: ReportingAudience[] = [{ kind: "site" }, ...[...staff].sort(compareUtf8).map((staffId) => ({ kind: "self" as const, staffId }))];
+  return audiences.map((audience) => {
+    const pin = partitionInput(reader, audience, input.events);
+    const result = projectReportingPartition(pin);
+    return {
+      desc: { audienceKind: audience.kind, audienceStaff: audience.kind === "self" ? audience.staffId : null, partitionKind: owner.partitionKind, partitionKey: owner.partitionKey, inputHash: sha256Hex(canonicalJson(pin)) },
+      rows: ownerRows(result, owner),
+      inputRows: pin.events.length,
+    };
+  });
 }
 
 /** Whole batch in memory (tests and small refreshes): every affected (refresh) or every (rebuild) owner and audience. */

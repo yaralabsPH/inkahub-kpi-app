@@ -143,6 +143,62 @@ Spec: [`docs/specs/item-counting.md`](../specs/item-counting.md) · Plan:
    | 500 `Full-site report needs SUPABASE_SERVICE_ROLE_KEY` | The server key is missing |
    | 500 | An evidence or side read failed (nothing is generated or sent) |
 
+### Reporting worker (Task 15) — prerequisites before any schedule runs
+
+These apply only when the published-report amendment is released. Nothing here
+is active until CJ enables it; the worker code does nothing for a site whose
+processor is off.
+
+1. **Hosting entitlement (blocker).** The three new refresh schedules run every
+   15 minutes per site and need a 300-second Node function. Confirm the Vercel
+   plan allows both, plus the budget for about 288 scheduled calls a day plus
+   manual retries, **before** deploying `vercel.json`. Do not upgrade or
+   purchase anything as part of this release.
+2. **Secrets.** Set `CRON_SECRET` (already used by the digest) and a new,
+   different `REPORTING_OPERATOR_SECRET` in the target environment, together
+   with `SUPABASE_SERVICE_ROLE_KEY`. The operator endpoint refuses every
+   request if the two secrets are equal.
+3. **Database.** Migrations 0037–0041 and **0043** (worker state) must be
+   applied in number order on staging first, then production. 0042 is reserved
+   for a measured Task 14 access-path correction and may not exist.
+4. **First build per site.** Enable capture once
+   (`{"action":"enable-capture"}`; this affects **all three sites** and
+   starts a new capture epoch), then for each site run
+   `{"action":"set-mode","site":"…","processorEnabled":true}` and
+   `{"action":"rebuild","site":"…"}` until the result says `published`
+   (a rebuild resumes over several calls; `pending` means call it again).
+   Keep `readMode` `legacy` until the read-path checks (Tasks 16–20) pass.
+5. **Schedules.** The refresh schedules are AU `0,15,30,45`, UK `1,16,31,46`
+   and US `2,17,32,47` minutes past each hour. The three digest schedules are
+   unchanged.
+
+Operator commands are `POST /api/reports/reporting-admin` with
+`Authorization: Bearer <REPORTING_OPERATOR_SECRET>` and a JSON body:
+`status`, `rebuild`, `cleanup`, `set-mode`, `abandon`, `disable-capture`,
+`enable-capture` (see the handler header for the exact fields). Each command is
+written to the redacted run log.
+
+### Reporting worker recovery
+
+- **`busy`**: another invocation holds the site's lease; nothing to do.
+- **`pending`**: the invocation used its 4-minute budget or a transient
+  database error was deferred. The next scheduled run continues from the saved
+  position (it never starts the batch again from zero).
+- **`failed` with `partition_too_large`, `conflicting_work` or `invalidated`**:
+  the batch stays as evidence and keeps failing visibly; reports stay on the
+  last published generation and their age warning grows. Inspect with
+  `status`, then `abandon` (with a reason) once the lease has expired, and run
+  `rebuild` for that site. `rebuild_required` means the site has no valid
+  published base (for example after a capture epoch change): run `rebuild`.
+- **Emergency stop:** `{"action":"set-mode","site":"…","processorEnabled":false}`
+  stops one site's refreshes without touching scanning. `disable-capture`
+  stops the journal for **all** sites and invalidates every site's published
+  reports until each is rebuilt after `enable-capture`.
+- **Retention:** `cleanup` (or a scheduled call later) expires generations
+  seven days after they were superseded and removes the 30-day run log and
+  finished batches' worker state. It never touches scans, the change journal,
+  active work or any retained generation.
+
 ## Rollback
 
 Restore the previous S1-protected deployment in Vercel. Leave migrations

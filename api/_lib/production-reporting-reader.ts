@@ -185,3 +185,54 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenR
     requests: () => n,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Task 15: cursor-resumable enumeration pages (one bounded call each)
+// ---------------------------------------------------------------------------
+
+/** One page of a resumable enumeration; an EMPTY page (only) means the end. */
+export interface EnumerationPages {
+  /** Refresh: changed keys strictly after `after` (bytewise id). */
+  changedKeyPage(after: string | null): Promise<ChangedKey[]>;
+  /** Rebuild: owners strictly after `after` ((kind, key) bytewise). */
+  ownerPage(after: Owner | null): Promise<Owner[]>;
+}
+
+export function rpcEnumerationPages(client: RpcClient, ref: FrozenBatchRef): EnumerationPages {
+  if (!UUID.test(ref.batchId)) throw new ReportingJobError("batchId must be a uuid");
+  const call = async (fn: string, args: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
+    const { data, error } = await client.rpc(fn, { p_batch: ref.batchId, p_fence: ref.fence, ...args });
+    if (error) throw new ReportingJobError(`${fn}: ${error.message}`, error.code ?? null);
+    if (!Array.isArray(data)) throw new ReportingJobError(`${fn} returned no rows array`);
+    if (data.length > 1000) throw new ReportingJobError(`${fn} returned more than 1,000 rows`);
+    const bytes = responseBytes(data);
+    if (bytes > MAX_RESPONSE_BYTES) throw new ReportingJobError(`${fn} returned ${bytes} bytes; a response must be at most ${MAX_RESPONSE_BYTES}`);
+    return data as Array<Record<string, unknown>>;
+  };
+  return {
+    async changedKeyPage(after) {
+      if (ref.kind !== "refresh") throw new ReportingJobError("changed keys are a refresh read");
+      const rows = await call("read_reporting_changed_keys", { p_after_event_id: after, p_limit: 1000 });
+      let prev = after;
+      return rows.map((r) => {
+        const id = str(r.event_id, "event_id");
+        if (prev !== null && compareUtf8(id, prev) <= 0) throw new ReportingJobError("read_reporting_changed_keys is not in keyset order");
+        prev = id;
+        return { id, before: r.before_image == null ? null : imageToEvent(r.before_image, ref.site, id), after: r.after_image == null ? null : imageToEvent(r.after_image, ref.site, id) };
+      });
+    },
+    async ownerPage(after) {
+      if (ref.kind !== "rebuild") throw new ReportingJobError("owners are a rebuild read");
+      const rows = await call("list_reporting_owners", { p_after_kind: after?.partitionKind ?? null, p_after_key: after?.partitionKey ?? null, p_limit: 1000 });
+      let prev = after;
+      return rows.map((r) => {
+        const kind = r.partition_kind;
+        if (kind !== "order" && kind !== "event") throw new ReportingJobError("list_reporting_owners returned an unknown kind");
+        const o: Owner = { partitionKind: kind, partitionKey: str(r.partition_key, "partition_key") };
+        if (prev && compareUtf8(ownerKey(o), ownerKey(prev)) <= 0) throw new ReportingJobError("list_reporting_owners is not in keyset order");
+        prev = o;
+        return o;
+      });
+    },
+  };
+}

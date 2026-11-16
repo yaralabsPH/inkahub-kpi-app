@@ -2706,3 +2706,84 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - Non-executing plans (`planSql`, plain EXPLAIN) and the exact diagnostic strings still pass.
   - Regressions: 11 executing forms are refused before sending, including bare SELECT/UPDATE/DELETE/INSERT, ANALYSE, newline/comment-prefixed forms and `ANALYZE TRUE`. Non-executing forms are accepted, and the owner ordering is pinned. Both old forms fail the new tests (2/2 mutations caught).
   - Gate: `npx tsc -b`, `typecheck:digest` and the strict runners OK; 1513/1513 tests (40 files); build OK.
+- 2026-11-16 — **Task 15 implemented offline; runtime gate pending** (Claude). Nothing was applied: no SQL, staging run, production access, merge or deploy. The Task 15 checkbox stays unchecked until CJ's protected staging refresh/rebuild/disable/recovery evidence and an entitlement record exist. CI for the T14S3 review repair `ed66c5c` is green.
+  - **Files:**
+    - new `supabase/migrations/0043_reporting_worker_state.sql` (draft, unapplied; 0042 left unallocated as reserved);
+    - new `api/_lib/production-reporting-worker.ts`, `api/_lib/reporting-worker-state.ts`, `api/_lib/reporting-auth.ts`;
+    - new handlers `api/reports/refresh-summaries.ts`, `api/reports/reporting-admin.ts`;
+    - new `tests/api/reporting-worker.test.ts` (41 tests);
+    - modified `vercel.json`, `package.json` (typecheck), `docs/releases/item-counting.md`.
+    - **Files the plan did not name:**
+      - `production-reporting-materialize.ts`: two exported units, no behavior change; all 61 materializer/dependency tests unchanged;
+      - `production-reporting-reader.ts`: cursor-resumable enumeration pages;
+      - two pinned assertions updated: the digest cron test now pins only the digest entries; the migration-list test includes 0043.
+  - **0043 durable state:**
+    - Tables:
+      - `worker_progress` (per batch: enumeration cursor, completion, counters);
+      - `worker_owners` (discovered owner, old self staff, planned count);
+      - `worker_runs` (redacted run log).
+    - RLS on, client grants revoked, service_role only.
+    - Service-only invoker RPCs, all fenced through `lock_batch` (live lease):
+      - `save_reporting_enumeration`: discoveries saved WITH the cursor advance; an identical replay is a no-op, any other cursor is refused, completion is final;
+      - `read_reporting_worker_progress`, `list_reporting_worker_owners`;
+      - `plan_reporting_owner`: one owner's descriptors via the existing `plan_reporting_work`, plus the planned mark, in one transaction; exactly one site audience; every old self audience required;
+      - `verify_reporting_plan`: enumeration complete, every owner planned, counters agree, per-owner exact work counts with no missing, extra or orphan rows;
+      - `list_reporting_work_descriptors`: bounded traversal in `work_manifest` order;
+      - `set_reporting_site_mode`, `record_reporting_run`;
+      - `cleanup_reporting_history`:
+        - superseded generations past `expires_at` become expired;
+        - deletes closed versions with `valid_to_seq ≤` the site's minimum published/superseded sequence number, across 7 families;
+        - removes the 30-day run log and finished batches' worker state;
+        - takes the site row lock; never touches source, journal, receipts, batches, work or results.
+    - Responses are ≤1,000 rows / 1 MiB, with single-row refusal.
+  - **Worker (`runReportingCycle`):**
+    - A live lease → `busy`. An expired one → takeover (new fence).
+    - Rebuild copy/freeze resumes from the database cursor.
+    - **Refresh enumeration** works per changed key: the exact per-key slice of `affectedOwners` (old/new owners, parents and their successors, inverse children, successor walks, each seed budgeted). It checkpoints every ≤50 keys / ≤500 owners, and at the deadline inside a page.
+    - **Rebuild enumeration** checkpoints each owner keyset page.
+    - **Plan:** one owner at a time, with old self audiences.
+    - **Seal:** only after `verify_reporting_plan`, using a streaming-SHA-256 traversal of the SAVED descriptors whose count must equal the proof.
+    - **Stage:** bounded claims; each claimed owner is re-materialized once from the frozen view, the input hash must equal the claimed descriptor, then ≤1 MiB chunks are staged.
+    - **Publish:** the existing atomic publication.
+    - Budget and errors:
+      - stops at 240 s;
+      - renews the 360 s lease every 30 s;
+      - transient errors retried after 30/60/120 s only within the budget, otherwise `pending`;
+      - permanent kinds (`partition_too_large`, `conflicting_work`, `invalidated`, `rebuild_required`, …) fail visibly and are never auto-abandoned.
+    - No `materializeBatch`/`affectedOwners` arrays in the production path; a source test enforces this.
+  - **Handlers:**
+    - Constant-time bearer check BEFORE any parsing, environment or database work.
+    - `refresh-summaries`: CRON_SECRET, GET, `site` only; 401 → 405 → 400 → 500 → work.
+    - `reporting-admin`: a separate REPORTING_OPERATOR_SECRET; refused when equal to CRON_SECRET; POST with a strict zod body for status/rebuild/cleanup/set-mode/abandon/disable-capture/enable-capture.
+    - Capture actions report their all-site effect and the rebuilds they require. Every action is run-logged; responses are no-store.
+  - **`vercel.json`:** the three refresh schedules (AU `0,15,30,45`, UK `1,16,31,46`, US `2,17,32,47`) and `maxDuration: 300` for both functions. The digest entries are unchanged.
+  - **Tests:** 41 (failing first — the worker, handlers, migration and schedule did not exist). A fake reporting database models fences, leases, takeover, durable checkpoints, the exact seal, claims, staging and publication, with frozen in-memory views. Covered:
+    - **Parity:** refresh and rebuild publish exactly the whole-batch reference's descriptors and chunks; the per-key union equals `affectedOwners`, including a successor-only owner, an inverse-child owner and an old-self-only owner.
+    - **Resume and replay:** resume from the saved cursor (never from null) for refresh and rebuild; deadline inside a page of keys; lost-response checkpoint replay; leased work returned on takeover over many invocations, with a heartbeat-span check.
+    - **Refusals and failures:** stale fence refused; orphan work and a traversal/proof count mismatch refuse the seal; a tampered claimed input hash fails as `conflicting_work`; `partition_too_large` is a visible failure.
+    - **Operations:** retry/deferral never sleeps past the deadline; a disabled processor does no batch work; a failed run log never masks the result; cleanup repeats bounded passes.
+    - **Handlers:** 401 with zero client calls for missing, wrong, app-JWT and duplicate headers; precedence; operator-secret separation; strict bodies; all-site capture notes.
+    - **Static checks:** the migration text (grants, invoker/search path, fencing, atomic save order, seal proof, cleanup scope) and the exact schedules.
+  - **Mutations: 18/18 caught**, after strengthening fixtures and tests for 9 that first survived:
+    - refresh/rebuild restart from zero;
+    - input-hash check removed;
+    - retry past the deadline;
+    - no heartbeat;
+    - old self audiences dropped;
+    - seal count not cross-checked;
+    - key-loop deadline;
+    - busy detection;
+    - failure classification;
+    - manifest join and order;
+    - handler precedence and extra query;
+    - equal secrets;
+    - non-strict body;
+    - per-key inverse children and successors.
+  - **Limitations and runtime gates still pending:**
+    - The 0043 SQL has not run on PostgreSQL.
+    - Real staging protected refresh/rebuild/disable/recovery with captured output (CJ) is still needed.
+    - The Vercel 15-minute/300 s entitlement is unobserved: a deployment blocker.
+    - The two-pass cost (plan materializes each owner, stage re-materializes it) adds to the open request-cost concern, as a Task 19 measurement item.
+    - Cleanup's `valid_to_seq` deletes rely on existing validity indexes; their cost at scale is a Task 19 item.
+    - Retention is not scheduled automatically; it is the operator `cleanup` action (a schedule can be added once entitlement is known).
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK (includes all new modules); strict runners OK; 1554/1554 tests (41 files); build OK.

@@ -808,7 +808,8 @@ describe("vercel.json schedules are unchanged", () => {
   it("keeps the AU, UK and US cron entries exactly, with no secret in any path", () => {
     const raw = readFileSync(new URL("../../vercel.json", import.meta.url), "utf-8");
     const cfg = JSON.parse(raw) as { crons: Array<{ path: string; schedule: string }> };
-    expect(cfg.crons).toEqual([
+    // Task 15 adds only the reporting refresh schedules (pinned in tests/api/reporting-worker.test.ts); the digest entries are unchanged.
+    expect(cfg.crons.filter((c) => !c.path.startsWith("/api/reports/refresh-summaries?"))).toEqual([
       { path: "/api/reports/daily-digest?location=au", schedule: "55 13 * * *" },
       { path: "/api/reports/daily-digest?location=uk", schedule: "55 22 * * *" },
       { path: "/api/reports/daily-digest?location=us", schedule: "55 4 * * *" },
