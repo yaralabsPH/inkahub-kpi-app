@@ -203,7 +203,7 @@ export const PLAN_SQL = {
   owner: `select reporting_private.order_key(pe.order_number) as k, min(pe.order_number) as raw, count(*)::int as n
   from public.production_events pe
  where pe.location = $1 and pe.id not like 'dr-%' and coalesce(reporting_private.order_key(pe.order_number), '') <> ''
- group by 1 order by count(*) desc, 1 collate "C" limit 1`,
+ group by 1 order by count(*) desc, reporting_private.order_key(pe.order_number) collate "C" limit 1`, // tie-break on the TEXT key (not the ordinal 1)
   /** The busiest real worker at the site (full volume). */
   staff: "select pe.staff_id::text as s, count(*)::int as n from public.production_events pe where pe.location = $1 and pe.id not like 'dr-%' and pe.staff_id is not null group by 1 order by count(*) desc, 1 limit 1",
 } as const;

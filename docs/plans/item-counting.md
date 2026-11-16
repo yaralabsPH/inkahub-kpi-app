@@ -2698,3 +2698,11 @@ Coder adds one line per task with focused/full check results, CI evidence and re
     - The refresh member probe relies on the overlay holding only the named rows (the cutoffs are equal, so there are no due keys).
     - A stream rewrite is deliberately not included.
   - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1500/1500 tests (40 files); build OK.
+- 2026-11-16 — T14S3 review repairs at `777f466`, OFFLINE (Claude). No SQL; the diagnostic was not run.
+  - (1) `PLAN_SQL.owner` now tie-breaks on the TEXT key: `order by count(*) desc, reporting_private.order_key(pe.order_number) collate "C"`. The old `1 collate "C"` collated the ordinal.
+  - (2) New `executesExplain`:
+    - It recognises ANY ANALYZE/ANALYSE option before the explained statement, in both the parenthesized and the bare `EXPLAIN ANALYZE [VERBOSE] …` syntax, after leading comments and whitespace. Explicit `ANALYZE false` is denied too (conservative).
+    - The guard refuses every executing EXPLAIN except the exact diagnostic allowlist.
+    - Non-executing plans (`planSql`, plain EXPLAIN) and the exact diagnostic strings still pass.
+  - Regressions: 11 executing forms are refused before sending, including bare SELECT/UPDATE/DELETE/INSERT, ANALYSE, newline/comment-prefixed forms and `ANALYZE TRUE`. Non-executing forms are accepted, and the owner ordering is pinned. Both old forms fail the new tests (2/2 mutations caught).
+  - Gate: `npx tsc -b`, `typecheck:digest` and the strict runners OK; 1513/1513 tests (40 files); build OK.

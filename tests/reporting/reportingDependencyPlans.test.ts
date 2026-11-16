@@ -12,7 +12,7 @@ import {
   comparePages, DIAG_PREFIX, diagnoseDependencyPlans, diagnosticStatements, EXPLAIN_CASES, expectedMembers, expectedStreamCount, explainAllowlist, MAX_EXPLAINS, memberPage, newPlanEvidence, OR_CANDIDATE, OR_MIRROR,
   PLAN_SQL, planEvidenceProblems, REQUIRED_PLAN_CASES, runPlanCases, smallLimit, SPLIT_CANDIDATE, SPLIT_MIRROR, splitMembersSql, summarizePlan, type MemberRow, type PlanCtx, type PlanDeps, type PlanEvidence,
 } from "../staging/reportingDependencyPlans";
-import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
+import { boundReadQuery, CASE_SQL, dependencyGuard, effectiveReadQuery, executesExplain, planSql, functionBody, MIGRATION_0040, MIGRATION_0041, rawView } from "../staging/reportingDependencyRehearsal";
 import { compareFullState, migrationBody, newPublicationReport, parsePublicationArgs, publicationStatus, ROLLBACK_ONLY, type Db, type FullState, type Observation } from "../staging/reportingPublication";
 import { bodyHashes, FUNCTION_SQL, publishBody } from "../staging/reportingRebuildRepair";
 
@@ -371,4 +371,43 @@ describe("T14S3: the diagnostic end to end (real cases over a scripted database)
       else expect(publicationStatus(report)).toMatch(/^STATUS: FAILED/);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// T14S3 review repairs (777f466)
+// ---------------------------------------------------------------------------
+
+describe("T14S3 review: every executing EXPLAIN form is refused unless exactly allowlisted", () => {
+  const body = [...migrationBody(read(MIGRATION_0040)), ...migrationBody(T41)];
+  const allow = explainAllowlist(T41);
+  const executing = [
+    `EXPLAIN ANALYZE ${ST["members-original"]}`, `EXPLAIN ANALYZE ${ST.stream}`, "EXPLAIN ANALYZE UPDATE reporting_private.batches SET state = 'failed'", "explain analyse select 1", "EXPLAIN ANALYZE VERBOSE select 1",
+    "/* c */ EXPLAIN\n  ANALYZE delete from reporting_private.source_candidate", "-- c\nexplain analyze insert into x values (1)", "EXPLAIN (FORMAT JSON, ANALYZE TRUE) select 1", "explain (analyze false) select 1", "EXPLAIN (ANALYSE) WITH x AS (SELECT 1) SELECT * FROM x",
+    `EXPLAIN ANALYZE ${DIAG_PREFIX.slice("EXPLAIN ".length)}${ST.stream}`,
+  ];
+  for (const sql of executing) {
+    it(`refuses before sending: ${sql.replace(/\s+/g, " ").slice(0, 70)}`, async () => {
+      expect(executesExplain(sql)).toBe(true);
+      const sent: string[] = [];
+      const db: Db = { query: async (q: string) => (sent.push(q), { rows: [], rowCount: 0 }) };
+      await expect(dependencyGuard(db, new Set(body), [], allow).query(sql)).rejects.toThrow(/dependency-read rehearsal refuses/);
+      expect(sent).toEqual([]);
+    });
+  }
+  it("non-executing plans and ordinary statements are not executing EXPLAINs; the exact diagnostic strings are still allowed", async () => {
+    for (const q of [planSql(T41, "read_reporting_owner_members"), planSql(T41, "read_reporting_staff_stream"), "EXPLAIN select 1", "explain (verbose, format json) select analyze_col from t", "select 'explain analyze'", ST.stream]) expect(executesExplain(q)).toBe(false);
+    const sent: string[] = [];
+    const db: Db = { query: async (q: string) => (sent.push(q), { rows: [], rowCount: 0 }) };
+    const g = dependencyGuard(db, new Set(body), [], allow);
+    for (const q of [...allow, planSql(T41, "read_reporting_staff_stream")]) await g.query(q);
+    expect(sent).toHaveLength(4);
+  });
+});
+
+describe("T14S3 review: the owner choice tie-breaks on the text key", () => {
+  it("orders by count then the order_key expression COLLATE \"C\" (never the ordinal 1)", () => {
+    expect(PLAN_SQL.owner).toContain('order by count(*) desc, reporting_private.order_key(pe.order_number) collate "C" limit 1');
+    expect(PLAN_SQL.owner).not.toMatch(/,\s*1\s+collate/i);
+    expect(PLAN_SQL.owner).toContain("group by 1");
+  });
 });

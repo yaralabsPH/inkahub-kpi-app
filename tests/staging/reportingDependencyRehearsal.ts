@@ -295,6 +295,19 @@ export function missingRequired(required: Iterable<string>, viaRpc: readonly Mat
 // Statement guard
 // ---------------------------------------------------------------------------
 
+/**
+ * Does this EXPLAIN execute its statement? Any ANALYZE/ANALYSE option before the
+ * explained statement, in either syntax: `EXPLAIN ANALYZE [VERBOSE] ...` or
+ * `EXPLAIN (... ANALYZE [true|on|false] ...) ...` (an explicit false is denied
+ * too: conservative). Non-executing plans (no ANALYZE option) are not affected.
+ */
+export function executesExplain(sql: string): boolean {
+  const s = sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/, "");
+  if (!/^explain\b/i.test(s)) return false;
+  const m = /^explain\b([\s\S]*?)\b(select|with|insert|update|delete|merge|values|table|execute|create|declare|refresh)\b/i.exec(s);
+  return /\banaly[sz]e\b/i.test(m ? m[1] : s);
+}
+
 /** Deny-list (the flow's statements are many): no commit, history, maintenance, timeout/planner change, unrelated DDL, EXPLAIN ANALYZE or network. */
 export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: string[] = [], allowedExplainAnalyze: ReadonlySet<string> = new Set()): Db {
   return {
@@ -309,7 +322,7 @@ export function dependencyGuard(c: Db, allowedDdl: ReadonlySet<string>, sent: st
         /supabase_migrations|schema_migrations|\bhttp_(get|post|request)\b|\bnet\.http|\bdblink\b|pg_read_file|lo_import/i.test(s) ||
         /set_config\(\s*'(statement_timeout|lock_timeout|idle_in_transaction_session_timeout|work_mem|enable_\w+|jit|plan_cache_mode|random_page_cost)'/i.test(s) ||
         // EXPLAIN ANALYZE executes its statement: only an exact allowlisted diagnostic SELECT (T14S3); the rehearsal allows none.
-        (/^explain\s*\([^)]*\banalyze\b/i.test(s) && !allowedExplainAnalyze.has(sql)) ||
+        (executesExplain(s) && !allowedExplainAnalyze.has(sql)) ||
         (ddl && !allowedDdl.has(sql));
       if (bad) throw new Error(`dependency-read rehearsal refuses: ${s.replace(/\s+/g, " ").slice(0, 120)}`);
       sent.push(sql);
