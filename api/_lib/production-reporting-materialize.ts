@@ -162,7 +162,47 @@ export interface FrozenReader {
   childPage(parentId: string, afterId: string | null, limit: number): Promise<Ev[]>;
   /** One page of a worker's events strictly before/after `from` (ordered away from it). */
   stream(staff: string, direction: "before" | "after", from: StreamPosition, limit: number): Promise<Ev[]>;
+  /**
+   * Task 15 (0045, optional): ONE 'before' stream page with the frozen children of exactly the lines a predecessor
+   * walk is certain to consume: every line_verified line at or above `certain` ((exact instant, bytewise id); a null
+   * id = instant only) and the first line_verified line below it. Same order and bounds as `stream` + `children`.
+   */
+  predecessorPage?(staff: string, from: StreamPosition, certain: CertainBound | null, limit: number): Promise<PredecessorPage>;
   requests(): number;
+}
+
+/** The keyset bound of a walk's certain range: lines at or above it cannot stop the walk. */
+export interface CertainBound { createdAt: string; id: string | null }
+export interface PredecessorLine { ev: Ev; kids: Ev[] | null; kidsComplete: boolean }
+/** `complete`: every line up to the limit (or the stream end) and every included line's children were returned. */
+export interface PredecessorPage { lines: PredecessorLine[]; complete: boolean }
+export type PredecessorRow = { kind: "line" | "line_kids"; ev: Ev } | { kind: "child"; ev: Ev } | { kind: "end" };
+
+/** The page a 0045 row sequence describes (grammar already checked): a line's included children are proven complete by any later line or the end row. */
+export function predecessorPageOf(rows: readonly PredecessorRow[]): PredecessorPage {
+  const lines: PredecessorLine[] = [];
+  let complete = false;
+  for (const r of rows) {
+    if (r.kind === "end") complete = true;
+    else if (r.kind === "child") lines[lines.length - 1].kids!.push(r.ev);
+    else lines.push({ ev: r.ev, kids: r.kind === "line_kids" ? [] : null, kidsComplete: false });
+  }
+  lines.forEach((l, i) => void (l.kidsComplete = l.kids !== null && (complete || i < lines.length - 1)));
+  return { lines, complete };
+}
+
+/** The ONE certain-range rule of 0045, as the in-memory reader applies it: are this line's children included? */
+function certainRule(certain: CertainBound | null) {
+  const cu = certain ? exactInstant(certain.createdAt) : null;
+  if (certain && cu === null) throw new RangeError("the certain bound is not an exact instant");
+  let open = true;
+  return (e: Ev, us: bigint): boolean => {
+    if (e.event_type !== "line_verified") return false;
+    if (cu !== null && (us > cu || (certain!.id !== null && us === cu && compareUtf8(e.id, certain!.id) >= 0))) return true;
+    if (!open) return false;
+    open = false;
+    return true;
+  };
 }
 
 const micros = (e: Pick<Ev, "created_at" | "id">): bigint => {
@@ -261,6 +301,31 @@ export function memoryFrozenReader(o: { site: string; cutoff: string; kind: "ref
       let j = lo;
       while (j > 0 && cmp({ us: list[j - 1].us, id: list[j - 1].e.id }, at) >= 0) j--;
       return list.slice(Math.max(0, j - size), j).reverse().map((x) => x.e);
+    },
+    async predecessorPage(staff, from, certain, limit) {
+      n++;
+      // the 0045 contract: the 'before' page (limit lines), each included line followed by its children; `maxPage`
+      // here caps the total rows (as the 1,000-row / 1 MiB bounds can), so a response can be cut anywhere
+      const cap = Math.min(1000, o.maxPage ?? 1000);
+      const list = byStaff.get(staff) ?? [];
+      const atp = { us: micros({ created_at: from.createdAt, id: from.id }), id: from.id };
+      let j = list.length;
+      while (j > 0 && cmp({ us: list[j - 1].us, id: list[j - 1].e.id }, atp) >= 0) j--;
+      const page = list.slice(Math.max(0, j - Math.min(limit, 1000)), j).reverse();
+      const include = certainRule(certain);
+      const rows: PredecessorRow[] = [];
+      const done = () => predecessorPageOf(rows);
+      for (const x of page) {
+        const kids = include(x.e, x.us);
+        if (rows.length >= cap) return done();
+        rows.push({ kind: kids ? "line_kids" : "line", ev: x.e });
+        if (kids) for (const k of byParent.get(x.e.id) ?? []) {
+          if (rows.length >= cap) return done();
+          rows.push({ kind: "child", ev: k });
+        }
+      }
+      if (rows.length < cap) rows.push({ kind: "end" });
+      return done();
     },
     requests: () => n,
   };
@@ -396,10 +461,35 @@ async function exactWalk(
   onLine: (l: StreamLine, effective: boolean) => boolean,
   /** Lines that can NEVER satisfy the walk (onLine cannot return true for them): certain to be consumed. */
   cannotStop?: (l: StreamLine) => boolean,
+  /** The same certain range as a keyset bound (lines at or above it cannot stop), for the 0045 page-with-children read. */
+  certain?: CertainBound | null,
 ): Promise<void> {
   let stopAt: bigint | null = null;
   let cursor = from;
+  const paged = direction === "before" && certain !== undefined && !!reader.predecessorPage;
   for (;;) {
+    // Task 15 (0045): while the walk is not satisfied, ONE read returns the page with the children of the lines it is
+    // certain to consume (the certain range and the next possible stop line); after the stop, ties use the plain page.
+    // If a bound cut an included line's children, the WHOLE combined page is discarded (nothing charged, the cursor not
+    // advanced) and this page is read exactly as before (plain page, certain lines' children, then one line at a time).
+    const p = paged && stopAt === null ? await reader.predecessorPage!(staff, cursor, certain!, STREAM_PAGE) : null;
+    if (p && !p.lines.length && p.complete) return; // ONLY an empty page WITH the end row proves the stream end
+    if (p && p.lines.length && p.lines.every((x) => x.kids === null || x.kidsComplete)) {
+      for (const { ev: e, kids } of p.lines) {
+        const us = micros(e);
+        if (stopAt !== null && us < stopAt) return;
+        budget.take(e);
+        onEvent(e);
+        const l = streamLine(e, cutoffUs);
+        if (!l) continue; // a non-candidate's included children are not part of the input
+        const got = kids === null ? await consumeChildren(reader, e.id, budget, onEvent) : chargeChildren(kids, budget, onEvent);
+        if (onLine(l, siteEffective(reader, l, got)) && stopAt === null) stopAt = l.us;
+      }
+      if (p.complete && p.lines.length < STREAM_PAGE) return; // the read proved the stream ended
+      const last = p.lines[p.lines.length - 1].ev;
+      cursor = { createdAt: last.created_at, id: last.id };
+      continue;
+    }
     const page = await reader.stream(staff, direction, cursor, STREAM_PAGE);
     if (!page.length) return;
     // Task 15 (hosted AU): the page's leading lines that cannot stop the walk WILL be consumed, so their own
@@ -504,7 +594,10 @@ export async function buildOwnerInput(reader: FrozenReader, owner: Owner, member
         if (l.workType !== null) need.delete(l.workType);
       }
       return need.size === 0;
-    }, (l) => projectorOrder(lineOrder(l), lineOrder(earliest)) >= 0); // only a line BELOW the earliest member can satisfy
+    }, (l) => projectorOrder(lineOrder(l), lineOrder(earliest)) >= 0, // only a line BELOW the earliest member can satisfy
+    // the same range as a bytewise keyset: exact when the earliest id has no UTF-16 unit >= 0xD800 (UTF-16 and bytewise
+    // order against it then agree); otherwise the instant alone (a subset: ties at that instant are not certain)
+    { createdAt: isoOfMicros(earliest.us), id: /^[\u0000-\ud7ff]*$/.test(earliest.ev.id) ? earliest.ev.id : null });
   }
   const events = [...context.values()].sort((x, y) => compareUtf8(x.id, y.id));
   return { owner, members: [...members].sort((x, y) => compareUtf8(x.id, y.id)), events };

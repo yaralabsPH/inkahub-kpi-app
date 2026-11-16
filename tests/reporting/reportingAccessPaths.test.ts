@@ -26,7 +26,7 @@ const REPLACED = ["read_reporting_owner_members", "read_reporting_staff_stream"]
 describe("0042 allocation and immutability", () => {
   it("0042 is the reserved number between the Task 14 drafts and Task 15/16 (append-only)", () => {
     const names = readdirSync("supabase/migrations").filter((n) => /^004\d_/.test(n)).sort();
-    expect(names).toEqual(["0040_reporting_dependency_reads.sql", "0041_reporting_dependency_read_bounds.sql", "0042_reporting_access_paths.sql", "0043_reporting_worker_state.sql", "0044_reporting_reads.sql"]);
+    expect(names).toEqual(["0040_reporting_dependency_reads.sql", "0041_reporting_dependency_read_bounds.sql", "0042_reporting_access_paths.sql", "0043_reporting_worker_state.sql", "0044_reporting_reads.sql", "0045_reporting_predecessor_page.sql"]);
   });
   it("0040 and 0041 are byte-identical to the reviewed drafts the T14S3 evidence ran", () => {
     expect(sha(lfOf(M40))).toBe("4e39243e2ee6526f656eb1b462156d6bc9eabf17cac78fcb2d873cd4498968b2");

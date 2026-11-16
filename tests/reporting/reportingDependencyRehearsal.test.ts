@@ -212,7 +212,7 @@ describe("T14S1: the SQL RpcClient on the rehearsal transaction", () => {
       const rest = view.filter((e) => afterParent === null || e.id > afterId!);
       return rest.slice(0, 2).map((e) => ({ parent_event_id: "p", event_id: e.id, image: imageOf(e) })); // a "short" page of 2 under limit 1000
     });
-    const reader = rpcFrozenReader(sqlRpcClient(db, async () => undefined, newRpcStats(), () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" });
+    const reader = { ...rpcFrozenReader(sqlRpcClient(db, async () => undefined, newRpcStats(), () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" }), predecessorPage: undefined }; // 0040/0041 only
     const got: string[] = [];
     for await (const e of reader.children(["p"])) got.push(e.id);
     expect(got).toEqual(view.map((e) => e.id));
@@ -238,7 +238,7 @@ describe("T14S1: the SQL RpcClient on the rehearsal transaction", () => {
       }
       return [];
     });
-    const reader = rpcFrozenReader(sqlRpcClient(db, async () => undefined, newRpcStats(), () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" });
+    const reader = { ...rpcFrozenReader(sqlRpcClient(db, async () => undefined, newRpcStats(), () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" }), predecessorPage: undefined }; // 0040/0041 only
     const owners = [{ partitionKind: "order" as const, partitionKey: "O-1" }, { partitionKind: "order" as const, partitionKey: "O-2" }];
     const z = () => ({ owners: 0, works: 0, maxInput: 0, totalInput: 0, requests: 0, peakInput: 0 });
     const a: MaterializedWork[] = [];
@@ -689,7 +689,7 @@ describe("T14S2: the owner byte cap is proven by an anchored probe, not by where
   it("regression (staging shape): complete enumeration is exact, but its ordinary 1,000-row pages straddle the long keys and NO byte-capped page occurs, so the old R2 assertion fails", async () => {
     const stats = newRpcStats();
     const { db } = ownerDb(all);
-    const reader = rpcFrozenReader(sqlRpcClient(db, async () => undefined, stats, () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" });
+    const reader = { ...rpcFrozenReader(sqlRpcClient(db, async () => undefined, stats, () => 0), { batchId: BATCH, fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" }), predecessorPage: undefined }; // 0040/0041 only
     const got: Owner[] = [];
     for await (const o of reader.owners()) got.push(o);
     expect(got).toEqual(expected);

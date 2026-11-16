@@ -775,7 +775,8 @@ export async function runDependencyCases(c: Db, ctx: FlowCtx, env: CaseEnv): Pro
     await rpc(c, ctx, "select * from public.freeze_reporting_rebuild($1, $2)", [x.batch_id, x.lease_fence]);
     return { ...(await batchRow(c, String(x.batch_id))), pages };
   }, (x) => `${x.pages.pages} pages, ${x.pages.rows} rows`);
-  const reader = rpcFrozenReader(client, { batchId: rb.batchId, fence: rb.fence, site: A, cutoff: rb.cutoff, kind: "rebuild" });
+  // the 0040/0041 rehearsal installs only those reads: the 0045 predecessor page is not used here
+  const reader: FrozenReader = { ...rpcFrozenReader(client, { batchId: rb.batchId, fence: rb.fence, site: A, cutoff: rb.cutoff, kind: "rebuild" }), predecessorPage: undefined };
   const rv1 = await independentView(c, A);
   const view1 = rv1.events;
   await step(c, ctx, "R1", "full volume: the frozen candidate is exactly the source (count, ids and images)", async () => {
@@ -1059,7 +1060,8 @@ export async function runDependencyCases(c: Db, ctx: FlowCtx, env: CaseEnv): Pro
   }, (x) => `refresh ${x.batchId} frozen at ${x.cutoff}`);
   const rv2 = await independentView(c, A);
   const view2 = rv2.events;
-  const rreader = rpcFrozenReader(client, { batchId: rf.batchId, fence: rf.fence, site: A, cutoff: rf.cutoff, kind: "refresh" });
+  // the 0040/0041 rehearsal installs only those reads: the 0045 predecessor page is not used here
+  const rreader: FrozenReader = { ...rpcFrozenReader(client, { batchId: rf.batchId, fence: rf.fence, site: A, cutoff: rf.cutoff, kind: "refresh" }), predecessorPage: undefined };
   // Membership from the FULL raw images (the 15 note-only changes are captured changes), then reduced for the projector.
   const changed = expectedChangedKeys(rv1, rv2, rb.cutoff, rf.cutoff);
   const before2 = await fp(rf.batchId); // before the first successful refresh read (F1)

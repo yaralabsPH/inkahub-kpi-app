@@ -34,7 +34,7 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner } from "./production-reporting-materialize.js";
+import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type StreamPosition } from "./production-reporting-materialize.js";
 import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
@@ -179,6 +179,7 @@ export function guardedReader(r: FrozenReader, guard: () => Promise<void>): Froz
     byIds: async (ids) => (await guard(), r.byIds(ids)),
     childPage: async (p, after, limit) => (await guard(), r.childPage(p, after, limit)),
     stream: async (staff, direction, from, limit) => (await guard(), r.stream(staff, direction, from, limit)),
+    ...(r.predecessorPage ? { predecessorPage: async (staff: string, from: StreamPosition, certain: CertainBound | null, limit: number) => (await guard(), r.predecessorPage!(staff, from, certain, limit)) } : {}),
   };
 }
 

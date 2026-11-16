@@ -58,6 +58,7 @@ function counted(r: FrozenReader) {
   const c = { childCalls: 0, childRows: 0 };
   const reader: FrozenReader = {
     ...r,
+    predecessorPage: undefined, // these cases pin the bebedcb path (the 0045 read's discard fallback); 0045 has its own suites
     children(ids) {
       c.childCalls++;
       const inner = r.children(ids);

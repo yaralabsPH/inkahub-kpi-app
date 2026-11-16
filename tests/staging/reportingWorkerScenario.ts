@@ -16,6 +16,9 @@ import { runReportingCycle, WORKER_BUDGET_MS } from "../../api/_lib/production-r
 import { abandonReportingBatch } from "../../api/_lib/reporting-jobs";
 import type { ServiceRpcClient, ServiceRpcOptions } from "./serviceRpc";
 
+/** Task 15 scale contingency: the worker's predecessor walk reads 0045; the runtime refuses unless it is installed exactly. */
+export const MIGRATION_0045 = "supabase/migrations/0045_reporting_predecessor_page.sql";
+
 export interface RuntimeConn extends Db { end(): Promise<void> }
 export interface RuntimeCtx {
   site: Site;
@@ -107,6 +110,9 @@ export async function preflightRuntime(main: Db, ctx: RuntimeCtx, own: RuntimeOw
     p.push(...dependencyIdentityProblems((await main.query(CASE_SQL.effective)).rows, read(MIGRATION_0040), read(MIGRATION_0041), read(MIGRATION_0042)));
     const cat = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t43)))).rows[0].j as WorkerCatalog;
     p.push(...workerCatalogProblems(cat, t43, "installed"));
+    const t45 = read(MIGRATION_0045);
+    const cat45 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t45)))).rows[0].j as WorkerCatalog;
+    p.push(...workerCatalogProblems(cat45, t45, "installed").map((x) => `0045: ${x}`));
     const pre = (await main.query(PREFLIGHT_SQL, [[own.site], `${own.prefix}%`])).rows[0].j as PreflightSnapshot;
     p.push(...preflightProblems(pre, [own.site]));
     if (p.length) throw new Error(p.join("; "));

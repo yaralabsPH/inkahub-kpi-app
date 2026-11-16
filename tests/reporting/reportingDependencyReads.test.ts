@@ -89,6 +89,27 @@ function fakeRpc(o: { view: Ev[]; changed: ChangedKey[]; kind: "refresh" | "rebu
           if (dir === "before") rows.reverse();
           return ok(rows.slice(0, cap).map((e) => ({ event_id: e.id, image: image(e) })));
         }
+        case "read_reporting_predecessor_page": {
+          // 0045: the 'before' page (p_limit lines), children of certain lines and of the first line_verified one below; `cap` rows in all
+          const at = { created_at: args.p_at as string, id: args.p_at_event_id as string };
+          const lines = view.filter((e) => e.staff_id === args.p_staff && compareStream(e, at) < 0).sort(compareStream).reverse().slice(0, args.p_limit as number);
+          const cAt = args.p_certain_at as string | null;
+          const cId = args.p_certain_event_id as string | null;
+          const out: Array<{ row_kind: string; event_id: string | null; image: unknown }> = [];
+          let open = true;
+          for (const l of lines) {
+            let kids = false;
+            if (l.event_type === "line_verified") {
+              const c = cAt === null ? 1 : compareStream({ created_at: cAt, id: "" }, { created_at: l.created_at, id: "" });
+              if (cAt !== null && (c < 0 || (cId !== null && c === 0 && compareUtf8(l.id, cId) >= 0))) kids = true;
+              else if (open) [kids, open] = [true, false];
+            }
+            out.push({ row_kind: kids ? "line_kids" : "line", event_id: l.id, image: image(l) });
+            if (kids) for (const k of view.filter((e) => e.parent_event_id === l.id).sort((x, y) => compareUtf8(x.id, y.id))) out.push({ row_kind: "child", event_id: k.id, image: image(k) });
+          }
+          out.push({ row_kind: "end", event_id: null, image: null });
+          return ok(out.slice(0, cap));
+        }
       }
       return { data: null, error: { message: `unknown function ${fn}` } };
     },
