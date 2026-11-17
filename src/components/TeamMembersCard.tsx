@@ -476,6 +476,11 @@ function TeamMembersCardInner() {
           locations: Array.from(newLocs),
         }),
       });
+      if (res.status === 404) {
+        throw new Error(
+          "the add-member service isn't running on this server. It runs on Vercel (a deploy, or `vercel dev` locally), not on the plain Vite dev server.",
+        );
+      }
       const body = (await res.json().catch(() => ({}))) as { user_id?: string; error?: string };
       if (!res.ok || !body.user_id) {
         throw new Error(body.error ?? `server returned ${res.status}`);
