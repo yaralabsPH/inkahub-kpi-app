@@ -460,31 +460,41 @@ function TeamMembersCardInner() {
     if (newLocs.size === 0) { setInviteMsg("Invite failed: tick at least one location."); return; }
     setInviteBusy(true);
     try {
-      // The server creates the login (service-role key), the profile and the
-      // location grants in one go, after checking we're an owner.
+      // The `add-member` Supabase Edge Function creates the login (with the
+      // service-role key Supabase gives it), the profile and the location
+      // grants in one go, after checking we're an owner.
       const { data: sessionData } = await supabase.auth.getSession();
       const token = sessionData.session?.access_token;
       if (!token) throw new Error("your session has expired. Sign in again.");
-      const res = await fetch("/api/team/add-member", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          email,
-          password: newPassword,
-          display_name: name,
-          role: newRole,
-          locations: Array.from(newLocs),
-        }),
-      });
-      if (res.status === 404) {
-        throw new Error(
-          "the add-member service isn't running on this server. It runs on Vercel (a deploy, or `vercel dev` locally), not on the plain Vite dev server.",
-        );
+      const { data, error } = await supabase.functions.invoke<{ user_id?: string; error?: string }>(
+        "add-member",
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          body: {
+            email,
+            password: newPassword,
+            display_name: name,
+            role: newRole,
+            locations: Array.from(newLocs),
+          },
+        },
+      );
+      if (error) {
+        // Non-2xx responses carry the function's JSON error in `context`.
+        const ctx = (error as { context?: Response }).context;
+        let detail: string | undefined;
+        if (ctx && typeof ctx.json === "function") {
+          if (ctx.status === 404) {
+            detail = "the add-member function isn't deployed to this Supabase project yet.";
+          } else {
+            const b = (await ctx.json().catch(() => null)) as { error?: string } | null;
+            detail = b?.error;
+          }
+        }
+        throw new Error(detail ?? error.message);
       }
-      const body = (await res.json().catch(() => ({}))) as { user_id?: string; error?: string };
-      if (!res.ok || !body.user_id) {
-        throw new Error(body.error ?? `server returned ${res.status}`);
-      }
+      const body = data ?? {};
+      if (!body.user_id) throw new Error(body.error ?? "no user id returned.");
 
       setAddedNotice(`Added ${name} as ${ROLE_LABELS[newRole]}. They sign in with ${email} and the password you set.`);
       setNewName("");
