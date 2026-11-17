@@ -28,6 +28,9 @@ test values (see "One-time setup").
       acceptance criteria and the smoke test below.
 - [ ] If the change has a migration: it was applied to **staging** first and the
       preview worked with it. The migration is backward-compatible (see below).
+- [ ] If the frontend needs a Supabase Edge Function: CJ deployed and tested
+      the reviewed function on staging, then deployed it to production **before
+      merging**. Vercel does not deploy Supabase Edge Functions.
 
 ### 2. Smoke test (staging preview, about 10 minutes)
 
@@ -109,6 +112,42 @@ always safe.
    for `main`: require a pull request before merging, and require the "CI /
    check" status to pass. This makes it impossible to push untested code
    straight to production, including by an AI agent.
+
+## Team member creation (`add-member` Edge Function)
+
+CJ deploys this function; agents never deploy it or apply SQL. There are no
+schema changes or new browser secrets for this feature.
+
+1. Redeploy `supabase/functions/add-member/index.ts` **and its shared core** to
+   staging (`ybrzhrgfrnvtcwymjdrq`). The review fixes change both files, so the
+   previously tested v2 is not sufficient. Keep gateway JWT verification enabled.
+2. Run the role, failure, keyboard, light/dark and mobile checks in
+   [team-page-redesign review](reviews/team-page-redesign-r1.md#staging-test-plan).
+   Confirm the new account can sign in with only the intended role and locations.
+3. Before merging PR #8, record the existing production Vercel deployment and
+   any existing production `add-member` function version. Deploy the reviewed
+   function to the **production Supabase project**, explicitly checking the
+   target project. Confirm its server-provided `SUPABASE_URL`,
+   `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are available; never put
+   the service key in a `VITE_*` variable. Table operations must continue to
+   run as the calling owner under RLS. Do not add service-role table grants.
+4. Merge only after CI and staging checks pass. Watch Supabase Edge Function
+   logs as well as Vercel: `add-member failed` logs a fixed stage and the new
+   user id when known, without request bodies, passwords, tokens or raw errors.
+
+For a lost response, duplicate-email response, or `rollback` failure, **check
+the existing account before retrying**. Auth creation and table writes are
+separate requests. Email uniqueness prevents a second login, but cannot prove
+that a previous request completed. CJ checks Authentication > Users and the
+profile/location rows, then completes the intended setup or removes a confirmed
+unused partial account. Never delete an established account just to retry.
+
+Rollback the frontend through Vercel Instant Rollback. The old Team page remains
+compatible with the unchanged schema and its dashboard-created-UID workflow.
+**Vercel rollback does not roll back the Edge Function.** CJ must separately
+restore a previously safe function version or disable `add-member` if the
+function itself is faulty. Do not restore staging v2's unchecked cleanup path.
+Existing members and normal production work do not require `add-member`.
 
 ## Daily KPI digest endpoint (`/api/reports/daily-digest`)
 

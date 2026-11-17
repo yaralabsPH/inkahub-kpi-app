@@ -80,13 +80,28 @@ describe("add-member edge function core", () => {
     const r = await runAddMember(d, OWNER, goodBody);
     expect(r.status).toBe(409);
     expect(d.insertProfile).not.toHaveBeenCalled();
+    expect(d.deleteLogin).not.toHaveBeenCalled();
   });
 
-  it("returns 502 with Supabase's message for other login errors", async () => {
-    const d = deps({ createLogin: vi.fn(async () => ({ ok: false as const, alreadyExists: false, message: "Password is too weak" })) });
+  it("does not delete the winning login when simultaneous requests use the same email", async () => {
+    const emails = new Set<string>();
+    const d = deps({ createLogin: vi.fn(async (email) => {
+      if (emails.has(email)) return { ok: false as const, alreadyExists: true, message: "exists" };
+      emails.add(email);
+      return { ok: true as const, userId: "new-id" };
+    }) });
+    const results = await Promise.all([runAddMember(d, OWNER, goodBody), runAddMember(d, OWNER, goodBody)]);
+    expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+    expect(d.insertProfile).toHaveBeenCalledTimes(1);
+    expect(d.insertLocations).toHaveBeenCalledTimes(1);
+    expect(d.deleteLogin).not.toHaveBeenCalled();
+  });
+
+  it("does not expose upstream login errors or credentials", async () => {
+    const d = deps({ createLogin: vi.fn(async () => ({ ok: false as const, alreadyExists: false, message: "internal detail s3cret-pass" })) });
     const r = await runAddMember(d, OWNER, goodBody);
     expect(r.status).toBe(502);
-    expect((r.body as { error: string }).error).toContain("Password is too weak");
+    expect(JSON.stringify(r.body)).not.toMatch(/internal detail|s3cret-pass/);
   });
 
   it("deletes the new login if the profile insert fails", async () => {
@@ -102,5 +117,61 @@ describe("add-member edge function core", () => {
     const r = await runAddMember(d, OWNER, goodBody);
     expect(r.status).toBe(500);
     expect(d.deleteLogin).toHaveBeenCalledWith("new-id");
+  });
+
+  it.each(["insertProfile", "insertLocations"] as const)("rolls back when %s throws, without exposing details", async (step) => {
+    const d = deps({ [step]: vi.fn(async () => { throw new Error("internal detail s3cret-pass"); }) });
+    const r = await runAddMember(d, OWNER, goodBody);
+    expect(r.status).toBe(500);
+    expect(d.deleteLogin).toHaveBeenCalledTimes(1);
+    expect(d.deleteLogin).toHaveBeenCalledWith("new-id");
+    expect(JSON.stringify(r.body)).not.toMatch(/internal detail|s3cret-pass/);
+  });
+
+  it.each(["insertProfile", "insertLocations"] as const)("sanitizes returned %s errors", async (step) => {
+    const d = deps({ [step]: vi.fn(async () => "internal detail s3cret-pass") });
+    const r = await runAddMember(d, OWNER, goodBody);
+    expect(r.status).toBe(500);
+    expect(JSON.stringify(r.body)).not.toMatch(/internal detail|s3cret-pass/);
+  });
+
+  it("warns that cleanup needs manual attention when deletion throws", async () => {
+    const d = deps({
+      insertLocations: vi.fn(async () => "write failed"),
+      deleteLogin: vi.fn(async () => { throw new Error("internal detail s3cret-pass"); }),
+    });
+    const r = await runAddMember(d, OWNER, goodBody);
+    expect(r.status).toBe(500);
+    expect((r.body as { error: string }).error).toMatch(/cleanup.*could not be confirmed/i);
+    expect((r.body as { error: string }).error).toMatch(/before retrying/i);
+    expect(JSON.stringify(r.body)).not.toMatch(/internal detail|s3cret-pass/);
+  });
+
+  it.each(["verifyToken", "getRole", "createLogin"] as const)("handles a rejected %s request safely", async (step) => {
+    const d = deps({ [step]: vi.fn(async () => { throw new Error("internal detail s3cret-pass"); }) });
+    const r = await runAddMember(d, OWNER, goodBody);
+    expect(r.status).toBe(502);
+    expect(d.insertProfile).not.toHaveBeenCalled();
+    expect(d.deleteLogin).not.toHaveBeenCalled();
+    expect(JSON.stringify(r.body)).not.toMatch(/internal detail|s3cret-pass/);
+  });
+
+  it.each(["manager", "staff", "kiosk", "cs", null])("rejects role %s before validating or writing", async (role) => {
+    const d = deps({ getRole: vi.fn(async () => role) });
+    expect((await runAddMember(d, OWNER, null)).status).toBe(403);
+    expect(d.createLogin).not.toHaveBeenCalled();
+  });
+
+  it("rejects passwords over bcrypt's 72-byte limit", async () => {
+    const d = deps();
+    const r = await runAddMember(d, OWNER, { ...goodBody, password: "é".repeat(37) });
+    expect(r.status).toBe(400);
+    expect(d.createLogin).not.toHaveBeenCalled();
+  });
+
+  it("accepts a password at the 72-byte boundary unchanged", async () => {
+    const d = deps();
+    expect((await runAddMember(d, OWNER, { ...goodBody, password: "é".repeat(36) })).status).toBe(201);
+    expect(d.createLogin).toHaveBeenCalledWith("jane@example.com", "é".repeat(36));
   });
 });

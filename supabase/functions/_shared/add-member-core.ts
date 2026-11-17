@@ -5,8 +5,9 @@
  *
  * Flow: verify the caller's token -> caller must be an owner -> validate
  * input -> create a confirmed email+password login -> insert profile ->
- * insert location grants. If a step after the login fails, the login is
- * deleted again (profiles / user_locations cascade from auth.users).
+ * insert location grants. If a step after the login fails, login deletion
+ * is attempted (profiles / user_locations cascade from auth.users).
+ * Failed cleanup is reported explicitly for manual recovery.
  * The password is never logged or returned.
  */
 
@@ -14,6 +15,7 @@ export const TEAM_ROLES = ["owner", "manager", "staff", "kiosk", "cs"] as const;
 export const TEAM_LOCATIONS = ["default", "uk", "us", "au"] as const;
 export type TeamRole = (typeof TEAM_ROLES)[number];
 export type TeamLocation = (typeof TEAM_LOCATIONS)[number];
+export type AddMemberStage = "verify_token" | "get_role" | "create_login" | "insert_profile" | "insert_locations" | "rollback";
 
 export interface AddMemberInput {
   email: string;
@@ -35,8 +37,10 @@ export interface AddMemberDeps {
   >;
   insertProfile(row: { user_id: string; display_name: string; role: string }): Promise<string | null>;
   insertLocations(rows: Array<{ user_id: string; location: string }>): Promise<string | null>;
-  /** Remove the login again (cascades to profile + locations). */
+  /** Remove the login again (cascades to profile + locations). Throw on failure. */
   deleteLogin(userId: string): Promise<void>;
+  /** Log only a fixed stage and optional new user id, never input or error objects. */
+  reportFailure?(stage: AddMemberStage, userId?: string): void;
 }
 
 export interface AddMemberResult {
@@ -53,7 +57,7 @@ export function validateAddMember(raw: unknown): { ok: true; value: AddMemberInp
 
   const password = typeof r.password === "string" ? r.password : "";
   if (password.length < 8) return { ok: false, error: "Password must be at least 8 characters." };
-  if (password.length > 72) return { ok: false, error: "Password must be 72 characters or fewer." };
+  if (new TextEncoder().encode(password).length > 72) return { ok: false, error: "Password must be 72 UTF-8 bytes or fewer." };
 
   const display_name = typeof r.display_name === "string" ? r.display_name.trim() : "";
   if (!display_name) return { ok: false, error: "Enter a display name." };
@@ -90,34 +94,48 @@ export async function runAddMember(
 ): Promise<AddMemberResult> {
   const token = bearerFrom(authHeader);
   if (!token) return { status: 401, body: { error: "Sign in again and retry." } };
-  const callerId = await deps.verifyToken(token);
-  if (!callerId) return { status: 401, body: { error: "Your session has expired. Sign in again and retry." } };
-  if ((await deps.getRole(callerId)) !== "owner") {
-    return { status: 403, body: { error: "Only owners can add team members." } };
-  }
+  let userId: string | undefined;
+  let stage: AddMemberStage = "verify_token";
+  try {
+    const callerId = await deps.verifyToken(token);
+    if (!callerId) return { status: 401, body: { error: "Your session has expired. Sign in again and retry." } };
+    stage = "get_role";
+    if ((await deps.getRole(callerId)) !== "owner") {
+      return { status: 403, body: { error: "Only owners can add team members." } };
+    }
 
-  const parsed = validateAddMember(rawBody);
-  if (!parsed.ok) return { status: 400, body: { error: parsed.error } };
-  const input = parsed.value;
+    const parsed = validateAddMember(rawBody);
+    if (!parsed.ok) return { status: 400, body: { error: parsed.error } };
+    const input = parsed.value;
 
-  const login = await deps.createLogin(input.email, input.password);
-  if (!login.ok) {
-    return login.alreadyExists
-      ? { status: 409, body: { error: `${input.email} already has a login.` } }
-      : { status: 502, body: { error: `Couldn't create the login: ${login.message}` } };
-  }
+    stage = "create_login";
+    const login = await deps.createLogin(input.email, input.password);
+    if (!login.ok) {
+      if (login.alreadyExists) return { status: 409, body: { error: "This email already has a login. Ask CJ to check the existing member before retrying." } };
+      throw new Error("Login creation failed");
+    }
 
-  const userId = login.userId;
-  const profileErr = await deps.insertProfile({ user_id: userId, display_name: input.display_name, role: input.role });
-  if (profileErr) {
-    await deps.deleteLogin(userId);
-    return { status: 500, body: { error: `Couldn't save the profile: ${profileErr}` } };
-  }
-  const locErr = await deps.insertLocations(input.locations.map((location) => ({ user_id: userId, location })));
-  if (locErr) {
-    await deps.deleteLogin(userId);
-    return { status: 500, body: { error: `Couldn't save locations: ${locErr}` } };
-  }
+    const newUserId = login.userId;
+    userId = newUserId;
+    stage = "insert_profile";
+    const profileErr = await deps.insertProfile({ user_id: newUserId, display_name: input.display_name, role: input.role });
+    if (profileErr) throw new Error("Profile creation failed");
+    stage = "insert_locations";
+    const locErr = await deps.insertLocations(input.locations.map((location) => ({ user_id: newUserId, location })));
+    if (locErr) throw new Error("Location creation failed");
 
-  return { status: 201, body: { user_id: userId, email: input.email } };
+    return { status: 201, body: { user_id: newUserId, email: input.email } };
+  } catch {
+    deps.reportFailure?.(stage, userId);
+    if (!userId) {
+      return { status: 502, body: { error: "Couldn't complete the request. Ask CJ to check whether the login was created and check the password policy before retrying." } };
+    }
+    try {
+      await deps.deleteLogin(userId);
+    } catch {
+      deps.reportFailure?.("rollback", userId);
+      return { status: 500, body: { error: "Member setup failed and login cleanup could not be confirmed. Ask CJ to check the account before retrying." } };
+    }
+    return { status: 500, body: { error: "Member setup failed. The new login was removed; retry when the service is available." } };
+  }
 }

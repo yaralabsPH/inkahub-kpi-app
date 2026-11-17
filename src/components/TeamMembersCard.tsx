@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { UserPlus, Trash2, Printer, RefreshCw, Search, ChevronRight, Lock, Check, X, Eye, EyeOff, Wand2 } from "lucide-react";
 import { Field, Input, Select } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
-import { useAuth } from "@/lib/auth/AuthProvider";
+import { useAuth, type UserProfile } from "@/lib/auth/AuthProvider";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import {
   LOCATIONS, LOCATION_LABELS,
@@ -120,6 +120,12 @@ export function TeamMembersCard() {
 
 function TeamMembersCardInner() {
   const { profile } = useAuth();
+  // Keep the owner gate outside the component that loads data and uses hooks.
+  if (profile?.role !== "owner") return null;
+  return <OwnerTeamMembersCard key={profile.user_id} profile={profile} />;
+}
+
+function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
   const supabase = getSupabase();
   const [members, setMembers] = useState<MemberRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -142,9 +148,6 @@ function TeamMembersCardInner() {
   const [tab, setTab] = useState<PanelTab>("access");
   const [query, setQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState<Role | "all">("all");
-
-  // Only owners see this card. Other roles get nothing.
-  if (profile?.role !== "owner") return null;
 
   const loadMembers = async () => {
     setLoading(true);
@@ -215,6 +218,7 @@ function TeamMembersCardInner() {
 
   /** Update one field of one user's profile row. */
   const updateRole = async (userId: string, role: Role) => {
+    if (userId === profile.user_id) return;
     setBusyUserId(userId);
     try {
       const { error } = await supabase
@@ -450,6 +454,7 @@ function TeamMembersCardInner() {
   };
 
   const submitInvite = async () => {
+    if (inviteBusy) return;
     setInviteMsg(null);
     setGlobalError(null);
     const name = newName.trim();
@@ -457,6 +462,7 @@ function TeamMembersCardInner() {
     if (!name) { setInviteMsg("Invite failed: enter a display name."); return; }
     if (!/^\S+@\S+\.\S+$/.test(email)) { setInviteMsg("Invite failed: enter a valid email address."); return; }
     if (newPassword.length < 8) { setInviteMsg("Invite failed: password must be at least 8 characters."); return; }
+    if (new TextEncoder().encode(newPassword).length > 72) { setInviteMsg("Invite failed: password must be 72 UTF-8 bytes or fewer."); return; }
     if (newLocs.size === 0) { setInviteMsg("Invite failed: tick at least one location."); return; }
     setInviteBusy(true);
     try {
@@ -491,7 +497,7 @@ function TeamMembersCardInner() {
             detail = b?.error;
           }
         }
-        throw new Error(detail ?? error.message);
+        throw new Error(detail ?? "Could not confirm whether the member was added. Ask CJ to check the account before retrying.");
       }
       const body = data ?? {};
       if (!body.user_id) throw new Error(body.error ?? "no user id returned.");
@@ -527,7 +533,7 @@ function TeamMembersCardInner() {
   return (
     <section className="space-y-4 p-1">
       {globalError ? (
-        <div className="flex items-start justify-between gap-3 text-sm text-red-600 dark:text-red-400 ring-1 ring-red-200 dark:ring-red-900/40 bg-red-50/40 dark:bg-red-900/10 px-3 py-2">
+        <div role="alert" className="flex items-start justify-between gap-3 text-sm text-red-600 dark:text-red-400 ring-1 ring-red-200 dark:ring-red-900/40 bg-red-50/40 dark:bg-red-900/10 px-3 py-2">
           <span>{globalError}</span>
           <button
             type="button"
@@ -541,7 +547,7 @@ function TeamMembersCardInner() {
       ) : null}
 
       {addedNotice ? (
-        <div className="flex items-start justify-between gap-3 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-200 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/30">
+        <div role="status" className="flex items-start justify-between gap-3 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-200 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/30">
           <span>{addedNotice}</span>
           <button
             type="button"
@@ -559,10 +565,11 @@ function TeamMembersCardInner() {
         <label className="flex h-10 min-w-[220px] flex-1 items-center gap-2 rounded-md bg-white px-3 ring-1 ring-slate-200 focus-within:ring-emerald-400 dark:bg-slate-900 dark:ring-slate-700">
           <Search size={15} className="text-slate-400" />
           <input
+            aria-label="Search members by name or role"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search by name or role…"
-            className="h-full flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
+            className="h-full min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
           />
         </label>
         <div className="flex flex-wrap rounded-md bg-white p-1 ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-700" role="group" aria-label="Filter by role">
@@ -584,6 +591,7 @@ function TeamMembersCardInner() {
           ))}
         </div>
         <Button
+          disabled={inviteBusy || busyUserId !== null}
           onClick={() => { setPanelMode("add"); setInviteMsg(null); }}
           className="h-10 rounded-full px-5"
         >
@@ -593,8 +601,8 @@ function TeamMembersCardInner() {
 
       <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_420px]">
         {/* ----- Member list ----- */}
-        <Frame>
-          <div className="bg-white ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
+        <Frame className="min-w-0">
+          <div className="overflow-x-auto bg-white ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
             <div className="hidden h-12 grid-cols-[minmax(180px,1.6fr)_110px_minmax(140px,1.2fr)_110px_130px_16px] items-center gap-5 border-b border-slate-200 px-6 text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:border-slate-800 md:grid">
               <span>Member</span>
               <span>Role</span>
@@ -618,10 +626,11 @@ function TeamMembersCardInner() {
                     <li key={m.user_id}>
                       <button
                         type="button"
+                        disabled={inviteBusy || busyUserId !== null}
                         onClick={() => selectMember(m.user_id)}
                         aria-current={isSel ? "true" : undefined}
                         className={cn(
-                          "grid w-full grid-cols-[1fr_auto] items-center gap-x-5 gap-y-2 px-4 py-4 text-left transition-colors md:min-h-[76px] md:grid-cols-[minmax(180px,1.6fr)_110px_minmax(140px,1.2fr)_110px_130px_16px] md:px-6 md:py-0",
+                          "grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-5 gap-y-2 px-4 py-4 text-left transition-colors md:min-h-[76px] md:grid-cols-[minmax(180px,1.6fr)_110px_minmax(140px,1.2fr)_110px_130px_16px] md:px-6 md:py-0",
                           isSel
                             ? "bg-slate-50 shadow-[inset_3px_0_0_theme(colors.emerald.500)] dark:bg-slate-800/50 dark:shadow-[inset_3px_0_0_theme(colors.emerald.400)]"
                             : "hover:bg-slate-50 dark:hover:bg-slate-800/30",
@@ -672,7 +681,7 @@ function TeamMembersCardInner() {
         </Frame>
 
         {/* ----- Side panel ----- */}
-        <Frame className="lg:sticky lg:top-4">
+        <Frame className="min-w-0 lg:sticky lg:top-4">
           <aside className="bg-white ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
             {showAdd ? (
               <AddMemberPanel
@@ -690,7 +699,7 @@ function TeamMembersCardInner() {
                 key={selected.user_id}
                 member={selected}
                 isSelf={selected.user_id === profile?.user_id}
-                busy={busyUserId === selected.user_id}
+                busy={busyUserId !== null}
                 tab={tab}
                 setTab={setTab}
                 onRename={(name) => void updateDisplayName(selected.user_id, name)}
@@ -754,10 +763,11 @@ function RoleBadge({ role }: { role: Role }) {
 
 /** Large checkbox-style toggle used for pages and locations. */
 function ToggleChip({
-  checked, locked, onChange, children, title,
+  checked, locked, disabled, onChange, children, title,
 }: {
   checked: boolean;
   locked?: boolean;
+  disabled?: boolean;
   onChange: (next: boolean) => void;
   children: ReactNode;
   title?: string;
@@ -768,10 +778,11 @@ function ToggleChip({
       role="checkbox"
       aria-checked={checked}
       aria-disabled={locked || undefined}
+      disabled={disabled || locked}
       title={title}
       onClick={() => { if (!locked) onChange(!checked); }}
       className={cn(
-        "flex items-center gap-2.5 rounded px-3 py-2.5 text-left text-sm ring-1 transition-colors",
+        "flex min-w-0 items-center gap-2.5 rounded px-3 py-2.5 text-left text-sm ring-1 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-500 disabled:cursor-not-allowed",
         checked
           ? "bg-emerald-50 text-emerald-900 ring-emerald-400 dark:bg-emerald-400/10 dark:text-slate-100 dark:ring-emerald-400/50"
           : "bg-slate-50 text-slate-500 ring-slate-200 hover:ring-slate-300 dark:bg-slate-800/40 dark:text-slate-400 dark:ring-slate-700 dark:hover:ring-slate-600",
@@ -788,7 +799,7 @@ function ToggleChip({
       >
         {checked ? <Check size={12} strokeWidth={3} /> : null}
       </span>
-      <span className="flex-1 truncate">{children}</span>
+      <span className="min-w-0 flex-1 break-words">{children}</span>
       {locked ? <Lock size={12} className="shrink-0" /> : null}
     </button>
   );
@@ -803,7 +814,7 @@ function SectionTitle({ title, hint }: { title: string; hint?: ReactNode }) {
   );
 }
 
-function MemberPanel({
+export function MemberPanel({
   member, isSelf, busy, tab, setTab,
   onRename, onRole, onToggleLocation, onSetNav, onIssueBarcode, onPrint, onRate, onRemove,
 }: {
@@ -822,6 +833,8 @@ function MemberPanel({
   onRemove: () => void;
 }) {
   const eff = effectiveFor(member);
+  const tabId = useId();
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tabs: Array<{ key: PanelTab; label: string; count?: number }> = [
     { key: "access", label: "Access", count: eff.size },
     { key: "locations", label: "Locations", count: member.locations.length },
@@ -832,7 +845,6 @@ function MemberPanel({
     const next = new Set<string>(eff);
     if (on) next.add(key);
     else next.delete(key);
-    next.add("dashboard"); // always on
     onSetNav(Array.from(next));
   };
 
@@ -843,6 +855,7 @@ function MemberPanel({
         <Avatar member={member} size="lg" />
         <div className="flex min-w-0 flex-1 flex-col items-start gap-2">
           <input
+            disabled={busy}
             defaultValue={member.display_name}
             aria-label="Display name"
             onBlur={(e) => {
@@ -858,14 +871,27 @@ function MemberPanel({
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 border-b border-slate-200 px-4 dark:border-slate-800" role="tablist">
-        {tabs.map((t) => (
+      <div className="flex gap-1 overflow-x-auto border-b border-slate-200 px-4 dark:border-slate-800" role="tablist" aria-label="Member settings">
+        {tabs.map((t, index) => (
           <button
             key={t.key}
             type="button"
             role="tab"
+            id={`${tabId}-${t.key}`}
+            aria-controls={`${tabId}-panel`}
             aria-selected={tab === t.key}
+            tabIndex={tab === t.key ? 0 : -1}
+            ref={(el) => { tabRefs.current[index] = el; }}
             onClick={() => setTab(t.key)}
+            onKeyDown={(e) => {
+              const next = e.key === "ArrowRight" ? (index + 1) % tabs.length
+                : e.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+                  : e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : null;
+              if (next === null) return;
+              e.preventDefault();
+              setTab(tabs[next].key);
+              tabRefs.current[next]?.focus();
+            }}
             className={cn(
               "-mb-px flex items-center gap-1.5 border-b-2 px-2.5 py-3 text-sm font-medium transition-colors",
               tab === t.key
@@ -884,14 +910,15 @@ function MemberPanel({
       </div>
 
       {/* Body */}
-      <div className="flex max-h-[calc(100vh-260px)] flex-col gap-6 overflow-auto p-6">
+      <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${tab}`} tabIndex={0} className="flex flex-col gap-6 p-4 sm:p-6 lg:max-h-[calc(100vh-260px)] lg:overflow-auto">
         {tab === "access" ? (
           <>
             <div>
               <SectionTitle title="Role" hint={ROLE_DESCRIPTIONS[member.role]} />
               <Select
                 value={member.role}
-                disabled={isSelf}
+                aria-label="Role"
+                disabled={isSelf || busy}
                 onChange={(e) => onRole(e.target.value as Role)}
                 title={isSelf ? "You can't change your own role here." : undefined}
                 className="h-10 w-full"
@@ -910,9 +937,9 @@ function MemberPanel({
                 </>}
               />
               <div className="mb-4 flex flex-wrap gap-2">
-                <MiniButton onClick={() => onSetNav([...NAV_KEYS])}>Select all</MiniButton>
-                <MiniButton onClick={() => onSetNav(["dashboard"])}>Clear</MiniButton>
-                <MiniButton onClick={() => onSetNav(null)} disabled={member.allowed_nav === null}>
+                <MiniButton onClick={() => onSetNav(NAV_KEYS.filter((key) => key !== "dashboard" || member.role === "owner"))} disabled={busy}>Select all</MiniButton>
+                <MiniButton onClick={() => onSetNav([])} disabled={busy}>Clear</MiniButton>
+                <MiniButton onClick={() => onSetNav(null)} disabled={busy || member.allowed_nav === null}>
                   Reset to role default
                 </MiniButton>
               </div>
@@ -924,13 +951,16 @@ function MemberPanel({
                     </div>
                     <div className="grid grid-cols-2 gap-2">
                       {g.keys.map((key) => {
-                        const locked = key === "dashboard";
+                        const lockReason = key === "welcome" ? "Welcome is always available"
+                          : key === "dashboard" && member.role !== "owner" ? "Dashboard is only available to owners"
+                            : key === "settings" && member.role === "owner" ? "Settings is always available to owners" : undefined;
                         return (
                           <ToggleChip
                             key={key}
                             checked={eff.has(key)}
-                            locked={locked}
-                            title={locked ? "Dashboard is always available" : undefined}
+                            locked={!!lockReason}
+                            disabled={busy}
+                            title={lockReason}
                             onChange={(on) => togglePage(key, on)}
                           >
                             {DEFAULT_NAV_LABELS[key]}
@@ -953,6 +983,7 @@ function MemberPanel({
                 <ToggleChip
                   key={loc}
                   checked={member.locations.includes(loc)}
+                  disabled={busy}
                   onChange={(on) => onToggleLocation(loc, on)}
                 >
                   {LOCATION_LABELS[loc as keyof typeof LOCATION_LABELS]}
@@ -1003,6 +1034,7 @@ function MemberPanel({
                 <span className="text-sm text-slate-400">$</span>
                 <input
                   type="number"
+                  disabled={busy}
                   min={0}
                   step={0.01}
                   defaultValue={member.hourly_rate ?? ""}
@@ -1028,7 +1060,7 @@ function MemberPanel({
       </div>
 
       {/* Footer */}
-      <div className="flex items-center justify-between gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-800">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-800">
         {isSelf ? (
           <span className="text-xs text-slate-400">You can't remove yourself</span>
         ) : (
@@ -1105,9 +1137,9 @@ function AddMemberPanel({
           </button>
         ) : null}
       </div>
-      <div className="space-y-5 p-6">
+      <fieldset disabled={inviteBusy} className="min-w-0 space-y-5 p-4 sm:p-6">
         <Field label="Name">
-          <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Jane Smith" />
+          <Input value={newName} maxLength={80} onChange={(e) => setNewName(e.target.value)} placeholder="Jane Smith" />
         </Field>
         <Field label="Email" hint="What they type to sign in.">
           <Input
@@ -1120,10 +1152,11 @@ function AddMemberPanel({
         </Field>
         <div>
           <div className="mb-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">Password</div>
-          <div className="flex gap-2">
-            <div className="relative flex-1">
+          <div className="flex flex-wrap gap-2">
+            <div className="relative min-w-0 flex-1 basis-40">
               <Input
                 type={showPassword ? "text" : "password"}
+                aria-label="Password"
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
                 placeholder="At least 8 characters"
@@ -1174,13 +1207,13 @@ function AddMemberPanel({
             ))}
           </div>
         </div>
-      </div>
+      </fieldset>
       <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 px-6 py-4 dark:border-slate-800">
         <Button type="submit" disabled={inviteBusy} className="rounded-full px-5">
           {inviteBusy ? "Adding…" : "Add member"}
         </Button>
         {inviteMsg ? (
-          <span className={cn(
+          <span role="alert" className={cn(
             "text-xs",
             inviteMsg.startsWith("Invite failed") ? "text-red-600 dark:text-red-400" : "text-emerald-700 dark:text-emerald-400",
           )}>

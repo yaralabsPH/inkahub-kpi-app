@@ -9,7 +9,7 @@
  * used only for the Auth admin API; table reads/writes run as the caller
  * under RLS. Logic lives in ../_shared/add-member-core.ts.
  */
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient } from "npm:@supabase/supabase-js@2.105.4";
 import { runAddMember, type AddMemberDeps } from "../_shared/add-member-core.ts";
 
 const CORS = {
@@ -49,13 +49,13 @@ Deno.serve(async (req: Request) => {
 
   const deps: AddMemberDeps = {
     async verifyToken(token) {
-      const { data, error } = await admin.auth.getUser(token);
+      const { data, error } = await asCaller.auth.getUser(token);
       return error || !data.user ? null : data.user.id;
     },
     async getRole(userId) {
       const { data, error } = await asCaller.from("profiles").select("role").eq("user_id", userId).maybeSingle();
-      if (error) console.error("add-member: role lookup failed:", error.message);
-      return error || !data ? null : String(data.role);
+      if (error) throw new Error("Role lookup failed");
+      return !data ? null : String(data.role);
     },
     async createLogin(email, password) {
       const { data, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
@@ -76,7 +76,11 @@ Deno.serve(async (req: Request) => {
       return error ? error.message : null;
     },
     async deleteLogin(userId) {
-      await admin.auth.admin.deleteUser(userId);
+      const { error } = await admin.auth.admin.deleteUser(userId);
+      if (error) throw new Error("Login cleanup failed");
+    },
+    reportFailure(stage, userId) {
+      console.error("add-member failed", { stage, userId });
     },
   };
 
