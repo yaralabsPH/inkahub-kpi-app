@@ -317,14 +317,39 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
     }
     if (!window.confirm(
       `Remove ${name} from the team?\n\n` +
-      `This deletes their profile and all location grants. They won't be able to access the app anymore.\n\n` +
-      `To completely delete their account, also remove them from Supabase → Authentication → Users.`,
+      `This blocks their login, turns off their lanyard barcode, and removes their location access and profile. ` +
+      `They won't be able to sign in or see any data.\n\n` +
+      `Their past production records are kept for reports.`,
     )) return;
     setBusyUserId(userId);
     try {
-      const { error } = await supabase.from("profiles").delete().eq("user_id", userId);
-      if (error) throw error;
+      // The `remove-member` Edge Function blocks the login (Auth admin API)
+      // and then, as us under RLS, revokes barcodes, location grants and the
+      // profile. History is kept. Every step is safe to retry.
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData.session?.access_token;
+      if (!token) throw new Error("your session has expired. Sign in again.");
+      const { error } = await supabase.functions.invoke<{ user_id?: string; error?: string }>(
+        "remove-member",
+        { headers: { Authorization: `Bearer ${token}` }, body: { user_id: userId } },
+      );
+      if (error) {
+        const ctx = (error as { context?: Response }).context;
+        let detail: string | undefined;
+        if (ctx && typeof ctx.json === "function") {
+          if (ctx.status === 404) {
+            detail = "the remove-member function isn't deployed to this Supabase project yet.";
+          } else {
+            const b = (await ctx.json().catch(() => null)) as { error?: string } | null;
+            detail = b?.error;
+          }
+        } else {
+          detail = "couldn't reach the server. Some steps may have run; it's safe to try again.";
+        }
+        throw new Error(detail ?? error.message);
+      }
       setMembers((prev) => prev.filter((m) => m.user_id !== userId));
+      setSelectedId(null);
     } catch (e) {
       setGlobalError(`Remove failed: ${(e as Error).message}`);
     } finally {

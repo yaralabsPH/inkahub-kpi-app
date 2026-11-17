@@ -149,6 +149,36 @@ restore a previously safe function version or disable `add-member` if the
 function itself is faulty. Do not restore staging v2's unchecked cleanup path.
 Existing members and normal production work do not require `add-member`.
 
+## Team member removal (`remove-member` Edge Function)
+
+Deploy alongside `add-member`, with the same rules: CJ deploys, gateway JWT
+verification stays on, no schema changes, no service-role table grants.
+
+1. Deploy `supabase/functions/remove-member/index.ts` **and**
+   `supabase/functions/_shared/remove-member-core.ts` to staging, then to the
+   production Supabase project before merging PR #8. Without it, "Remove
+   member" in production fails with "the remove-member function isn't deployed".
+2. What removal does, in order: bans the Auth login (no new sign-in or
+   session refresh), sets the member's active `staff_barcodes` to inactive,
+   deletes their `user_locations` rows, deletes their `profiles` row. The Auth
+   user is **not** deleted: `production_events` references it with
+   `ON DELETE RESTRICT`, and deleting it would cascade away barcode history.
+3. Staging checks: remove a disposable member that has a lanyard and
+   locations. Confirm they cannot sign in, their barcode no longer scans, and
+   they disappear from the Team page; confirm their past production events
+   still show in reports. Confirm a manager/staff call is rejected (403) and
+   an owner cannot remove themself.
+4. Failure part-way leaves **less** access, never more, and every step is
+   idempotent: retrying "Remove" is always safe. `remove-member failed` logs
+   a fixed stage and the target user id only.
+5. Re-adding the same email later returns "already has a login" because the
+   banned Auth user still exists. To reinstate someone, CJ unbans them in
+   Authentication > Users and re-creates their profile/locations.
+
+Rollback: restore the previous function version or disable `remove-member`.
+Vercel rollback restores the old "delete profile only" button, which is the
+incomplete behaviour this replaced, so prefer fixing forward.
+
 ## Daily KPI digest endpoint (`/api/reports/daily-digest`)
 
 The digest is sent by three Vercel crons (`vercel.json`: AU 13:55, UK 22:55,

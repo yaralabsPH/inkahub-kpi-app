@@ -176,3 +176,35 @@ node --input-type=module -e "import { build } from 'vite'; import config from '.
 ```
 
 **Final verdict: changes required.** Local fixes and alternate-path checks are complete. Approval awaits CJ's removal-security decision, successful normal command/CI runs and staging verification of the changed function/UI. Production function deployment is CJ's prerequisite before merging, not an action performed in this review.
+
+### Coder follow-up: member removal (Open question 1 / Must-fix 4)
+
+CJ decided: fix removal now. Done without a migration:
+
+- New `remove-member` Edge Function (`supabase/functions/remove-member/index.ts`,
+  core in `supabase/functions/_shared/remove-member-core.ts`). Owner-only;
+  cannot remove yourself; target must be a UUID.
+- Order: ban Auth login -> revoke active `staff_barcodes` -> delete
+  `user_locations` -> delete `profiles`. Fails toward less access; each step
+  idempotent, so retry is safe. Service role used only for the Auth ban; table
+  writes run as the calling owner under existing RLS (verified on staging:
+  `user_locations_modify` and `profiles_delete` are `is_owner()`,
+  `staff_barcodes_write` is manager+ with location access).
+- Auth user is kept, not deleted: staging FKs show `production_events ->
+  auth.users ON DELETE RESTRICT` and `staff_barcodes ... ON DELETE CASCADE`,
+  so deletion would either fail or erase barcode history.
+- Team page "Remove member" now calls the function; confirm text describes
+  what actually happens.
+- Tests: `tests/api/remove-member.test.ts` (order, auth, self-removal,
+  validation, part-way failure messages without detail, idempotent retry).
+- Checks (normal commands): `npx tsc -b` pass, `npm run test -- --run`
+  409 passed, `npm run build` pass.
+- Deployed to staging `ybrzhrgfrnvtcwymjdrq` as `remove-member` v1 (and
+  `add-member` v3 with Astra's fixes). Unauthenticated call returns 401.
+  Owner end-to-end removal on staging still to be run by CJ.
+- Known limit: barcodes at a location the owner has no grant for cannot be
+  revoked under RLS. In practice barcodes are issued by an owner for the
+  member's locations, so this should not occur; noted in RELEASING.md.
+
+Open questions 2 (barcode/rate redesign) and 3 (non-atomic add recovery) are
+unchanged and still need CJ's call.
