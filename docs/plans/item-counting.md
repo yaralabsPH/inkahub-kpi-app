@@ -6407,3 +6407,24 @@ STATUS: COMPLETE
   - post-reload check removed (the forged header adopted).
 - **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2380/2380**; `npm run build` 0.
 - **Open question for the planner — the step-3 worker wiring needs one more test file.** Wiring `requireOwnerInputProtocol`, `routedOwnerInput`/`sharedChildren`, `recoverOwnerJournal`, hashing and admission into `runReportingCycle`'s `plan()`/`stage()` changes behaviour that **`tests/api/reporting-worker.test.ts`** pins with fake RPC clients. Its fakes have no owner-input RPCs, so the version-first guard alone would fail them. That file is not in the r6 allowed existing-test list. May Claude update it, limited to adding the owner-input RPCs to its fakes and the new routed/admission expectations, within step 3? Until then the seams are implemented and tested but not called by the worker.
+
+## Coder log — T15P-4d step 4: the 0045 combined page on the durable route (local commit), 2026-11-19
+
+- **`durableOwnerInput`'s walk** (`production-reporting-materialize.ts`). While `stopAt` is unset and the reader has `predecessorPage`, it reads ONE 0045 page from the committed cursor, with `buildOwnerInput`'s exact certain range (instant plus id when the earliest id is below U+D800).
+  - **Uncut page.** If every included line's children are complete, the page is consumed as **one durable page of ordered steps**. For each line: pending `kids` → its included kids (one `kids` step at the last kid) → `done{effective}` (unchanged `siteEffective` over the page's kids) → cursor. Non-candidates advance only the cursor. `stopAt`/`need` follow the unchanged stop rule, and the walk ends on the empty page with its end row, or a complete short page, exactly as `exactWalk`.
+  - **Line without included kids.** It goes through the pending-line path: a checkpoint, then its own kid pages.
+  - **Cut page.** It is **discarded uncharged** and that position is read as a plain page. After the stop, ties use plain pages.
+- **Tests** (`reportingOwnerContinuation.test.ts`). The whole suite now runs the durable route over 0045 combined pages:
+  - every-owner parity;
+  - every-commit crash/resume (before-write and response-loss) for EMPTY, NOTE and BIG;
+  - the decisive later cancellation;
+  - hashing;
+  - activation.
+  - **Guard.** The exact-argument guard now also checks `read_reporting_predecessor_page`: only in the walk, with no pending line, before the stop, from the committed cursor. A resume's first request is the combined page before the stop and a plain page after it.
+  - **Malformed page.** That test reverses the first multi-row walk page, plain or combined. A reversed combined page is refused as a misplaced end row.
+- **Mutation checks** (confirmed applied, restored with no diff):
+  - Consuming a **cut** page as if complete fails in 7 s (NOTE's input differs), which proves the fixture produces cut pages.
+  - Judging effectiveness without the page's included kids fails in 16 s (OP-5's input differs).
+  - The first cut-page attempt did not apply (a multi-line argument without `\n` markers). It was redone and confirmed before counting.
+- **Results.** Continuation 26/26 (≈112 s). Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2380/2380**; `npm run build` 0. 0046 unchanged (`4641d7cd…`).
+- **Remaining 4d.** Step 3, wiring the seams into `runReportingCycle`'s `plan()`/`stage()`, awaits the planner's scope decision on `tests/api/reporting-worker.test.ts` (asked in `docs/reviews/item-counting-t15p4-scope.md`). Then 4e.

@@ -1345,10 +1345,57 @@ export async function durableOwnerInput(
       step(walkState(w0.worker, cursorOrd, stopAt, need, null));
     };
     if (line) await finishLine();
+    // the same certain range as buildOwnerInput's 0045 read (exact when the earliest id is below U+D800)
+    const certain: CertainBound = { createdAt: isoOfMicros(wk.earliest.us), id: /^[\u0000-\ud7ff]*$/.test(wk.earliest.ev.id) ? wk.earliest.ev.id : null };
     let ended = false;
     while (!ended) {
       const from: StreamPosition = cursorOrd === null ? { createdAt: isoOfMicros(wk.latestUs + 1n), id: "" } : { createdAt: evAt(cursorOrd).created_at, id: evAt(cursorOrd).id };
       await flush();
+      // T15P-4d step 4: while the walk is not satisfied, ONE 0045 page with the children of the lines it is certain to
+      // consume. A page whose included children are all complete is consumed as one durable page of ordered steps (each
+      // line: pending kids -> its included kids -> done{effective} -> cursor). A line whose children were not included goes
+      // through the pending-line path (checkpoint, then its own kid pages). A CUT page is discarded uncharged and this
+      // position is read as a plain page, exactly as exactWalk.
+      if (stopAt === null && reader.predecessorPage) {
+        const p = await reader.predecessorPage(wk.staff, from, certain, STREAM_PAGE);
+        if (!p.lines.length && p.complete) break; // only an empty page WITH the end row proves the stream end
+        if (p.lines.length && p.lines.every((x) => x.kids === null || x.kidsComplete)) {
+          for (const { ev: e, kids } of p.lines) {
+            if (stopAt !== null && micros(e) < stopAt) {
+              ended = true;
+              break;
+            }
+            const ord = take(e);
+            const l = streamLine(e, cutoffUs);
+            if (!l) {
+              cursorOrd = ord;
+              step(walkState(w0.worker, cursorOrd, stopAt, need, null));
+              continue;
+            }
+            line = { ord, afterKidOrd: null, phase: "kids", effective: null };
+            step(walkState(w0.worker, cursorOrd, stopAt, need, line));
+            if (kids === null) {
+              await finishLine();
+              continue;
+            }
+            let lastKid: number | null = null;
+            for (const k of kids) lastKid = take(k);
+            if (lastKid !== null) {
+              line = { ord, afterKidOrd: lastKid, phase: "kids", effective: null };
+              step(walkState(w0.worker, cursorOrd, stopAt, need, line));
+            }
+            line = { ...line, phase: "done", effective: siteEffective(reader, l, kids) };
+            step(walkState(w0.worker, cursorOrd, stopAt, need, line));
+            onLine(l, line.effective!);
+            cursorOrd = ord;
+            line = null;
+            step(walkState(w0.worker, cursorOrd, stopAt, need, null));
+          }
+          if (ended) break;
+          if (p.complete && p.lines.length < STREAM_PAGE) break; // the read proved the stream ended
+          continue;
+        }
+      }
       const page = await reader.stream(wk.staff, "before", from, STREAM_PAGE);
       if (!page.length) break;
       for (const e of page) {

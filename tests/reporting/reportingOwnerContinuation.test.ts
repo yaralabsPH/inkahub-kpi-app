@@ -210,7 +210,7 @@ describe("durable owner read (journaled buildOwnerInput)", () => {
 
 describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash modes, exact resumed requests", () => {
   type St = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-  const SOURCE = new Set(["read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream"]);
+  const SOURCE = new Set(["read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream", "read_reporting_predecessor_page"]);
   /** Wipe one owner's journal so a scenario starts from an empty journal. */
   async function reset(key: string) {
     const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`;
@@ -263,6 +263,13 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
       const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
       return { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null };
     }
+    if (fn === "read_reporting_predecessor_page") {
+      // step 4: the 0045 combined page is read only while the walk is unsatisfied, from the committed cursor
+      if (s.step !== "walk" || s.w.line !== null || s.w.stopAt !== null) fail("a combined page while a line is pending, after the stop or outside the walk");
+      if (s.w.cursorOrd === null) return null;
+      const cur = at(s.w.cursorOrd);
+      return { p_at: cur.created_at, p_at_event_id: cur.id };
+    }
     if (fn === "read_reporting_staff_stream") {
       if (s.step !== "walk" || s.w.line !== null) fail("a stream page while a line is pending or outside the walk");
       if (s.w.cursorOrd === null) return null;
@@ -309,7 +316,10 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
     }
     if (s.step === "walk" && s.w.line === null && s.w.cursorOrd !== null) {
       const cur = at(s.w.cursorOrd);
-      return { fn: "read_reporting_staff_stream", args: { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id } };
+      // while unsatisfied the walk reads the 0045 combined page; after the stop, plain pages for the ties
+      return s.w.stopAt === null
+        ? { fn: "read_reporting_predecessor_page", args: { p_at: cur.created_at, p_at_event_id: cur.id } }
+        : { fn: "read_reporting_staff_stream", args: { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id } };
     }
     return null;
   }
@@ -443,7 +453,7 @@ describe("a malformed source page never becomes durable (review r2 Must-fix 3, d
       rpc: async (fn, args) => {
         calls.push(fn);
         const r = await c().rpc(fn, args);
-        if (fn === "read_reporting_staff_stream" && !poisoned && Array.isArray(r.data) && (r.data as unknown[]).length > 1) {
+        if ((fn === "read_reporting_staff_stream" || fn === "read_reporting_predecessor_page") && !poisoned && Array.isArray(r.data) && (r.data as unknown[]).length > 1) {
           poisoned = true;
           return { data: [...(r.data as unknown[])].reverse(), error: null };
         }
@@ -451,9 +461,10 @@ describe("a malformed source page never becomes durable (review r2 Must-fix 3, d
       },
     };
     const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
-    await expect(durableOwnerInput(rpcFrozenReader(client, ref), o, j)).rejects.toThrow(/keyset order/);
+    // a reversed plain page breaks keyset order; a reversed 0045 page also misplaces its end row: either way it is refused
+    await expect(durableOwnerInput(rpcFrozenReader(client, ref), o, j)).rejects.toThrow(/keyset order|misplaced end row/);
     expect(poisoned).toBe(true);
-    expect(calls.at(-1)).toBe("read_reporting_staff_stream"); // the refused page was the last request
+    expect(["read_reporting_staff_stream", "read_reporting_predecessor_page"]).toContain(calls.at(-1)); // the refused page was the last request
     const head = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, h.handle);
     expect(head.seq).toBe(j.seq); // nothing was written after the refused page
     expect(head.state).toMatchObject({ step: "walk", w: { cursorOrd: null, line: null } });
