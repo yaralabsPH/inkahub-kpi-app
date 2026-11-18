@@ -6145,3 +6145,22 @@ The awaited flush at `production-reporting-materialize.ts:1239`, `:1278`, `:1314
 Authority remains **no push, no hosted environments or connections, no hosted worker/CI invocation, no merge or deployment, and 0046 draft-only**, executable solely against isolated synthetic local fixtures. Later staging requires separate clearance and must test service access, anon plus owner/manager/staff/kiosk/cs denials, independent-session takeover/cleanup, retained-generation/old-code compatibility, actual transport/CPU/memory and rollback. CJ owns release and SQL installation. Rollback remains processor-disable/legacy reads with the compatible prior app and retained additive schema/evidence; no destructive down migration is authorised. `STATUS: COMPLETE` below completes this review handoff only.
 
 STATUS: COMPLETE
+
+## Coder log — T15P-4 review r2 repairs: Must-fix 1–3 and Should-fix 1, 2026-11-19
+
+1. **NULL-safe purpose** (`0046`, `oi_write_gate`). `p_purpose IS NULL OR NOT IN ('plan', 'stage')` raises `owner_input_args` before either gate is chosen.
+   - Test (`owner-inputs.test.ts`): NULL, `""`, `"Plan"` and `"nonsense"` are refused on an existing (MF-6) and a new (MF-7) journal, both unsealed and on a sealed batch with all three seal fields set and then restored. The header and every row are unchanged.
+   - Controls: `stage` keeps `owner has no sealed work`, and `plan` returns the existing handle.
+   - The test helper cannot report errors inside an explicit transaction (its `RESET ROLE` would run in the aborted transaction), so the batch is sealed and unsealed directly.
+2. **JSON-string identity for every event** (`oi_commit_pending`). `id` and `location` must be JSON strings, and `event_type`/`created_at` likewise, all via NULL-safe `IS DISTINCT FROM` inside `(…) IS NOT FALSE`, for candidates and non-candidates alike.
+   - Test: correctly digested images with numeric, boolean, null, object and array ids (matching textual metadata, `stream_candidate: false`), and number, null and array locations, all reject atomically. The string `"123"` control commits.
+3. **Source-position order** (`api/_lib/production-reporting-reader.ts`), validated on the whole page before use:
+   - member pages strictly ascending `(owner_index, bytewise id)` after their cursor, with `(index, NULL)` = owners after the index;
+   - by-ID pages strictly ascending;
+   - `stream` pages strictly away from the exclusive boundary in the requested direction, in `compareStream` order.
+   - Test (`reportingPageGuard.test.ts`, +3): reversed, duplicate, at/before-cursor and `(index, NULL)`-violating member pages; reversed and duplicate by-ID pages; and wrong-direction, out-of-bound, ascending-in-a-before-page and duplicate stream pages, including the same-microsecond `""` boundary and the `ü` > `é` bytewise tie. Valid controls pass.
+- **Should-fix 1.** `reportingPageGuard.test.ts:283` no longer passes `code: null`. `package.json` `typecheck:digest` now also covers `tests/reporting/pg/owner-inputs.test.ts`, `reportingOwnerInputState.test.ts`, `reportingOwnerContinuation.test.ts` and `reportingPageGuard.test.ts`. The strict no-emit check over all four passes as part of the gate.
+- **Sensitivity.** Against the reviewed `25f1dc7` 0046 and reader, the new SQL and reader regressions fail (5 tests) and pass after the repair.
+- **New 0046 SHA-256: `4641d7cd4dd3ca48d0ccf5350584bb6c23efec6bac4c5a4e6c26d60b7b0b6141`** (supersedes `d658113d…`). 0037–0045 are unchanged.
+- **Gate:** `npx tsc -b` 0; `npm run typecheck:digest` 0 (now with the four suites); `npm run test -- --run` **80 files, 2345/2345**; `npm run build` 0.
+- **Still open from r2:** the Must-fix 4 recovery-boundary tests, which come next in their own commit, together with the durable-route malformed-page test and the `"123"` reload control.

@@ -200,8 +200,9 @@ SET search_path = ''
 AS $fn$
 DECLARE b reporting_private.batches;
 BEGIN
+  -- NULL-safe: a NULL, empty or unknown purpose is the protocol error before either gate is chosen
+  IF p_purpose IS NULL OR p_purpose NOT IN ('plan', 'stage') THEN RAISE EXCEPTION 'owner_input_args: purpose must be plan or stage'; END IF;
   IF p_purpose = 'plan' THEN RETURN reporting_private.worker_batch(p_batch, p_fence, true); END IF;
-  IF p_purpose <> 'stage' THEN RAISE EXCEPTION 'owner_input_args: purpose must be plan or stage'; END IF;
   b := reporting_private.oi_read_gate(p_batch, p_fence);
   IF b.sealed_at IS NULL THEN RAISE EXCEPTION 'owner_input_transition: stage writes need a sealed batch'; END IF;
   RETURN b;
@@ -591,8 +592,10 @@ BEGIN
           IS DISTINCT FROM ARRAY['created_at', 'cs_case_id', 'department', 'event_type', 'id', 'line_quantity', 'line_sku', 'location', 'order_number', 'parent_event_id', 'staff_id'] THEN
       RAISE EXCEPTION 'owner_input_invalid: event % does not have exactly the 11 evidence fields', e.ord;
     END IF;
-    IF ev ->> 'id' IS DISTINCT FROM e.event_id OR ev ->> 'location' IS DISTINCT FROM h.site OR ev ->> 'created_at' IS DISTINCT FROM e.src_at
-       OR pg_catalog.jsonb_typeof(ev -> 'event_type') <> 'string' OR pg_catalog.jsonb_typeof(ev -> 'created_at') <> 'string' THEN
+    -- the identity fields must be JSON strings for EVERY event (->> would coerce a number 123 to '123')
+    IF (pg_catalog.jsonb_typeof(ev -> 'id') IS DISTINCT FROM 'string' OR pg_catalog.jsonb_typeof(ev -> 'location') IS DISTINCT FROM 'string'
+       OR ev ->> 'id' IS DISTINCT FROM e.event_id OR ev ->> 'location' IS DISTINCT FROM h.site OR ev ->> 'created_at' IS DISTINCT FROM e.src_at
+       OR pg_catalog.jsonb_typeof(ev -> 'event_type') IS DISTINCT FROM 'string' OR pg_catalog.jsonb_typeof(ev -> 'created_at') IS DISTINCT FROM 'string') IS NOT FALSE THEN
       RAISE EXCEPTION 'owner_input_invalid: event % identity, site or time differs from its metadata', e.ord;
     END IF;
     FOREACH v_last IN ARRAY ARRAY['staff_id', 'department', 'order_number', 'line_sku', 'parent_event_id', 'cs_case_id'] LOOP

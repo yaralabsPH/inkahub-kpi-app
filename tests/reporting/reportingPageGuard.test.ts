@@ -280,7 +280,7 @@ describe("T15P-1a: the deadline is checked again after a lease renewal (real wor
           attempt++;
           const r = renew({ t, deadline, attempt });
           t = r.t;
-          if (r.fail) return { data: null, error: { message: "fetch failed", code: null } };
+          if (r.fail) return { data: null, error: { message: "fetch failed" } };
           const out = await inner.rpc(fn, a);
           done = true;
           renewedAt = t;
@@ -579,5 +579,50 @@ describe("T15P-4b compatibility at group rollover (interim Should-fix 1): the re
       for await (const e of rpcFrozenReader(c.client, REF).children(PARENTS)) seen.push(e.id);
     })()).rejects.toThrow(/another parent/);
     expect(seen).toEqual([]); // no row of the malformed page was yielded
+  });
+});
+
+describe("source-position order (review r2 Must-fix 3): pages are rejected before use unless strictly in keyset order", () => {
+  const T = "2026-10-01T10:00:00.000000Z";
+  const T1 = "2026-10-01T10:00:00.000001Z";
+  const S = "00000003-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const im = (id: string, at = T, staff: string | null = S) => ({ id, location: "au", staff_id: staff, department: "framed", order_number: "O-1", line_sku: null, line_quantity: null, event_type: "line_verified", created_at: at, parent_event_id: null, cs_case_id: null });
+  /** A client that answers ONE call with the given rows. */
+  const once = (data: Array<Record<string, unknown>>) => rpcFrozenReader({ rpc: async () => ({ data, error: null }) }, REF);
+  const A = { partitionKind: "order" as const, partitionKey: "A" };
+  const B = { partitionKind: "order" as const, partitionKey: "B" };
+  const mem = (idx: number, id: string) => ({ owner_index: idx, event_id: id, image: im(id) });
+  const str = (id: string, at: string) => ({ event_id: id, image: im(id, at) });
+
+  it("member pages: reversed, duplicate, at/before the cursor and (index, NULL) skips are refused; valid pages pass", async () => {
+    await expect(once([mem(0, "b"), mem(0, "a")]).pages.membersPage([A, B], null)).rejects.toThrow(/keyset order/);
+    await expect(once([mem(0, "a"), mem(0, "a")]).pages.membersPage([A, B], null)).rejects.toThrow(/keyset order/);
+    await expect(once([mem(1, "a"), mem(0, "z")]).pages.membersPage([A, B], null)).rejects.toThrow(/keyset order/);
+    await expect(once([mem(0, "m")]).pages.membersPage([A, B], { index: 0, id: "z" })).rejects.toThrow(/keyset order/);
+    await expect(once([mem(0, "z")]).pages.membersPage([A, B], { index: 0, id: "z" })).rejects.toThrow(/keyset order/);
+    await expect(once([mem(0, "zz")]).pages.membersPage([A, B], { index: 0, id: null })).rejects.toThrow(/keyset order/); // (0, NULL) = owners after 0
+    expect((await once([mem(1, "a")]).pages.membersPage([A, B], { index: 0, id: null })).rows).toHaveLength(1);
+    expect((await once([mem(0, "é"), mem(1, "a")]).pages.membersPage([A, B], { index: 0, id: "z" })).rows).toHaveLength(2); // bytewise: é > z
+  });
+
+  it("by-id pages: reversed or duplicate ids are refused (nothing returned stays pending)", async () => {
+    await expect(once([str("b", T), str("a", T)]).pages.byIdsPage(["a", "b"])).rejects.toThrow(/ascending id order/);
+    await expect(once([str("a", T), str("a", T)]).pages.byIdsPage(["a", "b"])).rejects.toThrow(/ascending id order/);
+    expect(await once([str("a", T)]).pages.byIdsPage(["a", "b"])).toMatchObject({ pending: ["b"] });
+  });
+
+  it("stream pages: wrong direction, out of bound, duplicates and microsecond/Unicode ties are refused; valid order passes", async () => {
+    const before = (rows: Array<Record<string, unknown>>, from: { createdAt: string; id: string }) => once(rows).stream(S, "before", from, 200);
+    const after = (rows: Array<Record<string, unknown>>, from: { createdAt: string; id: string }) => once(rows).stream(S, "after", from, 200);
+    await expect(before([str("a", T1)], { createdAt: T, id: "" })).rejects.toThrow(/before keyset order/); // later than the boundary
+    await expect(before([str("a", T1)], { createdAt: T1, id: "" })).rejects.toThrow(/before keyset order/); // same microsecond, id after ""
+    await expect(before([str("n", T)], { createdAt: T, id: "m" })).rejects.toThrow(/before keyset order/);
+    await expect(before([str("ü", T)], { createdAt: T, id: "é" })).rejects.toThrow(/before keyset order/); // ü > é bytewise
+    await expect(before([str("b", T), str("c", T)], { createdAt: T1, id: "" })).rejects.toThrow(/before keyset order/); // ascending within the page
+    await expect(before([str("b", T), str("b", T)], { createdAt: T1, id: "" })).rejects.toThrow(/before keyset order/);
+    expect((await before([str("z", T), str("é", "2026-10-01T09:59:59.999999Z")], { createdAt: T, id: "é" })).map((e) => e.id)).toEqual(["z", "é"]);
+    await expect(after([str("a", T)], { createdAt: T1, id: "" })).rejects.toThrow(/after keyset order/);
+    await expect(after([str("b", T1), str("a", T1)], { createdAt: T, id: "" })).rejects.toThrow(/after keyset order/);
+    expect((await after([str("a", T), str("b", T), str("a", T1)], { createdAt: T, id: "" })).map((e) => e.id)).toEqual(["a", "b", "a"]);
   });
 });

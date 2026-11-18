@@ -116,10 +116,15 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
       const rows = await call("read_reporting_owner_members", {
         p_owners: owners.map((o) => [o.partitionKind, o.partitionKey]), p_after_index: after?.index ?? null, p_after_event_id: after?.id ?? null, p_limit: pageLimit(limit),
       });
+      // r6 R5 (adapter-owned source order): strictly ascending (owner_index, bytewise id), strictly after the cursor;
+      // a cursor (index, NULL) means "the owners after index".
+      let prev: MembersAfter | null = after;
       const out: MembersPage["rows"] = rows.map((r) => {
         const idx = r.owner_index;
         if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0 || idx >= owners.length) throw new ReportingJobError("read_reporting_owner_members returned a bad owner_index");
         const id = str(r.event_id, "event_id");
+        if (prev !== null && (idx < prev.index || (idx === prev.index && (prev.id === null || compareUtf8(id, prev.id) <= 0)))) throw new ReportingJobError("read_reporting_owner_members is not in keyset order");
+        prev = { index: idx, id };
         return { ownerIndex: idx, ev: imageToEvent(r.image, ref.site, id) };
       });
       const last = out.at(-1);
@@ -133,6 +138,7 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
       for (const r of rows) {
         const id = str(r.event_id, "event_id");
         if (!ids.includes(id)) throw new ReportingJobError(`read_reporting_events_by_id returned an id that was not requested`);
+        if (out.length && compareUtf8(id, last) <= 0) throw new ReportingJobError("read_reporting_events_by_id is not in ascending id order");
         out.push(imageToEvent(r.image, ref.site, id));
         last = id;
       }
@@ -260,9 +266,14 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
     async stream(staff, direction, from: StreamPosition, limit) {
       if (!UUID.test(staff)) throw new ReportingJobError("staff must be a uuid");
       const rows = await call("read_reporting_staff_stream", { p_staff: staff, p_direction: direction, p_at: from.createdAt, p_at_event_id: from.id, p_limit: Math.min(limit, 1000) });
+      // r6 R5: strictly away from the exclusive boundary in the requested direction, in (exact instant, bytewise id) order
+      let prev: Pick<Ev, "created_at" | "id"> = { created_at: from.createdAt, id: from.id };
+      const sign = direction === "before" ? -1 : 1;
       return rows.map((r) => {
         const e = imageToEvent(r.image, ref.site, str(r.event_id, "event_id"));
         if (e.staff_id !== staff) throw new ReportingJobError("read_reporting_staff_stream returned another worker's event");
+        if (Math.sign(compareStream(e, prev)) !== sign) throw new ReportingJobError(`read_reporting_staff_stream is not in ${direction} keyset order`);
+        prev = e;
         return e;
       });
     },

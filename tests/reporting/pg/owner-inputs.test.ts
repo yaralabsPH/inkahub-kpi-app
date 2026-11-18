@@ -627,3 +627,56 @@ describe("interim review repairs (Must-fix 1-4): fail-closed payloads, parent gr
     expect(done).toMatchObject({ seq: "3", event_count: 2, pending_events: 0 });
   });
 });
+
+describe("review r2 repairs (Must-fix 1-2): NULL-safe purpose, JSON-string identity for every event", () => {
+  const headerOf = async (h: string) => (await call("load_reporting_owner_input_header", { ...base(), p_handle: h }))[0];
+  const rowsOf = async () => (await db.query<{ n: number }>("select (select count(*) from reporting_private.owner_inputs) + (select count(*) from reporting_private.owner_input_events) + (select count(*) from reporting_private.owner_input_pieces) as n")).rows[0].n;
+
+  it("1: a NULL, empty or unknown purpose is owner_input_args before either gate, unsealed and sealed, existing and new journals", async () => {
+    const existing = String((await open("order", "MF-6")).handle);
+    const before = { head: await headerOf(existing), n: await rowsOf() };
+    const bad = [null, "", "Plan", "nonsense"];
+    const openWith = (key: string, purpose: unknown) => call("open_reporting_owner_input", { ...base(), p_kind: "order", p_key: key, p_purpose: purpose });
+    for (const p of bad) {
+      await expect(openWith("MF-6", p)).rejects.toThrow(/owner_input_args: purpose must be plan or stage/);
+      await expect(openWith("MF-7", p)).rejects.toThrow(/owner_input_args: purpose must be plan or stage/);
+    }
+    // a sealed batch (all three seal fields), restored afterwards (the helper cannot report errors inside an explicit transaction)
+    await db.query("update reporting_private.batches set sealed_at = now(), sealed_work_count = 0, sealed_manifest_hash = repeat('0', 64) where batch_id = $1", [batch]);
+    try {
+      for (const p of bad) {
+        await expect(openWith("MF-6", p)).rejects.toThrow(/owner_input_args: purpose must be plan or stage/);
+        await expect(openWith("MF-7", p)).rejects.toThrow(/owner_input_args: purpose must be plan or stage/);
+      }
+      await expect(openWith("MF-6", "stage")).rejects.toThrow(/owner has no sealed work/); // the valid stage control keeps its refusal
+    } finally {
+      await db.query("update reporting_private.batches set sealed_at = null, sealed_work_count = null, sealed_manifest_hash = null where batch_id = $1", [batch]);
+    }
+    expect({ head: await headerOf(existing), n: await rowsOf() }).toEqual(before);
+    expect((await openWith("MF-6", "plan"))[0]).toMatchObject({ handle: existing, created: false }); // the valid plan control
+  });
+
+  it("2: numeric, boolean, null, object or array image ids (and locations) reject atomically even for a false candidate flag", async () => {
+    const h = String((await open("order", "MF-8")).handle);
+    const base0 = ev("123", { order_number: "MF-8" });
+    const forged: Array<[string, unknown, string]> = [
+      ["id", 123, "123"], ["id", true, "true"], ["id", null, "null"], ["id", { a: 1 }, '{"a": 1}'], ["id", [1], "[1]"],
+    ];
+    const before = { head: await headerOf(h), n: await rowsOf() };
+    for (const [field, value, metaId] of forged) {
+      const img = { ...base0, [field]: value } as unknown as Ev;
+      const t = text(img);
+      const entry = [1, 0, t, { event_id: metaId, pieces: 1, text_bytes: Buffer.byteLength(t), text_sha256: sha(t), src_at: base0.created_at, stream_candidate: false }];
+      await expect(cp(h, "0", { kind: "page", pieces: [entry], steps: [S.members(1)] }), JSON.stringify(value)).rejects.toThrow(/owner_input_invalid/);
+    }
+    for (const loc of [1, null, ["au"]]) {
+      const img = { ...base0, location: loc } as unknown as Ev;
+      const t = text(img);
+      const entry = [1, 0, t, { event_id: "123", pieces: 1, text_bytes: Buffer.byteLength(t), text_sha256: sha(t), src_at: base0.created_at, stream_candidate: false }];
+      await expect(cp(h, "0", { kind: "page", pieces: [entry], steps: [S.members(1)] }), `location ${JSON.stringify(loc)}`).rejects.toThrow(/owner_input_invalid/);
+    }
+    expect({ head: await headerOf(h), n: await rowsOf() }).toEqual(before);
+    // the string "123" control commits
+    expect((await cp(h, "0", { kind: "page", pieces: entries([base0], 1), steps: [S.members(1)] }))).toMatchObject({ seq: "1", event_count: 1 });
+  });
+});
