@@ -34,12 +34,12 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type StreamPosition } from "./production-reporting-materialize.js";
+import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
 import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
 import { buildChunks, claimReportingWork, packStageRequests, stageReportingResults, type StageEntry } from "./reporting-stage.js";
-import { cleanupHistory, listWorkerOwners, manifestFromSaved, planOwner, readWalkLine, readWorkerProgress, recordRun, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery } from "./reporting-worker-state.js";
+import { checkpointOwnerInput, cleanupHistory, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
 export const HEARTBEAT_MS = 30_000;
@@ -519,4 +519,79 @@ export function admitDurableUnit(path: AdmissionPath, remainingMs: number, budge
   const nowMs = withRenewals((path.prerequisitesPaid ? 0 : pre) + unit);
   if (nowMs > remainingMs) return { verdict: "pending", freshMs, nowMs };
   return { verdict: "run" };
+}
+
+// ---------------------------------------------------------------------------
+// T15P-4d step 3a: worker seams over the 0046 journal (not yet called by runReportingCycle)
+// ---------------------------------------------------------------------------
+
+/** Raised before any batch work when the 0046 protocol is missing or unsupported; the caller records no run. */
+export class OwnerInputUnsupportedError extends ReportingJobError {
+  constructor(detail: string) {
+    super(`owner_input_unsupported: ${detail}`, "owner_input_unsupported");
+  }
+}
+/**
+ * Version FIRST: the owner-input protocol must exist and be exactly OWNER_INPUT_VERSION before the worker touches a
+ * batch. A missing function (the migration is not installed) or another version is a typed refusal, not a run.
+ */
+export async function requireOwnerInputProtocol(client: RpcClient): Promise<void> {
+  let v: number;
+  try {
+    v = await ownerInputVersion(client);
+  } catch (e) {
+    throw new OwnerInputUnsupportedError(`reporting_owner_input_version is unavailable (${e instanceof Error ? e.message : String(e)})`);
+  }
+  if (v !== OWNER_INPUT_VERSION) throw new OwnerInputUnsupportedError(`protocol version ${v}, this worker speaks ${OWNER_INPUT_VERSION}`);
+}
+
+/** A journal that proved too heavy to reload: visible failure, evidence retained, publication blocked. */
+export class OwnerInputTooHeavyError extends ReportingJobError {
+  constructor(owner: Owner, calls: number) {
+    super(`owner_input_too_heavy: ${owner.partitionKind}:${owner.partitionKey} needs ${calls} reload calls (max 120)`, "owner_input_too_heavy");
+  }
+}
+export const MAX_RELOAD_CALLS = 120;
+/**
+ * The protocol's purpose rule: a PLAN request may use only a plan journal (a stage journal is never downgraded); a
+ * STAGE request may recover a plan journal (stage takeover of an incomplete plan read, or sealed reuse of a complete
+ * one: its first sealed write upgrades the stored purpose) or a stage journal.
+ */
+export const purposeCompatible = (found: "plan" | "stage", wanted: "plan" | "stage"): boolean => wanted === "stage" || found === "plan";
+/** An existing journal whose purpose the request may not use (a stage journal for a plan request). */
+export class OwnerInputPurposeError extends ReportingJobError {
+  constructor(owner: Owner, found: string, wanted: string) {
+    super(`owner_input_purpose: ${owner.partitionKind}:${owner.partitionKey} is a ${found} journal, not ${wanted}`, "owner_input_purpose");
+  }
+}
+
+/**
+ * Recover one owner's durable journal in a (possibly new) process, in the r6 order: `lookup` first, failing fast on a
+ * persisted heavy proof or a reload cost above 120 BEFORE any reload or discard; open the journal if there is none;
+ * discard only NON-heavy pending data of an unfinished page (a new process never re-sends an unpersisted payload);
+ * then the snapshot-pinned reload. Returns the handle, the current seq and a resumable snapshot (null when the journal
+ * is past reading, i.e. hashing/complete: the caller continues with the hash step).
+ */
+export async function recoverOwnerJournal(
+  client: RpcClient, batchId: string, fence: number, owner: Owner, site: string, purpose: "plan" | "stage",
+): Promise<{ handle: string; seq: string; snapshot: OwnerJournalSnapshot | null; discarded: number; header: OwnerInputHeader; reloadCalls: number }> {
+  const [found] = await lookupOwnerInputs(client, batchId, fence, [owner]);
+  const j = found.journal;
+  if (j && (j.heavyProven || j.reloadCalls > MAX_RELOAD_CALLS || j.provisionalReloadCalls > MAX_RELOAD_CALLS)) {
+    throw new OwnerInputTooHeavyError(owner, Math.max(j.reloadCalls, j.provisionalReloadCalls));
+  }
+  // purpose compatibility (item-counting §4 / 0046: plan -> stage is the single legal upgrade), BEFORE any discard or reload
+  if (j && !purposeCompatible(j.purpose, purpose)) throw new OwnerInputPurposeError(owner, j.purpose, purpose);
+  const handle = j ? j.handle : (await openOwnerInput(client, batchId, fence, owner, purpose)).handle;
+  let discarded = 0;
+  if (j && j.pendingEvents > 0) {
+    const r = await checkpointOwnerInput(client, batchId, fence, handle, j.seq, { kind: "discard_pending" });
+    discarded = j.pendingEvents;
+    if (r.pendingEvents !== 0) throw new ReportingJobError("discard_pending left pending events");
+  }
+  const back = await reloadOwnerInput(client, batchId, fence, handle, site);
+  // re-verified after the reload with the same rule: an incompatible header is rejected, never adopted
+  if (!purposeCompatible(back.header.purpose, purpose)) throw new OwnerInputPurposeError(owner, back.header.purpose, purpose);
+  const snapshot = back.header.phase === "reading" ? ownerJournalSnapshot(back) : null;
+  return { handle, seq: back.header.seq, snapshot, discarded, header: back.header, reloadCalls: back.calls };
 }

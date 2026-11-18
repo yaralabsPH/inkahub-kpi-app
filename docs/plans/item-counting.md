@@ -6379,3 +6379,31 @@ STATUS: COMPLETE
   - RPC-count check removed (NaN then reached the `workMs` guard with the wrong message);
   - `remainingMs` check removed.
 - **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2375/2375**; `npm run build` 0.
+
+## Coder log — T15P-4d step 3a: version-first guard and journal recovery seams (local commit; worker wiring blocked on scope), 2026-11-19
+
+- **`requireOwnerInputProtocol(client)`** (`production-reporting-worker.ts`). The protocol must exist and be exactly version 1 **before** any batch work. A missing function or another version raises the typed `OwnerInputUnsupportedError` (`owner_input_unsupported`); the caller records no run.
+- **`recoverOwnerJournal(client, batch, fence, owner, site, purpose)`**, in the r6 order:
+  1. **`lookup` first.** A persisted heavy proof, or reload/provisional calls above 120, raises `OwnerInputTooHeavyError` **before any reload or discard**.
+  2. **Purpose compatibility** (CJ correction; item-counting §4 / 0046: plan → stage is the single legal upgrade). A **plan** request accepts only a plan journal; a **stage** request accepts a plan **or** a stage journal. This is checked after lookup and before any discard or reload, and re-checked on the reloaded header. An incompatible journal raises `OwnerInputPurposeError` (`owner_input_purpose`) and is never adopted. The strict-equality guard was replaced, not committed.
+  3. **Open** if there is no journal.
+  4. **Discard** only non-heavy pending data (a new process never re-sends an unpersisted payload).
+  5. **Snapshot-pinned reload.** It returns a resumable snapshot, or null past reading (the caller continues hashing).
+- **Tests** (`reportingOwnerContinuation.test.ts`, +5, real 0046):
+  - **Version:** supported, missing and version-2 cases.
+  - **Purpose:**
+    - A stage request recovers a plan journal. Its first write on the **sealed** batch (all three seal fields, restored afterwards) upgrades the stored purpose to `stage`.
+    - A plan request then refuses that stage journal, with the call list stopping at `lookup` each time.
+    - A stage request still recovers it.
+    - A forged `stage` header on a plan request is rejected and nothing is written.
+  - **Heavy:** a heavy journal makes only the `lookup` call.
+  - **Interrupted page:** an interrupted fragmented page is discarded and the journal resumes to `buildOwnerInput`. A hashing journal recovers with no snapshot.
+- **Mutation checks** (confirmed applied, restored with no diff; each 6–8 s on an assertion):
+  - heavy check removed;
+  - discard removed;
+  - version check removed;
+  - purpose rule always-true (a stage journal adopted for a plan request);
+  - purpose rule strict-equality (the legal plan → stage recovery refused);
+  - post-reload check removed (the forged header adopted).
+- **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2380/2380**; `npm run build` 0.
+- **Open question for the planner — the step-3 worker wiring needs one more test file.** Wiring `requireOwnerInputProtocol`, `routedOwnerInput`/`sharedChildren`, `recoverOwnerJournal`, hashing and admission into `runReportingCycle`'s `plan()`/`stage()` changes behaviour that **`tests/api/reporting-worker.test.ts`** pins with fake RPC clients. Its fakes have no owner-input RPCs, so the version-first guard alone would fail them. That file is not in the r6 allowed existing-test list. May Claude update it, limited to adding the owner-input RPCs to its fakes and the new routed/admission expectations, within step 3? Until then the seams are implemented and tested but not called by the worker.

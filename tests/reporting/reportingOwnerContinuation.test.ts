@@ -10,6 +10,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { ACTIVATION_LIMITS, activationWatch, buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, reducedBytes, routedOwnerInput, sharedChildren, type ActivationLimits, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
+import { OwnerInputPurposeError, OwnerInputTooHeavyError, OwnerInputUnsupportedError, recoverOwnerJournal, requireOwnerInputProtocol } from "../../api/_lib/production-reporting-worker";
 import { checkpointOwnerInput, hashOwnerInput, hashOwnerInputStep, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
 import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
 import { exactInstant } from "../../src/lib/domain/productionCounts";
@@ -754,5 +755,108 @@ describe("failed and retried attempts count toward activation (step 1b hardening
     const sharedPages2 = shared2.stats.flushes.reduce((x, f) => x + f.pages, 0);
     expect(m + sharedPages2).toBe(16 - before); // only the remaining allowance on the retry
     expect(r.input).toEqual(await buildOwnerInput(rpcFrozenReader(c(), ref), o));
+  }, 120_000);
+});
+
+describe("worker seams over the journal (T15P-4d step 3a)", () => {
+  async function wipe(key: string) {
+    const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key}'`;
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key}'`);
+  }
+  it("version first: the supported protocol passes; a missing function or another version is a typed refusal", async () => {
+    await expect(requireOwnerInputProtocol(c())).resolves.toBeUndefined();
+    const missing: RpcClient = { rpc: async (fn, a) => (fn === "reporting_owner_input_version" ? { data: null, error: { message: "Could not find the function public.reporting_owner_input_version" } } : c().rpc(fn, a)) };
+    await expect(requireOwnerInputProtocol(missing)).rejects.toThrow(/owner_input_unsupported: reporting_owner_input_version is unavailable/);
+    const v2: RpcClient = { rpc: async (fn, a) => (fn === "reporting_owner_input_version" ? { data: [{ version: 2 }], error: null } : c().rpc(fn, a)) };
+    await expect(requireOwnerInputProtocol(v2)).rejects.toThrow(/owner_input_unsupported: protocol version 2/);
+    await expect(requireOwnerInputProtocol(v2)).rejects.toBeInstanceOf(OwnerInputUnsupportedError);
+  });
+
+  it("plan -> stage: a stage request recovers a plan journal and its first sealed write upgrades the stored purpose; a plan request then refuses it right after lookup", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "OQ-5" };
+    await wipe("OQ-5");
+    await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    // (2) the single legal upgrade: a stage request recovers the plan journal
+    const r = await recoverOwnerJournal(c(), ref.batchId, ref.fence, o, SITE, "stage");
+    expect(r.header.purpose).toBe("plan");
+    expect(r.snapshot?.state).toEqual({ v: 1, step: "members", m: { afterOrd: null } });
+    const member = (await buildOwnerInput(rpcFrozenReader(c(), ref), o)).members[0];
+    // the first write on the SEALED batch (all three seal fields; restored afterwards) upgrades the stored purpose
+    await db.query("update reporting_private.batches set sealed_at = now(), sealed_work_count = 0, sealed_manifest_hash = repeat('0', 64) where batch_id = $1", [ref.batchId]);
+    try {
+      const j = ownerJournal(c(), ref.batchId, ref.fence, r.handle, r.seq, cutoffUs());
+      await j.commit({ events: [member], firstOrd: 1, steps: [{ v: 1, step: "members", m: { afterOrd: 1 } }] });
+      expect((await loadOwnerInputHeader(c(), ref.batchId, ref.fence, r.handle)).purpose).toBe("stage");
+    } finally {
+      await db.query("update reporting_private.batches set sealed_at = null, sealed_work_count = null, sealed_manifest_hash = null where batch_id = $1", [ref.batchId]);
+    }
+    // (1) a plan request never downgrades a stage journal: refused right after lookup, nothing discarded or reloaded
+    const calls: string[] = [];
+    const rec: RpcClient = { rpc: async (fn, a) => (calls.push(fn), c().rpc(fn, a)) };
+    await expect(recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toBeInstanceOf(OwnerInputPurposeError);
+    await expect(recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toThrow(/owner_input_purpose: order:OQ-5 is a stage journal, not plan/);
+    expect(calls).toEqual(["lookup_reporting_owner_inputs", "lookup_reporting_owner_inputs"]);
+    // a stage request still recovers the (now stage) journal
+    expect((await recoverOwnerJournal(c(), ref.batchId, ref.fence, o, SITE, "stage")).header).toMatchObject({ purpose: "stage", eventCount: 1 });
+    await wipe("OQ-5");
+  });
+
+  it("a reloaded header that disagrees with the requested purpose is rejected, not adopted", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "OQ-5" };
+    const forged: RpcClient = {
+      rpc: async (fn, a) => {
+        const r = await c().rpc(fn, a);
+        if (fn === "load_reporting_owner_input_header" && Array.isArray(r.data)) return { data: (r.data as Array<Record<string, unknown>>).map((x) => ({ ...x, purpose: "stage" })), error: null };
+        return r;
+      },
+    };
+    const before = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, (await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan")).handle);
+    await expect(recoverOwnerJournal(forged, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toThrow(/owner_input_purpose: order:OQ-5 is a stage journal, not plan/);
+    const after = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, (await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan")).handle);
+    expect(after).toEqual(before); // nothing was written
+  });
+
+  it("a heavy journal fails fast after lookup, before any reload or discard", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "OQ-4" };
+    await wipe("OQ-4");
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    await db.query("update reporting_private.owner_inputs set heavy_proven = true where handle = $1::bigint", [h.handle]);
+    const calls: string[] = [];
+    const rec: RpcClient = { rpc: async (fn, a) => (calls.push(fn), c().rpc(fn, a)) };
+    await expect(recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toBeInstanceOf(OwnerInputTooHeavyError);
+    expect(calls).toEqual(["lookup_reporting_owner_inputs"]); // no header load, no events load, no discard
+    await wipe("OQ-4");
+  });
+
+  it("a new process: an unfinished page's pending data is discarded, then the journal reloads to a resumable snapshot", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "NOTE" };
+    await wipe("NOTE");
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    // an interrupted process left the first pieces call of a fragmented page (not heavy)
+    let pieceCalls = 0;
+    const lossy: RpcClient = {
+      rpc: async (fn, a) => {
+        const r = await c().rpc(fn, a);
+        if (fn === "checkpoint_reporting_owner_input" && (a?.p_payload as { kind?: string })?.kind === "pieces" && ++pieceCalls === 1) throw new Error("process died");
+        return r;
+      },
+    };
+    await expect(durableOwnerInput(rpcFrozenReader(c(), ref), o, ownerJournal(lossy, ref.batchId, ref.fence, h.handle, h.seq, cutoffUs()))).rejects.toThrow(/process died/);
+    const r = await recoverOwnerJournal(c(), ref.batchId, ref.fence, o, SITE, "plan");
+    expect(r.discarded).toBeGreaterThan(0);
+    expect(r.header.pendingEvents).toBe(0);
+    expect(r.snapshot).not.toBeNull();
+    expect(r.reloadCalls).toBe(r.header.reloadCalls);
+    const got = await durableOwnerInput(rpcFrozenReader(c(), ref), o, ownerJournal(c(), ref.batchId, ref.fence, r.handle, r.seq, cutoffUs()), r.snapshot);
+    expect(got).toEqual(await buildOwnerInput(rpcFrozenReader(c(), ref), o));
+    // a journal past reading recovers with no snapshot (the caller continues hashing)
+    const old = await readOwnerOldStaff(c(), ref.batchId, ref.fence, o, null);
+    const hashes = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, got, old).map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
+    await hashOwnerInput(c(), ref.batchId, ref.fence, r.handle, hashes, { unit: 1, maxSteps: 1 });
+    const again = await recoverOwnerJournal(c(), ref.batchId, ref.fence, o, SITE, "plan");
+    expect(again.snapshot).toBeNull();
+    expect(again.header.phase).toBe(hashes.length === 1 ? "complete" : "hashing");
   }, 120_000);
 });
