@@ -199,6 +199,17 @@ describe("journal adapters over the real 0046 draft (PGlite)", () => {
     expect((await reloadOwnerInput(c(), batch, fence, h, SITE)).events.map((x) => x.ev)).toEqual(events);
   });
 
+  it("a numeric-looking string id ('123') checkpoints and reloads byte-exactly (review r2 Must-fix 2 control)", async () => {
+    const h = (await openOwnerInput(c(), batch, fence, O("OS-0"), "plan")).handle;
+    const hd = await loadOwnerInputHeader(c(), batch, fence, h);
+    const e = ev("123", { order_number: "OS-0" });
+    const w = await writeOwnerPage(c(), batch, fence, h, hd.seq, eventEntries([e], hd.eventCount + 1, () => false), [MEMBERS(hd.eventCount + 1)]);
+    expect(w.result.eventCount).toBe(hd.eventCount + 1);
+    const r = await reloadOwnerInput(c(), batch, fence, h, SITE);
+    expect(r.events.at(-1)!.ev).toEqual(e);
+    expect(typeof r.events.at(-1)!.ev.id).toBe("string");
+  });
+
   it("reload rejects a tampered committed piece and a wrong event count (evidence is verified, never repaired)", async () => {
     const h = (await openOwnerInput(c(), batch, fence, O("OS-1"), "plan")).handle;
     await db.exec("begin");

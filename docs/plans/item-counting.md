@@ -6164,3 +6164,31 @@ STATUS: COMPLETE
 - **New 0046 SHA-256: `4641d7cd4dd3ca48d0ccf5350584bb6c23efec6bac4c5a4e6c26d60b7b0b6141`** (supersedes `d658113d…`). 0037–0045 are unchanged.
 - **Gate:** `npx tsc -b` 0; `npm run typecheck:digest` 0 (now with the four suites); `npm run test -- --run` **80 files, 2345/2345**; `npm run build` 0.
 - **Still open from r2:** the Must-fix 4 recovery-boundary tests, which come next in their own commit, together with the durable-route malformed-page test and the `"123"` reload control.
+
+## Coder log — T15P-4 review r2 Must-fix 4: recovery boundaries (tests only), 2026-11-19
+
+`tests/reporting/reportingOwnerContinuation.test.ts` (+6 tests) and `reportingOwnerInputState.test.ts` (+1). No implementation change was needed.
+
+- **New fixtures.**
+  - **BIG:** 1,001 member cancellations, giving two member pages and two 1,000-member child groups. The first 501 name distinct non-member parents (501 by-ID requests in two 500-groups); every fifth (`g % 5 = 3`) is absent, and three 400 KB parents byte-shorten the by-ID pages inside group 0. Kids sit in both child groups.
+  - **NOTE:** W3 lines with 400 KB notes, so member and kid pages are byte-shortened. Line `nt-2` has three cancellations over several non-empty kid pages. A non-timing line with a 300,000-backslash SKU makes a page that needs several `pieces` calls. W3's walk also crosses 400 clock-ins over several stream pages.
+  - **EMPTY:** a discovered owner with no members.
+- **Every commit, both crash modes.** For EMPTY, NOTE (21 commits) and BIG, every commit k is run in both modes: dying **before** commit k, and committing k then **losing the response**.
+  - A fresh process reloads and resumes, and must equal `buildOwnerInput`.
+  - The **first resumed source request must equal the one implied by the saved cursor**: the members keyset, the children `(parent, id)` keyset, a pending line's kid keyset, or the stream boundary. From `done` there must be zero source reads.
+  - A guard on the source client asserts before **every** source read that the stored state is the phase that read depends on (checkpoint-before-dependent-read).
+- **States reached.**
+  - BIG reaches members-cursor, parents-cursor (mid-group), parents group 1, children-cursor, children group 1, children-cursor in group 1, and done.
+  - NOTE reaches members-cursor, pending kids, mid-kids (between non-empty kid pages), walk cursor, and done.
+  - A parents cursor inside the **last** parent group is never stored, because that group ends in the same commit (a one-id group). This is stated rather than forced.
+- **Seeded `done{effective}`.** A legal intermediate state (the line finished, the cursor not yet moved) is committed through the adapter by truncating the commit's steps; the resume goes through the done branch.
+- **Fragmented page.** The first `pieces` call's response is lost. The new process sees pending events (not heavy), calls `discard_pending`, and redoes that source unit to the exact input.
+- **Malformed page on the durable route.** A reversed stream page is refused (`keyset order`). It was the last request, and the journal seq and state are unchanged. The journal then resumes to the exact input.
+- **`"123"` control.** A numeric-looking string id checkpoints and reloads byte-exactly.
+- **Mutation checks** (file restored, no diff):
+  - Resetting the saved kid cursor on resume fails at NOTE "after 15/21" (the exact-next-request assertion).
+  - Dropping the flush before each kid page fails the checkpoint-before-read guard.
+- **Results.**
+  - Focused: continuation 8/8 and adapters 17/17 (≈95 s).
+  - Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2352/2352**; `npm run build` 0.
+  - 0046 unchanged (`4641d7cd…`).

@@ -10,13 +10,15 @@ import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { buildOwnerInput, durableOwnerInput, ownerKey, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
-import { openOwnerInput, ownerJournal, ownerJournalSnapshot, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
+import { checkpointOwnerInput, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
+import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
 import { exactInstant } from "../../src/lib/domain/productionCounts";
 import { reportingDb } from "./pg/harness";
 import { pgRpc } from "./pg/rpc";
 
 const W1 = "00000008-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W2 = "00000009-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W3 = "0000000a-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SITE = "au";
 let db: PGlite;
 let ref: FrozenBatchRef;
@@ -75,6 +77,35 @@ beforeAll(async () => {
   }
   await ins({ id: "pr-0240-tie", order: "OP-T", at: at(-2400), dept: "unframed" }); // a tie at the stop instant
   for (let g = 1; g <= 5; g++) await ins({ id: `w2-${g}`, staff: W2, order: `OQ-${g}`, at: at(-g * 7) });
+  // review r2 Must-fix 4 fixtures:
+  //  BIG: 1,001 member cancellations (two member pages, two 1,000-groups of children); the first 501 name distinct parents
+  //       outside the order (501 by-id requests in two 500-groups), every 5th of them (g % 5 = 3) absent from the source.
+  //  NOTE: W3 lines with 400 KB notes (byte-shortened member and kid pages), a line whose cancellations span several
+  //        non-empty kid pages, and a non-timing line with a 300,000-backslash SKU (a multi-call fragmented page).
+  //  EMPTY: a discovered owner with no members (zero groups and zero workers).
+  await db.query("insert into auth.users (id, email) values ($1, 'w3@x')", [W3]);
+  await db.query(
+    `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+     select 'au', 'bp-' || lpad(g::text, 4, '0'), $1, 'framed', null, null, null, 'clock_in', 's', '', timestamptz '2026-09-01' + g * interval '1 second', null
+       from generate_series(0, 500) g where g % 5 <> 3`, [W3]);
+  await db.query(
+    `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+     select 'au', 'bg-' || lpad(g::text, 4, '0'), $1, 'framed', 'BIG', null, null, 'cancelled', 's', '', timestamptz '2026-09-02' + g * interval '1 second',
+            case when g <= 500 then 'bp-' || lpad(g::text, 4, '0') end
+       from generate_series(0, 1000) g`, [W2]);
+  // three 400 KB parents byte-shorten the by-id pages inside group 0, so a parents cursor is stored mid-group
+  await db.query("update public.production_events set note = repeat('n', 400000) where id in ('bp-0010', 'bp-0011', 'bp-0012')");
+  for (const [id, parent] of [["bk-0005", "bg-0005"], ["bk-1000", "bg-1000"]]) await ins({ id, staff: W2, order: "BIGK", type: "cancelled", parent, at: "2026-09-03T00:00:00Z" });
+  const noteRow = async (id: string, type: string, order: string, at: string, parent: string | null, sku: string | null, staff = W3) =>
+    db.query(
+      `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+       values ('au', $1, $2, 'framed', $3, $4, $5, $6, 's', repeat('n', 400000), $7, $8)`,
+      [id, staff, order, sku, type === "line_verified" ? 1 : null, type, at, parent]);
+  for (let i = 1; i <= 5; i++) await noteRow(`nt-${i}`, "line_verified", "NOTE", `2026-10-01T08:00:0${i}Z`, null, "INKA-KAN0566-A4-FB");
+  for (let i = 1; i <= 3; i++) await noteRow(`ntk-${i}`, "cancelled", "NOTEK", `2026-10-01T08:01:0${i}Z`, "nt-2", null, W2);
+  await db.query(
+    `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+     values ('au', 'nt-big', $1, 'framed', 'NOTE', 'X' || repeat(chr(92), 300000), 1, 'line_verified', 's', '', '2026-10-01T08:00:10Z', null)`, [W3]);
   expect((await c().rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
   expect((await c().rpc("set_reporting_site_mode", { p_site: SITE, p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
   const r = await beginReportingRebuild(c(), SITE);
@@ -88,7 +119,7 @@ beforeAll(async () => {
   const b = (await db.query<{ cutoff: string }>("select to_char(source_cutoff at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as cutoff from reporting_private.batches where batch_id = $1", [r.batchId])).rows[0];
   ref = { batchId: r.batchId, fence: r.leaseFence, site: SITE, cutoff: b.cutoff, kind: "rebuild" };
   const keys = (await db.query<{ k: string }>("select distinct order_number as k from public.production_events where order_number is not null order by 1")).rows.map((x) => x.k);
-  owners = keys.map((k) => ({ partitionKind: "order" as const, partitionKey: k }));
+  owners = [...keys, "EMPTY"].map((k) => ({ partitionKind: "order" as const, partitionKey: k }));
   const sorted = [...owners].sort((x, y) => (ownerKey(x) < ownerKey(y) ? -1 : 1));
   const last: ["order", string] = ["order", sorted.at(-1)!.partitionKey];
   await saveEnumeration(c(), ref.batchId, ref.fence, null, { kind: "rebuild", after: last }, sorted.map((o) => ({ owner: o, oldStaff: [] })), false);
@@ -165,4 +196,200 @@ describe("durable owner read (journaled buildOwnerInput)", () => {
       if (snap.state.step === "walk" || snap.state.step === "done") expect(reads.calls.some((x) => x.fn === "read_reporting_events_by_id"), `parents re-read at ${k}`).toBe(false);
     }
   }, 600_000);
+});
+
+describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash modes, exact resumed requests", () => {
+  type St = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const SOURCE = new Set(["read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream"]);
+  /** Wipe one owner's journal so a scenario starts from an empty journal. */
+  async function reset(key: string) {
+    const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`;
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`);
+  }
+  /**
+   * A source client that checks, before EVERY source read, that the journal's stored state is the phase that read
+   * depends on (checkpoint-before-dependent-read), and records each source call.
+   */
+  function guardedSource(stored: () => St | null) {
+    const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const client: RpcClient = {
+      rpc: async (fn, args) => {
+        if (SOURCE.has(fn)) {
+          const s = stored();
+          const a = args ?? {};
+          if (s) {
+            const ok =
+              fn === "read_reporting_owner_members" ? s.step === "members"
+              : fn === "read_reporting_events_by_id" ? s.step === "parents"
+              : fn === "read_reporting_staff_stream" ? s.step === "walk" && s.w.line === null
+              : (a.p_parent_ids as string[]).length === 1 && s.step === "walk" ? s.w.line !== null && s.w.line.phase === "kids"
+              : s.step === "children";
+            if (!ok) throw new Error(`${fn} was requested while the stored state is ${JSON.stringify(s)}`);
+          }
+          calls.push({ fn, args: a });
+        }
+        return c().rpc(fn, args);
+      },
+    };
+    return { client, calls };
+  }
+  /** The exact first source request a resume from `s` must make (null: none is predictable / no read at all). */
+  function expectedFirst(s: St, events: Ev[], owner: Owner): { fn: string; args: Record<string, unknown> } | "none" | null {
+    const at = (ord: number) => events[ord - 1];
+    if (s.step === "done") return "none";
+    if (s.step === "members") {
+      const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
+      return { fn: "read_reporting_owner_members", args: { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null } };
+    }
+    if (s.step === "children") {
+      const a = s.c.afterOrd === null ? null : at(s.c.afterOrd);
+      return { fn: "read_reporting_children", args: { p_after_parent_id: a ? a.parent_event_id : null, p_after_event_id: a ? a.id : null } };
+    }
+    if (s.step === "walk" && s.w.line && s.w.line.phase === "kids") {
+      const l = at(s.w.line.ord);
+      const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
+      return { fn: "read_reporting_children", args: { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null } };
+    }
+    if (s.step === "walk" && s.w.line === null && s.w.cursorOrd !== null) {
+      const cur = at(s.w.cursorOrd);
+      return { fn: "read_reporting_staff_stream", args: { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id } };
+    }
+    return null;
+  }
+  /** Run `owner` to the k-th journal call boundary: mode "before" dies before commit k, "after" commits k then loses the response. */
+  async function crashAt(owner: Owner, k: number, mode: "before" | "after", truncateDone = false) {
+    await reset(owner.partitionKey);
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
+    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+    let stored: St | null = { v: 1, step: "members", m: { afterOrd: null } };
+    let n = 0;
+    const src = guardedSource(() => stored);
+    const journal: OwnerJournal = {
+      async commit(p) {
+        n++;
+        let steps = p.steps;
+        // seed the legal intermediate state "done{effective}" (pending line finished, cursor not yet moved) through the adapter
+        if (truncateDone && n === k) {
+          const i = steps.findIndex((s) => s.step === "walk" && s.w.line?.phase === "done");
+          if (i < 0) throw new Error("no done line in this commit");
+          steps = steps.slice(0, i + 1);
+        }
+        if (mode === "before" && n === k) throw new Crash(`before ${k}`);
+        await j.commit({ ...p, steps });
+        stored = steps[steps.length - 1] as unknown as St;
+        if ((mode === "after" || truncateDone) && n === k) throw new Crash(`after ${k}`);
+      },
+    };
+    await expect(durableOwnerInput(rpcFrozenReader(src.client, ref), owner, journal)).rejects.toBeInstanceOf(Crash);
+    return h.handle;
+  }
+  async function resume(owner: Owner, handle: string, want: unknown, label: string) {
+    const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
+    const snap = ownerJournalSnapshot(back);
+    let stored: St = snap.state as unknown as St;
+    const j = ownerJournal(c(), ref.batchId, ref.fence, handle, back.header.seq, cutoffUs());
+    const src = guardedSource(() => stored);
+    const got = await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { await j.commit(p); stored = p.steps[p.steps.length - 1] as unknown as St; } }, snap);
+    expect(got, label).toEqual(want);
+    const first = expectedFirst(snap.state as unknown as St, snap.events, owner);
+    if (first === "none") expect(src.calls, `${label}: a done journal reads nothing`).toEqual([]);
+    else if (first) expect(src.calls[0], `${label}: the first resumed request continues exactly at the saved cursor`).toMatchObject(first);
+    return snap.state as unknown as St;
+  }
+  /** The steps of every commit of an uninterrupted durable read (journal-free). */
+  async function commitsOf(owner: Owner) {
+    const commits: St[][] = [];
+    await durableOwnerInput(rpcFrozenReader(c(), ref), owner, { commit: async (p) => void commits.push(p.steps as unknown as St[]) });
+    return commits;
+  }
+
+  for (const key of ["EMPTY", "NOTE", "BIG"]) {
+    it(`${key}: a crash before or after EVERY commit resumes to buildOwnerInput, with the exact next request and checkpoint-first reads`, async () => {
+      const o: Owner = { partitionKind: "order", partitionKey: key };
+      const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+      const stored = (await commitsOf(o)).map((steps) => steps[steps.length - 1]);
+      const kinds = new Set<string>();
+      for (let k = 1; k <= stored.length; k++) {
+        for (const mode of ["before", "after"] as const) {
+          const handle = await crashAt(o, k, mode);
+          const s = await resume(o, handle, want, `${key} ${mode} ${k}/${stored.length}`);
+          kinds.add(s.step === "walk" ? `walk:${s.w.line ? `line-${s.w.line.phase}${s.w.line.afterKidOrd === null ? "" : "-mid"}` : "cursor"}` : `${s.step}${s.m?.afterOrd || s.p?.afterOrd || s.c?.afterOrd ? "-cursor" : ""}${s.p?.group || s.c?.group ? "-g1" : ""}`);
+        }
+      }
+      if (key === "EMPTY") expect(stored.map((s) => s.step)).toEqual(["done"]);
+      if (key === "BIG") for (const kind of ["members-cursor", "parents-cursor", "parents-g1", "children-cursor", "children-g1", "children-cursor-g1", "done"]) expect(kinds, [...kinds].join(",")).toContain(kind);
+      if (key === "NOTE") for (const kind of ["members-cursor", "walk:line-kids", "walk:line-kids-mid", "walk:cursor", "done"]) expect(kinds, [...kinds].join(",")).toContain(kind);
+    }, 600_000);
+  }
+
+  it("a seeded pending done{effective} line resumes through its done branch", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "NOTE" };
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const commits = await commitsOf(o);
+    const k = commits.findIndex((steps) => steps.some((s) => s.step === "walk" && s.w.line?.phase === "done")) + 1; // the first commit that finishes a line
+    expect(k).toBeGreaterThan(0);
+    const handle = await crashAt(o, k, "after", true);
+    const s = await resume(o, handle, want, "seeded done");
+    expect(s.w.line).toMatchObject({ phase: "done", effective: expect.any(Boolean) });
+  }, 300_000);
+
+  it("a fragmented page interrupted between pieces calls: the new process discards the pending data and redoes that source unit", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "NOTE" };
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    await reset("NOTE");
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    let pieceCalls = 0;
+    const lossy: RpcClient = {
+      rpc: async (fn, args) => {
+        const r = await c().rpc(fn, args);
+        if (fn === "checkpoint_reporting_owner_input" && (args?.p_payload as { kind?: string })?.kind === "pieces" && ++pieceCalls === 1) throw new Crash("lost after the first pieces call");
+        return r;
+      },
+    };
+    const j = ownerJournal(lossy, ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+    await expect(durableOwnerInput(rpcFrozenReader(c(), ref), o, j)).rejects.toBeInstanceOf(Crash);
+    const head = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, h.handle);
+    expect(head.pendingEvents).toBeGreaterThan(0);
+    expect(head.heavyProven).toBe(false);
+    const d = await checkpointOwnerInput(c(), ref.batchId, ref.fence, h.handle, head.seq, { kind: "discard_pending" });
+    expect(d.pendingEvents).toBe(0);
+    await resume(o, h.handle, want, "after discard");
+  }, 300_000);
+});
+
+describe("a malformed source page never becomes durable (review r2 Must-fix 3, durable route)", () => {
+  it("an out-of-order stream page is refused: nothing from it is committed and no next dependent read is made", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "O-1" };
+    const sel = "select handle from reporting_private.owner_inputs where partition_key = 'O-1'";
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query("delete from reporting_private.owner_inputs where partition_key = 'O-1'");
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    const calls: string[] = [];
+    let poisoned = false;
+    const client: RpcClient = {
+      rpc: async (fn, args) => {
+        calls.push(fn);
+        const r = await c().rpc(fn, args);
+        if (fn === "read_reporting_staff_stream" && !poisoned && Array.isArray(r.data) && (r.data as unknown[]).length > 1) {
+          poisoned = true;
+          return { data: [...(r.data as unknown[])].reverse(), error: null };
+        }
+        return r;
+      },
+    };
+    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+    await expect(durableOwnerInput(rpcFrozenReader(client, ref), o, j)).rejects.toThrow(/keyset order/);
+    expect(poisoned).toBe(true);
+    expect(calls.at(-1)).toBe("read_reporting_staff_stream"); // the refused page was the last request
+    const head = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, h.handle);
+    expect(head.seq).toBe(j.seq); // nothing was written after the refused page
+    expect(head.state).toMatchObject({ step: "walk", w: { cursorOrd: null, line: null } });
+    // and the journal still resumes to the exact input
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, h.handle, SITE);
+    expect(await durableOwnerInput(rpcFrozenReader(c(), ref), o, ownerJournal(c(), ref.batchId, ref.fence, h.handle, back.header.seq, cutoffUs()), ownerJournalSnapshot(back))).toEqual(want);
+  }, 120_000);
 });
