@@ -5876,3 +5876,26 @@ These predicates identify a site, not ownership of arbitrary same-site writes. T
 **Hardening, release and rollback remain unchanged.** This extension changes test expectations and audit attribution only. Counting, historical credit, inventory/money, both repository adapters, authentication, RLS/grants, endpoints, external services and dependencies are unchanged. Other-site mutation detection and unknown-table fail-closed behaviour are explicit regression obligations. 0046 remains an offline-only draft, executable only in isolated synthetic PGlite tests under this authority; pre-existing migrations remain byte-identical. No push, hosted connections (including staging or production reads), hosted worker/CI invocation, SQL installation, merge or deployment. Later staging and independent-session/role/transport evidence require separate clearance; CJ retains release ownership. Existing processor-disable/legacy-read rollback and retention of additive schema/evidence remain the rollback plan. Task 15 and hosted gates remain open.
 
 STATUS: COMPLETE
+
+## Coder log — T15P-4a complete (local commit), 2026-11-19
+
+**Scope.** Under the T15P-4a scope decision: `supabase/migrations/0046_reporting_owner_inputs.sql` (new, offline draft, SHA-256 `0a294af753e5cfae85f9e4697ffbe24a2f89fd824f149dca04deabff4a25fde0`, unchanged since the scope decision) and `tests/reporting/pg/owner-inputs.test.ts` (new). The three approved dependency edits, and only those: the 0046 entry in `tests/reporting/reportingAccessPaths.test.ts` and in `tests/reporting/reportingJobs.test.ts` (`slice(-10)`), plus the three planner-given `SITE_ATTRIBUTION` entries in `tests/staging/reportingWorkerRuntime.ts`. `tests/reporting/reportingWorkerRuntime.test.ts`, the shared harnesses, table discovery, `stableHashSql`/`stableHashes`/`PRE_EXISTING`/`OWNERSHIP_SQL`/`runtimeAuditProblems` are unchanged.
+
+**Required audit regression** (new describe in `owner-inputs.test.ts`, 5 tests, real 0046 tables and the imported runtime-audit helpers):
+- **Fixture.** A second synthetic site (uk) gets its own frozen batch through the same sanctioned adapters, with no worker loop. Both au and uk have committed and pending headers, events and pieces, each bound to its own site's batch. The block builds its own run-site journals (OI-5 committed, OI-0 pending), so it passes when run alone (`-t "runtime audit"`: 5/5).
+- **Mutations.** Nine FK-ordered mutations (insert, update and delete on each of the three tables) run inside rolled-back transactions. At the run site they leave all `stableHashes` unchanged. At uk the mutated table's stable hash changes, and `runtimeAuditProblems` names `reporting_private.<table>: rows the run may not change differ`.
+- **Ownership.** A run-site journal on an undeclared batch gives `OWNERSHIP_SQL` `batches = 1` and the audit problem `1 batches row(s) at au do not belong to this run`. Declaring that batch gives 0; uk's batch is never counted.
+- **Unknown tables.** A temporary unattributed `reporting_private` table is compared in full, run-site rows included.
+- **Deliberate breaks** (file restored afterwards; diff is exactly the 3 approved lines): `owner_input_events: "true"` fails only the other-site test, and `"false"` fails only the run-site test.
+
+**Results.**
+- Focused: `npx vitest run tests/reporting/pg/owner-inputs.test.ts tests/reporting/reportingAccessPaths.test.ts tests/reporting/reportingJobs.test.ts tests/reporting/reportingWorkerRuntime.test.ts`: 4 files, **91/91**.
+- Common gate:
+  - `npx tsc -b`: 0.
+  - `npm run typecheck:digest`: 0.
+  - `tsc --noEmit --strict … tests/reporting/pg/owner-inputs.test.ts tests/staging/reportingWorkerRuntime.ts`: 0.
+  - `npm run test -- --run`: **78 files, 2312/2312**.
+  - `npm run build`: 0 (the existing chunk-size warning only).
+- Migration hashes: 0037–0045 before and after are byte-identical (`531bb2c5…`, `002d6e58…`, `05d7eff1…`, `4e39243e…`, `dfa49d59…`, `e38aba76…`, `156ee4d5…`, `84a07d1b…`, `5f42f300…`).
+
+**Not done or not claimed.** T15P-4a covers the SQL protocol and its SQL tests only. No TypeScript adapter yet consumes 0046; that is T15P-4b–4e. 0046 has run only in isolated PGlite. Nothing is pushed, and no hosted system, CI or worker was used. Next: T15P-4b (bounded reader pages).

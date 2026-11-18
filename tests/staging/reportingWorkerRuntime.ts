@@ -82,6 +82,9 @@ export const SITE_ATTRIBUTION: Readonly<Record<string, string>> = Object.freeze(
   worker_seen: "exists (select 1 from reporting_private.batches b where b.batch_id = t.batch_id and b.site = $1)",
   worker_walk_line: "exists (select 1 from reporting_private.batches b where b.batch_id = t.batch_id and b.site = $1)",
   partition_results: "exists (select 1 from reporting_private.partition_work w join reporting_private.batches b on b.batch_id = w.batch_id where w.work_id = t.work_id and b.site = $1)",
+  owner_inputs: "t.site = $1",
+  owner_input_events: "exists (select 1 from reporting_private.owner_inputs o where o.handle = t.handle and o.site = $1)",
+  owner_input_pieces: "exists (select 1 from reporting_private.owner_inputs o where o.handle = t.handle and o.site = $1)",
 });
 /** Run-site rows that existed before the run and must stay identical (history the run never touches). */
 const PRE_EXISTING: Readonly<Record<string, string>> = Object.freeze({ changes: "t.change_id <= $2::bigint", worker_runs: "t.started_at < $3::timestamptz" });
