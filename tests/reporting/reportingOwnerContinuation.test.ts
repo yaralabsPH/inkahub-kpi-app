@@ -10,15 +10,18 @@ import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
-import { checkpointOwnerInput, hashOwnerInput, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
+import { checkpointOwnerInput, hashOwnerInput, hashOwnerInputStep, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
 import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
 import { exactInstant } from "../../src/lib/domain/productionCounts";
+import { compareUtf8 } from "../../api/_lib/reporting-stage";
 import { reportingDb } from "./pg/harness";
 import { pgRpc } from "./pg/rpc";
 
 const W1 = "00000008-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W2 = "00000009-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W3 = "0000000a-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+/** 200 old-self audiences for owner OQ-3 (resumable hashing across three checkpoints). */
+const OLD200 = Array.from({ length: 200 }, (_, i) => `${(0x100 + i).toString(16).padStart(8, "0")}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`);
 const SITE = "au";
 let db: PGlite;
 let ref: FrozenBatchRef;
@@ -103,6 +106,12 @@ beforeAll(async () => {
       [id, staff, order, sku, type === "line_verified" ? 1 : null, type, at, parent]);
   for (let i = 1; i <= 5; i++) await noteRow(`nt-${i}`, "line_verified", "NOTE", `2026-10-01T08:00:0${i}Z`, null, "INKA-KAN0566-A4-FB");
   for (let i = 1; i <= 3; i++) await noteRow(`ntk-${i}`, "cancelled", "NOTEK", `2026-10-01T08:01:0${i}Z`, "nt-2", null, W2);
+  // review r3 Must-fix 2: PRE-P is a W3 predecessor (not a member of NOTE). Its first two cancellations carry another
+  // order (the pair rule rejects them: they do not cancel); the third, on a LATER kid page, matches and cancels it.
+  await noteRow("pre-p", "line_verified", "PRE", "2026-10-01T07:59:00Z", null, "INKA-KAN0566-A4-FB");
+  await noteRow("pre-k1", "cancelled", "PX", "2026-10-01T07:59:10Z", "pre-p", null, W3);
+  await noteRow("pre-k2", "cancelled", "PX", "2026-10-01T07:59:11Z", "pre-p", null, W3);
+  await noteRow("pre-k3", "cancelled", "PRE", "2026-10-01T07:59:12Z", "pre-p", null, W3);
   await db.query(
     `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
      values ('au', 'nt-big', $1, 'framed', 'NOTE', 'X' || repeat(chr(92), 300000), 1, 'line_verified', 's', '', '2026-10-01T08:00:10Z', null)`, [W3]);
@@ -122,7 +131,7 @@ beforeAll(async () => {
   owners = [...keys, "EMPTY"].map((k) => ({ partitionKind: "order" as const, partitionKey: k }));
   const sorted = [...owners].sort((x, y) => (ownerKey(x) < ownerKey(y) ? -1 : 1));
   const last: ["order", string] = ["order", sorted.at(-1)!.partitionKey];
-  await saveEnumeration(c(), ref.batchId, ref.fence, null, { kind: "rebuild", after: last }, sorted.map((o) => ({ owner: o, oldStaff: o.partitionKey === "OP-1" ? [W3] : [] })), false);
+  await saveEnumeration(c(), ref.batchId, ref.fence, null, { kind: "rebuild", after: last }, sorted.map((o) => ({ owner: o, oldStaff: o.partitionKey === "OP-1" ? [W3] : o.partitionKey === "OQ-3" ? OLD200 : [] })), false);
   await saveEnumeration(c(), ref.batchId, ref.fence, { kind: "rebuild", after: last }, { kind: "rebuild", after: last, end: true }, [], true);
   await db.query("update reporting_private.batches set lease_expires_at = now() + interval '1 hour' where batch_id = $1", [ref.batchId]);
 }, 180_000);
@@ -153,7 +162,7 @@ describe("durable owner read (journaled buildOwnerInput)", () => {
     }
   }, 300_000);
 
-  it("a crash after ANY commit resumes in a fresh process to the same input, without re-reading completed pages", async () => {
+  it("a crash BEFORE a sampled set of commits (each resumable state kind) resumes in a fresh process to the same input", async () => {
     const o: Owner = { partitionKind: "order", partitionKey: "O-1" };
     const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
     // learn the commit count of an uninterrupted durable read in a scratch batch-free way: count on a throwaway journal
@@ -208,26 +217,68 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
     await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
     await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`);
   }
+  /** What the journal has committed so far (state, events in ordinal order, members count), as a fresh process would see it. */
+  interface Track { state: St; events: Ev[]; membersCount: number | null }
+  const trackOf = (snap: { state: unknown; events: Ev[]; membersCount: number | null } | null): Track =>
+    snap ? { state: snap.state as St, events: [...snap.events], membersCount: snap.membersCount } : { state: { v: 1, step: "members", m: { afterOrd: null } }, events: [], membersCount: null };
+  const record = (t: Track, p: { events: Ev[]; steps: unknown[]; membersCount?: number }) => {
+    t.events.push(...p.events);
+    if (p.membersCount !== undefined) t.membersCount = p.membersCount;
+    t.state = p.steps[p.steps.length - 1] as St;
+  };
   /**
-   * A source client that checks, before EVERY source read, that the journal's stored state is the phase that read
-   * depends on (checkpoint-before-dependent-read), and records each source call.
+   * The EXACT arguments the next dependent source read must carry, derived only from the committed journal
+   * (checkpoint-before-dependent-read, no repeat of a completed member/parent/child unit). Null = not derivable
+   * (the first stream page of a worker starts at its latest member line + 1 µs; only the phase is checked then).
    */
-  function guardedSource(stored: () => St | null) {
+  function expectedArgs(t: Track, fn: string, args: Record<string, unknown>, owner: Owner): Record<string, unknown> | null {
+    const s = t.state;
+    const at = (ord: number) => t.events[ord - 1];
+    const members = () => t.events.slice(0, t.membersCount ?? 0);
+    const fail = (why: string): never => {
+      throw new Error(`${fn} ${JSON.stringify(args).slice(0, 200)} was requested while the committed state is ${JSON.stringify(s)}: ${why}`);
+    };
+    if (fn === "read_reporting_owner_members") {
+      if (s.step !== "members") fail("not in the members phase");
+      const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
+      return { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null };
+    }
+    if (fn === "read_reporting_events_by_id") {
+      if (s.step !== "parents") fail("not in the parents phase");
+      const ids = new Set(members().map((m) => m.id));
+      const parents = [...new Set(members().map((m) => m.parent_event_id).filter((x): x is string => !!x && !ids.has(x)))].sort(compareUtf8);
+      const group = parents.slice(s.p.group * 500, s.p.group * 500 + 500);
+      const a = s.p.afterOrd === null ? null : at(s.p.afterOrd);
+      return { p_ids: a ? group.filter((id) => compareUtf8(id, a.id) > 0) : group };
+    }
+    if (fn === "read_reporting_children" && s.step === "children") {
+      const group = members().map((m) => m.id).sort(compareUtf8).slice(s.c.group * 1000, s.c.group * 1000 + 1000);
+      const a = s.c.afterOrd === null ? null : at(s.c.afterOrd);
+      return { p_parent_ids: group, p_after_parent_id: a ? a.parent_event_id : null, p_after_event_id: a ? a.id : null };
+    }
+    if (fn === "read_reporting_children") {
+      if (s.step !== "walk" || !s.w.line || s.w.line.phase !== "kids") fail("no pending line is committed before its kid page");
+      const l = at(s.w.line.ord);
+      const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
+      return { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null };
+    }
+    if (fn === "read_reporting_staff_stream") {
+      if (s.step !== "walk" || s.w.line !== null) fail("a stream page while a line is pending or outside the walk");
+      if (s.w.cursorOrd === null) return null;
+      const cur = at(s.w.cursorOrd);
+      return { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id };
+    }
+    return fail("an unexpected source read");
+  }
+  /** A source client that checks EVERY source read's exact arguments against the committed journal, and records the reads. */
+  function guardedSource(t: Track, owner: Owner) {
     const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     const client: RpcClient = {
       rpc: async (fn, args) => {
+        const a = args ?? {};
         if (SOURCE.has(fn)) {
-          const s = stored();
-          const a = args ?? {};
-          if (s) {
-            const ok =
-              fn === "read_reporting_owner_members" ? s.step === "members"
-              : fn === "read_reporting_events_by_id" ? s.step === "parents"
-              : fn === "read_reporting_staff_stream" ? s.step === "walk" && s.w.line === null
-              : (a.p_parent_ids as string[]).length === 1 && s.step === "walk" ? s.w.line !== null && s.w.line.phase === "kids"
-              : s.step === "children";
-            if (!ok) throw new Error(`${fn} was requested while the stored state is ${JSON.stringify(s)}`);
-          }
+          const want = expectedArgs(t, fn, a, owner);
+          if (want) for (const [k, v] of Object.entries(want)) if (JSON.stringify(a[k]) !== JSON.stringify(v)) throw new Error(`${fn}: ${k} = ${JSON.stringify(a[k])?.slice(0, 120)}, the committed journal implies ${JSON.stringify(v)?.slice(0, 120)}`);
           calls.push({ fn, args: a });
         }
         return c().rpc(fn, args);
@@ -236,16 +287,19 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
     return { client, calls };
   }
   /** The exact first source request a resume from `s` must make (null: none is predictable / no read at all). */
-  function expectedFirst(s: St, events: Ev[], owner: Owner): { fn: string; args: Record<string, unknown> } | "none" | null {
+  function expectedFirst(s: St, events: Ev[], owner: Owner, snapMembers: number | null): { fn: string; args: Record<string, unknown> } | "none" | null {
     const at = (ord: number) => events[ord - 1];
     if (s.step === "done") return "none";
     if (s.step === "members") {
       const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
       return { fn: "read_reporting_owner_members", args: { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null } };
     }
-    if (s.step === "children") {
-      const a = s.c.afterOrd === null ? null : at(s.c.afterOrd);
-      return { fn: "read_reporting_children", args: { p_after_parent_id: a ? a.parent_event_id : null, p_after_event_id: a ? a.id : null } };
+    if (s.step === "parents" || s.step === "children") {
+      const t: Track = { state: s, events, membersCount: snapMembers };
+      const fn = s.step === "parents" ? "read_reporting_events_by_id" : "read_reporting_children";
+      const args = expectedArgs(t, fn, {}, owner)!;
+      if (fn === "read_reporting_events_by_id" && !(args.p_ids as string[]).length) return null; // the group ends without a read
+      return { fn, args };
     }
     if (s.step === "walk" && s.w.line && s.w.line.phase === "kids") {
       const l = at(s.w.line.ord);
@@ -263,9 +317,9 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
     await reset(owner.partitionKey);
     const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
     const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
-    let stored: St | null = { v: 1, step: "members", m: { afterOrd: null } };
+    const t = trackOf(null);
     let n = 0;
-    const src = guardedSource(() => stored);
+    const src = guardedSource(t, owner);
     const journal: OwnerJournal = {
       async commit(p) {
         n++;
@@ -278,7 +332,7 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
         }
         if (mode === "before" && n === k) throw new Crash(`before ${k}`);
         await j.commit({ ...p, steps });
-        stored = steps[steps.length - 1] as unknown as St;
+        record(t, { ...p, steps });
         if ((mode === "after" || truncateDone) && n === k) throw new Crash(`after ${k}`);
       },
     };
@@ -288,12 +342,12 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
   async function resume(owner: Owner, handle: string, want: unknown, label: string) {
     const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
     const snap = ownerJournalSnapshot(back);
-    let stored: St = snap.state as unknown as St;
+    const t = trackOf(snap);
     const j = ownerJournal(c(), ref.batchId, ref.fence, handle, back.header.seq, cutoffUs());
-    const src = guardedSource(() => stored);
-    const got = await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { await j.commit(p); stored = p.steps[p.steps.length - 1] as unknown as St; } }, snap);
+    const src = guardedSource(t, owner);
+    const got = await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { await j.commit(p); record(t, p); } }, snap);
     expect(got, label).toEqual(want);
-    const first = expectedFirst(snap.state as unknown as St, snap.events, owner);
+    const first = expectedFirst(snap.state as unknown as St, snap.events, owner, snap.membersCount);
     if (first === "none") expect(src.calls, `${label}: a done journal reads nothing`).toEqual([]);
     else if (first) expect(src.calls[0], `${label}: the first resumed request continues exactly at the saved cursor`).toMatchObject(first);
     return snap.state as unknown as St;
@@ -301,7 +355,10 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
   /** The steps of every commit of an uninterrupted durable read (journal-free). */
   async function commitsOf(owner: Owner) {
     const commits: St[][] = [];
-    await durableOwnerInput(rpcFrozenReader(c(), ref), owner, { commit: async (p) => void commits.push(p.steps as unknown as St[]) });
+    // the uninterrupted pass is guarded too: every read must carry the exact arguments its committed prefix implies
+    const t = trackOf(null);
+    const src = guardedSource(t, owner);
+    await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { commits.push(p.steps as unknown as St[]); record(t, p); } });
     return commits;
   }
 
@@ -320,6 +377,18 @@ describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash m
       }
       if (key === "EMPTY") expect(stored.map((s) => s.step)).toEqual(["done"]);
       if (key === "BIG") for (const kind of ["members-cursor", "parents-cursor", "parents-g1", "children-cursor", "children-g1", "children-cursor-g1", "done"]) expect(kinds, [...kinds].join(",")).toContain(kind);
+      if (key === "NOTE") {
+        // PRE-P: two non-cancelling kid pages, then the decisive cancellation on a LATER page -> done{effective: false}
+        const evs: Ev[] = [];
+        const steps: St[] = [];
+        await durableOwnerInput(rpcFrozenReader(c(), ref), o, { commit: async (p) => { evs.push(...p.events); steps.push(...(p.steps as unknown as St[])); } });
+        const preOrd = evs.findIndex((e) => e.id === "pre-p") + 1;
+        expect(preOrd).toBeGreaterThan(0);
+        expect(evs.some((e) => e.id === "pre-k3")).toBe(true);
+        const pre = steps.filter((x) => x.step === "walk" && x.w.line?.ord === preOrd);
+        expect(pre.some((x) => x.w.line.phase === "kids" && x.w.line.afterKidOrd !== null)).toBe(true); // between non-empty kid pages
+        expect(pre.find((x) => x.w.line.phase === "done")?.w.line.effective).toBe(false);
+      }
       if (key === "NOTE") for (const kind of ["members-cursor", "walk:line-kids", "walk:line-kids-mid", "walk:cursor", "done"]) expect(kinds, [...kinds].join(",")).toContain(kind);
     }, 600_000);
   }
@@ -409,14 +478,13 @@ describe("durable works and the hash checkpoint (T15P-4d part 2)", () => {
       const works = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, input, old);
       expect(works, o.partitionKey).toEqual(want);
       const hashes = works.map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
-      const r = await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, back.header.seq, hashes);
-      expect(r.calls).toBe(Math.ceil(hashes.length / 100));
+      const r = await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, hashes);
+      expect(r).toMatchObject({ calls: Math.ceil(hashes.length / 100), complete: true });
       const head = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, h.handle);
       expect(head).toMatchObject({ phase: "complete", hashesDone: hashes.length });
       expect(head.inputHashes).toEqual(hashes);
-      // a lost final response: the identical final call replays; anything else is refused (the journal is immutable)
-      const last = await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, back.header.seq, hashes);
-      expect(last.result).toMatchObject({ replay: true, seq: r.result.seq });
+      // a fresh process on a complete journal adopts it: zero hash writes
+      expect(await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, hashes)).toEqual({ result: null, calls: 0, complete: true });
     }
     // the old-staff audience (not a member's staff) is part of the required set
     const op1 = owners.find((o) => o.partitionKey === "OP-1")!;
@@ -434,8 +502,81 @@ describe("durable works and the hash checkpoint (T15P-4d part 2)", () => {
     const works = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, input, []);
     const hashes = works.map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
     const seq = (await loadOwnerInputHeader(c(), ref.batchId, ref.fence, handle)).seq;
-    await expect(hashOwnerInput(c(), ref.batchId, ref.fence, handle, seq, [...hashes, { audienceKind: "self", audienceStaff: W3, inputHash: "c".repeat(64) }])).rejects.toThrow(/required set/);
-    await expect(hashOwnerInput(c(), ref.batchId, ref.fence, handle, seq, [{ audienceKind: "self", audienceStaff: W1, inputHash: "c".repeat(64) }])).rejects.toThrow(/first audience is the site/);
-    expect((await hashOwnerInput(c(), ref.batchId, ref.fence, handle, seq, hashes)).result.seq).toBe(String(BigInt(seq) + 1n));
+    await expect(hashOwnerInput(c(), ref.batchId, ref.fence, handle, [...hashes, { audienceKind: "self", audienceStaff: W3, inputHash: "c".repeat(64) }])).rejects.toThrow(/required set/);
+    await expect(hashOwnerInput(c(), ref.batchId, ref.fence, handle, [{ audienceKind: "self", audienceStaff: W1, inputHash: "c".repeat(64) }])).rejects.toThrow(/first audience is the site/);
+    expect((await hashOwnerInput(c(), ref.batchId, ref.fence, handle, hashes)).result!.seq).toBe(String(BigInt(seq) + 1n));
   });
+});
+
+describe("resumable hashing (review r3 Must-fix 1): 202 audiences across three checkpoints", () => {
+  const o: Owner = { partitionKind: "order", partitionKey: "OQ-3" };
+  async function prepared() {
+    const sel = "select handle from reporting_private.owner_inputs where partition_key = 'OQ-3'";
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query("delete from reporting_private.owner_inputs where partition_key = 'OQ-3'");
+    const { handle, journal } = await freshJournal(o);
+    const input = await durableOwnerInput(rpcFrozenReader(c(), ref), o, journal);
+    const old = await readOwnerOldStaff(c(), ref.batchId, ref.fence, o, null);
+    expect(old).toHaveLength(200);
+    const hashes = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, input, old).map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
+    expect(hashes.length).toBe(202); // site + the member worker + 200 old self audiences
+    return { handle, hashes };
+  }
+  const head = (handle: string, fence = ref.fence) => loadOwnerInputHeader(c(), ref.batchId, fence, handle);
+
+  it("each checkpoint's lost response: the identical RPC replays without advancing; a fresh process adopts saved progress; complete needs zero writes", async () => {
+    const { handle, hashes } = await prepared();
+    const seqs: string[] = [];
+    for (const [from, to, entering] of [[0, 100, true], [100, 200, false], [200, 202, false]] as const) {
+      const step = await hashOwnerInputStep(c(), ref.batchId, ref.fence, handle, hashes); // a fresh process: reloads and adopts
+      expect(step.payload, `unit ${from}`).toEqual({
+        kind: "hash", ...(entering ? { audiences: hashes.map((h) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff })) } : {}), hashes: hashes.slice(from, to),
+      });
+      expect(step.result).toMatchObject({ seq: String(BigInt(step.seq) + 1n), replay: false });
+      expect(step.complete).toBe(to === 202);
+      // the response was lost: the identical individual RPC (same expected seq, same payload) replays, seq unchanged
+      const again = await checkpointOwnerInput(c(), ref.batchId, ref.fence, handle, step.seq, step.payload!);
+      expect(again).toMatchObject({ seq: step.result!.seq, replay: true });
+      const h = await head(handle);
+      expect(h).toMatchObject({ seq: step.result!.seq, hashesDone: to, phase: to === 202 ? "complete" : "hashing" });
+      expect(h.inputHashes).toEqual(hashes.slice(0, to));
+      seqs.push(step.result!.seq);
+    }
+    expect(seqs.map((s) => BigInt(s) - BigInt(seqs[0]))).toEqual([0n, 1n, 2n]);
+    // a fresh process on the complete journal makes zero writes
+    const rec = { n: 0 };
+    const counting: RpcClient = { rpc: async (fn, a) => (fn === "checkpoint_reporting_owner_input" && rec.n++, c().rpc(fn, a)) };
+    expect(await hashOwnerInputStep(counting, ref.batchId, ref.fence, handle, hashes)).toMatchObject({ result: null, complete: true, payload: null });
+    expect(rec.n).toBe(0);
+  }, 300_000);
+
+  it("a unit smaller than 100 returns after its checkpoint; a mismatched saved prefix is refused; a new fence continues and a stale fence is refused", async () => {
+    const { handle, hashes } = await prepared();
+    const one = await hashOwnerInput(c(), ref.batchId, ref.fence, handle, hashes, { unit: 37, maxSteps: 1 });
+    expect(one).toMatchObject({ calls: 1, complete: false });
+    expect(await head(handle)).toMatchObject({ phase: "hashing", hashesDone: 37 });
+    const forged = hashes.map((h, i) => (i === 5 ? { ...h, inputHash: "e".repeat(64) } : h));
+    await expect(hashOwnerInputStep(c(), ref.batchId, ref.fence, handle, forged, 37)).rejects.toThrow(/saved hash 5 differs/);
+    const shifted = [hashes[0], ...hashes.slice(2), hashes[1]];
+    await expect(hashOwnerInputStep(c(), ref.batchId, ref.fence, handle, shifted, 37)).rejects.toThrow(/saved audience list differs/);
+    expect(await head(handle)).toMatchObject({ hashesDone: 37 }); // nothing written by the refused calls
+    // a takeover: the site's lease fence moves on; the old writer is refused, the new one continues from the saved progress
+    const old = Number((await db.query<{ f: string }>("select lease_fence::text as f from reporting_private.site_state where site = $1", [SITE])).rows[0].f);
+    const bump = async (f: number) => {
+      await db.query("update reporting_private.site_state set lease_fence = $2 where site = $1", [SITE, f]);
+      await db.query("update reporting_private.batches set lease_fence = $2 where batch_id = $1", [ref.batchId, f]);
+    };
+    await bump(old + 1);
+    try {
+      await expect(hashOwnerInputStep(c(), ref.batchId, old, handle, hashes, 37)).rejects.toThrow(/obsolete/);
+      const next = await hashOwnerInputStep(c(), ref.batchId, old + 1, handle, hashes, 37);
+      expect((next.payload as { hashes: unknown[] }).hashes).toEqual(hashes.slice(37, 74));
+      const rest = await hashOwnerInput(c(), ref.batchId, old + 1, handle, hashes, { unit: 37 });
+      expect(rest).toMatchObject({ complete: true, calls: Math.ceil((202 - 74) / 37) });
+      expect((await head(handle, old + 1)).inputHashes).toEqual(hashes);
+    } finally {
+      await bump(old);
+    }
+  }, 300_000);
 });

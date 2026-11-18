@@ -621,23 +621,66 @@ export function ownerJournalSnapshot(r: { header: OwnerInputHeader; events: Jour
 
 /** One audience's input hash as the journal's `hash` checkpoint carries it (r5 hashing; site first, then self bytewise). */
 export interface OwnerHashEntry { audienceKind: "site" | "self"; audienceStaff: string | null; inputHash: string }
+const sameAudience = (a: unknown, b: { audienceKind: string; audienceStaff: string | null }) =>
+  !!a && typeof a === "object" && (a as Record<string, unknown>).audienceKind === b.audienceKind && (a as Record<string, unknown>).audienceStaff === b.audienceStaff;
+
 /**
- * Finish a read journal: the first call carries the exact audience list (the server recomputes and requires it),
- * then the hashes go in order, at most 100 per call, each call moving seq by one. Returns the final result
- * (phase `complete` once every audience is hashed). A complete journal accepts only an identical replay.
+ * The next hash checkpoint for a journal, derived from its PINNED header (r6 R5/R6, approval condition 3): from `reading`
+ * (state done) it enters hashing with the exact audience list and the first `unit` hashes; from `hashing` it validates
+ * the saved audience list and saved hash prefix against `hashes`, then sends only the next 1..`unit`; a `complete`
+ * journal must already hold exactly `hashes` and needs no write (null). Never guesses progress from a starting seq.
  */
-export async function hashOwnerInput(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, hashes: readonly OwnerHashEntry[]): Promise<{ result: CheckpointResult; calls: number }> {
+export function nextHashPayload(header: OwnerInputHeader, hashes: readonly OwnerHashEntry[], unit = 100): OwnerInputPayload | null {
+  if (!Number.isInteger(unit) || unit < 1 || unit > 100) throw new ReportingJobError("a hash unit is 1..100 audiences");
   if (!hashes.length || hashes[0].audienceKind !== "site" || hashes[0].audienceStaff !== null) throw new ReportingJobError("the first audience is the site");
   for (const h of hashes) if (!/^[0-9a-f]{64}$/.test(h.inputHash)) throw new ReportingJobError("an input hash must be 64 lowercase hex");
-  const audiences = hashes.map((h) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff }));
-  let s = parseSeq(seq);
+  const entry = (h: OwnerHashEntry) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff, inputHash: h.inputHash });
+  if (header.phase === "reading") {
+    const st = header.state as { step?: unknown } | null;
+    if (!st || st.step !== "done" || header.pendingEvents !== 0) throw new ReportingJobError("hashing needs a finished read");
+    return { kind: "hash", audiences: hashes.map((h) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff })), hashes: hashes.slice(0, unit).map(entry) };
+  }
+  const saved = Array.isArray(header.audiences) ? header.audiences : null;
+  if (!saved || saved.length !== hashes.length || hashes.some((h, i) => !sameAudience(saved[i], h))) throw new ReportingJobError("the saved audience list differs from this owner's audiences");
+  const done = Array.isArray(header.inputHashes) ? header.inputHashes : null;
+  if (!done || done.length !== header.hashesDone) throw new ReportingJobError("the saved hash progress is inconsistent");
+  done.forEach((d, i) => {
+    const want = entry(hashes[i]);
+    const got = d as Record<string, unknown>;
+    if (!sameAudience(got, want) || got.inputHash !== want.inputHash) throw new ReportingJobError(`the saved hash ${i} differs from this owner's input`);
+  });
+  if (header.phase === "complete") {
+    if (header.hashesDone !== hashes.length) throw new ReportingJobError("a complete journal does not hold every audience");
+    return null;
+  }
+  return { kind: "hash", hashes: hashes.slice(header.hashesDone, header.hashesDone + unit).map(entry) };
+}
+
+/**
+ * ONE bounded hash unit: reload the pinned header, derive the next payload from the saved progress and commit it.
+ * Returns `complete` and the checkpoint (null when the journal was already complete: zero writes). A lost response is
+ * retried by the caller either as the identical individual RPC (same seq and payload: a replay) or by calling this
+ * again, which adopts the saved progress.
+ */
+export async function hashOwnerInputStep(client: RpcClient, batchId: string, fence: number, handle: string, hashes: readonly OwnerHashEntry[], unit = 100): Promise<{ result: CheckpointResult | null; complete: boolean; seq: string; payload: OwnerInputPayload | null }> {
+  const header = await loadOwnerInputHeader(client, batchId, fence, handle);
+  const payload = nextHashPayload(header, hashes, unit);
+  if (!payload) return { result: null, complete: true, seq: header.seq, payload: null };
+  const result = await checkpointOwnerInput(client, batchId, fence, handle, header.seq, payload);
+  const sent = (payload as { hashes: unknown[] }).hashes.length;
+  return { result, complete: header.hashesDone + sent === hashes.length, seq: header.seq, payload };
+}
+
+/** Hash to completion (or `maxSteps` units), one durable checkpoint per unit. */
+export async function hashOwnerInput(client: RpcClient, batchId: string, fence: number, handle: string, hashes: readonly OwnerHashEntry[], opts: { unit?: number; maxSteps?: number } = {}): Promise<{ result: CheckpointResult | null; calls: number; complete: boolean }> {
   let result: CheckpointResult | null = null;
   let calls = 0;
-  for (let i = 0; i < hashes.length; i += 100) {
-    const part = hashes.slice(i, i + 100).map((h) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff, inputHash: h.inputHash }));
-    result = await checkpointOwnerInput(client, batchId, fence, handle, s, i === 0 ? { kind: "hash", audiences, hashes: part } : { kind: "hash", hashes: part });
+  for (let i = 0; i < (opts.maxSteps ?? Number.MAX_SAFE_INTEGER); i++) {
+    const s = await hashOwnerInputStep(client, batchId, fence, handle, hashes, opts.unit);
+    if (!s.payload) return { result, calls, complete: true };
+    result = s.result;
     calls++;
-    s = result.seq;
+    if (s.complete) return { result, calls, complete: true };
   }
-  return { result: result!, calls };
+  return { result, calls, complete: false };
 }

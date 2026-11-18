@@ -6269,3 +6269,40 @@ This orders work within the already-approved 4d/4e scope; it grants no new file 
 Authority remains **no push, no hosted environments or connections (including staging/production reads), no hosted worker or CI invocation, no merge/deployment, and 0046 draft-only**, executable only against isolated synthetic local fixtures. Later separately cleared staging must prove service access, anon and owner/manager/staff/kiosk/cs denials, independent-session takeover/cleanup, retained-generation and old-code compatibility, actual transport/CPU/memory and rollback. CJ owns release and SQL installation. Rollback remains processor-disable/legacy reads with the compatible prior app and retained additive schema/evidence; no destructive down migration is authorised. The status below completes this review handoff, not implementation or release acceptance.
 
 STATUS: COMPLETE
+
+## Coder log — T15P-4 review r3 repairs: resumable hashing and exact recovery arguments, 2026-11-19
+
+1. **Resumable hashing** (`api/_lib/reporting-worker-state.ts`).
+   - **`nextHashPayload(header, hashes, unit)`** derives the next checkpoint only from the pinned header. From `reading` (state done, no pending) it sends the audience list plus the first `unit`. From `hashing` it validates the saved audience list and the whole saved hash prefix against `hashes`, then sends only the next 1..`unit`, with no audience list. From `complete` it requires the full saved list and returns null (no write). Progress is never guessed from a starting seq.
+   - **`hashOwnerInputStep`** is one bounded unit: reload, derive, commit, return. **`hashOwnerInput(..., {unit, maxSteps})`** loops it. SQL is unchanged: audiences only on entry, identical-replay only.
+   - **Tests** (`reportingOwnerContinuation.test.ts`, owner OQ-3 with 200 old-self audiences, so **202 audiences**). The first, middle and final checkpoints each have their response lost:
+     - the identical individual RPC (same seq and payload) replays without advancing seq;
+     - a fresh step adopts the saved progress and sends exactly the next slice;
+     - after each step, the exact payloads, seq +1 and saved hashes are asserted;
+     - a complete journal makes **zero** checkpoint calls.
+   - **More tests:** `unit: 37, maxSteps: 1` returns after its checkpoint. A forged saved-prefix hash and a reordered audience list are refused with nothing written. A takeover (both fences moved) refuses the old fence (`obsolete`) and lets the new one continue from `hashesDone` to completion.
+   - The earlier single-call tests now use the new signature. A repeated helper on a complete journal is a zero-write adoption.
+2. **Exact recovery arguments** (tests only).
+   - **Exact-argument guard.** Every source read in the recovery tests, in every crash run, resume and the guarded uninterrupted pass (not only the first resumed read), must carry the **exact arguments implied by the committed journal**:
+     - the members keyset;
+     - the parents `p_ids` = the frozen 500-group suffix after the saved found-parent id, derived from the immutable member prefix and including absent ids;
+     - the children `p_parent_ids` = the exact 1,000-member group with its `(parent, id)` boundary;
+     - a pending line's kid keyset;
+     - the stream boundary at the committed cursor.
+     - Reads are allowed only in their phase and only after their prerequisite checkpoint; the first stream page of a worker is checked by phase only. Completed member, parent and child units therefore cannot be re-read.
+   - **Decisive later cancellation.** `PRE-P` is a non-member W3 predecessor. Its first two cancellations (order `PX`) do not cancel it under the pair rule; the third (order `PRE`), on a later byte-shortened kid page, does. NOTE's journal shows a mid-kids state for PRE-P and `done{effective: false}`, and every crash and resume around those pages equals `buildOwnerInput`.
+   - The sampled before-write test is renamed to describe its sampling.
+   - **Mutation checks** (each confirmed applied, file restored with no diff, each failing **promptly on its exact assertion**):
+
+     | Mutation | Result |
+     |---|---|
+     | parent cursor reset | 5 s: `p_ids` repeats `bp-0000…` where the journal implies `bp-0012…` |
+     | child cursor reset | 5 s: `p_after_parent_id` null where `bg-0005` is implied |
+     | child group fixed at 0 | 6 s: group `bg-0000…` where `["bg-1000"]` is implied |
+     | flush before by-ID dropped | 5 s: checkpoint-before-read guard |
+     | kid cursor reset | 28 s: `nt-2` keyset |
+     | flush before kid page dropped | 5 s |
+
+   - The first parent-cursor attempt only **timed out**: the unguarded uninterrupted pass looped. It was not counted. The pass is now guarded too, and the rerun failed in 5 s.
+- **Results.** Continuation 12/12 (≈109 s). Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2356/2356**; `npm run build` 0. 0046 unchanged (`4641d7cd…`).
+- **Should-fix 1 (independent works oracle)** remains for 4e as the review allows.
