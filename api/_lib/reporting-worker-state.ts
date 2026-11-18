@@ -10,7 +10,7 @@
 import { createHash } from "node:crypto";
 import { ReportingJobError, type RpcClient } from "./reporting-jobs.js";
 import { compareUtf8, descriptorProblem, manifestLine, type WorkDescriptor } from "./reporting-stage.js";
-import { parseKeyProgress, type KeyCheckpoint, type KeyProgress, type Owner } from "./production-reporting-materialize.js";
+import { isStreamCandidate, parseKeyProgress, type KeyCheckpoint, type KeyProgress, type Owner, type OwnerJournal, type OwnerJournalSnapshot } from "./production-reporting-materialize.js";
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -588,4 +588,33 @@ export function parseOwnerState(v: unknown): OwnerStepState {
     default:
       return bad(`unknown step ${JSON.stringify(String(s.step)).slice(0, 30)}`);
   }
+}
+
+/**
+ * T15P-4d part 1: the 0046 journal behind a durable owner read. Each commit is one durable page
+ * (`writeOwnerPage`), with the adapter-authoritative stream flag against the batch's frozen cutoff.
+ * A `heavy` result stops the owner visibly (`owner_input_too_heavy`, its evidence retained).
+ */
+export function ownerJournal(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, cutoffUs: bigint): OwnerJournal & { seq: string; calls: number } {
+  const j = {
+    seq: parseSeq(seq),
+    calls: 0,
+    async commit(p: { events: ProductionEvidenceEvent[]; firstOrd: number; steps: OwnerStepState[]; membersCount?: number }) {
+      const entries = eventEntries(p.events, p.firstOrd, (e) => isStreamCandidate(e, cutoffUs));
+      const w = await writeOwnerPage(client, batchId, fence, handle, j.seq, entries, p.steps, p.membersCount);
+      j.calls += w.calls;
+      j.seq = w.result.seq;
+      if (w.result.heavy) throw new ReportingJobError(`owner input ${handle} is too heavy to reload (${w.result.provisionalReloadCalls} calls)`, "owner_input_too_heavy");
+    },
+  };
+  return j;
+}
+/** The resumable snapshot of a reloaded journal (the stored state parsed exactly as the server validates it). */
+export function ownerJournalSnapshot(r: { header: OwnerInputHeader; events: JournalEvent[] }): OwnerJournalSnapshot {
+  if (r.header.phase !== "reading") throw new ReportingJobError(`owner input is ${r.header.phase}, not reading`);
+  if (r.header.pendingEvents !== 0) throw new ReportingJobError("owner input has pending events: discard them before resuming");
+  r.events.forEach((e, i) => {
+    if (e.ord !== i + 1) throw new ReportingJobError("journal ordinals are not contiguous");
+  });
+  return { state: parseOwnerState(r.header.state), events: r.events.map((e) => e.ev), membersCount: r.header.membersCount };
 }

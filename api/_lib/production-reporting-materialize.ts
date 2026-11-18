@@ -28,6 +28,8 @@ import { productionDateAt, type ReportSite } from "../../src/lib/domain/producti
 import { canonicalJson, REPORTING_RULE_VERSION, sha256Hex, type FrozenPartitionInput, type PartitionResult, type ReportingAudience } from "../../src/lib/domain/productionReporting.js";
 import { projectReportingPartition } from "../../src/lib/domain/productionReportingProjection.js";
 import { compareUtf8, type ResultRows, type WorkDescriptor } from "./reporting-stage.js";
+import type { FrozenReaderPages } from "./production-reporting-reader.js";
+import type { OwnerStepState, WalkLineState, WalkNeed } from "./reporting-worker-state.js";
 
 type Ev = ProductionEvidenceEvent;
 
@@ -1127,4 +1129,236 @@ export async function materializeBatch(reader: FrozenReader): Promise<{ works: M
   await materializeOwners(reader, owners, oldStaff, (w) => void works.push(w), stats);
   works.sort((a, b) => compareUtf8(a.desc.audienceKind, b.desc.audienceKind) || compareUtf8(a.desc.audienceStaff ?? "", b.desc.audienceStaff ?? "") || compareUtf8(a.desc.partitionKind, b.desc.partitionKind) || compareUtf8(a.desc.partitionKey, b.desc.partitionKey));
   return { works, stats };
+}
+
+// ---------------------------------------------------------------------------
+// T15P-4d part 1: the durable owner read (journaled, resumable buildOwnerInput)
+// ---------------------------------------------------------------------------
+
+/** The journal a durable owner read writes to: one call per durable page (r5 §4). Ordinals are assigned by the caller. */
+export interface OwnerJournal {
+  commit(page: { events: Ev[]; firstOrd: number; steps: OwnerStepState[]; membersCount?: number }): Promise<void>;
+}
+/** A reconstructed journal (r6 R5): committed events in ordinal order and the stored state. */
+export interface OwnerJournalSnapshot { state: OwnerStepState; events: Ev[]; membersCount: number | null }
+
+const walkState = (worker: number, cursorOrd: number | null, stopAt: bigint | null, need: ReadonlySet<string>, line: WalkLineState | null): OwnerStepState => ({
+  v: 1, step: "walk", w: { worker, cursorOrd, stopAt: stopAt === null ? null : stopAt.toString(), need: [...need].sort(compareUtf8) as WalkNeed[], line },
+});
+
+/**
+ * buildOwnerInput's exact read, over ONE-call page methods only (no coalescing, no provenChildren, no multi-page
+ * helpers, plain stream pages), journaling each source response's consumed events and step states BEFORE the next
+ * dependent read. `resume` continues a journal from its stored state without re-reading a completed source page.
+ * The result equals buildOwnerInput(reader, owner) for the same frozen view.
+ */
+export async function durableOwnerInput(
+  reader: FrozenReader & { pages: FrozenReaderPages },
+  owner: Owner,
+  journal: OwnerJournal,
+  resume: OwnerJournalSnapshot | null = null,
+): Promise<OwnerInput> {
+  const cutoffUs = exactInstant(reader.cutoff);
+  if (cutoffUs === null) throw new RangeError("the frozen cutoff is not an exact instant");
+  const budget = new DependencyBudget(owner);
+  const context = new Map<string, Ev>();
+  const ordOf = new Map<string, number>();
+  const byOrd: Ev[] = [];
+  let state: OwnerStepState = resume?.state ?? { v: 1, step: "members", m: { afterOrd: null } };
+  let membersCount: number | null = resume?.membersCount ?? null;
+  // what the current durable page has consumed since the last commit
+  let fresh: Ev[] = [];
+  let steps: OwnerStepState[] = [];
+  let pageMembers: number | undefined;
+  const take = (e: Ev): number => {
+    budget.take(e);
+    const known = ordOf.get(e.id);
+    if (known !== undefined) return known;
+    context.set(e.id, e);
+    byOrd.push(e);
+    ordOf.set(e.id, byOrd.length);
+    fresh.push(e);
+    return byOrd.length;
+  };
+  const step = (s: OwnerStepState) => {
+    steps.push(s);
+    state = s;
+  };
+  const flush = async () => {
+    if (!steps.length) {
+      if (fresh.length) throw new Error("a durable page consumed events without a step");
+      return;
+    }
+    const firstOrd = byOrd.length - fresh.length + 1;
+    await journal.commit({ events: fresh, firstOrd, steps, ...(pageMembers === undefined ? {} : { membersCount: pageMembers }) });
+    fresh = [];
+    steps = [];
+    pageMembers = undefined;
+  };
+  for (const e of resume?.events ?? []) take(e);
+  fresh = [];
+  const evAt = (ord: number): Ev => {
+    const e = byOrd[ord - 1];
+    if (!e) throw new Error(`the journal has no event at ordinal ${ord}`);
+    return e;
+  };
+
+  // MEMBERS: one owner's member pages (the cap+1 overflow is the budget's, exactly as buildOwnerInput)
+  while (state.step === "members") {
+    const a: number | null = state.m.afterOrd;
+    const page = await reader.pages.membersPage([owner], a === null ? null : { index: 0, id: evAt(a).id });
+    if (page.empty) {
+      membersCount = byOrd.length;
+      pageMembers = membersCount;
+      step({ v: 1, step: "parents", p: { group: 0, afterOrd: null } });
+      break;
+    }
+    let last = 0;
+    for (const r of page.rows) last = take(r.ev);
+    step({ v: 1, step: "members", m: { afterOrd: last } });
+    await flush();
+  }
+  if (membersCount === null) throw new Error("the member prefix is unknown");
+  const members = byOrd.slice(0, membersCount);
+  const memberIds = new Set(members.map((m) => m.id));
+
+  // PARENTS of members, in 500-groups, each group read until an empty page or nothing is pending
+  const parentIds = [...new Set(members.map((e) => e.parent_event_id).filter((p): p is string => !!p && !memberIds.has(p)))].sort(compareUtf8);
+  const parentGroups = Math.ceil(parentIds.length / 500);
+  const memberGroups = Math.ceil(members.length / 1000);
+  const enterChildren = () => step({ v: 1, step: "children", c: { group: 0, afterOrd: null } });
+  if (state.step === "parents") {
+    if (parentGroups === 0) enterChildren();
+    while (state.step === "parents") {
+      const g: number = state.p.group;
+      const group = parentIds.slice(g * 500, g * 500 + 500);
+      const a: number | null = state.p.afterOrd;
+      let pending = a === null ? group : group.filter((id) => compareUtf8(id, evAt(a).id) > 0);
+      let advanced = false;
+      if (pending.length) {
+        await flush();
+        const page = await reader.pages.byIdsPage(pending);
+        if (!page.empty) {
+          let last = 0;
+          for (const e of page.rows) last = take(e);
+          step({ v: 1, step: "parents", p: { group: g, afterOrd: last } });
+          pending = page.pending;
+          advanced = true;
+        } else pending = [];
+      }
+      if (!pending.length) {
+        if (g + 1 < parentGroups) step({ v: 1, step: "parents", p: { group: g + 1, afterOrd: null } });
+        else enterChildren();
+      } else if (!advanced) throw new Error("a parents page neither advanced nor ended");
+    }
+  }
+
+  // INVERSE CHILDREN of members, in 1,000-groups of bytewise member ids, until an empty page per group
+  const memberSorted = [...memberIds].sort(compareUtf8);
+  const workers = new Map<string, StreamLine[]>();
+  for (const e of members) {
+    const l = streamLine(e, cutoffUs);
+    if (l) (workers.get(e.staff_id!) ?? workers.set(e.staff_id!, []).get(e.staff_id!)!).push(l);
+  }
+  const workerList = [...workers.entries()].sort((x, y) => compareUtf8(x[0], y[0])).map(([staff, lines]) => {
+    lines.sort((x, y) => projectorOrder(lineOrder(x), lineOrder(y)));
+    const types = new Set(lines.map((l) => l.workType).filter((t): t is string => t !== null));
+    return { staff, earliest: lines[0], latestUs: lines[lines.length - 1].us, need: new Set<string>(["*", ...types]) };
+  });
+  const startWorker = (i: number) => {
+    if (i < workerList.length) step(walkState(i, null, null, workerList[i].need, null));
+    else step({ v: 1, step: "done" });
+  };
+  if (state.step === "children" && memberGroups === 0) startWorker(0);
+  while (state.step === "children") {
+    const g: number = state.c.group;
+    const group = memberSorted.slice(g * 1000, g * 1000 + 1000);
+    const a: number | null = state.c.afterOrd;
+    const ae = a === null ? null : evAt(a);
+    await flush();
+    const page = await reader.pages.childrenPage(group, ae === null ? null : { parent: ae.parent_event_id!, id: ae.id });
+    if (page.empty) {
+      if (g + 1 < memberGroups) step({ v: 1, step: "children", c: { group: g + 1, afterOrd: null } });
+      else startWorker(0);
+      continue;
+    }
+    let last = 0;
+    for (const k of page.rows) last = take(k);
+    step({ v: 1, step: "children", c: { group: g, afterOrd: last } });
+  }
+
+  // THE WALK: per worker, exactWalk("before") from just after the latest member line, one plain page at a time
+  while (state.step === "walk") {
+    const w0 = state.w;
+    const wk = workerList[w0.worker];
+    if (!wk) throw new Error(`walk worker ${w0.worker} is out of range`);
+    const need = new Set<string>(w0.need);
+    let stopAt: bigint | null = w0.stopAt === null ? null : BigInt(w0.stopAt);
+    let cursorOrd: number | null = w0.cursorOrd;
+    let line: WalkLineState | null = w0.line;
+    const onLine = (l: StreamLine, effective: boolean) => {
+      if (effective && projectorOrder(lineOrder(l), lineOrder(wk.earliest)) < 0) {
+        need.delete("*");
+        if (l.workType !== null) need.delete(l.workType);
+      }
+      if (need.size === 0 && stopAt === null) stopAt = l.us;
+    };
+    /** Finish a pending line: its kids so far (bytewise id <= the kid cursor), then the remaining kid pages. */
+    const finishLine = async () => {
+      const lev = evAt(line!.ord);
+      const l = streamLine(lev, cutoffUs);
+      if (!l) throw new Error("the pending line is not a stream line");
+      if (line!.phase === "kids") {
+        let after: string | null = line!.afterKidOrd === null ? null : evAt(line!.afterKidOrd).id;
+        for (;;) {
+          await flush();
+          const kids = await reader.childPage(lev.id, after, 1000);
+          if (!kids.length) break;
+          let last = 0;
+          for (const k of kids) last = take(k);
+          after = kids[kids.length - 1].id;
+          line = { ord: line!.ord, afterKidOrd: last, phase: "kids", effective: null };
+          step(walkState(w0.worker, cursorOrd, stopAt, need, line));
+        }
+        const upTo = after;
+        // the kids in the order the pages returned them (bytewise id), exactly what consumeChildren collected
+        const got = upTo === null ? [] : byOrd.filter((e) => e.parent_event_id === lev.id && compareUtf8(e.id, upTo) <= 0).sort((x, y) => compareUtf8(x.id, y.id));
+        line = { ...line!, phase: "done", effective: siteEffective(reader, l, got) };
+        step(walkState(w0.worker, cursorOrd, stopAt, need, line));
+      }
+      onLine(l, line!.effective!);
+      cursorOrd = line!.ord;
+      line = null;
+      step(walkState(w0.worker, cursorOrd, stopAt, need, null));
+    };
+    if (line) await finishLine();
+    let ended = false;
+    while (!ended) {
+      const from: StreamPosition = cursorOrd === null ? { createdAt: isoOfMicros(wk.latestUs + 1n), id: "" } : { createdAt: evAt(cursorOrd).created_at, id: evAt(cursorOrd).id };
+      await flush();
+      const page = await reader.stream(wk.staff, "before", from, STREAM_PAGE);
+      if (!page.length) break;
+      for (const e of page) {
+        if (stopAt !== null && micros(e) < stopAt) {
+          ended = true;
+          break;
+        }
+        const ord = take(e);
+        const l = streamLine(e, cutoffUs);
+        if (!l) {
+          cursorOrd = ord;
+          step(walkState(w0.worker, cursorOrd, stopAt, need, null));
+          continue;
+        }
+        line = { ord, afterKidOrd: null, phase: "kids", effective: null };
+        step(walkState(w0.worker, cursorOrd, stopAt, need, line));
+        await finishLine();
+      }
+    }
+    startWorker(w0.worker + 1);
+  }
+  await flush();
+  if (state.step !== "done") throw new Error(`the durable read stopped at ${state.step}`);
+  const events = [...context.values()].sort((x, y) => compareUtf8(x.id, y.id));
+  return { owner, members: [...members].sort((x, y) => compareUtf8(x.id, y.id)), events };
 }

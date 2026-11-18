@@ -6056,3 +6056,33 @@ All five Must-fix items are repaired within the authorised files. Each new regre
 - **Whole-page rejection.** A malformed trailing member row and a malformed trailing child row fail the whole page, and no row of that page is yielded.
 - **Deliberate break.** Changing the overflow skip `(idx, NULL)` to `(idx, id)` fails the comparison; the file was restored.
 - **Gate:** `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **79 files, 2338/2338**; `npm run build` 0.
+
+## Coder log — T15P-4d part 1: the durable owner read (local commit; 4d NOT complete), 2026-11-19
+
+- **`durableOwnerInput(reader & {pages}, owner, journal, resume?)`**, new in `api/_lib/production-reporting-materialize.ts`.
+  - **What it is.** `buildOwnerInput`'s exact read, using only one-call page methods: `membersPage`, `byIdsPage` (500-groups), `childrenPage` (1,000-groups), plain `stream` pages and `childPage`. It uses no coalescing, no `provenChildren`, no multi-page helper and no 0045 combined page.
+  - **Journaling.** Each source response's newly consumed events (ordinals in first-insertion order) and its step states are committed through `OwnerJournal.commit` before the next dependent read.
+  - **Walk.** It follows r6 R5: a candidate is journaled as a pending `kids` line before its kids are read, and each kids page is checkpointed. When the kids end, `done{effective}` (the unchanged `siteEffective` over the line's kids, bytewise) and then the cursor move are recorded. Consumed non-candidates advance only the cursor. `stopAt`, `need` and ties follow `exactWalk`, and worker end → the next worker or `done`.
+  - **Resume.** It rebuilds context, identity map, budget, member prefix, parent groups and walk workers from the reloaded journal, then continues from the stored state. It never re-reads a completed page.
+  - **Not yet.** It does not use the 0045 combined page. That is a call-count optimisation only, whose trace effect belongs to 4e.
+- **Classifier and glue.** `isStreamCandidate` (4c) supplies the condition-2 flag. In `api/_lib/reporting-worker-state.ts`:
+  - `ownerJournal(...)` commits each page through `writeOwnerPage`. A `heavy` result throws `owner_input_too_heavy` with its evidence retained.
+  - `ownerJournalSnapshot(...)` parses the stored state and requires `reading`, no pending events and contiguous ordinals.
+- **Tests** (`tests/reporting/reportingOwnerContinuation.test.ts`, new, 2; real 0040–0046 in PGlite with synthetic data).
+  - **Fixture.** Two workers and two work types; a member cancellation; a member that cancels another order's line, so the parents phase is non-empty. A W1 predecessor stream of 260 lines plus cancellations (every third line cancelled; some cancellations are W1's own stream events) and clock-ins. The first effective unframed line is far down, with a tie at its instant. W2 has a short stream.
+  - **Parity.** For **every** owner of the batch, `durableOwnerInput` with the real 0046 journal equals `buildOwnerInput`. The reloaded journal holds exactly that input and its state is `done`.
+  - **Crash and resume (O-1, 333 commits).** The test asserts that the stored states include every kind: members, parents, children, walk, a pending line before and mid-kids, a walk with `stopAt` set, and the second worker. It crashes at the first commit after each of those, plus early, middle and final points. A fresh process then reloads (snapshot-pinned), resumes, and must equal `buildOwnerInput`; it re-reads no journaled id by id, no member page after the members phase, and no parents after the walk starts.
+  - **Deliberate breaks** (file restored afterwards):
+    - Stopping before ties (`<` → `<=`) fails both tests.
+    - Forgetting the stored `stopAt` on resume was **not** caught by the first, fixed crash points. That is why the state-kind crash points were added; with them it fails (the server refuses the resumed walk's illegal transition).
+- **Results.** Focused 2/2 (≈38 s). Strict `tsc` of the new test: 0. Gate:
+  - `npx tsc -b`: 0.
+  - `npm run typecheck:digest`: 0.
+  - `npm run test -- --run`: **80 files, 2340/2340**.
+  - `npm run build`: 0.
+- **Remaining for 4d** (not started; the next session continues here):
+  - activation from the light route at K=16 / 1,000 rows / 900 KiB, with the bounded shared-flush allowance;
+  - the worker wiring: a version-first guard, ordered parking and resumption, lookup → `heavy_proven` fail-fast, `discard_pending` on takeover, per-audience hashing via the `hash` checkpoint, stage claims and staged-chunk reuse, post-publish `release`;
+  - `ref_ms` admission (`owner_input_capacity`) and the 0045 combined page on the durable route.
+- **Then 4e.** Integrated acceptance: PG-LONG/PG-CUT traces, 119/121, 50,000/50,001, 999 self + site, descriptor/hash/five-family parity, and memory figures.
+- **Boundary.** Nothing is pushed; no hosted system was used; 0046 stays an offline draft (hash unchanged, `d658113d…`).
