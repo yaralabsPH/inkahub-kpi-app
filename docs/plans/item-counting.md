@@ -6455,3 +6455,23 @@ Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) sa
   - computing all works and hashing the rest make **zero source reads and zero further event loads**.
 - **Mutation checks** (confirmed applied, restored with no diff): no input returned fails in 6 s; a second reload inside recovery fails in 5 s (`expected 5 to be 3`).
 - **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2385/2385**; `npm run build` 0.
+
+## Coder log — T15P-4d scope-review Must-fix 4, part 1: the complete multi-line 0045 page is one atomic durable page (tests only; local commit), 2026-11-19
+
+- **Fixture** (`reportingOwnerContinuation.test.ts`). Worker W4: order CP-M has lines at T1 and T3, another order's line at T2 lies between them, and a predecessor sits at T0 below. Each line has one small cancellation. W4's first 0045 page is therefore a **complete multi-line page with included children**.
+- **Tests** (+2). An interleaved trace of source RPCs and journal commits shows:
+  - **Arguments.** The combined page carries `p_staff = W4`, the `""` boundary just above the latest member line, and the exact ASCII certain id `cp-t1`.
+  - **Atomic commit.** The **very next trace entry is the page's commit**: no dependent read occurs before it. It contains the page's lines and newly consumed kids, with ordered steps `kids, kids, done, cursor` per line.
+  - **No child reads.** There is **no children request** for any line whose complete kids were included.
+  - **Journal.** The reloaded journal equals `buildOwnerInput`.
+  - **Crash before the commit.** Nothing of the page is journaled, and the resume re-reads it to the exact input.
+  - **Commit, then response lost.** The page also proved the stream end in the same atomic commit (state `done`), so the resume makes **zero source reads**. Had a walk cursor been stored, the first resumed read would have been asserted at that cursor.
+- **Mutation checks** (confirmed applied, restored with no diff from HEAD; none left active):
+  - a flush after each line (splitting the page into per-line commits) fails in 5 s;
+  - re-reading included kids through the pending-line path fails in 6 s.
+- **Results.** Focused 2/2. Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2387/2387**; `npm run build` 0.
+- **Still open in Must-fix 4:**
+  - explicit cut and stop-lookahead assertions (discarded or unconsumed ids absent from the journal and outside the 50,000 allowance, with a later distinct 50,001 still refused);
+  - the line-without-included-kids path inside a combined page;
+  - the conservative Unicode certain bound.
+- **Next session, in order:** the rest of Must-fix 4; the rest of Must-fix 3 (no-run-record path) together with the step-3 `runReportingCycle` wiring and the authorised `tests/api/reporting-worker.test.ts` fakes; then 4e, including Should-fix 2's independent oracle.

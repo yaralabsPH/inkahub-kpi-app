@@ -21,6 +21,7 @@ import { pgRpc } from "./pg/rpc";
 const W1 = "00000008-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W2 = "00000009-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W3 = "0000000a-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W4 = "0000000b-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 /** 200 old-self audiences for owner OQ-3 (resumable hashing across three checkpoints). */
 const OLD200 = Array.from({ length: 200 }, (_, i) => `${(0x100 + i).toString(16).padStart(8, "0")}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`);
 const SITE = "au";
@@ -116,6 +117,15 @@ beforeAll(async () => {
   await db.query(
     `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
      values ('au', 'nt-big', $1, 'framed', 'NOTE', 'X' || repeat(chr(92), 300000), 1, 'line_verified', 's', '', '2026-10-01T08:00:10Z', null)`, [W3]);
+  // scope review Must-fix 4: order CP-M of W4 has lines at T1 and T3; another order's W4 line at T2 lies between them and a
+  // predecessor at T0 below; each line has one small cancellation. The walk's first 0045 page therefore includes, complete,
+  // the children of T3, T2, T1 (at/above the certain bound) and T0 (the first line below it).
+  await db.query("insert into auth.users (id, email) values ($1, 'w4@x')", [W4]);
+  const cp = (s: number) => new Date(Date.parse("2026-10-02T06:00:00Z") + s * 1000).toISOString();
+  for (const [id, order, t] of [["cp-t3", "CP-M", 30], ["cp-t2", "CP-X", 20], ["cp-t1", "CP-M", 10], ["cp-t0", "CP-Y", 0]] as const) {
+    await ins({ id, staff: W4, order, at: cp(t) });
+    await ins({ id: `${id}-k`, staff: W2, order: order === "CP-M" ? "CP-K" : order, type: "cancelled", parent: id, at: cp(t + 1) });
+  }
   expect((await c().rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
   expect((await c().rpc("set_reporting_site_mode", { p_site: SITE, p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
   const r = await beginReportingRebuild(c(), SITE);
@@ -919,4 +929,91 @@ describe("worker seams over the journal (T15P-4d step 3a)", () => {
     expect(again.snapshot).toBeNull();
     expect(again.header.phase).toBe(hashes.length === 1 ? "complete" : "hashing");
   }, 120_000);
+});
+
+describe("a complete multi-line 0045 page is ONE atomic durable page (scope review Must-fix 4)", () => {
+  const o: Owner = { partitionKind: "order", partitionKey: "CP-M" };
+  async function wipe() {
+    const sel = "select handle from reporting_private.owner_inputs where partition_key = 'CP-M'";
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query("delete from reporting_private.owner_inputs where partition_key = 'CP-M'");
+  }
+  /** Interleaved trace of source RPCs and journal commits. */
+  async function traced(crashAt?: { k: number; mode: "before" | "after" }) {
+    await wipe();
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    const trace: Array<{ rpc: string; args: Record<string, unknown> } | { commit: number; ids: string[]; steps: unknown[] }> = [];
+    const client: RpcClient = { rpc: async (fn, a) => (fn.startsWith("read_reporting_") && trace.push({ rpc: fn, args: a ?? {} }), c().rpc(fn, a)) };
+    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+    let n = 0;
+    const journal: OwnerJournal = {
+      async commit(p) {
+        n++;
+        if (crashAt && crashAt.mode === "before" && n === crashAt.k) throw new Crash("before");
+        await j.commit(p);
+        trace.push({ commit: n, ids: p.events.map((e) => e.id), steps: p.steps });
+        if (crashAt && crashAt.mode === "after" && n === crashAt.k) throw new Crash("after");
+      },
+    };
+    const run = durableOwnerInput(rpcFrozenReader(client, ref), o, journal);
+    if (crashAt) await expect(run).rejects.toBeInstanceOf(Crash);
+    else await run;
+    return { trace, handle: h.handle };
+  }
+
+  it("lines and included kids commit together in ordered steps, before the next dependent read, with no child request for them", async () => {
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const { trace } = await traced();
+    const i = trace.findIndex((x) => "rpc" in x && x.rpc === "read_reporting_predecessor_page");
+    expect(i).toBeGreaterThan(-1);
+    const page = trace[i] as { rpc: string; args: Record<string, unknown> };
+    expect(page.args).toMatchObject({ p_staff: W4, p_at_event_id: "" }); // the first page starts just above the latest member line
+    expect(page.args.p_certain_event_id).toBe("cp-t1"); // ASCII earliest id: the exact (instant, id) bound
+    // the very next entry after the combined page is its commit: no dependent read happens before it
+    const next = trace[i + 1] as { commit: number; ids: string[]; steps: Array<{ step: string; w?: { line: { phase: string } | null } }> };
+    expect("commit" in next).toBe(true);
+    expect(next.ids).toEqual(expect.arrayContaining(["cp-t2", "cp-t2-k", "cp-t0", "cp-t0-k"]));
+    // ordered steps per line: pending kids -> kids at its included child -> done -> cursor
+    const phases = next.steps.map((st) => (st.step === "walk" ? (st.w!.line ? st.w!.line.phase : "cursor") : st.step));
+    expect(phases.join(",")).toMatch(/^(kids,kids,done,cursor,)+/);
+    // no children request for any line whose complete kids were included in the page
+    const kidReads = trace.filter((x) => "rpc" in x && x.rpc === "read_reporting_children" && (x.args.p_parent_ids as string[]).some((pid) => ["cp-t3", "cp-t2", "cp-t1", "cp-t0"].includes(pid)) && (x.args.p_parent_ids as string[]).length === 1);
+    expect(kidReads).toEqual([]);
+    const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, (await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan")).handle, SITE);
+    expect(back.events.map((e) => e.ev).sort((x, y) => compareUtf8(x.id, y.id))).toEqual(want.events);
+  });
+
+  it("a crash just before that commit, or after it with the response lost, recovers from the saved cursor without re-reading the committed page", async () => {
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const full = await traced();
+    const i = full.trace.findIndex((x) => "rpc" in x && x.rpc === "read_reporting_predecessor_page");
+    const k = (full.trace[i + 1] as { commit: number }).commit;
+    for (const mode of ["before", "after"] as const) {
+      const { handle } = await traced({ k, mode });
+      const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
+      const snap = ownerJournalSnapshot(back);
+      const reads: Array<{ fn: string; args: Record<string, unknown> }> = [];
+      const client: RpcClient = { rpc: async (fn, a) => (fn.startsWith("read_reporting_") && reads.push({ fn, args: a ?? {} }), c().rpc(fn, a)) };
+      const got = await durableOwnerInput(rpcFrozenReader(client, ref), o, ownerJournal(c(), ref.batchId, ref.fence, handle, back.header.seq, cutoffUs()), snap);
+      expect(got, mode).toEqual(want);
+      const committed = new Set(back.events.map((e) => e.ev.id));
+      if (mode === "after") {
+        // the page was committed: the resume starts at the saved cursor (the last consumed line), never re-reads it
+        expect(committed.has("cp-t0")).toBe(true);
+        const st = snap.state as { step: string; w?: { cursorOrd: number | null } };
+        if (st.step === "walk" && st.w!.cursorOrd !== null) {
+          const first = reads.find((r) => r.fn === "read_reporting_predecessor_page" || r.fn === "read_reporting_staff_stream")!;
+          const cur = snap.events[st.w!.cursorOrd - 1];
+          expect(first.args).toMatchObject({ p_at: cur.created_at, p_at_event_id: cur.id });
+        } else {
+          // the complete short page also proved the stream end in the same atomic commit: nothing is read again
+          expect(st.step).toBe("done");
+          expect(reads).toEqual([]);
+        }
+      } else {
+        expect(committed.has("cp-t2")).toBe(false); // nothing of the page was committed: it is read again
+      }
+    }
+  });
 });
