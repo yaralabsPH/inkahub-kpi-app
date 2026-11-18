@@ -107,12 +107,13 @@ beforeAll(async () => {
     after = p.nextAfterEventId;
   }
   await freezeReportingRebuild(c, batch, fence);
-  const owners = Array.from({ length: 6 }, (_, i) => ({ owner: { partitionKind: "order" as const, partitionKey: `OI-${i}` }, oldStaff: [] as string[] }));
+  // MF-0..MF-9: owners for the interim-review regressions (bytewise before OI-*, so OI-5 stays the last keyset)
+  const owners = [...Array.from({ length: 10 }, (_, i) => `MF-${i}`), ...Array.from({ length: 6 }, (_, i) => `OI-${i}`)].map((k) => ({ owner: { partitionKind: "order" as const, partitionKey: k }, oldStaff: [] as string[] }));
   const last: ["order", string] = ["order", "OI-5"];
   await saveEnumeration(c, batch, fence, null, { kind: "rebuild", after: last }, owners, false);
   await saveEnumeration(c, batch, fence, { kind: "rebuild", after: last }, { kind: "rebuild", after: last, end: true }, [], true);
   const st = (await db.query<{ state: string; n: number }>("select b.state, (select count(*)::int from reporting_private.worker_owners o where o.batch_id = b.batch_id) as n from reporting_private.batches b where b.batch_id = $1", [batch])).rows[0];
-  expect(st).toEqual({ state: "frozen", n: 6 });
+  expect(st).toEqual({ state: "frozen", n: 16 });
   await db.query("update reporting_private.batches set lease_expires_at = now() + interval '1 hour' where batch_id = $1", [batch]);
 }, 300_000);
 afterAll(async () => db?.close());
@@ -503,5 +504,126 @@ describe("runtime audit attribution of the 0046 journal (two sites, real stable 
     } finally {
       await db.exec("rollback");
     }
+  });
+});
+
+describe("interim review repairs (Must-fix 1-4): fail-closed payloads, parent groups, walk/member references, the pending text bound", () => {
+  /** Everything a rejected checkpoint must leave unchanged: the header (seq, state, counts, packing) and every row. */
+  async function frozen(h: string) {
+    const head = (await call("load_reporting_owner_input_header", { ...base(), p_handle: h }))[0];
+    const rows = (await db.query<{ e: number; ec: number; p: number; pc: number }>(
+      `select (select count(*)::int from reporting_private.owner_input_events where handle = $1::bigint) as e,
+              (select count(*)::int from reporting_private.owner_input_events where handle = $1::bigint and committed) as ec,
+              (select count(*)::int from reporting_private.owner_input_pieces where handle = $1::bigint) as p,
+              (select count(*)::int from reporting_private.owner_input_pieces where handle = $1::bigint and committed) as pc`, [h])).rows[0];
+    return { head, rows };
+  }
+  async function rejectsUnchanged(h: string, seq: string, payload: unknown, re: RegExp) {
+    const before = await frozen(h);
+    await expect(cp(h, seq, payload)).rejects.toThrow(re);
+    expect(await frozen(h)).toEqual(before);
+  }
+  const need = ["*", "framed"];
+
+  it("1: page payloads with omitted, null or empty steps are rejected atomically (inline and after saved pending pieces)", async () => {
+    const h = String((await open("order", "MF-1")).handle);
+    const e1 = ev("mf1-a", { order_number: "MF-1" });
+    for (const steps of [undefined, null, [], {}, "x"]) {
+      const payload: Record<string, unknown> = { kind: "page", pieces: entries([e1], 1) };
+      if (steps !== undefined) payload.steps = steps;
+      await rejectsUnchanged(h, "0", payload, /owner_input_invalid: a page payload/);
+    }
+    expect((await cp(h, "0", { kind: "pieces", pieces: entries([e1], 1) })).seq).toBe("1");
+    for (const steps of [undefined, null, []]) {
+      const payload: Record<string, unknown> = { kind: "page" };
+      if (steps !== undefined) payload.steps = steps;
+      await rejectsUnchanged(h, "1", payload, /owner_input_invalid: a page payload/);
+    }
+    // the other payload variants: missing, null or wrong-typed required fields, before any mutation
+    for (const p of [{ kind: "pieces" }, { kind: "pieces", pieces: null }, { kind: "pieces", pieces: "x" }, { kind: "pieces", pieces: {} }, { kind: "pieces", pieces: [] }])
+      await rejectsUnchanged(h, "1", p, /owner_input_invalid: a pieces payload/);
+    for (const p of [{ kind: "page", pieces: "x", steps: [S.members(1)] }, { kind: "page", steps: [S.members(1)], members_count: "1" }, { kind: "page", steps: [S.members(1)], members_count: null }])
+      await rejectsUnchanged(h, "1", p, /owner_input_invalid: a page payload/);
+    await rejectsUnchanged(h, "1", { kind: "discard_pending", x: 1 }, /owner_input_invalid: discard_pending has no fields/);
+    for (const p of [{ kind: null }, {}, { kind: 1 }]) await rejectsUnchanged(h, "1", p, /owner_input_invalid: unknown payload kind/);
+    // the lookup owner list: a null kind is the protocol error, not a later constraint
+    await expect(call("lookup_reporting_owner_inputs", { ...base(), p_owners: [[null, "MF-1"]] })).rejects.toThrow(/owner_input_args/);
+    await expect(call("lookup_reporting_owner_inputs", { ...base(), p_owners: [["order", null]] })).rejects.toThrow(/owner_input_args/);
+  });
+
+  it("1: hash payloads with missing, null or wrong-typed fields are rejected before mutation", async () => {
+    const h = String((await open("order", "MF-9")).handle);
+    expect((await cp(h, "0", { kind: "page", pieces: entries([ev("mf9-a", { order_number: "MF-9" })], 1, () => false), steps: [S.members(1)] })).seq).toBe("1");
+    expect((await cp(h, "1", { kind: "page", steps: [S.parents(0, null), S.children(0, null), S.done], members_count: 1 })).seq).toBe("2"); // no candidate -> no walk
+    const aud = [{ audienceKind: "site", audienceStaff: null }, { audienceKind: "self", audienceStaff: W }];
+    await rejectsUnchanged(h, "2", { kind: "hash", hashes: [{ ...aud[0], inputHash: "a".repeat(64) }] }, /first hash call carries the audience list/);
+    for (const hashes of [undefined, null, "x", [], [null], [{ ...aud[0], inputHash: null }], [{ ...aud[0], inputHash: 1 }], [{ audienceKind: null, audienceStaff: null, inputHash: "a".repeat(64) }]]) {
+      const p: Record<string, unknown> = { kind: "hash", audiences: aud };
+      if (hashes !== undefined) p.hashes = hashes;
+      await rejectsUnchanged(h, "2", p, /owner_input_invalid/);
+    }
+    await rejectsUnchanged(h, "2", { kind: "hash", audiences: null, hashes: [{ ...aud[0], inputHash: "a".repeat(64) }] }, /owner_input_invalid: the audience list is not the required set/);
+    expect((await cp(h, "2", { kind: "hash", audiences: aud, hashes: [{ ...aud[0], inputHash: "a".repeat(64) }, { ...aud[1], inputHash: "b".repeat(64) }] })).seq).toBe("3");
+  });
+
+  it("2: a fetched parent in its frozen group is a legal parents cursor; wrong-group and unrelated cursors reject atomically", async () => {
+    const h = String((await open("order", "MF-2")).handle);
+    const child = ev("mf2-c", { order_number: "MF-2", event_type: "cancelled", parent_event_id: "mf2-p", line_sku: null, line_quantity: null });
+    const parent = ev("mf2-p", { order_number: "MF-29" });
+    expect((await cp(h, "0", { kind: "page", pieces: entries([child], 1), steps: [S.members(1)] })).seq).toBe("1");
+    expect((await cp(h, "1", { kind: "page", steps: [S.parents(0, null)], members_count: 1 })).seq).toBe("2");
+    await rejectsUnchanged(h, "2", { kind: "page", pieces: entries([parent], 2), steps: [S.parents(0, 1)] }, /owner_input_invalid: the parents cursor is not a found parent of group 0/); // the member itself
+    await rejectsUnchanged(h, "2", { kind: "page", pieces: entries([parent], 2), steps: [S.parents(1, null)] }, /owner_input_transition: parents group 0 -> 1/); // only one group exists
+    const ok = await cp(h, "2", { kind: "page", pieces: entries([parent], 2), steps: [S.parents(0, 2)] });
+    expect(ok).toMatchObject({ seq: "3", event_count: 2 });
+    // a fresh process reloads the header and continues from the parent cursor
+    expect((await call("load_reporting_owner_input_header", { ...base(), p_handle: h }))[0]).toMatchObject({ state: S.parents(0, 2), members_count: 1, event_count: 2 });
+    expect((await cp(h, "3", { kind: "page", steps: [S.children(0, null)] })).seq).toBe("4");
+    expect((await cp(h, "4", { kind: "page", steps: [S.done] })).seq).toBe("5");
+  });
+
+  it("3: a same-worker non-candidate advances only the cursor; a candidate shortcut, a malformed line phase and bad member cursors reject", async () => {
+    const h = String((await open("order", "MF-3")).handle);
+    const line = ev("mf3-l", { order_number: "MF-3", created_at: "2026-10-01T00:03:00.000000Z" });
+    expect((await cp(h, "0", { kind: "page", pieces: entries([line], 1, () => true), steps: [S.members(1)] })).seq).toBe("1");
+    expect((await cp(h, "1", { kind: "page", steps: [S.parents(0, null), S.children(0, null)], members_count: 1 })).seq).toBe("2");
+    expect((await cp(h, "2", { kind: "page", steps: [S.walk(0, need)] })).seq).toBe("3");
+    const nc = ev("mf3-nc", { order_number: null, event_type: "clock_in", line_sku: null, line_quantity: null, created_at: "2026-10-01T00:02:30.000000Z" });
+    expect((await cp(h, "3", { kind: "page", pieces: entries([nc], 2, () => false), steps: [S.walk(0, need, { cursorOrd: 2 })] })).seq).toBe("4");
+    await rejectsUnchanged(h, "4", { kind: "page", steps: [S.walk(0, ["*"], { cursorOrd: 2 })] }, /owner_input_transition/); // need cannot change on a cursor step
+    const cand = ev("mf3-c2", { order_number: "MF-39", created_at: "2026-10-01T00:02:00.000000Z" });
+    await rejectsUnchanged(h, "4", { kind: "page", pieces: entries([cand], 3, () => true), steps: [S.walk(0, need, { cursorOrd: 3 })] }, /a stream candidate is consumed only through a pending line/);
+    await rejectsUnchanged(h, "4", { kind: "page", pieces: entries([cand], 3, () => true), steps: [
+      S.walk(0, need, { cursorOrd: 2, line: { ord: 3, afterKidOrd: null, phase: "kids", effective: null } }),
+      S.walk(0, need, { cursorOrd: 2, line: { ord: 3, afterKidOrd: null, phase: null, effective: null } }),
+    ] }, /owner_input_invalid: bad pending line/);
+    const legit = await cp(h, "4", { kind: "page", pieces: entries([cand], 3, () => true), steps: [
+      S.walk(0, need, { cursorOrd: 2, line: { ord: 3, afterKidOrd: null, phase: "kids", effective: null } }),
+      S.walk(0, need, { cursorOrd: 2, line: { ord: 3, afterKidOrd: null, phase: "done", effective: true } }),
+      S.walk(0, need, { cursorOrd: 3 }),
+    ] });
+    expect(legit.seq).toBe("5");
+    // member cursors: ordinal 0, an absent ordinal and another handle's ordinal are not committed members of THIS journal
+    const h5 = String((await open("order", "MF-5")).handle);
+    const m = entries([ev("mf5-a", { order_number: "MF-5" })], 1);
+    for (const bad of [0, 5, 3]) await rejectsUnchanged(h5, "0", { kind: "page", pieces: m, steps: [S.members(bad)] }, /the members cursor is not a committed member/);
+    expect((await cp(h5, "0", { kind: "page", pieces: m, steps: [S.members(1)] })).seq).toBe("1");
+  });
+
+  it("4: pending reduced text is bounded at 1,048,576 UTF-8 bytes across calls (boundary accepted, one byte more rejected)", async () => {
+    const h = String((await open("order", "MF-4")).handle);
+    const a = ev("mf4-a", { order_number: "MF-4", line_sku: "x".repeat(600_000) });
+    const bytesA = Buffer.byteLength(text(a));
+    const baseB = Buffer.byteLength(text(ev("mf4-b", { order_number: "MF-4", line_sku: "" })));
+    const rem = 1_048_576 - bytesA - baseB;
+    const sku = "é".repeat(Math.floor(rem / 2)) + "x".repeat(rem % 2); // multibyte: measured in UTF-8 bytes, not characters
+    const b = ev("mf4-b", { order_number: "MF-4", line_sku: sku });
+    expect(bytesA + Buffer.byteLength(text(b))).toBe(1_048_576);
+    expect((await cp(h, "0", { kind: "pieces", pieces: entries([a], 1) })).seq).toBe("1");
+    const over = ev("mf4-b", { order_number: "MF-4", line_sku: `${sku}x` });
+    await rejectsUnchanged(h, "1", { kind: "pieces", pieces: entries([over], 2) }, /pending events exceed 1048576 text bytes/);
+    expect((await cp(h, "1", { kind: "pieces", pieces: entries([b], 2) })).seq).toBe("2");
+    const done = await cp(h, "2", { kind: "page", steps: [S.members(2)] });
+    expect(done).toMatchObject({ seq: "3", event_count: 2, pending_events: 0 });
   });
 });

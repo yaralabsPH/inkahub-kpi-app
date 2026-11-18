@@ -14,6 +14,7 @@ import {
   checkpointOwnerInput, eventEntries, eventText, EVENT_TEXT_KEYS, loadOwnerInputHeader, lookupOwnerInputs, openOwnerInput, ownerInputVersion, packEntries, parseEventText,
   parseHandle, parseOwnerState, parseSeq, PIECE_LITERAL_BYTES, readOwnerOldStaff, reloadOwnerInput, REQUEST_BODY_BYTES, saveEnumeration, splitPieces, writeOwnerPage, type PieceEntry,
 } from "../../api/_lib/reporting-worker-state";
+import { MAX_RESPONSE_BYTES, responseBytes } from "../../api/_lib/production-reporting-reader";
 import { reportingDb } from "./pg/harness";
 import { pgRpc } from "./pg/rpc";
 
@@ -26,6 +27,14 @@ const ev = (id: string, o: Partial<Ev> = {}): Ev => ({
   created_at: "2026-10-01T00:00:00.000000Z", parent_event_id: null, cs_case_id: null, ...o,
 });
 const MEMBERS = (afterOrd: number | null) => ({ v: 1, step: "members", m: { afterOrd } });
+/** Two backslash-heavy events: one admissible source response (<= 1 MiB envelope), ~2 MB once escaped for transport. */
+function admissible(prefix: string, order: string): Ev[] {
+  const events = [0, 1].map((i) => ev(`${prefix}-${i}`, { order_number: order, line_sku: "\\".repeat(250_000 - i) }));
+  const envelope = events.map((e, i) => ({ owner_index: 0, event_id: e.id, image: { ...e, station_id: "s", note: "" }, n: i }));
+  expect(responseBytes(envelope)).toBeLessThanOrEqual(MAX_RESPONSE_BYTES);
+  expect(events.reduce((n, e) => n + Buffer.byteLength(eventText(e)), 0)).toBeLessThanOrEqual(1_048_576);
+  return events;
+}
 
 describe("the one piece rule, entries and packing (pure)", () => {
   it("splits into maximal pieces by code point; the r4 backslash counterexample, control characters and 4-byte emoji", () => {
@@ -155,11 +164,17 @@ describe("journal adapters over the real 0046 draft (PGlite)", () => {
 
   it("a large page goes as pending piece calls then one page call; reload is byte-exact across load pages", async () => {
     const h = (await openOwnerInput(c(), batch, fence, O("OS-2"), "plan")).handle;
-    const events = Array.from({ length: 6 }, (_, i) => ev(`big-${i}`, { order_number: "OS-2", line_sku: (i % 2 ? "\\" : "é").repeat(180_000 + i) }));
+    // An admissible source response (its envelope fits 1 MiB) whose transport expansion still needs several calls.
+    const events = admissible("big", "OS-2");
     const entries = eventEntries(events, 1, () => false);
-    const w = await writeOwnerPage(c(), batch, fence, h, "0", entries, [MEMBERS(6)]);
+    // the old fixture (about 2.16 MB of reduced text) can never be one source page: it is refused, not stored
+    const oversized = Array.from({ length: 6 }, (_, i) => ev(`over-${i}`, { order_number: "OS-2", line_sku: (i % 2 ? "\\" : "é").repeat(180_000 + i) }));
+    await expect(writeOwnerPage(c(), batch, fence, h, "0", eventEntries(oversized, 1, () => false), [MEMBERS(6)])).rejects.toThrow(/exceed 1048576 text bytes/);
+    await checkpointOwnerInput(c(), batch, fence, h, (await loadOwnerInputHeader(c(), batch, fence, h)).seq, { kind: "discard_pending" });
+    const seq0 = (await loadOwnerInputHeader(c(), batch, fence, h)).seq;
+    const w = await writeOwnerPage(c(), batch, fence, h, seq0, entries, [MEMBERS(2)]);
     expect(w.calls).toBeGreaterThan(2);
-    expect(w.result).toMatchObject({ seq: String(w.calls), eventCount: 6, pendingEvents: 0, pendingPieces: 0, heavy: false });
+    expect(w.result).toMatchObject({ seq: String(Number(seq0) + w.calls), eventCount: 2, pendingEvents: 0, pendingPieces: 0, heavy: false });
     const r = await reloadOwnerInput(c(), batch, fence, h, SITE);
     expect(r.events.map((x) => x.ev)).toEqual(events);
     expect(r.calls).toBe(r.header.reloadCalls);
@@ -168,7 +183,7 @@ describe("journal adapters over the real 0046 draft (PGlite)", () => {
 
   it("takeover between pending calls: the new process reads the header, discards pending and rewrites the page", async () => {
     const h = (await openOwnerInput(c(), batch, fence, O("OS-3"), "plan")).handle;
-    const events = Array.from({ length: 4 }, (_, i) => ev(`tk-${i}`, { order_number: "OS-3", line_sku: "q".repeat(300_000) }));
+    const events = admissible("tk", "OS-3");
     const entries = eventEntries(events, 1, () => false);
     const groups = packEntries(entries, 30);
     expect(groups.length).toBeGreaterThan(1);
@@ -179,8 +194,8 @@ describe("journal adapters over the real 0046 draft (PGlite)", () => {
     expect(hd).toMatchObject({ seq: "1", eventCount: 0, pendingEvents: first.pendingEvents });
     const d = await checkpointOwnerInput(c(), batch, fence, h, hd.seq, { kind: "discard_pending" });
     expect(d).toMatchObject({ seq: "2", pendingEvents: 0, pendingPieces: 0 });
-    const w = await writeOwnerPage(c(), batch, fence, h, d.seq, entries, [MEMBERS(4)]);
-    expect(w.result.eventCount).toBe(4);
+    const w = await writeOwnerPage(c(), batch, fence, h, d.seq, entries, [MEMBERS(2)]);
+    expect(w.result.eventCount).toBe(2);
     expect((await reloadOwnerInput(c(), batch, fence, h, SITE)).events.map((x) => x.ev)).toEqual(events);
   });
 
@@ -218,6 +233,8 @@ describe("journal adapters over the real 0046 draft (PGlite)", () => {
       { v: 1, step: "walk", w: { ...W0, need: ["bad"] } }, { v: 1, step: "walk", w: { ...W0, stopAt: 12 } }, { v: 1, step: "walk", w: { ...W0, stopAt: "1e3" } },
       { v: 1, step: "walk", w: { ...W0, line: { ord: 3, afterKidOrd: null, phase: "kids", effective: true } } },
       { v: 1, step: "walk", w: { ...W0, line: { ord: 3, afterKidOrd: null, phase: "done", effective: null } } }, { v: 1, step: "walk", w: { ...W0, extra: 1 } },
+      { v: 1, step: "walk", w: { ...W0, line: { ord: 3, afterKidOrd: null, phase: null, effective: null } } }, { v: 1, step: "walk", w: { ...W0, line: { ord: 3, afterKidOrd: null, phase: null, effective: true } } },
+      { v: 1, step: "walk", w: { ...W0, worker: null } }, { v: 1, step: "children", c: { group: null, afterOrd: null } }, { v: 1, step: null }, { v: null, step: "done" },
       { v: 1, step: "members", m: { afterOrd: 1_000_000_000 } },
     ];
     const sql = async (s: unknown) => {
@@ -248,5 +265,79 @@ describe("journal adapters over the real 0046 draft (PGlite)", () => {
     const h = (await openOwnerInput(c(), batch, fence, O("OS-1"), "plan")).handle;
     const r = await pgRpc(db).rpc("load_reporting_owner_input_events", { p_batch: batch, p_fence: fence, p_handle: h, p_seq: "0", p_after_ord: 0, p_after_piece: -1 });
     expect(r.error?.message).toMatch(/owner_input_snapshot/);
+  });
+});
+
+describe("strict reload rows (Must-fix 5): metadata only on piece 0, a lone all-null eof", () => {
+  const BIG_SEQ = "9007199254740993"; // above 2^53: must be sent unchanged on every load call
+  const BATCH = "11111111-1111-4111-8111-111111111111";
+  const events = [ev("r1"), ev("r2", { line_sku: "\\".repeat(200_000) })];
+  type Row = Record<string, unknown>;
+  function loaderRows(): Row[] {
+    return eventEntries(events, 1, () => false).map((e) => {
+      const m = e.length === 4 ? e[3] : null;
+      return { ord: e[0], piece_no: e[1], pieces: m?.pieces ?? null, event_id: m?.event_id ?? null, text_bytes: m?.text_bytes ?? null, text_sha256: m?.text_sha256 ?? null, piece: e[2], eof: false };
+    });
+  }
+  const EOF: Row = { ord: null, piece_no: null, pieces: null, event_id: null, text_bytes: null, text_sha256: null, piece: null, eof: true };
+  /** A fake client serving the loader shape one row per page (fragmented), then `eof`. */
+  function fake(rows: Row[], eof: Row = EOF) {
+    const seqs: unknown[] = [];
+    const client = {
+      rpc: async (fn: string, a: Record<string, unknown>) => {
+        if (fn === "load_reporting_owner_input_header")
+          return { data: [{ phase: "reading", purpose: "plan", seq: BIG_SEQ, state: MEMBERS(2), members_count: null, event_count: 2, pending_events: 0, pending_pieces: 0, audiences: null, hashes_done: 0, input_hashes: [], reload_calls: rows.length + 2, provisional_reload_calls: rows.length + 2, heavy_proven: false }], error: null };
+        if (fn === "load_reporting_owner_input_events") {
+          seqs.push(a.p_seq);
+          const after = [a.p_after_ord as number, a.p_after_piece as number];
+          const next = rows.find((r) => (r.ord as number) > after[0] || ((r.ord as number) === after[0] && (r.piece_no as number) > after[1]));
+          return { data: [next ?? eof], error: null };
+        }
+        throw new Error(`unexpected ${fn}`);
+      },
+    };
+    return { client, seqs };
+  }
+  it("a valid fragmented journal reloads, with the >2^53 seq sent unchanged on every load call", async () => {
+    const f = fake(loaderRows());
+    const r = await reloadOwnerInput(f.client, BATCH, 1, "1", SITE);
+    expect(r.events.map((x) => x.ev)).toEqual(events);
+    expect(f.seqs.length).toBe(loaderRows().length + 1);
+    expect(f.seqs.every((s) => s === BIG_SEQ)).toBe(true);
+  });
+  it("rejects metadata on a continuation piece, each field independently, including omission", async () => {
+    const cont = loaderRows().findIndex((r) => r.piece_no === 1);
+    expect(cont).toBeGreaterThan(0);
+    for (const [k, v] of [["pieces", 2], ["event_id", "r2"], ["text_bytes", 5], ["text_sha256", "a".repeat(64)]] as const) {
+      const rows = loaderRows();
+      rows[cont] = { ...rows[cont], [k]: v };
+      await expect(reloadOwnerInput(fake(rows).client, BATCH, 1, "1", SITE), k).rejects.toThrow(/piece-zero metadata/);
+      const omitted = loaderRows();
+      delete omitted[cont][k];
+      await expect(reloadOwnerInput(fake(omitted).client, BATCH, 1, "1", SITE), `omit ${k}`).rejects.toThrow(/missing a field|piece-zero metadata/);
+    }
+  });
+  it("rejects an eof row carrying any data or missing any field", async () => {
+    for (const k of ["ord", "piece_no", "pieces", "event_id", "text_bytes", "text_sha256", "piece"]) {
+      await expect(reloadOwnerInput(fake(loaderRows(), { ...EOF, [k]: k === "event_id" || k === "piece" || k === "text_sha256" ? "x" : 1 }).client, BATCH, 1, "1", SITE), k).rejects.toThrow(/eof row carries data/);
+      const { [k]: _gone, ...missing } = EOF;
+      await expect(reloadOwnerInput(fake(loaderRows(), missing).client, BATCH, 1, "1", SITE), `omit ${k}`).rejects.toThrow(/eof row carries data/);
+    }
+  });
+  it("still rejects a wrong digest, truncation and a misplaced eof", async () => {
+    const bad = loaderRows();
+    bad[0] = { ...bad[0], text_sha256: "0".repeat(64) };
+    await expect(reloadOwnerInput(fake(bad).client, BATCH, 1, "1", SITE)).rejects.toThrow(/length\/digest/);
+    const cut = loaderRows().slice(0, -1);
+    await expect(reloadOwnerInput(fake(cut).client, BATCH, 1, "1", SITE)).rejects.toThrow(/missing pieces/);
+    const f = fake(loaderRows());
+    const inner = f.client.rpc;
+    let n = 0;
+    f.client.rpc = async (fn, a) => {
+      const r = await inner(fn, a);
+      if (fn === "load_reporting_owner_input_events" && ++n === 2) return { data: [...(r.data as Row[]), EOF], error: null };
+      return r;
+    };
+    await expect(reloadOwnerInput(f.client, BATCH, 1, "1", SITE)).rejects.toThrow(/misplaced eof/);
   });
 });

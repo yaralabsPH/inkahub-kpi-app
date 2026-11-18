@@ -445,6 +445,9 @@ export async function writeOwnerPage(
 }
 
 export interface JournalEvent { ord: number; ev: ProductionEvidenceEvent }
+/** The loader's row shape (r5 §3): metadata only on piece 0; a lone eof row with every other field null. */
+const LOAD_FIELDS = ["ord", "piece_no", "pieces", "event_id", "text_bytes", "text_sha256", "piece", "eof"] as const;
+const PIECE_ZERO_ONLY = ["pieces", "event_id", "text_bytes", "text_sha256"] as const;
 /** Parse ONE reassembled journal text back to the exact evidence event (11 keys, id/location binding). */
 export function parseEventText(text: string, site: string, eventId: string): ProductionEvidenceEvent {
   let v: unknown;
@@ -488,12 +491,13 @@ export async function reloadOwnerInput(client: RpcClient, batchId: string, fence
     const page = await rows(client, "load_reporting_owner_input_events", { ...batchArgs(batchId, fence), p_handle: parseHandle(handle), p_seq: header.seq, p_after_ord: after[0], p_after_piece: after[1] }, false);
     calls++;
     if (page.length === 1 && page[0].eof === true) {
-      if (page[0].ord !== null || page[0].piece !== null) throw new ReportingJobError("the eof row carries data");
+      if (!LOAD_FIELDS.every((k) => k === "eof" || (k in page[0] && page[0][k] === null))) throw new ReportingJobError("the eof row carries data (every other field must be an explicit null)");
       break;
     }
     if (!page.length) throw new ReportingJobError("load_reporting_owner_input_events returned no rows (not even eof)");
     for (const r of page) {
       if (r.eof !== false) throw new ReportingJobError("a misplaced eof row");
+      if (!LOAD_FIELDS.every((k) => k in r)) throw new ReportingJobError("a journal row is missing a field");
       const ord = int(r.ord, "ord");
       const no = int(r.piece_no, "piece_no");
       const piece = str(r.piece, "piece");
@@ -502,7 +506,8 @@ export async function reloadOwnerInput(client: RpcClient, batchId: string, fence
         finish();
         cur = { ord, meta: { pieces: int(r.pieces, "pieces"), eventId: str(r.event_id, "event_id"), textBytes: int(r.text_bytes, "text_bytes"), sha: str(r.text_sha256, "text_sha256") }, parts: [piece] };
       } else {
-        if (!cur || ord !== cur.ord || no !== cur.parts.length || r.pieces !== null || r.event_id !== null) throw new ReportingJobError(`journal pieces are not contiguous at ${ord}/${no}`);
+        if (!cur || ord !== cur.ord || no !== cur.parts.length) throw new ReportingJobError(`journal pieces are not contiguous at ${ord}/${no}`);
+        if (!PIECE_ZERO_ONLY.every((k) => k in r && r[k] === null)) throw new ReportingJobError(`journal piece ${ord}/${no} carries piece-zero metadata (it must be an explicit null)`);
         cur.parts.push(piece);
       }
       after = [ord, no];

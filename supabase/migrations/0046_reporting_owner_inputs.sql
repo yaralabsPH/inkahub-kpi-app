@@ -305,42 +305,42 @@ SET search_path = ''
 AS $fn$
 DECLARE st text; o jsonb; l jsonb;
 BEGIN
-  IF pg_catalog.jsonb_typeof(s) <> 'object' OR s -> 'v' IS DISTINCT FROM '1'::jsonb THEN RAISE EXCEPTION 'owner_input_invalid: state must be an object with v 1'; END IF;
+  IF (pg_catalog.jsonb_typeof(s) <> 'object' OR s -> 'v' IS DISTINCT FROM '1'::jsonb) IS NOT FALSE THEN RAISE EXCEPTION 'owner_input_invalid: state must be an object with v 1'; END IF;
   st := s ->> 'step';
   IF st = 'members' THEN
     o := s -> 'm';
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['m', 'step', 'v']
+    IF ((SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['m', 'step', 'v']
        OR pg_catalog.jsonb_typeof(o) <> 'object' OR (SELECT pg_catalog.array_agg(k) FROM pg_catalog.jsonb_object_keys(o) k) IS DISTINCT FROM ARRAY['afterOrd']
-       OR NOT (o -> 'afterOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'afterOrd')) THEN RAISE EXCEPTION 'owner_input_invalid: bad members state'; END IF;
+       OR NOT (o -> 'afterOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'afterOrd'))) IS NOT FALSE THEN RAISE EXCEPTION 'owner_input_invalid: bad members state'; END IF;
   ELSIF st IN ('parents', 'children') THEN
     o := s -> CASE st WHEN 'parents' THEN 'p' ELSE 'c' END;
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY[CASE st WHEN 'parents' THEN 'p' ELSE 'c' END, 'step', 'v']
+    IF ((SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY[CASE st WHEN 'parents' THEN 'p' ELSE 'c' END, 'step', 'v']
        OR pg_catalog.jsonb_typeof(o) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(o) k) IS DISTINCT FROM ARRAY['afterOrd', 'group']
        OR NOT reporting_private.oi_is_int(o -> 'group')
-       OR NOT (o -> 'afterOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'afterOrd')) THEN RAISE EXCEPTION 'owner_input_invalid: bad % state', st; END IF;
+       OR NOT (o -> 'afterOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'afterOrd'))) IS NOT FALSE THEN RAISE EXCEPTION 'owner_input_invalid: bad % state', st; END IF;
   ELSIF st = 'walk' THEN
     o := s -> 'w';
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['step', 'v', 'w']
+    IF ((SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['step', 'v', 'w']
        OR pg_catalog.jsonb_typeof(o) <> 'object'
        OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(o) k) IS DISTINCT FROM ARRAY['cursorOrd', 'line', 'need', 'stopAt', 'worker']
        OR NOT reporting_private.oi_is_int(o -> 'worker')
        OR NOT (o -> 'cursorOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'cursorOrd'))
        OR NOT (o -> 'stopAt' = 'null'::jsonb OR (pg_catalog.jsonb_typeof(o -> 'stopAt') = 'string' AND (o ->> 'stopAt') ~ '^-?[0-9]{1,20}$'))
        OR pg_catalog.jsonb_typeof(o -> 'need') <> 'array'
-       OR EXISTS (SELECT 1 FROM pg_catalog.jsonb_array_elements(o -> 'need') e(x) WHERE NOT (x #>> '{}' IN ('*', 'a0_framed', 'framed', 'unframed', 'dispatch')) OR pg_catalog.jsonb_typeof(x) <> 'string') THEN
+       OR EXISTS (SELECT 1 FROM pg_catalog.jsonb_array_elements(o -> 'need') e(x) WHERE NOT (x #>> '{}' IN ('*', 'a0_framed', 'framed', 'unframed', 'dispatch')) OR pg_catalog.jsonb_typeof(x) <> 'string')) IS NOT FALSE THEN
       RAISE EXCEPTION 'owner_input_invalid: bad walk state';
     END IF;
     l := o -> 'line';
     IF l <> 'null'::jsonb THEN
-      IF pg_catalog.jsonb_typeof(l) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(l) k) IS DISTINCT FROM ARRAY['afterKidOrd', 'effective', 'ord', 'phase']
+      IF (pg_catalog.jsonb_typeof(l) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(l) k) IS DISTINCT FROM ARRAY['afterKidOrd', 'effective', 'ord', 'phase']
          OR NOT reporting_private.oi_is_int(l -> 'ord')
          OR NOT (l -> 'afterKidOrd' = 'null'::jsonb OR reporting_private.oi_is_int(l -> 'afterKidOrd'))
-         OR NOT ((l ->> 'phase' = 'kids' AND l -> 'effective' = 'null'::jsonb) OR (l ->> 'phase' = 'done' AND pg_catalog.jsonb_typeof(l -> 'effective') = 'boolean')) THEN
+         OR NOT ((l ->> 'phase' = 'kids' AND l -> 'effective' = 'null'::jsonb) OR (l ->> 'phase' = 'done' AND pg_catalog.jsonb_typeof(l -> 'effective') = 'boolean'))) IS NOT FALSE THEN
         RAISE EXCEPTION 'owner_input_invalid: bad pending line';
       END IF;
     END IF;
   ELSIF st = 'done' THEN
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['step', 'v'] THEN RAISE EXCEPTION 'owner_input_invalid: bad done state'; END IF;
+    IF ((SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['step', 'v']) IS NOT FALSE THEN RAISE EXCEPTION 'owner_input_invalid: bad done state'; END IF;
   ELSE
     RAISE EXCEPTION 'owner_input_invalid: unknown step %', pg_catalog.left(coalesce(st, '(null)'), 20);
   END IF;
@@ -366,7 +366,10 @@ DECLARE
   wa jsonb; wb jsonb; v_staff text; v_need jsonb;
 BEGIN
   IF sa = 'members' AND sb = 'members' THEN
-    IF b #> '{m,afterOrd}' <> 'null'::jsonb AND (b #>> '{m,afterOrd}')::integer > h.event_count THEN RAISE EXCEPTION 'owner_input_invalid: members cursor beyond the journal'; END IF;
+    IF b #> '{m,afterOrd}' <> 'null'::jsonb AND NOT EXISTS (
+         SELECT 1 FROM reporting_private.owner_input_events x WHERE x.handle = h.handle AND x.committed AND x.ord = (b #>> '{m,afterOrd}')::integer) THEN
+      RAISE EXCEPTION 'owner_input_invalid: the members cursor is not a committed member';
+    END IF;
     RETURN v_members;
   END IF;
   IF sa = 'members' AND sb = 'parents' THEN
@@ -384,7 +387,7 @@ BEGIN
     IF gb = ga THEN
       IF b #> '{p,afterOrd}' = 'null'::jsonb THEN RAISE EXCEPTION 'owner_input_transition: a parents page must advance its cursor'; END IF;
       e := reporting_private.oi_event(h.handle, (b #>> '{p,afterOrd}')::integer);
-      IF e.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM reporting_private.oi_parent_ids(h.handle, v_members) x WHERE x.event_id IS NULL OR (x.parent_id = e.event_id AND x.n / 500 = ga)) THEN
+      IF e.event_id IS NULL OR NOT EXISTS (SELECT 1 FROM reporting_private.oi_parent_ids(h.handle, v_members) x WHERE x.parent_id = e.event_id AND x.n / 500 = ga) THEN
         RAISE EXCEPTION 'owner_input_invalid: the parents cursor is not a found parent of group %', ga;
       END IF;
       RETURN v_members;
@@ -453,6 +456,7 @@ BEGIN
       IF wb -> 'stopAt' <> wa -> 'stopAt' OR wb -> 'need' <> wa -> 'need' OR wb -> 'cursorOrd' = 'null'::jsonb THEN RAISE EXCEPTION 'owner_input_transition: non-candidate step'; END IF;
       e := reporting_private.oi_event(h.handle, (wb ->> 'cursorOrd')::integer);
       IF e.event_id IS NULL OR e.staff_id IS DISTINCT FROM v_staff THEN RAISE EXCEPTION 'owner_input_invalid: the walk cursor is not this worker''s event'; END IF;
+      IF e.stream_candidate IS NOT FALSE THEN RAISE EXCEPTION 'owner_input_transition: a stream candidate is consumed only through a pending line'; END IF;
       RETURN v_members;
     END IF;
     IF wa -> 'line' = 'null'::jsonb THEN
@@ -525,6 +529,10 @@ BEGIN
          OR pg_catalog.jsonb_typeof(m -> 'src_at') <> 'string' OR pg_catalog.jsonb_typeof(m -> 'stream_candidate') <> 'boolean' THEN
         RAISE EXCEPTION 'owner_input_invalid: bad event metadata';
       END IF;
+      IF (SELECT coalesce(pg_catalog.sum(e.text_bytes), 0) FROM reporting_private.owner_input_events e WHERE e.handle = h.handle AND NOT e.committed)
+         + (m ->> 'text_bytes')::integer > 1048576 THEN
+        RAISE EXCEPTION 'owner_input_invalid: the pending events exceed 1048576 text bytes (one source response)';
+      END IF;
       IF EXISTS (SELECT 1 FROM reporting_private.owner_input_events e WHERE e.handle = h.handle AND e.event_id = m ->> 'event_id') THEN
         RAISE EXCEPTION 'owner_input_invalid: event id is already in the journal';
       END IF;
@@ -580,7 +588,7 @@ BEGIN
     END;
     IF pg_catalog.jsonb_typeof(ev) <> 'object'
        OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(ev) k)
-          <> ARRAY['created_at', 'cs_case_id', 'department', 'event_type', 'id', 'line_quantity', 'line_sku', 'location', 'order_number', 'parent_event_id', 'staff_id'] THEN
+          IS DISTINCT FROM ARRAY['created_at', 'cs_case_id', 'department', 'event_type', 'id', 'line_quantity', 'line_sku', 'location', 'order_number', 'parent_event_id', 'staff_id'] THEN
       RAISE EXCEPTION 'owner_input_invalid: event % does not have exactly the 11 evidence fields', e.ord;
     END IF;
     IF ev ->> 'id' IS DISTINCT FROM e.event_id OR ev ->> 'location' IS DISTINCT FROM h.site OR ev ->> 'created_at' IS DISTINCT FROM e.src_at
@@ -607,7 +615,7 @@ BEGIN
         EXCEPTION WHEN others THEN NULL;
         END;
       END IF;
-      IF NOT v_ok THEN RAISE EXCEPTION 'owner_input_invalid: event % cannot be a stream candidate', e.ord; END IF;
+      IF v_ok IS NOT TRUE THEN RAISE EXCEPTION 'owner_input_invalid: event % cannot be a stream candidate', e.ord; END IF;
     END IF;
     UPDATE reporting_private.owner_input_events x
        SET committed = true, staff_id = ev ->> 'staff_id', parent_id = ev ->> 'parent_event_id', department = ev ->> 'department'
@@ -678,10 +686,11 @@ AS $fn$
 #variable_conflict use_column
 DECLARE b reporting_private.batches;
 BEGIN
-  IF p_owners IS NULL OR pg_catalog.jsonb_typeof(p_owners) <> 'array' OR pg_catalog.jsonb_array_length(p_owners) NOT BETWEEN 1 AND 100
+  IF (p_owners IS NULL OR pg_catalog.jsonb_typeof(p_owners) <> 'array' OR pg_catalog.jsonb_array_length(p_owners) NOT BETWEEN 1 AND 100
      OR EXISTS (SELECT 1 FROM pg_catalog.jsonb_array_elements(p_owners) e(v)
-                 WHERE pg_catalog.jsonb_typeof(v) <> 'array' OR pg_catalog.jsonb_array_length(v) <> 2 OR v ->> 0 NOT IN ('order', 'event')
-                    OR pg_catalog.jsonb_typeof(v -> 1) <> 'string' OR v ->> 1 = '') THEN
+                 WHERE (pg_catalog.jsonb_typeof(v) <> 'array' OR pg_catalog.jsonb_array_length(v) <> 2
+                    OR pg_catalog.jsonb_typeof(v -> 0) IS DISTINCT FROM 'string' OR v ->> 0 NOT IN ('order', 'event')
+                    OR pg_catalog.jsonb_typeof(v -> 1) IS DISTINCT FROM 'string' OR v ->> 1 = '') IS NOT FALSE)) IS NOT FALSE THEN
     RAISE EXCEPTION 'owner_input_args: 1..100 [kind, key] owners are required';
   END IF;
   b := reporting_private.oi_read_gate(p_batch, p_fence);
@@ -805,14 +814,18 @@ BEGIN
   IF v_kind IN ('pieces', 'page', 'discard_pending') AND h.phase <> 'reading' THEN RAISE EXCEPTION 'owner_input_transition: % needs phase reading', v_kind; END IF;
 
   IF v_kind = 'pieces' THEN
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(p_payload) k) IS DISTINCT FROM ARRAY['kind', 'pieces'] OR pg_catalog.jsonb_array_length(p_payload -> 'pieces') < 1 THEN
+    IF ((SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(p_payload) k) IS DISTINCT FROM ARRAY['kind', 'pieces']
+        OR pg_catalog.jsonb_typeof(p_payload -> 'pieces') IS DISTINCT FROM 'array' OR pg_catalog.jsonb_array_length(p_payload -> 'pieces') < 1) IS NOT FALSE THEN
       RAISE EXCEPTION 'owner_input_invalid: a pieces payload is {kind, pieces[1..]}';
     END IF;
     h := reporting_private.oi_insert_pieces(h, p_payload -> 'pieces');
   ELSIF v_kind = 'page' THEN
-    IF EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(p_payload) k WHERE k NOT IN ('kind', 'pieces', 'steps', 'members_count'))
-       OR pg_catalog.jsonb_typeof(p_payload -> 'steps') <> 'array' OR pg_catalog.jsonb_array_length(p_payload -> 'steps') < 1
-       OR pg_catalog.jsonb_array_length(p_payload -> 'steps') > 1100 THEN
+    IF (EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(p_payload) k WHERE k NOT IN ('kind', 'pieces', 'steps', 'members_count'))
+       OR pg_catalog.jsonb_typeof(p_payload -> 'steps') IS DISTINCT FROM 'array'
+       OR (p_payload ? 'pieces' AND pg_catalog.jsonb_typeof(p_payload -> 'pieces') IS DISTINCT FROM 'array')
+       OR (p_payload ? 'members_count' AND NOT reporting_private.oi_is_int(p_payload -> 'members_count'))
+       OR pg_catalog.jsonb_array_length(p_payload -> 'steps') < 1
+       OR pg_catalog.jsonb_array_length(p_payload -> 'steps') > 1100) IS NOT FALSE THEN
       RAISE EXCEPTION 'owner_input_invalid: a page payload is {kind, pieces?, steps[1..1100], members_count?}';
     END IF;
     IF p_payload ? 'pieces' THEN h := reporting_private.oi_insert_pieces(h, p_payload -> 'pieces'); END IF;
@@ -849,23 +862,23 @@ BEGIN
               SELECT u::text FROM reporting_private.worker_owners o, pg_catalog.unnest(o.old_staff) u
                WHERE o.batch_id = h.batch_id AND o.partition_kind = h.partition_kind AND o.partition_key = h.partition_key) z;
       IF pg_catalog.jsonb_array_length(v_exp) > 1000 THEN RAISE EXCEPTION 'owner_input_invalid: more than 1000 descriptors for one owner'; END IF;
-      IF p_payload -> 'audiences' <> v_exp THEN RAISE EXCEPTION 'owner_input_invalid: the audience list is not the required set'; END IF;
+      IF (p_payload -> 'audiences') IS DISTINCT FROM v_exp THEN RAISE EXCEPTION 'owner_input_invalid: the audience list is not the required set'; END IF;
       h.audiences := v_exp;
       h.phase := 'hashing';
     ELSIF p_payload ? 'audiences' THEN
       RAISE EXCEPTION 'owner_input_invalid: audiences are set only once';
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(p_payload) k WHERE k NOT IN ('kind', 'audiences', 'hashes'))
-       OR pg_catalog.jsonb_typeof(p_payload -> 'hashes') <> 'array' OR pg_catalog.jsonb_array_length(p_payload -> 'hashes') NOT BETWEEN 1 AND 100
-       OR h.hashes_done + pg_catalog.jsonb_array_length(p_payload -> 'hashes') > pg_catalog.jsonb_array_length(h.audiences) THEN
+    IF (EXISTS (SELECT 1 FROM pg_catalog.jsonb_object_keys(p_payload) k WHERE k NOT IN ('kind', 'audiences', 'hashes'))
+       OR pg_catalog.jsonb_typeof(p_payload -> 'hashes') IS DISTINCT FROM 'array' OR pg_catalog.jsonb_array_length(p_payload -> 'hashes') NOT BETWEEN 1 AND 100
+       OR h.hashes_done + pg_catalog.jsonb_array_length(p_payload -> 'hashes') > pg_catalog.jsonb_array_length(h.audiences)) IS NOT FALSE THEN
       RAISE EXCEPTION 'owner_input_invalid: hashes must be the next 1..100 audiences';
     END IF;
     v_i := h.hashes_done;
     FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements(p_payload -> 'hashes') WITH ORDINALITY t(e, i) ORDER BY i LOOP
       v_aud := h.audiences -> v_i;
-      IF pg_catalog.jsonb_typeof(x) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(x) k) IS DISTINCT FROM ARRAY['audienceKind', 'audienceStaff', 'inputHash']
-         OR x -> 'audienceKind' <> v_aud -> 'audienceKind' OR x -> 'audienceStaff' <> v_aud -> 'audienceStaff'
-         OR pg_catalog.jsonb_typeof(x -> 'inputHash') <> 'string' OR (x ->> 'inputHash') !~ '^[0-9a-f]{64}$' THEN
+      IF (pg_catalog.jsonb_typeof(x) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(x) k) IS DISTINCT FROM ARRAY['audienceKind', 'audienceStaff', 'inputHash']
+         OR x -> 'audienceKind' IS DISTINCT FROM v_aud -> 'audienceKind' OR x -> 'audienceStaff' IS DISTINCT FROM v_aud -> 'audienceStaff'
+         OR pg_catalog.jsonb_typeof(x -> 'inputHash') IS DISTINCT FROM 'string' OR (x ->> 'inputHash') !~ '^[0-9a-f]{64}$') IS NOT FALSE THEN
         RAISE EXCEPTION 'owner_input_invalid: hash % is not the next audience', v_i;
       END IF;
       SELECT w.input_hash INTO v_bad FROM reporting_private.partition_work w

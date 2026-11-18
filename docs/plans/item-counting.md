@@ -6008,3 +6008,38 @@ This checkpoint does not accept all of 4a..4c or close Task 15. The existing 4d/
 **May Claude proceed to T15P-4d now? No, not on these committed objects.** Repair all Must-fix items within the already authorised files and pass their focused regressions plus the unchanged common gates before proceeding to 4d. Append repair commit IDs, results and the new draft hash; preserve prior logs and 0037–0045 bytes. Existing offline authority is unchanged and needs no new CJ permission: **no push, no hosted environments or connections, and 0046 remains draft-only**, executable solely in isolated synthetic local tests. No merge, deployment, hosted SQL installation or hosted CI/worker invocation is authorised.
 
 STATUS: COMPLETE
+
+## Coder log — T15P-4 interim review repairs (Must-fix 1–5), 2026-11-19
+
+All five Must-fix items are repaired within the authorised files. Each new regression fails on the reviewed `1108b43` code (9 failing tests when both new test files run against the reviewed 0046 and adapter) and passes after the repair.
+
+1. **Fail-closed JSON gates** (`0046`).
+   - Every rejection condition in `oi_check_shape` is now `(…) IS NOT FALSE`, so a NULL result rejects; the `phase: null` pending line is now refused.
+   - The `pieces`, `page` and `hash` payload checks now require typed fields. `steps` must be an array; `pieces`, if present, an array; `members_count`, if present, an integer; `hashes` an array of 1..100. Hash entries use NULL-safe comparisons, and the audience list uses `IS DISTINCT FROM`.
+   - The lookup owner list requires string kinds and keys.
+   - The assembled-event key set is NULL-safe, and the stream-candidate recheck is `IF v_ok IS NOT TRUE`.
+   - Tests (in `owner-inputs.test.ts`, each asserting the header and every row are unchanged):
+     - `page` payloads with omitted, null, empty or wrong-typed `steps`, both inline and after saved pending pieces;
+     - every `pieces`, `page`, `discard_pending` and `kind` variant;
+     - `hash` with missing, null or wrong-typed `hashes`, entries and audiences;
+     - lookup with a null kind or key.
+     - In `reportingOwnerInputState.test.ts`, the TypeScript/SQL shape parity set gains `phase: null`, a null worker, a null group, a null step and a null `v`. The real kids-to-malformed-phase checkpoint is refused.
+2. **The parent-group query** no longer references the nonexistent `x.event_id`. It requires the cursor event's id to be a frozen parent in the current 500-group. Test: the complete legal sequence (a cancellation member whose parent is missing → parents group 0 → the fetched parent journaled → its ordinal as the cursor) succeeds, reloads and continues to `children` and `done`. Unrelated-event and wrong-group cursors reject atomically.
+3. **Walk and member references.** The cursor-only walk step now requires a committed **non-candidate** of the worker (`owner_input_transition: a stream candidate is consumed only through a pending line`). A non-null member cursor must be a committed event of this journal, so 0, absent ordinals and another handle's ordinals reject. Tests: a same-worker clock-in advances only the cursor; changing `need` on a cursor step rejects; the candidate shortcut rejects; the legitimate pending kids → done → cursor path passes.
+4. **Aggregate pending text bound.** Before each event insert, the sum of pending `text_bytes` plus the new event's must be ≤ 1,048,576.
+   - Test: across calls, a 600,000-byte event, then a multibyte (`é`) event filling exactly 1,048,576 bytes, is accepted and committed. The same event one byte longer is refused with the preceding checkpoint unchanged.
+   - The adapter fixtures are replaced by `admissible()`: two 250,000-backslash events whose source envelope is ≤ 1 MiB but which need 3+ calls once escaped. Discard/takeover and byte-exact multi-page reload are re-proved on them.
+   - The old 2.16 MB fixture is now a negative test.
+5. **Strict reload rows** (`api/_lib/reporting-worker-state.ts`). Every row must carry all loader fields. Continuation pieces must have explicit-null `pieces`, `event_id`, `text_bytes` and `text_sha256`; the lone `eof` row must have every other field explicitly null.
+   - Tests use a fake one-row-per-page client: each forbidden field is set and also omitted, independently, on continuation and eof rows, and every case rejects.
+   - A valid fragmented control passes, with seq `9007199254740993` sent unchanged on every load call.
+   - A wrong digest, truncation and a misplaced eof still fail.
+
+**New 0046 SHA-256: `d658113d49c6fd471bcb4b6c36fceb98c142ce7026f604a565bc32da6ae18267`** (supersedes `098864be…`). Still an offline draft; 0037–0045 are byte-identical.
+
+**Results.**
+- Focused: `owner-inputs` 28/28, `reportingOwnerInputState` 16/16.
+- Strict `tsc` of both test files: 0.
+- Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **79 files, 2336/2336**; `npm run build` 0.
+
+**Should-fix 1 (4b compatibility at group rollover)** follows in its own commit. On the 4b log: early whole-page validation applies to `members` as well as `children`. A malformed trailing member row that the old cap+1 loop never reached now fails the call. That is a stricter failure, never a different successful result.
