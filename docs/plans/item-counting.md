@@ -6324,3 +6324,26 @@ STATUS: COMPLETE
 - **Mutation checks** (confirmed applied, restored with no diff): letting a 17th call through fails in 8 s (`expected 17 to be 16`); not counting member pages fails in 6 s (three member RPCs instead of one).
 - **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2361/2361**; `npm run build` 0.
 - **Remaining for step 1.** 1b, the allowance-bounded shared flush for simultaneous owners (min-waiter allowance, per-page charge to every waiter, discarded prefix, fallback to the owner's own checked reader). The worker does not call `routedOwnerInput` yet; that is step 3.
+
+## Coder log — T15P-4d step 1b: allowance-bounded shared flush, with failed and retried attempts counted (local commit), 2026-11-19
+
+- **`sharedChildren(reader, {maxRows})`** (`production-reporting-materialize.ts`) is a coalesced children view for simultaneous light owners, using one-call `childrenPage` reads in 1,000-parent groups.
+  - **Allowance.** A flush issues at most the **minimum remaining call allowance over its waiters**. Each waiter's `FlushShare` allowance is 0 once any of its triggers is reached.
+  - **Charging.** **Every attempt is charged to every waiter, and the allowance consumed, BEFORE the RPC is sent** (CJ's hardening note, matching `rpcFrozenReader`'s `beforeRead`), so failed and retried shared attempts count.
+  - **Window.** At most `maxRows` rows are kept; the rest of a cut page is discarded, never evidence, and its parent stays unproven. Only parents proven complete are answered; from the first unproven parent, the owner continues with its **own** reader, whose activation check runs before that dependent read.
+  - **Wiring.** `forOwner(own, share)` gives each owner its view. `routedOwnerInput` now passes each owner's `FlushShare` (allowance = 16 − counted calls) and accepts a **caller-supplied watch**, so a whole-owner retry after a transient failure accumulates its earlier attempts instead of restarting them.
+  - `coalescingChildren` is unchanged; the worker does not use `sharedChildren` yet (step 3).
+- **Tests** (`reportingOwnerContinuation.test.ts`, +4):
+  - **Four simultaneous owners** (O-1, OP-1, OP-2, OQ-2) over one shared view: every result equals `buildOwnerInput`; at least one flush has ≥ 2 waiters; every flush's pages ≤ its smallest allowance (≤ 16); no activated owner exceeds 16 counted calls; O-1 activates.
+  - **Tight limits** (`calls: 4`, `maxRows: 2`): flushes are capped at their allowance, prefixes are discarded, results are unchanged, and no owner exceeds 4.
+  - **A failed shared attempt** is charged to both waiting owners: one flush, one page, `[1, 1]`, although it failed.
+  - **An owner retried with the same watch** after its 4th own RPC fails: the failed attempt is counted, and the retry is admitted only the remaining allowance (own plus shared attempts = 16 − the earlier count), activating at exactly 16.
+- **Mutation checks** (confirmed applied, restored with no diff):
+
+  | Mutation | Result |
+  |---|---|
+  | charge after the RPC | 7 s: `[0, 0]` instead of `[1, 1]` |
+  | a fresh watch on retry | 5 s |
+  | allowance cap ignored | 14 s: `expected 2 to be ≤ 0` |
+
+- **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2365/2365**; `npm run build` 0.

@@ -8,7 +8,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
-import { ACTIVATION_LIMITS, buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, reducedBytes, routedOwnerInput, type ActivationLimits, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
+import { ACTIVATION_LIMITS, activationWatch, buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, reducedBytes, routedOwnerInput, sharedChildren, type ActivationLimits, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
 import { checkpointOwnerInput, hashOwnerInput, hashOwnerInputStep, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
 import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
@@ -648,4 +648,111 @@ describe("light-route activation (T15P-4d step 1)", () => {
   it("the default limits are the approved ones", () => {
     expect(ACTIVATION_LIMITS).toEqual({ calls: 16, rows: 1000, bytes: 921_600 });
   });
+});
+
+describe("allowance-bounded shared flush for simultaneous light owners (T15P-4d step 1b)", () => {
+  async function wipe(key: string) {
+    const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key}'`;
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key}'`);
+  }
+  async function together(keys: string[], limits: ActivationLimits = ACTIVATION_LIMITS, maxRows?: number) {
+    for (const k of keys) await wipe(k);
+    const shared = sharedChildren(rpcFrozenReader(c(), ref), { maxRows });
+    const own: Record<string, string[]> = {};
+    const results = await Promise.all(keys.map((key) => {
+      const o: Owner = { partitionKind: "order", partitionKey: key };
+      own[key] = [];
+      const client: RpcClient = { rpc: async (fn, a) => (own[key].push(fn), c().rpc(fn, a)) };
+      return routedOwnerInput((beforeRead, share) => shared.forOwner(rpcFrozenReader(client, ref, { beforeRead }), share), o, async () => {
+        const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+        return { reader: rpcFrozenReader(c(), ref), journal: ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs()), resume: null };
+      }, limits);
+    }));
+    for (let i = 0; i < keys.length; i++) expect(results[i].input, keys[i]).toEqual(await buildOwnerInput(rpcFrozenReader(c(), ref), { partitionKind: "order", partitionKey: keys[i] }));
+    return { results, stats: shared.stats, own };
+  }
+  const KEYS = ["O-1", "OP-1", "OP-2", "OQ-2"];
+
+  it("every flush issues at most its smallest waiter allowance; activated owners never exceed 16 counted calls", async () => {
+    const { results, stats } = await together(KEYS);
+    expect(stats.flushes.length).toBeGreaterThan(0);
+    expect(stats.flushes.some((f) => f.waiters >= 2)).toBe(true); // genuinely shared
+    for (const f of stats.flushes) {
+      expect(f.allowance).toBeLessThanOrEqual(16);
+      expect(f.pages).toBeLessThanOrEqual(Math.max(0, f.allowance));
+    }
+    for (const r of results) if (r.activation) expect(r.activation.counts.calls).toBeLessThanOrEqual(16);
+    expect(results.find((r) => r.input.owner.partitionKey === "O-1")!.route).toBe("durable");
+  }, 300_000);
+
+  it("tight allowances and a small window: flushes are capped, the discarded prefix is not evidence, results are unchanged", async () => {
+    const { results, stats } = await together(KEYS, { calls: 4, rows: 1000, bytes: 921_600 }, 2);
+    for (const f of stats.flushes) expect(f.pages).toBeLessThanOrEqual(Math.max(0, f.allowance));
+    expect(stats.flushes.some((f) => f.allowance <= 0 || f.pages === f.allowance)).toBe(true); // the allowance bound was reached
+    for (const r of results) if (r.activation) expect(r.activation.counts.calls).toBeLessThanOrEqual(4);
+  }, 300_000);
+});
+
+describe("failed and retried attempts count toward activation (step 1b hardening)", () => {
+  it("a failed shared attempt is charged to every waiting owner before it is sent", async () => {
+    let failNext = true;
+    const flaky: RpcClient = {
+      rpc: async (fn, a) => {
+        if (fn === "read_reporting_children" && failNext) {
+          failNext = false;
+          return { data: null, error: { message: "fetch failed" } };
+        }
+        return c().rpc(fn, a);
+      },
+    };
+    const shared = sharedChildren(rpcFrozenReader(flaky, ref));
+    const mk = () => {
+      const s = { calls: 0, allowance: () => 16 - s.calls, charge: () => void s.calls++ };
+      return s;
+    };
+    const a = mk();
+    const b = mk();
+    const drain = async (it: AsyncIterable<Ev>) => {
+      for await (const _ of it) void 0;
+    };
+    const ra = drain(shared.forOwner(rpcFrozenReader(c(), ref), a).children(["o1-a"]));
+    const rb = drain(shared.forOwner(rpcFrozenReader(c(), ref), b).children(["nt-2"]));
+    await expect(ra).rejects.toThrow(/fetch failed/);
+    await expect(rb).rejects.toThrow(/fetch failed/);
+    expect(shared.stats.flushes).toEqual([{ allowance: 16, pages: 1, waiters: 2 }]); // ONE shared attempt, failed
+    expect([a.calls, b.calls]).toEqual([1, 1]); // charged to both waiters although it failed
+  });
+
+  it("an owner retried with the same watch keeps its failed attempts: the retry gets only the remaining allowance", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "O-1" };
+    const sel = "select handle from reporting_private.owner_inputs where partition_key = 'O-1'";
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query("delete from reporting_private.owner_inputs where partition_key = 'O-1'");
+    const durable = async () => {
+      const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+      return { reader: rpcFrozenReader(c(), ref), journal: ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs()), resume: null };
+    };
+    const w = activationWatch(o);
+    let n = 0;
+    const failing4th: RpcClient = { rpc: async (fn, a) => (++n === 4 ? { data: null, error: { message: "fetch failed" } } : c().rpc(fn, a)) };
+    const shared1 = sharedChildren(rpcFrozenReader(c(), ref));
+    await expect(routedOwnerInput((beforeRead, share) => shared1.forOwner(rpcFrozenReader(failing4th, ref, { beforeRead }), share), o, durable, ACTIVATION_LIMITS, w)).rejects.toThrow(/fetch failed/);
+    const sharedPages1 = shared1.stats.flushes.reduce((x, f) => x + f.pages, 0);
+    expect(n).toBe(4); // the failed 4th attempt was the last one
+    expect(w.calls).toBe(4 + sharedPages1); // own attempts (the failed one included) plus charged shared attempts
+    expect(w.calls).toBeLessThan(16);
+    const before = w.calls;
+    let m = 0;
+    const counting: RpcClient = { rpc: async (fn, a) => (m++, c().rpc(fn, a)) };
+    const shared2 = sharedChildren(rpcFrozenReader(c(), ref));
+    const r = await routedOwnerInput((beforeRead, share) => shared2.forOwner(rpcFrozenReader(counting, ref, { beforeRead }), share), o, durable, ACTIVATION_LIMITS, w);
+    expect(r.activation?.trigger).toBe("calls");
+    expect(r.activation?.counts.calls).toBe(16);
+    const sharedPages2 = shared2.stats.flushes.reduce((x, f) => x + f.pages, 0);
+    expect(m + sharedPages2).toBe(16 - before); // only the remaining allowance on the retry
+    expect(r.input).toEqual(await buildOwnerInput(rpcFrozenReader(c(), ref), o));
+  }, 120_000);
 });

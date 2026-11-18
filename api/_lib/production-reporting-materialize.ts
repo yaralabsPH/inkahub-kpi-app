@@ -28,7 +28,7 @@ import { productionDateAt, type ReportSite } from "../../src/lib/domain/producti
 import { canonicalJson, REPORTING_RULE_VERSION, sha256Hex, type FrozenPartitionInput, type PartitionResult, type ReportingAudience } from "../../src/lib/domain/productionReporting.js";
 import { projectReportingPartition } from "../../src/lib/domain/productionReportingProjection.js";
 import { compareUtf8, type ResultRows, type WorkDescriptor } from "./reporting-stage.js";
-import type { FrozenReaderPages } from "./production-reporting-reader.js";
+import type { ChildrenAfter, FrozenReaderPages } from "./production-reporting-reader.js";
 import type { OwnerStepState, WalkLineState, WalkNeed } from "./reporting-worker-state.js";
 
 type Ev = ProductionEvidenceEvent;
@@ -1423,13 +1423,18 @@ export function activationWatch(owner: Owner, limits: ActivationLimits = ACTIVAT
  * the journal.
  */
 export async function routedOwnerInput(
-  lightReader: (beforeRead: () => Promise<void>) => FrozenReader & { pages: FrozenReaderPages },
+  /** The owner's own light reader (its activation check on every RPC); `share` is its allowance for a shared flush. */
+  lightReader: (beforeRead: () => Promise<void>, share: FlushShare) => FrozenReader & { pages: FrozenReaderPages },
   owner: Owner,
   durable: () => Promise<{ reader: FrozenReader & { pages: FrozenReaderPages }; journal: OwnerJournal; resume: OwnerJournalSnapshot | null }>,
   limits: ActivationLimits = ACTIVATION_LIMITS,
+  /** Pass the SAME watch when retrying the owner after a transient failure: attempts accumulate across retries. */
+  watch: ReturnType<typeof activationWatch> = activationWatch(owner, limits),
 ): Promise<{ input: OwnerInput; route: "light" | "durable"; activation: OwnerActivation | null; light: { calls: number; rows: number; bytes: number } }> {
-  const w = activationWatch(owner, limits);
-  const reader = lightReader(() => w.beforeRead());
+  const w = watch;
+  // a shared flush may issue at most this owner's remaining call allowance (0 once any trigger is reached)
+  const share: FlushShare = { allowance: () => (w.trigger() ? 0 : limits.calls - w.calls), charge: () => void w.calls++ };
+  const reader = lightReader(() => w.beforeRead(), share);
   try {
     const members: Ev[] = [];
     let after: { index: number; id: string | null } | null = null;
@@ -1451,4 +1456,119 @@ export async function routedOwnerInput(
     const input = await durableOwnerInput(d.reader, owner, d.journal, d.resume);
     return { input, route: "durable", activation: e, light: e.counts };
   }
+}
+
+/** A light owner's share of a coalesced flush (r6 approval D): its remaining call allowance, and the per-page charge. */
+export interface FlushShare { allowance(): number; charge(): void }
+
+/**
+ * T15P-4d step 1b: an allowance-bounded shared children view for SIMULTANEOUS light owners. A flush serves every
+ * pending request with one-call `childrenPage` reads (groups of 1,000 parents), issues at most min over its waiters of
+ * their remaining allowance attempts, charges each attempt to EVERY waiter BEFORE it is sent (allowance accounting,
+ * not physical attribution; failed and retried attempts count)
+ * and keeps at most `maxRows` rows (anything beyond is discarded uncharged as evidence). Only parents proven complete
+ * inside the window are answered; from the first unproven parent on, each owner continues with its OWN reader, whose
+ * per-RPC activation check then runs before that dependent read.
+ */
+export function sharedChildren(reader: FrozenReader & { pages: FrozenReaderPages }, opts: { maxRows?: number } = {}) {
+  const maxRows = Math.max(1, Math.min(opts.maxRows ?? 1000, 1000));
+  type Waiter = { share: FlushShare; resolve: (kids: Ev[] | null) => void; reject: (e: unknown) => void };
+  let pending: Map<string, Waiter[]> | null = null;
+  const stats = { flushes: [] as Array<{ allowance: number; pages: number; waiters: number }> };
+  const flush = async (batch: Map<string, Waiter[]>) => {
+    const ids = [...batch.keys()].sort(compareUtf8);
+    const waiters = [...new Set([...batch.values()].flat().map((w) => w.share))];
+    let allowance = Math.min(...waiters.map((s) => s.allowance()));
+    const rec = { allowance, pages: 0, waiters: waiters.length };
+    stats.flushes.push(rec);
+    const got = new Map<string, Ev[]>(ids.map((id) => [id, []]));
+    let complete = true;
+    let last: string | null = null;
+    let n = 0;
+    try {
+      outer: for (let g = 0; g < ids.length; g += 1000) {
+        const group = ids.slice(g, g + 1000);
+        let after: ChildrenAfter | null = null;
+        for (;;) {
+          if (allowance <= 0 || n >= maxRows) {
+            complete = false;
+            break outer;
+          }
+          // charged BEFORE the attempt (rpcFrozenReader's beforeRead semantics): a failed or retried shared
+          // attempt consumes every waiter's allowance exactly like a successful one
+          allowance--;
+          rec.pages++;
+          for (const s of waiters) s.charge();
+          const page = await reader.pages.childrenPage(group, after);
+          if (page.empty) break;
+          for (const k of page.rows) {
+            if (n >= maxRows) {
+              complete = false; // the rest of this page is discarded (never evidence); its parent stays unproven
+              break outer;
+            }
+            got.get(k.parent_event_id!)!.push(k);
+            last = k.parent_event_id;
+            n++;
+          }
+          after = page.next;
+        }
+      }
+    } catch (e) {
+      for (const ws of batch.values()) for (const w of ws) w.reject(e);
+      return;
+    }
+    for (const id of ids) {
+      const proven = complete || (last !== null && compareUtf8(id, last) < 0);
+      for (const w of batch.get(id)!) w.resolve(proven ? got.get(id)! : null);
+    }
+  };
+  const soon: (f: () => void) => void = typeof setImmediate === "function" ? (f) => void setImmediate(f) : (f) => void setTimeout(f, 0);
+  let inflight = false;
+  let scheduled = false;
+  const kick = () => {
+    if (inflight || scheduled || !pending) return;
+    scheduled = true;
+    soon(() => {
+      scheduled = false;
+      const batch = pending;
+      if (!batch) return;
+      pending = null;
+      inflight = true;
+      void flush(batch).finally(() => {
+        inflight = false;
+        kick();
+      });
+    });
+  };
+  const request = (id: string, share: FlushShare) =>
+    new Promise<Ev[] | null>((resolve, reject) => {
+      const batch = pending ?? (pending = new Map<string, Waiter[]>());
+      (batch.get(id) ?? batch.set(id, []).get(id)!).push({ share, resolve, reject });
+      kick();
+    });
+  return {
+    stats,
+    /** One owner's view: its own reader for everything else, the shared window for children, its own reader as fallback. */
+    forOwner(own: FrozenReader & { pages: FrozenReaderPages }, share: FlushShare): FrozenReader & { pages: FrozenReaderPages } {
+      return {
+        ...own,
+        pages: own.pages,
+        children(parentIds) {
+          const ids = [...new Set(parentIds)].sort(compareUtf8);
+          if (!ids.length) return own.children(ids);
+          return (async function* () {
+            const lists = await Promise.all(ids.map((id) => request(id, share)));
+            for (let i = 0; i < ids.length; i++) {
+              const kids = lists[i];
+              if (!kids) {
+                yield* own.children(ids.slice(i));
+                return;
+              }
+              yield* kids;
+            }
+          })();
+        },
+      };
+    },
+  };
 }
