@@ -6428,3 +6428,20 @@ STATUS: COMPLETE
   - The first cut-page attempt did not apply (a multi-line argument without `\n` markers). It was redone and confirmed before counting.
 - **Results.** Continuation 26/26 (≈112 s). Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2380/2380**; `npm run build` 0. 0046 unchanged (`4641d7cd…`).
 - **Remaining 4d.** Step 3, wiring the seams into `runReportingCycle`'s `plan()`/`stage()`, awaits the planner's scope decision on `tests/api/reporting-worker.test.ts` (asked in `docs/reviews/item-counting-t15p4-scope.md`). Then 4e.
+
+## Coder log — T15P-4d scope-review repairs: Must-fix 1, 2 and the safe-diagnostics part of 3 (local commit), 2026-11-19
+
+Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) says **YES** to a narrow `tests/api/reporting-worker.test.ts` fake-RPC update within step 3. Its Must-fix items are addressed as follows.
+
+1. **Transient version failures stay transient** (`requireOwnerInputProtocol`). `isTransient` errors are re-thrown unchanged, keeping their code (for example `40001`), for the existing bounded retry/Deferred path. Only a non-transient failure or another version is `owner_input_unsupported`, and its message no longer embeds the raw error.
+   - Tests (`reportingOwnerContinuation.test.ts`): a code-only `40001` error stays transient with its code; `fetch failed` is `transient`; the missing and version-2 controls are retained.
+   - The `runReportingCycle` retry/deferral and no-acquire assertions belong to the step-3 API tests.
+2. **The heartbeat phase in current-invocation admission.** `withRenewals(workMs, sinceBeatMs)` brings the first renewal forward by the time elapsed since the last heartbeat. `sinceBeatMs` is validated finite, non-negative and below the interval (a due renewal is taken first). `admitDurableUnit(..., sinceBeatMs)` uses it only for the current invocation; the fresh path still starts at a beat.
+   - Tests (`reportingOwnerInputState.test.ts`, +3): 29,500 ms after a beat, a two-RPC unit needs 5,000 ms (pending at 4,000, run at 5,000). A renewal whose own cost crosses the next boundary is charged twice. A fixed-point invariant holds over several phases. NaN, negative and full-interval phases are refused.
+   - The `runReportingCycle` 29,500 ms case belongs to the step-3 API tests.
+3. **Stable failure kinds and key-free diagnostics** (partial). `failureKind` returns the exact `owner_input_unsupported`, `owner_input_too_heavy`, `owner_input_capacity` and `owner_input_purpose` codes. The heavy and purpose errors now carry only the owner **kind** and counts, never the raw order/event key.
+   - Test: `CUSTOMER-ORDER-123` and an event key are absent from every message, and the kinds are exact and non-transient.
+   - **Still open in 3:** the early no-run-record path for a missing/unsupported protocol, and the run-argument/`problems` assertions. Both need the main-loop wiring.
+- **Mutation checks** (confirmed applied, restored with no diff): dropping the phase from renewals fails in 3 s (`expected 4000 to be 5000`); relabelling transient errors as unsupported fails in 6 s.
+- **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2384/2384**; `npm run build` 0.
+- **Still open from the scope review.** The rest of Must-fix 3 (with the wiring); Must-fix 4 (a direct complete multi-line 0045 atomic/crash proof); Should-fix 1 (recovery returns the reloaded input; next); Should-fix 2 (the independent oracle, in 4e).

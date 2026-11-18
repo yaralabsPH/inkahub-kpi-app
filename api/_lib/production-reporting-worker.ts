@@ -91,8 +91,11 @@ export function isTransient(e: unknown): boolean {
   return /fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|network error|\b50[234]\b|statement timeout|could not serialize|deadlock detected/i.test(m);
 }
 /** A short, stable failure kind for the run log and metadata. */
+const OWNER_INPUT_KINDS = new Set(["owner_input_unsupported", "owner_input_too_heavy", "owner_input_capacity", "owner_input_purpose"]);
 export function failureKind(e: unknown): string {
   if (e instanceof PartitionTooLargeError) return "partition_too_large";
+  const ownerCode = (e as { code?: unknown } | null)?.code;
+  if (typeof ownerCode === "string" && OWNER_INPUT_KINDS.has(ownerCode)) return ownerCode;
   const m = e instanceof Error ? e.message : String(e);
   if (/partition_too_large/i.test(m)) return "partition_too_large";
   if (/no continuous published base|a rebuild is required/i.test(m)) return "rebuild_required";
@@ -491,12 +494,15 @@ const legMs = (c: AdmissionCost, what: string) => {
   return admissionRpcs(c.rpcs, `${what}.rpcs`) * ADMISSION_RPC_MS + admissionMs(c.cpuMs, `${what}.cpuMs`);
 };
 /** Elapsed time including every due lease renewal (each one RPC), to a fixed point, plus the run-record reserve. */
-export function withRenewals(workMs: number): number {
+export function withRenewals(workMs: number, sinceBeatMs = 0): number {
   admissionMs(workMs, "workMs");
+  admissionMs(sinceBeatMs, "sinceBeatMs");
+  if (sinceBeatMs >= HEARTBEAT_MS) throw new ReportingJobError("admission sinceBeatMs must be below the heartbeat interval (a due renewal is taken first)");
   let renewals = 0;
   for (;;) {
     const total = workMs + renewals * ADMISSION_RPC_MS;
-    const due = Math.floor(total / HEARTBEAT_MS);
+    // renewals fall due HEARTBEAT_MS after the last one: the phase already elapsed brings the first one forward
+    const due = Math.floor((sinceBeatMs + total) / HEARTBEAT_MS);
     if (due === renewals) return total + ADMISSION_RESERVE_MS;
     renewals = due;
   }
@@ -507,7 +513,7 @@ export type AdmissionVerdict = { verdict: "run" } | { verdict: "pending"; freshM
  * uninterrupted invocation could not reach the boundary; `pending` (the owner is parked first for the next invocation)
  * when it fits fresh but not the time left now; otherwise `run`. Every cost counts once.
  */
-export function admitDurableUnit(path: AdmissionPath, remainingMs: number, budgetMs = WORKER_BUDGET_MS): AdmissionVerdict {
+export function admitDurableUnit(path: AdmissionPath, remainingMs: number, budgetMs = WORKER_BUDGET_MS, sinceBeatMs = 0): AdmissionVerdict {
   admissionMs(remainingMs, "remainingMs");
   admissionMs(budgetMs, "budgetMs");
   if (budgetMs <= ADMISSION_RESERVE_MS) throw new ReportingJobError("admission budgetMs must leave a usable budget after the run-record reserve");
@@ -516,7 +522,8 @@ export function admitDurableUnit(path: AdmissionPath, remainingMs: number, budge
   const unit = legMs(path.unit, "unit");
   const freshMs = withRenewals(pre + unit);
   if (freshMs > budgetMs) return { verdict: "capacity", freshMs };
-  const nowMs = withRenewals((path.prerequisitesPaid ? 0 : pre) + unit);
+  // the CURRENT invocation: the time already elapsed since its last heartbeat counts (the fresh path starts at a beat)
+  const nowMs = withRenewals((path.prerequisitesPaid ? 0 : pre) + unit, sinceBeatMs);
   if (nowMs > remainingMs) return { verdict: "pending", freshMs, nowMs };
   return { verdict: "run" };
 }
@@ -540,7 +547,10 @@ export async function requireOwnerInputProtocol(client: RpcClient): Promise<void
   try {
     v = await ownerInputVersion(client);
   } catch (e) {
-    throw new OwnerInputUnsupportedError(`reporting_owner_input_version is unavailable (${e instanceof Error ? e.message : String(e)})`);
+    // a temporarily unavailable database is NOT an unsupported protocol: transient errors keep their code for the
+    // existing bounded retry / Deferred path; only a missing function or a malformed answer is unsupported
+    if (isTransient(e)) throw e;
+    throw new OwnerInputUnsupportedError("reporting_owner_input_version is unavailable");
   }
   if (v !== OWNER_INPUT_VERSION) throw new OwnerInputUnsupportedError(`protocol version ${v}, this worker speaks ${OWNER_INPUT_VERSION}`);
 }
@@ -548,7 +558,8 @@ export async function requireOwnerInputProtocol(client: RpcClient): Promise<void
 /** A journal that proved too heavy to reload: visible failure, evidence retained, publication blocked. */
 export class OwnerInputTooHeavyError extends ReportingJobError {
   constructor(owner: Owner, calls: number) {
-    super(`owner_input_too_heavy: ${owner.partitionKind}:${owner.partitionKey} needs ${calls} reload calls (max 120)`, "owner_input_too_heavy");
+    // diagnostics carry only the owner KIND and counts, never the raw order/event key
+    super(`owner_input_too_heavy: an ${owner.partitionKind} owner needs ${calls} reload calls (max 120)`, "owner_input_too_heavy");
   }
 }
 export const MAX_RELOAD_CALLS = 120;
@@ -561,7 +572,7 @@ export const purposeCompatible = (found: "plan" | "stage", wanted: "plan" | "sta
 /** An existing journal whose purpose the request may not use (a stage journal for a plan request). */
 export class OwnerInputPurposeError extends ReportingJobError {
   constructor(owner: Owner, found: string, wanted: string) {
-    super(`owner_input_purpose: ${owner.partitionKind}:${owner.partitionKey} is a ${found} journal, not ${wanted}`, "owner_input_purpose");
+    super(`owner_input_purpose: an ${owner.partitionKind} owner has a ${found} journal, not ${wanted}`, "owner_input_purpose");
   }
 }
 

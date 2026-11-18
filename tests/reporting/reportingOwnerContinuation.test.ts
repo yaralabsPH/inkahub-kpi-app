@@ -10,7 +10,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { ACTIVATION_LIMITS, activationWatch, buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, reducedBytes, routedOwnerInput, sharedChildren, type ActivationLimits, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
-import { OwnerInputPurposeError, OwnerInputTooHeavyError, OwnerInputUnsupportedError, recoverOwnerJournal, requireOwnerInputProtocol } from "../../api/_lib/production-reporting-worker";
+import { failureKind, isTransient, OwnerInputPurposeError, OwnerInputTooHeavyError, OwnerInputUnsupportedError, recoverOwnerJournal, requireOwnerInputProtocol } from "../../api/_lib/production-reporting-worker";
 import { checkpointOwnerInput, hashOwnerInput, hashOwnerInputStep, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
 import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
 import { exactInstant } from "../../src/lib/domain/productionCounts";
@@ -807,7 +807,7 @@ describe("worker seams over the journal (T15P-4d step 3a)", () => {
     const calls: string[] = [];
     const rec: RpcClient = { rpc: async (fn, a) => (calls.push(fn), c().rpc(fn, a)) };
     await expect(recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toBeInstanceOf(OwnerInputPurposeError);
-    await expect(recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toThrow(/owner_input_purpose: order:OQ-5 is a stage journal, not plan/);
+    await expect(recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toThrow(/owner_input_purpose: an order owner has a stage journal, not plan/);
     expect(calls).toEqual(["lookup_reporting_owner_inputs", "lookup_reporting_owner_inputs"]);
     // a stage request still recovers the (now stage) journal
     expect((await recoverOwnerJournal(c(), ref.batchId, ref.fence, o, SITE, "stage")).header).toMatchObject({ purpose: "stage", eventCount: 1 });
@@ -824,9 +824,28 @@ describe("worker seams over the journal (T15P-4d step 3a)", () => {
       },
     };
     const before = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, (await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan")).handle);
-    await expect(recoverOwnerJournal(forged, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toThrow(/owner_input_purpose: order:OQ-5 is a stage journal, not plan/);
+    await expect(recoverOwnerJournal(forged, ref.batchId, ref.fence, o, SITE, "plan")).rejects.toThrow(/owner_input_purpose: an order owner has a stage journal, not plan/);
     const after = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, (await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan")).handle);
     expect(after).toEqual(before); // nothing was written
+  });
+
+  it("a transient version failure stays transient (code-only and message-only); diagnostics and failure kinds are stable and key-free", async () => {
+    const codeOnly: RpcClient = { rpc: async (fn, a) => (fn === "reporting_owner_input_version" ? { data: null, error: { message: "retry this transaction", code: "40001" } } : c().rpc(fn, a)) };
+    const e1 = await requireOwnerInputProtocol(codeOnly).then(() => null, (e: unknown) => e);
+    expect(e1).not.toBeInstanceOf(OwnerInputUnsupportedError);
+    expect(isTransient(e1)).toBe(true);
+    expect(failureKind(e1)).toBe("transient");
+    expect((e1 as { code?: string }).code).toBe("40001");
+    const network: RpcClient = { rpc: async (fn, a) => (fn === "reporting_owner_input_version" ? { data: null, error: { message: "fetch failed" } } : c().rpc(fn, a)) };
+    expect(failureKind(await requireOwnerInputProtocol(network).then(() => null, (e: unknown) => e))).toBe("transient");
+    // stable kinds for the owner-input failures, and no raw owner key in any diagnostic
+    const secretOrder: Owner = { partitionKind: "order", partitionKey: "CUSTOMER-ORDER-123" };
+    const secretEvent: Owner = { partitionKind: "event", partitionKey: "evt-9f8e7d" };
+    const errors = [new OwnerInputTooHeavyError(secretOrder, 121), new OwnerInputTooHeavyError(secretEvent, 130), new OwnerInputPurposeError(secretOrder, "stage", "plan"), new OwnerInputUnsupportedError("protocol version 2")];
+    expect(errors.map(failureKind)).toEqual(["owner_input_too_heavy", "owner_input_too_heavy", "owner_input_purpose", "owner_input_unsupported"]);
+    expect(failureKind(Object.assign(new Error("x"), { code: "owner_input_capacity" }))).toBe("owner_input_capacity");
+    for (const e of errors) expect(e.message).not.toMatch(/CUSTOMER-ORDER-123|evt-9f8e7d/);
+    expect(errors.every((e) => !isTransient(e))).toBe(true);
   });
 
   it("a heavy journal fails fast after lookup, before any reload or discard", async () => {

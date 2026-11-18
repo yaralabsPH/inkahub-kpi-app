@@ -450,6 +450,29 @@ describe("admission inputs are validated at runtime (NaN, Infinity, negative, fr
   });
 });
 
+describe("current-invocation admission counts the time since the last heartbeat (Astra scope review Must-fix 2)", () => {
+  it("29,500 ms after a beat a two-RPC unit needs a renewal: 5,000 ms, not 4,000", () => {
+    const unit = path(FIXED, 0, 2, 0, true);
+    expect(withRenewals(2_000, 29_500)).toBe(2_000 + ADMISSION_RPC_MS + ADMISSION_RESERVE_MS);
+    expect(admitDurableUnit(unit, 4_000, WORKER_BUDGET_MS, 29_500).verdict).toBe("pending"); // park before starting it
+    expect(admitDurableUnit(unit, 5_000, WORKER_BUDGET_MS, 29_500).verdict).toBe("run");
+    expect(admitDurableUnit(unit, 4_000, WORKER_BUDGET_MS, 0).verdict).toBe("run"); // just after a beat no renewal is due
+  });
+  it("a renewal whose own cost crosses the next boundary is charged too (once each)", () => {
+    // 29,500 ms elapsed + 30,000 ms work: one renewal falls due; its 1,000 ms pushes past the second boundary as well
+    expect(withRenewals(30_000, 29_500)).toBe(30_000 + 2 * ADMISSION_RPC_MS + ADMISSION_RESERVE_MS);
+    for (const [w, since] of [[0, 29_999], [1_000, 29_000], [59_000, 1_000], [100_000, 15_000]] as const) {
+      const t = withRenewals(w, since) - ADMISSION_RESERVE_MS;
+      expect((t - w) / ADMISSION_RPC_MS, `${w}/${since}`).toBe(Math.floor((since + t) / HEARTBEAT_MS));
+    }
+  });
+  it("the elapsed phase is validated: NaN, negative, or a full interval (a due renewal is taken first) are refused", () => {
+    for (const v of [Number.NaN, -1, Number.POSITIVE_INFINITY]) expect(() => withRenewals(1_000, v), String(v)).toThrow(/sinceBeatMs must be a finite non-negative number/);
+    expect(() => withRenewals(1_000, HEARTBEAT_MS)).toThrow(/below the heartbeat interval/);
+    expect(() => admitDurableUnit(path(FIXED, 0, 1, 0), WORKER_BUDGET_MS, WORKER_BUDGET_MS, Number.NaN)).toThrow(/sinceBeatMs/);
+  });
+});
+
 describe("the bounded per-audience seam", () => {
   const ev = (id: string, staff: string | null) => ({ id, location: "au", staff_id: staff, department: "framed", order_number: "O-1", line_sku: "INKA-KAN0566-A4-FB", line_quantity: 1, event_type: "line_verified", created_at: "2026-10-01T00:00:00.000000Z", parent_event_id: null, cs_case_id: null });
   const A = "00000001-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
