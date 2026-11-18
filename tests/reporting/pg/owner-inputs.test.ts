@@ -238,6 +238,8 @@ describe("pages, graph and replay (one owner, one member, no parents, no childre
   it("hashing requires the exact audience set, then the next hashes in order, then the journal is immutable", async () => {
     const aud = [{ audienceKind: "site", audienceStaff: null }, { audienceKind: "self", audienceStaff: W }];
     await expect(cp(h, seq, { kind: "hash", audiences: [aud[0]], hashes: [{ ...aud[0], inputHash: "a".repeat(64) }] })).rejects.toThrow(/required set/);
+    await expect(cp(h, seq, { kind: "hash", audiences: aud, hashes: [{}] })).rejects.toThrow(/owner_input_invalid/); // an empty hash entry
+    await expect(cp(h, seq, { kind: "page", steps: [{ v: 1, step: "walk", w: {} }] })).rejects.toThrow(/owner_input_invalid: bad walk state/); // an empty state body
     const r = await cp(h, seq, { kind: "hash", audiences: aud, hashes: [{ ...aud[0], inputHash: "a".repeat(64) }] });
     expect(r.seq).toBe("5");
     await expect(cp(h, "5", { kind: "hash", hashes: [{ ...aud[0], inputHash: "b".repeat(64) }] })).rejects.toThrow(/not the next audience/);
@@ -289,6 +291,8 @@ describe("pieces, pending pages, discard, snapshot loads", () => {
     await expect(cp(h, "0", { kind: "pieces", pieces: tiny })).rejects.toThrow(/owner_input_invalid/); // second piece too long, or first not maximal
     await expect(cp(h, "0", { kind: "pieces", pieces: entries([ev("g1")], 2) })).rejects.toThrow(/not contiguous/);
     await expect(cp(h, "0", { kind: "pieces", pieces: [[1, 0, "x", { event_id: "y" }]] })).rejects.toThrow(/bad event metadata/);
+    // an EMPTY metadata object must be rejected too (a NULL key-set comparison once let it through)
+    await expect(cp(h, "0", { kind: "pieces", pieces: [[1, 0, "x", {}]] })).rejects.toThrow(/bad event metadata/);
     const forged = entries([ev("oi-f", { order_number: "   " })], 1, () => true);
     await expect(cp(h, "0", { kind: "page", pieces: forged, steps: [S.members(1)] })).rejects.toThrow(/cannot be a stream candidate/);
     const nbsp = entries([ev("oi-f2", { staff_id: "  " })], 1, () => true);

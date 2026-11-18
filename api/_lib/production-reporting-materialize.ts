@@ -353,6 +353,14 @@ function streamLine(e: Ev, cutoffUs: bigint): StreamLine | null {
   return { ev: e, us, workType: cls.workType };
 }
 
+/**
+ * T15P-4 condition 2: the owner-input journal's `stream_candidate` flag, computed by the UNCHANGED stream rule
+ * against the batch's frozen cutoff (microseconds). The SQL side only re-checks it independently; this is authoritative.
+ */
+export function isStreamCandidate(e: Ev, cutoffUs: bigint): boolean {
+  return streamLine(e, cutoffUs) !== null;
+}
+
 /** Site-effectiveness of ONE stream line, decided by the shared projector over the line and its own cancellations. */
 function siteEffective(reader: FrozenReader, l: StreamLine, kids: readonly Ev[]): boolean {
   const r = projectReportingPartition({ site: reader.site, audience: { kind: "site" }, ruleVersion: REPORTING_RULE_VERSION, sourceCutoffUtc: reader.cutoff, events: [l.ev, ...kids.filter((k) => k.id !== l.ev.id)] });

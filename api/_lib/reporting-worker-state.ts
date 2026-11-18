@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { ReportingJobError, type RpcClient } from "./reporting-jobs.js";
 import { compareUtf8, descriptorProblem, manifestLine, type WorkDescriptor } from "./reporting-stage.js";
 import { parseKeyProgress, type KeyCheckpoint, type KeyProgress, type Owner } from "./production-reporting-materialize.js";
+import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_ROWS = 1000;
@@ -29,6 +30,10 @@ const int = (v: unknown, what: string): number => {
   const n = typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v;
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) throw new ReportingJobError(`${what} is not a non-negative integer`);
   return n;
+};
+const str = (v: unknown, what: string): string => {
+  if (typeof v !== "string") throw new ReportingJobError(`${what} must be text`);
+  return v;
 };
 const bool = (v: unknown, what: string): boolean => {
   if (typeof v !== "boolean") throw new ReportingJobError(`${what} is not a boolean`);
@@ -227,4 +232,355 @@ export async function readWalkLine(client: RpcClient, batchId: string, fence: nu
   const out = await rows(client, "read_reporting_walk_line", { ...batchArgs(batchId, fence), p_key: keyId, p_seed: seed, p_line: line }, false);
   if (out.length > 1) throw new ReportingJobError("read_reporting_walk_line returned more than one line");
   return out.length ? out[0].image : null;
+}
+
+// ---------------------------------------------------------------------------
+// T15P-4c: the 0046 owner-input journal (service-only; offline draft)
+// ---------------------------------------------------------------------------
+
+/** The journal protocol version this code speaks (`reporting_owner_input_version`). */
+export const OWNER_INPUT_VERSION = 1;
+/** The one piece rule (r5 §2): a piece's own JSON string literal (quotes and escapes included) is at most this many bytes. */
+export const PIECE_LITERAL_BYTES = 196_608;
+/** Request bodies are packed to at most this many UTF-8 bytes of JSON (r6 R6 "the request fit"). */
+export const REQUEST_BODY_BYTES = 1_048_576 - 512;
+/** The reduced event's text: exactly these keys, in this order (r5 §2). */
+export const EVENT_TEXT_KEYS = ["id", "location", "staff_id", "department", "order_number", "line_sku", "line_quantity", "event_type", "created_at", "parent_event_id", "cs_case_id"] as const;
+
+const MAX_BIGINT = 9223372036854775807n;
+/** Decimal text in lo..2^63-1, never converted to a Number (seq: lo 0; handles: lo 1). */
+function decimalText(v: unknown, lo: 0 | 1, what: string): string {
+  if (typeof v !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(v)) throw new ReportingJobError(`${what} must be decimal text`);
+  const n = BigInt(v);
+  if (n < BigInt(lo) || n > MAX_BIGINT) throw new ReportingJobError(`${what} is out of range`);
+  return v;
+}
+export const parseSeq = (v: unknown, what = "seq"): string => decimalText(v, 0, what);
+export const parseHandle = (v: unknown, what = "handle"): string => decimalText(v, 1, what);
+const nextSeq = (seq: string): string => (BigInt(seq) + 1n).toString();
+
+const utf8 = (s: string): number => Buffer.byteLength(s, "utf8");
+const sha256 = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
+const literalBytes = (s: string): number => utf8(JSON.stringify(s));
+
+/** The canonical reduced-event text the journal stores (and the server reassembles and parses). */
+export function eventText(e: ProductionEvidenceEvent): string {
+  return JSON.stringify(Object.fromEntries(EVENT_TEXT_KEYS.map((k) => [k, e[k]])));
+}
+
+/** Split by code points into MAXIMAL pieces whose escaped literal is <= PIECE_LITERAL_BYTES (linear). */
+export function splitPieces(text: string): string[] {
+  if (!text) throw new ReportingJobError("an event text cannot be empty");
+  const out: string[] = [];
+  let cur: string[] = [];
+  let len = 2;
+  for (const ch of text) {
+    const w = literalBytes(ch) - 2;
+    if (cur.length && len + w > PIECE_LITERAL_BYTES) {
+      out.push(cur.join(""));
+      cur = [ch];
+      len = 2 + w;
+    } else {
+      cur.push(ch);
+      len += w;
+    }
+  }
+  out.push(cur.join(""));
+  return out;
+}
+
+export interface PieceMeta { event_id: string; pieces: number; text_bytes: number; text_sha256: string; src_at: string; stream_candidate: boolean }
+/** `[ord, piece_no, piece]` for a continuation, `[ord, 0, piece, meta]` for an event's first piece. */
+export type PieceEntry = [number, number, string] | [number, 0, string, PieceMeta];
+
+/** Entries for `events` taking ordinals from `fromOrd`; `candidate` is the adapter-authoritative stream flag. */
+export function eventEntries(events: readonly ProductionEvidenceEvent[], fromOrd: number, candidate: (e: ProductionEvidenceEvent) => boolean): PieceEntry[] {
+  if (!Number.isInteger(fromOrd) || fromOrd < 1) throw new ReportingJobError("ordinals start at 1");
+  const out: PieceEntry[] = [];
+  events.forEach((e, i) => {
+    const t = eventText(e);
+    const ps = splitPieces(t);
+    const flag = candidate(e);
+    if (typeof flag !== "boolean") throw new ReportingJobError("stream_candidate must be a boolean");
+    ps.forEach((p, n) => {
+      if (n === 0) out.push([fromOrd + i, 0, p, { event_id: e.id, pieces: ps.length, text_bytes: utf8(t), text_sha256: sha256(t), src_at: e.created_at, stream_candidate: flag }]);
+      else out.push([fromOrd + i, n, p]);
+    });
+  });
+  return out;
+}
+
+/**
+ * Greedy packing of entries into request bodies: each group, inside `{"kind":…,"pieces":[…]…}` with `fixedBytes`
+ * of other fields, stays within REQUEST_BODY_BYTES. Order is preserved; every entry fits an empty body (r6 R6).
+ */
+export function packEntries(entries: readonly PieceEntry[], fixedBytes: number): PieceEntry[][] {
+  const groups: PieceEntry[][] = [];
+  let cur: PieceEntry[] = [];
+  let size = fixedBytes;
+  for (const e of entries) {
+    const b = utf8(JSON.stringify(e));
+    if (fixedBytes + b > REQUEST_BODY_BYTES) throw new ReportingJobError("a piece entry does not fit one request");
+    if (cur.length && size + 1 + b > REQUEST_BODY_BYTES) {
+      groups.push(cur);
+      cur = [];
+      size = fixedBytes;
+    }
+    size += (cur.length ? 1 : 0) + b;
+    cur.push(e);
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+
+const owners2 = (o: Owner): [string, string] => [o.partitionKind, o.partitionKey];
+const nint = (v: unknown, what: string): number | null => (v === null || v === undefined ? null : int(v, what));
+const purposeOf = (v: unknown): "plan" | "stage" => {
+  if (v !== "plan" && v !== "stage") throw new ReportingJobError("owner input purpose must be plan or stage");
+  return v;
+};
+const phaseOf = (v: unknown): "reading" | "hashing" | "complete" => {
+  if (v !== "reading" && v !== "hashing" && v !== "complete") throw new ReportingJobError("owner input phase is unknown");
+  return v;
+};
+
+export async function ownerInputVersion(client: RpcClient): Promise<number> {
+  const [r] = await rows(client, "reporting_owner_input_version", {}, true);
+  return int(r.version, "version");
+}
+
+export interface OwnerInputHandle { handle: string; created: boolean; phase: "reading" | "hashing" | "complete"; seq: string; reloadCalls: number; provisionalReloadCalls: number; heavyProven: boolean; pendingEvents: number }
+export async function openOwnerInput(client: RpcClient, batchId: string, fence: number, owner: Owner, purpose: "plan" | "stage"): Promise<OwnerInputHandle> {
+  const [r] = await rows(client, "open_reporting_owner_input", { ...batchArgs(batchId, fence), p_kind: owner.partitionKind, p_key: owner.partitionKey, p_purpose: purposeOf(purpose) }, true);
+  return {
+    handle: parseHandle(r.handle), created: bool(r.created, "created"), phase: phaseOf(r.phase), seq: parseSeq(r.seq), reloadCalls: int(r.reload_calls, "reload_calls"),
+    provisionalReloadCalls: int(r.provisional_reload_calls, "provisional_reload_calls"), heavyProven: bool(r.heavy_proven, "heavy_proven"), pendingEvents: int(r.pending_events, "pending_events"),
+  };
+}
+
+export interface OwnerInputLookup { handle: string; phase: "reading" | "hashing" | "complete"; seq: string; purpose: "plan" | "stage"; reloadCalls: number; provisionalReloadCalls: number; heavyProven: boolean; pendingEvents: number }
+/** One row per requested owner (1..100), in request order; `journal` is null when none exists. */
+export async function lookupOwnerInputs(client: RpcClient, batchId: string, fence: number, owners: readonly Owner[]): Promise<Array<{ journal: OwnerInputLookup | null; oldStaffCount: number }>> {
+  if (owners.length < 1 || owners.length > 100) throw new ReportingJobError("a lookup needs 1..100 owners");
+  const out = await rows(client, "lookup_reporting_owner_inputs", { ...batchArgs(batchId, fence), p_owners: owners.map(owners2) }, false);
+  if (out.length !== owners.length) throw new ReportingJobError(`lookup_reporting_owner_inputs returned ${out.length} rows for ${owners.length} owners`);
+  return out.map((r, i) => {
+    if (r.idx !== i) throw new ReportingJobError("lookup_reporting_owner_inputs is not in request order");
+    const journal: OwnerInputLookup | null = r.handle === null ? null : {
+      handle: parseHandle(r.handle), phase: phaseOf(r.phase), seq: parseSeq(r.seq), purpose: purposeOf(r.purpose), reloadCalls: int(r.reload_calls, "reload_calls"),
+      provisionalReloadCalls: int(r.provisional_reload_calls, "provisional_reload_calls"), heavyProven: bool(r.heavy_proven, "heavy_proven"), pendingEvents: int(r.pending_events, "pending_events"),
+    };
+    return { journal, oldStaffCount: int(r.old_staff_count, "old_staff_count") };
+  });
+}
+
+/** One page (<= `limit`) of an owner's saved old staff, ascending; an empty page is the end. */
+export async function readOwnerOldStaff(client: RpcClient, batchId: string, fence: number, owner: Owner, after: string | null, limit = MAX_ROWS): Promise<string[]> {
+  if (after !== null && !UUID.test(after)) throw new ReportingJobError("old-staff cursor must be a uuid");
+  const out = await rows(client, "read_reporting_owner_old_staff", { ...batchArgs(batchId, fence), p_kind: owner.partitionKind, p_key: owner.partitionKey, p_after: after, p_limit: limit }, false);
+  let prev = after;
+  return out.map((r) => {
+    const s = str(r.staff, "staff");
+    if (!UUID.test(s)) throw new ReportingJobError("old staff must be a uuid");
+    if (prev !== null && s <= prev) throw new ReportingJobError("read_reporting_owner_old_staff is not ascending");
+    prev = s;
+    return s;
+  });
+}
+
+export interface OwnerInputHeader {
+  phase: "reading" | "hashing" | "complete"; purpose: "plan" | "stage"; seq: string; state: unknown; membersCount: number | null; eventCount: number;
+  pendingEvents: number; pendingPieces: number; audiences: unknown; hashesDone: number; inputHashes: unknown; reloadCalls: number; provisionalReloadCalls: number; heavyProven: boolean;
+}
+export async function loadOwnerInputHeader(client: RpcClient, batchId: string, fence: number, handle: string): Promise<OwnerInputHeader> {
+  const [r] = await rows(client, "load_reporting_owner_input_header", { ...batchArgs(batchId, fence), p_handle: parseHandle(handle) }, true);
+  return {
+    phase: phaseOf(r.phase), purpose: purposeOf(r.purpose), seq: parseSeq(r.seq), state: r.state, membersCount: nint(r.members_count, "members_count"), eventCount: int(r.event_count, "event_count"),
+    pendingEvents: int(r.pending_events, "pending_events"), pendingPieces: int(r.pending_pieces, "pending_pieces"), audiences: r.audiences ?? null, hashesDone: int(r.hashes_done, "hashes_done"),
+    inputHashes: r.input_hashes, reloadCalls: int(r.reload_calls, "reload_calls"), provisionalReloadCalls: int(r.provisional_reload_calls, "provisional_reload_calls"), heavyProven: bool(r.heavy_proven, "heavy_proven"),
+  };
+}
+
+export interface CheckpointResult { seq: string; eventCount: number; pendingEvents: number; pendingPieces: number; reloadCalls: number; provisionalReloadCalls: number; heavy: boolean; replay: boolean }
+export type OwnerInputPayload =
+  | { kind: "pieces"; pieces: PieceEntry[] }
+  | { kind: "page"; pieces: PieceEntry[]; steps: unknown[]; members_count?: number }
+  | { kind: "discard_pending" }
+  | { kind: "hash"; audiences?: unknown[]; hashes: unknown[] };
+/** One fenced checkpoint; an identical retry of a lost response returns `replay: true` with the same result. */
+export async function checkpointOwnerInput(client: RpcClient, batchId: string, fence: number, handle: string, expectedSeq: string, payload: OwnerInputPayload): Promise<CheckpointResult> {
+  const [r] = await rows(client, "checkpoint_reporting_owner_input", { ...batchArgs(batchId, fence), p_handle: parseHandle(handle), p_expected_seq: parseSeq(expectedSeq, "expected seq"), p_payload: payload }, true);
+  const out: CheckpointResult = {
+    seq: parseSeq(r.seq), eventCount: int(r.event_count, "event_count"), pendingEvents: int(r.pending_events, "pending_events"), pendingPieces: int(r.pending_pieces, "pending_pieces"),
+    reloadCalls: int(r.reload_calls, "reload_calls"), provisionalReloadCalls: int(r.provisional_reload_calls, "provisional_reload_calls"), heavy: bool(r.heavy, "heavy"), replay: bool(r.replay, "replay"),
+  };
+  if (out.seq !== nextSeq(expectedSeq)) throw new ReportingJobError(`checkpoint_reporting_owner_input moved seq ${expectedSeq} to ${out.seq}, expected ${nextSeq(expectedSeq)}`);
+  return out;
+}
+
+/**
+ * One durable page: the consumed events' entries plus the step states. Sent inline in ONE `page` call when the body
+ * fits; otherwise as `pieces` calls (pending) and then one `page` call with no pieces. Each call moves seq by one.
+ * `heavy` stops the page at the call that proved it (its pieces stay as evidence; r5 §3).
+ */
+export async function writeOwnerPage(
+  client: RpcClient, batchId: string, fence: number, handle: string, seq: string,
+  entries: readonly PieceEntry[], steps: readonly unknown[], membersCount?: number,
+): Promise<{ result: CheckpointResult; calls: number }> {
+  if (!steps.length) throw new ReportingJobError("a page needs at least one step");
+  const tail: Record<string, unknown> = { kind: "page", pieces: [], steps, ...(membersCount === undefined ? {} : { members_count: membersCount }) };
+  const fixed = utf8(JSON.stringify(tail));
+  const page = (pieces: PieceEntry[]): OwnerInputPayload => ({ kind: "page", pieces, steps: [...steps], ...(membersCount === undefined ? {} : { members_count: membersCount }) });
+  const inline = packEntries(entries, fixed);
+  if (inline.length <= 1) return { result: await checkpointOwnerInput(client, batchId, fence, handle, seq, page(inline[0] ?? [])), calls: 1 };
+  let s = seq;
+  let calls = 0;
+  for (const g of packEntries(entries, utf8(JSON.stringify({ kind: "pieces", pieces: [] })))) {
+    const r = await checkpointOwnerInput(client, batchId, fence, handle, s, { kind: "pieces", pieces: g });
+    calls++;
+    s = r.seq;
+    if (r.heavy) return { result: r, calls };
+  }
+  return { result: await checkpointOwnerInput(client, batchId, fence, handle, s, page([])), calls: calls + 1 };
+}
+
+export interface JournalEvent { ord: number; ev: ProductionEvidenceEvent }
+/** Parse ONE reassembled journal text back to the exact evidence event (11 keys, id/location binding). */
+export function parseEventText(text: string, site: string, eventId: string): ProductionEvidenceEvent {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    throw new ReportingJobError(`journal event ${JSON.stringify(eventId)} is not JSON`);
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new ReportingJobError("a journal event must be an object");
+  const o = v as Record<string, unknown>;
+  const keys = Object.keys(o);
+  if (keys.length !== EVENT_TEXT_KEYS.length || EVENT_TEXT_KEYS.some((k, i) => keys[i] !== k)) throw new ReportingJobError(`journal event ${JSON.stringify(eventId)} does not have exactly the 11 keys in order`);
+  if (o.id !== eventId || o.location !== site) throw new ReportingJobError(`journal event ${JSON.stringify(eventId)} is not bound to its id and site`);
+  const ev = Object.fromEntries(EVENT_TEXT_KEYS.map((k) => [k, o[k]])) as unknown as ProductionEvidenceEvent;
+  if (eventText(ev) !== text) throw new ReportingJobError(`journal event ${JSON.stringify(eventId)} is not canonical`);
+  return ev;
+}
+
+/**
+ * Snapshot-pinned reconstruction (r5 §3): the header's `seq` is pinned on every page; pieces must be contiguous
+ * `(ord, piece_no)`, piece 0 carries the metadata, the read ends with a lone `eof` row, the event count equals the
+ * header's, and the number of calls (header + pages + eof) equals `reload_calls`. Each event is reassembled and
+ * verified (bytes, sha-256, canonical 11-key text) before it is returned, in ordinal order.
+ */
+export async function reloadOwnerInput(client: RpcClient, batchId: string, fence: number, handle: string, site: string): Promise<{ header: OwnerInputHeader; events: JournalEvent[]; calls: number }> {
+  const header = await loadOwnerInputHeader(client, batchId, fence, handle);
+  let calls = 1;
+  const events: JournalEvent[] = [];
+  let after: [number, number] = [0, -1];
+  let cur: { ord: number; meta: { pieces: number; eventId: string; textBytes: number; sha: string }; parts: string[] } | null = null;
+  const finish = () => {
+    if (!cur) return;
+    if (cur.parts.length !== cur.meta.pieces) throw new ReportingJobError(`journal event ${cur.ord} is missing pieces`);
+    const text = cur.parts.join("");
+    if (utf8(text) !== cur.meta.textBytes || sha256(text) !== cur.meta.sha) throw new ReportingJobError(`journal event ${cur.ord} does not match its length/digest`);
+    events.push({ ord: cur.ord, ev: parseEventText(text, site, cur.meta.eventId) });
+    cur = null;
+  };
+  for (;;) {
+    if (calls > 200) throw new ReportingJobError("an owner-input reload exceeded 200 calls");
+    const page = await rows(client, "load_reporting_owner_input_events", { ...batchArgs(batchId, fence), p_handle: parseHandle(handle), p_seq: header.seq, p_after_ord: after[0], p_after_piece: after[1] }, false);
+    calls++;
+    if (page.length === 1 && page[0].eof === true) {
+      if (page[0].ord !== null || page[0].piece !== null) throw new ReportingJobError("the eof row carries data");
+      break;
+    }
+    if (!page.length) throw new ReportingJobError("load_reporting_owner_input_events returned no rows (not even eof)");
+    for (const r of page) {
+      if (r.eof !== false) throw new ReportingJobError("a misplaced eof row");
+      const ord = int(r.ord, "ord");
+      const no = int(r.piece_no, "piece_no");
+      const piece = str(r.piece, "piece");
+      if (no === 0) {
+        if (ord !== after[0] + 1 || (cur && cur.parts.length !== cur.meta.pieces)) throw new ReportingJobError(`journal pieces are not contiguous at ${ord}/0`);
+        finish();
+        cur = { ord, meta: { pieces: int(r.pieces, "pieces"), eventId: str(r.event_id, "event_id"), textBytes: int(r.text_bytes, "text_bytes"), sha: str(r.text_sha256, "text_sha256") }, parts: [piece] };
+      } else {
+        if (!cur || ord !== cur.ord || no !== cur.parts.length || r.pieces !== null || r.event_id !== null) throw new ReportingJobError(`journal pieces are not contiguous at ${ord}/${no}`);
+        cur.parts.push(piece);
+      }
+      after = [ord, no];
+    }
+  }
+  finish();
+  if (events.length !== header.eventCount) throw new ReportingJobError(`the journal has ${events.length} committed events, its header says ${header.eventCount}`);
+  if (calls !== header.reloadCalls) throw new ReportingJobError(`the reload took ${calls} calls, the header accounted ${header.reloadCalls}`);
+  return { header, events, calls };
+}
+
+/** Published-journal cleanup for one site (bounded); `more` means call again. */
+export async function releaseOwnerInputs(client: RpcClient, site: string, limit = 5000): Promise<{ deleted: number; more: boolean }> {
+  const [r] = await rows(client, "release_reporting_owner_inputs", { p_site: site, p_limit: limit }, true);
+  return { deleted: int(r.deleted, "deleted"), more: bool(r.more, "more") };
+}
+
+/** One page of staged chunk hashes for sealed work ids (decimal text), in (work, chunk) order. */
+export async function readStagedChunks(client: RpcClient, batchId: string, fence: number, workIds: readonly string[], after: { work: string; chunk: number } | null, limit = MAX_ROWS): Promise<Array<{ workId: string; chunkNo: number; chunkHash: string }>> {
+  if (!workIds.length) throw new ReportingJobError("staged chunks need work ids");
+  const out = await rows(client, "read_reporting_staged_chunks", {
+    ...batchArgs(batchId, fence), p_work_ids: workIds.map((w) => parseHandle(w, "work id")), p_after_work: after ? parseHandle(after.work, "work id") : null, p_after_chunk: after?.chunk ?? null, p_limit: limit,
+  }, false);
+  return out.map((r) => ({ workId: parseHandle(r.work_id, "work id"), chunkNo: int(r.chunk_no, "chunk_no"), chunkHash: str(r.chunk_hash, "chunk_hash") }));
+}
+
+/** The persisted step state of one owner's durable read (r6 R5); exactly the shapes `oi_check_shape` accepts. */
+export type WalkNeed = "*" | "a0_framed" | "framed" | "unframed" | "dispatch";
+export interface WalkLineState { ord: number; afterKidOrd: number | null; phase: "kids" | "done"; effective: boolean | null }
+export type OwnerStepState =
+  | { v: 1; step: "members"; m: { afterOrd: number | null } }
+  | { v: 1; step: "parents"; p: { group: number; afterOrd: number | null } }
+  | { v: 1; step: "children"; c: { group: number; afterOrd: number | null } }
+  | { v: 1; step: "walk"; w: { worker: number; cursorOrd: number | null; stopAt: string | null; need: WalkNeed[]; line: WalkLineState | null } }
+  | { v: 1; step: "done" };
+const NEEDS: readonly string[] = ["*", "a0_framed", "framed", "unframed", "dispatch"];
+const stateInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 999_999_999;
+const keysAre = (o: unknown, keys: readonly string[]): o is Record<string, unknown> =>
+  !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
+const optInt = (v: unknown) => v === null || stateInt(v);
+
+/** Parse a stored state exactly as the server validates it (reject, never repair). */
+export function parseOwnerState(v: unknown): OwnerStepState {
+  const bad = (what: string): never => {
+    throw new ReportingJobError(`owner input state: ${what}`);
+  };
+  if (!v || typeof v !== "object" || Array.isArray(v) || (v as Record<string, unknown>).v !== 1) return bad("must be an object with v 1");
+  const s = v as Record<string, unknown>;
+  switch (s.step) {
+    case "members":
+      if (!keysAre(s, ["v", "step", "m"]) || !keysAre(s.m, ["afterOrd"]) || !optInt(s.m.afterOrd)) return bad("bad members state");
+      return { v: 1, step: "members", m: { afterOrd: s.m.afterOrd as number | null } };
+    case "parents":
+    case "children": {
+      const k = s.step === "parents" ? "p" : "c";
+      const o = s[k];
+      if (!keysAre(s, ["v", "step", k]) || !keysAre(o, ["group", "afterOrd"]) || !stateInt(o.group) || !optInt(o.afterOrd)) return bad(`bad ${s.step} state`);
+      const body = { group: o.group as number, afterOrd: o.afterOrd as number | null };
+      return s.step === "parents" ? { v: 1, step: "parents", p: body } : { v: 1, step: "children", c: body };
+    }
+    case "walk": {
+      const w = s.w;
+      if (!keysAre(s, ["v", "step", "w"]) || !keysAre(w, ["worker", "cursorOrd", "stopAt", "need", "line"]) || !stateInt(w.worker) || !optInt(w.cursorOrd)) return bad("bad walk state");
+      if (!(w.stopAt === null || (typeof w.stopAt === "string" && /^-?[0-9]{1,20}$/.test(w.stopAt)))) return bad("bad walk stopAt");
+      if (!Array.isArray(w.need) || w.need.some((x) => typeof x !== "string" || !NEEDS.includes(x))) return bad("bad walk need");
+      let line: WalkLineState | null = null;
+      if (w.line !== null) {
+        const l = w.line;
+        if (!keysAre(l, ["ord", "afterKidOrd", "phase", "effective"]) || !stateInt(l.ord) || !optInt(l.afterKidOrd)) return bad("bad pending line");
+        if (!((l.phase === "kids" && l.effective === null) || (l.phase === "done" && typeof l.effective === "boolean"))) return bad("bad pending line phase");
+        line = { ord: l.ord as number, afterKidOrd: l.afterKidOrd as number | null, phase: l.phase, effective: l.effective as boolean | null };
+      }
+      return { v: 1, step: "walk", w: { worker: w.worker as number, cursorOrd: w.cursorOrd as number | null, stopAt: w.stopAt as string | null, need: [...(w.need as WalkNeed[])], line } };
+    }
+    case "done":
+      if (!keysAre(s, ["v", "step"])) return bad("bad done state");
+      return { v: 1, step: "done" };
+    default:
+      return bad(`unknown step ${JSON.stringify(String(s.step)).slice(0, 30)}`);
+  }
 }

@@ -309,20 +309,20 @@ BEGIN
   st := s ->> 'step';
   IF st = 'members' THEN
     o := s -> 'm';
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) <> ARRAY['m', 'step', 'v']
-       OR pg_catalog.jsonb_typeof(o) <> 'object' OR (SELECT pg_catalog.array_agg(k) FROM pg_catalog.jsonb_object_keys(o) k) <> ARRAY['afterOrd']
+    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['m', 'step', 'v']
+       OR pg_catalog.jsonb_typeof(o) <> 'object' OR (SELECT pg_catalog.array_agg(k) FROM pg_catalog.jsonb_object_keys(o) k) IS DISTINCT FROM ARRAY['afterOrd']
        OR NOT (o -> 'afterOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'afterOrd')) THEN RAISE EXCEPTION 'owner_input_invalid: bad members state'; END IF;
   ELSIF st IN ('parents', 'children') THEN
     o := s -> CASE st WHEN 'parents' THEN 'p' ELSE 'c' END;
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) <> ARRAY[CASE st WHEN 'parents' THEN 'p' ELSE 'c' END, 'step', 'v']
-       OR pg_catalog.jsonb_typeof(o) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(o) k) <> ARRAY['afterOrd', 'group']
+    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY[CASE st WHEN 'parents' THEN 'p' ELSE 'c' END, 'step', 'v']
+       OR pg_catalog.jsonb_typeof(o) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(o) k) IS DISTINCT FROM ARRAY['afterOrd', 'group']
        OR NOT reporting_private.oi_is_int(o -> 'group')
        OR NOT (o -> 'afterOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'afterOrd')) THEN RAISE EXCEPTION 'owner_input_invalid: bad % state', st; END IF;
   ELSIF st = 'walk' THEN
     o := s -> 'w';
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) <> ARRAY['step', 'v', 'w']
+    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['step', 'v', 'w']
        OR pg_catalog.jsonb_typeof(o) <> 'object'
-       OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(o) k) <> ARRAY['cursorOrd', 'line', 'need', 'stopAt', 'worker']
+       OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(o) k) IS DISTINCT FROM ARRAY['cursorOrd', 'line', 'need', 'stopAt', 'worker']
        OR NOT reporting_private.oi_is_int(o -> 'worker')
        OR NOT (o -> 'cursorOrd' = 'null'::jsonb OR reporting_private.oi_is_int(o -> 'cursorOrd'))
        OR NOT (o -> 'stopAt' = 'null'::jsonb OR (pg_catalog.jsonb_typeof(o -> 'stopAt') = 'string' AND (o ->> 'stopAt') ~ '^-?[0-9]{1,20}$'))
@@ -332,7 +332,7 @@ BEGIN
     END IF;
     l := o -> 'line';
     IF l <> 'null'::jsonb THEN
-      IF pg_catalog.jsonb_typeof(l) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(l) k) <> ARRAY['afterKidOrd', 'effective', 'ord', 'phase']
+      IF pg_catalog.jsonb_typeof(l) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(l) k) IS DISTINCT FROM ARRAY['afterKidOrd', 'effective', 'ord', 'phase']
          OR NOT reporting_private.oi_is_int(l -> 'ord')
          OR NOT (l -> 'afterKidOrd' = 'null'::jsonb OR reporting_private.oi_is_int(l -> 'afterKidOrd'))
          OR NOT ((l ->> 'phase' = 'kids' AND l -> 'effective' = 'null'::jsonb) OR (l ->> 'phase' = 'done' AND pg_catalog.jsonb_typeof(l -> 'effective') = 'boolean')) THEN
@@ -340,7 +340,7 @@ BEGIN
       END IF;
     END IF;
   ELSIF st = 'done' THEN
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) <> ARRAY['step', 'v'] THEN RAISE EXCEPTION 'owner_input_invalid: bad done state'; END IF;
+    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(s) k) IS DISTINCT FROM ARRAY['step', 'v'] THEN RAISE EXCEPTION 'owner_input_invalid: bad done state'; END IF;
   ELSE
     RAISE EXCEPTION 'owner_input_invalid: unknown step %', pg_catalog.left(coalesce(st, '(null)'), 20);
   END IF;
@@ -517,7 +517,7 @@ BEGIN
       IF pg_catalog.jsonb_array_length(x) <> 4 THEN RAISE EXCEPTION 'owner_input_invalid: the first piece carries the event metadata'; END IF;
       m := x -> 3;
       IF pg_catalog.jsonb_typeof(m) <> 'object'
-         OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(m) k) <> ARRAY['event_id', 'pieces', 'src_at', 'stream_candidate', 'text_bytes', 'text_sha256']
+         OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(m) k) IS DISTINCT FROM ARRAY['event_id', 'pieces', 'src_at', 'stream_candidate', 'text_bytes', 'text_sha256']
          OR pg_catalog.jsonb_typeof(m -> 'event_id') <> 'string' OR (m ->> 'event_id') = ''
          OR NOT reporting_private.oi_is_int(m -> 'pieces') OR (m ->> 'pieces')::integer NOT BETWEEN 1 AND 33
          OR NOT reporting_private.oi_is_int(m -> 'text_bytes') OR (m ->> 'text_bytes')::integer NOT BETWEEN 1 AND 1048576
@@ -805,7 +805,7 @@ BEGIN
   IF v_kind IN ('pieces', 'page', 'discard_pending') AND h.phase <> 'reading' THEN RAISE EXCEPTION 'owner_input_transition: % needs phase reading', v_kind; END IF;
 
   IF v_kind = 'pieces' THEN
-    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(p_payload) k) <> ARRAY['kind', 'pieces'] OR pg_catalog.jsonb_array_length(p_payload -> 'pieces') < 1 THEN
+    IF (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(p_payload) k) IS DISTINCT FROM ARRAY['kind', 'pieces'] OR pg_catalog.jsonb_array_length(p_payload -> 'pieces') < 1 THEN
       RAISE EXCEPTION 'owner_input_invalid: a pieces payload is {kind, pieces[1..]}';
     END IF;
     h := reporting_private.oi_insert_pieces(h, p_payload -> 'pieces');
@@ -863,7 +863,7 @@ BEGIN
     v_i := h.hashes_done;
     FOR x IN SELECT e FROM pg_catalog.jsonb_array_elements(p_payload -> 'hashes') WITH ORDINALITY t(e, i) ORDER BY i LOOP
       v_aud := h.audiences -> v_i;
-      IF pg_catalog.jsonb_typeof(x) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(x) k) <> ARRAY['audienceKind', 'audienceStaff', 'inputHash']
+      IF pg_catalog.jsonb_typeof(x) <> 'object' OR (SELECT pg_catalog.array_agg(k ORDER BY k) FROM pg_catalog.jsonb_object_keys(x) k) IS DISTINCT FROM ARRAY['audienceKind', 'audienceStaff', 'inputHash']
          OR x -> 'audienceKind' <> v_aud -> 'audienceKind' OR x -> 'audienceStaff' <> v_aud -> 'audienceStaff'
          OR pg_catalog.jsonb_typeof(x -> 'inputHash') <> 'string' OR (x ->> 'inputHash') !~ '^[0-9a-f]{64}$' THEN
         RAISE EXCEPTION 'owner_input_invalid: hash % is not the next audience', v_i;

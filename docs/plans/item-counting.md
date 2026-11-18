@@ -5917,3 +5917,33 @@ STATUS: COMPLETE
   - `npm run test -- --run`: **78 files, 2315/2315**.
   - `npm run build`: 0.
 - **Not fixed (pre-existing).** A strict standalone `tsc` of `reportingPageGuard.test.ts` reports one error at line 293 (a fake client's `code: null` vs `RpcClient`). It is identical at HEAD and the file is not in any type-check gate; out of scope.
+
+## Coder log — T15P-4c owner state and journal adapters (local commit), 2026-11-19
+
+- **Adapters** (`api/_lib/reporting-worker-state.ts`, appended; existing wrappers unchanged):
+  - **Constants.** `OWNER_INPUT_VERSION = 1`, `PIECE_LITERAL_BYTES = 196,608`, `REQUEST_BODY_BYTES = 1 MiB − 512`, and the 11 `EVENT_TEXT_KEYS`.
+  - **Wire types.** `parseSeq`/`parseHandle` keep decimal text in 0|1..2^63−1, never a Number.
+  - **Text and pieces.** `eventText` (the canonical reduced text) and a linear `splitPieces` (maximal by code point).
+  - **`eventEntries`**: piece-zero metadata carries bytes, SHA-256, `src_at` and the adapter-authoritative boolean `stream_candidate`.
+  - **`packEntries`**: greedy, order-preserving, within the request bound.
+  - **Typed RPC wrappers**: `ownerInputVersion`, `openOwnerInput`, `lookupOwnerInputs` (request order checked), `readOwnerOldStaff` (ascending), `loadOwnerInputHeader`, `checkpointOwnerInput` (seq must move by exactly one), `releaseOwnerInputs`, `readStagedChunks`.
+  - **`writeOwnerPage`**: one inline `page` call when it fits; otherwise pending `pieces` calls, then one `page`, stopping at a `heavy` result.
+  - **`parseEventText`**: canonical 11 keys in order, id/site bound, canonical re-serialization.
+  - **`reloadOwnerInput`**: snapshot-pinned seq; contiguous `(ord, piece_no)`; piece-0 metadata only; lone `eof`; per-event bytes and SHA-256 checks; event count = header; calls = `reload_calls`.
+  - **`parseOwnerState`**: the typed step union, exactly the `oi_check_shape` shapes.
+- **Materializer.** `api/_lib/production-reporting-materialize.ts` gains only `isStreamCandidate(e, cutoffUs) = streamLine(e, cutoffUs) !== null` (condition 2); the classifier is unchanged.
+- **0046 draft fix found by the new parity test.**
+  - Eleven key-set checks compared `array_agg(...) <> ARRAY[...]`. For an empty object the aggregate is NULL, so the rejection was NULL and the input was accepted.
+  - Old-draft evidence, all three now fail on the committed 0046 and pass on the fix: `{"v":1,"step":"members","m":{}}` passed the shape check; empty piece metadata `{}` reached a NOT NULL insert error instead of `bad event metadata`; and an empty hash entry `{}` was **accepted and advanced the journal to seq 5**.
+  - All eleven are now `IS DISTINCT FROM`. New regressions live in `tests/reporting/pg/owner-inputs.test.ts` (empty metadata, empty hash entry, empty walk body).
+  - **New 0046 SHA-256: `098864be2050f9d70862f1d73b239f0ec589fe2dfb12b2046dfbcaf451d4bfe7`** (supersedes `0a294af7…`). Still an offline draft; 0037–0045 byte-identical.
+- **Tests** (`tests/reporting/reportingOwnerInputState.test.ts`, new, 12):
+  - **Pure:** piece-rule maximality, bounds and surrogate safety on the r4 400,221-backslash text, control characters, 4-byte emoji and the exact P edges; entry metadata; packing bound and order; decimal text above 2^53 and the range edges; canonical parse rejections.
+  - **PGlite, real 0046:** version, idempotent open, lookup order, old-staff paging; an inline page, then its identical lost-response replay and a stale writer's conflict, then a byte-exact reload whose calls = `reload_calls`; a multi-call pending page reloaded byte-exactly over several load pages; takeover between pending calls (header adoption → `discard_pending` → rewrite); tamper detection (digest, event count); `parseOwnerState` vs `oi_check_shape` agreement on 9 valid and 18 invalid states; a stale-seq snapshot refusal.
+  - **Deliberate break:** a non-maximal split (`>=`) fails the pure maximality test and is rejected by the server on three PGlite page writes.
+- **Results.** Focused 35/35 (owner-inputs + adapters). Strict `tsc` of both test files: 0. Gate:
+  - `npx tsc -b`: 0.
+  - `npm run typecheck:digest`: 0.
+  - `npm run test -- --run`: **79 files, 2327/2327**.
+  - `npm run build`: 0.
+- **Not yet.** The durable owner step machine (`buildOwnerInput` over `pages` with journaled pages and resume), activation and admission belong to T15P-4d; the integrated acceptance to T15P-4e. Nothing is pushed; no hosted system was used.
