@@ -8,9 +8,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
-import { buildOwnerInput, durableOwnerInput, ownerKey, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
+import { buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
-import { checkpointOwnerInput, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
+import { checkpointOwnerInput, hashOwnerInput, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
 import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
 import { exactInstant } from "../../src/lib/domain/productionCounts";
 import { reportingDb } from "./pg/harness";
@@ -122,7 +122,7 @@ beforeAll(async () => {
   owners = [...keys, "EMPTY"].map((k) => ({ partitionKind: "order" as const, partitionKey: k }));
   const sorted = [...owners].sort((x, y) => (ownerKey(x) < ownerKey(y) ? -1 : 1));
   const last: ["order", string] = ["order", sorted.at(-1)!.partitionKey];
-  await saveEnumeration(c(), ref.batchId, ref.fence, null, { kind: "rebuild", after: last }, sorted.map((o) => ({ owner: o, oldStaff: [] })), false);
+  await saveEnumeration(c(), ref.batchId, ref.fence, null, { kind: "rebuild", after: last }, sorted.map((o) => ({ owner: o, oldStaff: o.partitionKey === "OP-1" ? [W3] : [] })), false);
   await saveEnumeration(c(), ref.batchId, ref.fence, { kind: "rebuild", after: last }, { kind: "rebuild", after: last, end: true }, [], true);
   await db.query("update reporting_private.batches set lease_expires_at = now() + interval '1 hour' where batch_id = $1", [ref.batchId]);
 }, 180_000);
@@ -392,4 +392,50 @@ describe("a malformed source page never becomes durable (review r2 Must-fix 3, d
     const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, h.handle, SITE);
     expect(await durableOwnerInput(rpcFrozenReader(c(), ref), o, ownerJournal(c(), ref.batchId, ref.fence, h.handle, back.header.seq, cutoffUs()), ownerJournalSnapshot(back))).toEqual(want);
   }, 120_000);
+});
+
+describe("durable works and the hash checkpoint (T15P-4d part 2)", () => {
+  it("a done journal resumes with no source read; its works equal materializeOwnerWorks; hashing completes the journal with exactly those hashes", async () => {
+    for (const o of owners) {
+      const old = await readOwnerOldStaff(c(), ref.batchId, ref.fence, o, null);
+      const want = await materializeOwnerWorks(rpcFrozenReader(c(), ref), o, old);
+      const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+      const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, h.handle, SITE);
+      const snap = ownerJournalSnapshot(back);
+      expect(snap.state, o.partitionKey).toEqual({ v: 1, step: "done" });
+      const reads = recording(c());
+      const input = await durableOwnerInput(rpcFrozenReader(reads.client, ref), o, { commit: async () => { throw new Error("a done journal must not commit"); } }, snap);
+      expect(reads.calls, `${o.partitionKey}: a done journal reads nothing`).toEqual([]);
+      const works = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, input, old);
+      expect(works, o.partitionKey).toEqual(want);
+      const hashes = works.map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
+      const r = await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, back.header.seq, hashes);
+      expect(r.calls).toBe(Math.ceil(hashes.length / 100));
+      const head = await loadOwnerInputHeader(c(), ref.batchId, ref.fence, h.handle);
+      expect(head).toMatchObject({ phase: "complete", hashesDone: hashes.length });
+      expect(head.inputHashes).toEqual(hashes);
+      // a lost final response: the identical final call replays; anything else is refused (the journal is immutable)
+      const last = await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, back.header.seq, hashes);
+      expect(last.result).toMatchObject({ replay: true, seq: r.result.seq });
+    }
+    // the old-staff audience (not a member's staff) is part of the required set
+    const op1 = owners.find((o) => o.partitionKey === "OP-1")!;
+    expect((await materializeOwnerWorks(rpcFrozenReader(c(), ref), op1, [W3])).some((w) => w.desc.audienceStaff === W3)).toBe(true);
+  }, 300_000);
+
+  it("the server refuses a hash set that is not the exact required audience list", async () => {
+    const o = owners.find((x) => x.partitionKey === "OQ-1")!;
+    // a fresh journal for this owner on a scratch handle: delete and redo its read
+    await db.query("delete from reporting_private.owner_input_pieces where handle in (select handle from reporting_private.owner_inputs where partition_key = 'OQ-1')");
+    await db.query("delete from reporting_private.owner_input_events where handle in (select handle from reporting_private.owner_inputs where partition_key = 'OQ-1')");
+    await db.query("delete from reporting_private.owner_inputs where partition_key = 'OQ-1'");
+    const { handle, journal } = await freshJournal(o);
+    const input = await durableOwnerInput(rpcFrozenReader(c(), ref), o, journal);
+    const works = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, input, []);
+    const hashes = works.map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
+    const seq = (await loadOwnerInputHeader(c(), ref.batchId, ref.fence, handle)).seq;
+    await expect(hashOwnerInput(c(), ref.batchId, ref.fence, handle, seq, [...hashes, { audienceKind: "self", audienceStaff: W3, inputHash: "c".repeat(64) }])).rejects.toThrow(/required set/);
+    await expect(hashOwnerInput(c(), ref.batchId, ref.fence, handle, seq, [{ audienceKind: "self", audienceStaff: W1, inputHash: "c".repeat(64) }])).rejects.toThrow(/first audience is the site/);
+    expect((await hashOwnerInput(c(), ref.batchId, ref.fence, handle, seq, hashes)).result.seq).toBe(String(BigInt(seq) + 1n));
+  });
 });

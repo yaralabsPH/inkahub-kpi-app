@@ -983,7 +983,11 @@ export async function materializeOwners(reader: FrozenReader, owners: readonly O
  * worker plans and later stages; `materializeOwners` is this per owner.
  */
 export async function materializeOwnerWorks(reader: FrozenReader, owner: Owner, oldStaff: Iterable<string>, stats?: MaterializeStats): Promise<MaterializedWork[]> {
-  const input = await buildOwnerInput(reader, owner);
+  return ownerWorksFromInput(reader, owner, await buildOwnerInput(reader, owner), oldStaff, stats);
+}
+
+/** T15P-4d: the per-audience works of an already built owner input (light or durable); materializeOwnerWorks is this over buildOwnerInput. */
+export function ownerWorksFromInput(reader: FrozenReader, owner: Owner, input: OwnerInput, oldStaff: Iterable<string>, stats?: MaterializeStats): MaterializedWork[] {
   if (stats) {
     stats.owners++;
     stats.maxInput = Math.max(stats.maxInput, input.events.length);

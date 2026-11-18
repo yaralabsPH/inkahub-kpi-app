@@ -6192,3 +6192,20 @@ STATUS: COMPLETE
   - Focused: continuation 8/8 and adapters 17/17 (≈95 s).
   - Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2352/2352**; `npm run build` 0.
   - 0046 unchanged (`4641d7cd…`).
+
+## Coder log — T15P-4d part 2: works from a durable input and the hash checkpoint (local commit; 4d NOT complete), 2026-11-19
+
+- **`ownerWorksFromInput(reader, owner, input, oldStaff, stats?)`** (`production-reporting-materialize.ts`) is the unchanged per-audience step, extracted from `materializeOwnerWorks`: site, then member and old-staff self audiences in bytewise order, with projection, `canonicalJson` input hash and owner rows. `materializeOwnerWorks` is now `ownerWorksFromInput` over `buildOwnerInput`, with identical behaviour; the full suite is unchanged.
+- **`hashOwnerInput(client, batch, fence, handle, seq, hashes)`** (`reporting-worker-state.ts`) finishes a read journal. The first call carries the exact audience list (site first), then up to 100 hashes per call in order, each moving seq by one. The journal is `complete` after the last.
+- **Tests** (`reportingOwnerContinuation.test.ts`, +2; the enumeration now gives owner `OP-1` a non-member old staff W3):
+  - For **every** owner, a reloaded `done` journal resumes with **zero source reads**. Its works equal `materializeOwnerWorks` (descriptors and rows) for the owner's saved old staff.
+  - `hashOwnerInput` takes ⌈n/100⌉ calls, then the header is `complete` with `input_hashes` exactly the descriptors. An identical repeat of the final call replays (`replay: true`, same seq).
+  - `OP-1`'s works include the W3 old-staff audience.
+  - The server refuses an extra audience (`required set`), and the adapter refuses a non-site first audience. The exact set completes.
+- **Results.** Continuation 10/10 (≈98 s). Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2354/2354**; `npm run build` 0. 0046 unchanged (`4641d7cd…`).
+- **Remaining T15P-4d** (not started). These are the riskiest pieces and are left for a fresh session with review:
+  - **Activation** from the light route: K=16 source attempts, 1,000 rows or 900 KiB, the allowance-bounded shared flush, and the activation check points inside `exactWalk`.
+  - **Worker wiring** (`production-reporting-worker.ts`): a version-first guard; lookup → `heavy_proven` fail-fast; takeover `discard_pending`; ordered parking and resumption in `plan` and `stage`; the per-audience hash checkpoint in `plan`; stage claims with staged-chunk discovery and reuse; post-publish `release`; run-record diagnostics.
+  - **Admission:** `ref_ms` with `owner_input_capacity`.
+  - **The 0045 combined page** on the durable route.
+- **Then T15P-4e.** The integrated acceptance (PG-LONG/PG-CUT traces, 119/121, 50,000/50,001, 999 self + site, descriptor/hash/five-family parity, memory) and the evidence package.

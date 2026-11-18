@@ -618,3 +618,26 @@ export function ownerJournalSnapshot(r: { header: OwnerInputHeader; events: Jour
   });
   return { state: parseOwnerState(r.header.state), events: r.events.map((e) => e.ev), membersCount: r.header.membersCount };
 }
+
+/** One audience's input hash as the journal's `hash` checkpoint carries it (r5 hashing; site first, then self bytewise). */
+export interface OwnerHashEntry { audienceKind: "site" | "self"; audienceStaff: string | null; inputHash: string }
+/**
+ * Finish a read journal: the first call carries the exact audience list (the server recomputes and requires it),
+ * then the hashes go in order, at most 100 per call, each call moving seq by one. Returns the final result
+ * (phase `complete` once every audience is hashed). A complete journal accepts only an identical replay.
+ */
+export async function hashOwnerInput(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, hashes: readonly OwnerHashEntry[]): Promise<{ result: CheckpointResult; calls: number }> {
+  if (!hashes.length || hashes[0].audienceKind !== "site" || hashes[0].audienceStaff !== null) throw new ReportingJobError("the first audience is the site");
+  for (const h of hashes) if (!/^[0-9a-f]{64}$/.test(h.inputHash)) throw new ReportingJobError("an input hash must be 64 lowercase hex");
+  const audiences = hashes.map((h) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff }));
+  let s = parseSeq(seq);
+  let result: CheckpointResult | null = null;
+  let calls = 0;
+  for (let i = 0; i < hashes.length; i += 100) {
+    const part = hashes.slice(i, i + 100).map((h) => ({ audienceKind: h.audienceKind, audienceStaff: h.audienceStaff, inputHash: h.inputHash }));
+    result = await checkpointOwnerInput(client, batchId, fence, handle, s, i === 0 ? { kind: "hash", audiences, hashes: part } : { kind: "hash", hashes: part });
+    calls++;
+    s = result.seq;
+  }
+  return { result: result!, calls };
+}
