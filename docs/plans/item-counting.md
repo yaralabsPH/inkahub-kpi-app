@@ -6543,3 +6543,55 @@ Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) sa
 - No harness edits. No hosted systems. 0046 stays a draft.
 
 **State at this checkpoint.** The worktree is clean at `c0b7413` and no mutation is active. The last common gate was 80 files, **2387/2387**. A Unicode-bound test was attempted at 02:45 but **not applied**: the edit script failed on an escape before writing, and its follow-up run selected 0 tests, so nothing changed. It is listed in step 8.
+
+## Coder checkpoint — TDD plan for the three remaining scope-review Must-fix 4 proofs (doc only; no code changed), 2026-11-19
+
+All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (authorised). They reuse:
+- **Fixture helpers:** `ins`/`noteRow`, the per-describe `wipe(key)`, `freshJournal`/`cutoffUs`.
+- **Recovery helpers:** `crashAt(owner, k, mode)`/`resume(...)` (before-write and commit-then-lost-response); `trackOf`/`record`/`guardedSource`/`expectedArgs` (exact arguments of every source read, including `read_reporting_predecessor_page`); `commitsOf(owner)` (the steps of every commit of a guarded uninterrupted pass); and the `traced(...)` RPC/commit interleaving from the atomic-page describe.
+- **Mutations:** `scratchpad/mut.py` (literal `\n` markers, CRLF/LF aware). A mutation counts only if it is confirmed applied and fails **promptly on an assertion**; a timeout never counts. Restore the file and check `git diff --quiet HEAD` after each.
+- **Gates:** focused, then common, then one commit.
+
+### Proof 1 — cut page and look-ahead past the stop are never evidence; the 50,000 allowance counts only consumed distinct ids
+
+- **Fixture A (cut page, existing).** NOTE's walk reads 0045 pages whose included kids (`ntk-*`, `pre-k*`, 400 KB notes) are byte-cut. Record, through `traced`, every `read_reporting_predecessor_page` response that is **discarded**: a line has `kids !== null && !kidsComplete`, then the next source call is a `read_reporting_staff_stream` at the **same** `p_at`/`p_at_event_id`.
+  - Collect the discarded page's **unconsumed** ids: the cut lines' kids beyond the last consumed kid, and any page line after the stop.
+  - **Assert** that every such id that `buildOwnerInput` does not consume is **absent** from the reloaded journal (`reloadOwnerInput(...).events`) and from `want.events`.
+  - **Assert** the journal's event count equals `want.events.length`.
+- **Fixture B (look-ahead past the stop, existing).** O-1's W1 walk stops at the effective unframed `pr-0240` instant and keeps the tie `pr-0240-tie`. The plain page read after the stop also returns lines **below** the stop instant, starting at `pr-0241`.
+  - **Assert:** `pr-0240-tie` **is** journaled; `pr-0241` and every later-returned id below the stop instant are **absent** from the journal; and the stored `stopAt` equals `pr-0240`'s microseconds.
+- **Fixture C (the 50,000 allowance, new).** One owner `CAP-M` of a new worker W6 has a member line `cap-l` and **49,998** distinct cancellations `cap-k-00001…49998` (order CAP-M), inserted with one `generate_series` like `runtimeFixtures.seed`. That is 49,999 distinct consumed ids. A W6 predecessor line `cap-p` below it has 3 kids on a **cut** 0045 page (400 KB notes), and the stream continues with look-ahead lines.
+  - **Assert pass:** with cut and look-ahead ids **not** counted, the durable read consumes exactly the distinct ids `buildOwnerInput` consumes (≤ 50,000) and **succeeds**. The SQL side holds `event_count ≤ 50,000`.
+  - **Assert refusal:** add exactly one more distinct consumed id (one more `cap-k` row in a sibling owner `CAP-M2` fixture) to cross 50,000. Both `buildOwnerInput` and `durableOwnerInput` throw `PartitionTooLargeError` at the **50,001st distinct consumed id**, and the journal holds no event beyond 50,000 (the throw happens before the commit).
+  - **Cost note.** This fixture is about 50k PGlite rows: run it once in its own `describe` with a 600 s cap.
+  - **Fallback.** If pages make it too slow, prove the allowance on `DependencyBudget` through a recording `OwnerJournal` over the same PGlite reader, with a counting `consumed` hook. Record that choice in the log rather than weakening the assertion.
+- **Prompt mutation.** In the plain-page loop, move `const ord = take(e);` **above** the `stopAt !== null && micros(e) < stopAt` check, so look-ahead is charged and journaled. Proof 1B must fail immediately (`pr-0241` present) and 1C on count. A second, already-recorded mutation (consuming a cut page as complete) stays as the cut-page control.
+
+### Proof 2 — a line without included kids inside a combined page
+
+- **Fixture (extend CP-M).** Add a W4 line `cp-tm1` (order `CP-Z`) **below** `cp-t0`, with two cancellations `cp-tm1-k1`/`-k2` (400 KB notes). 0045 includes kids only for the certain range plus the **first** line below, so in W4's combined page `cp-tm1` arrives with `kids === null`. Its kids then need two non-empty kid pages and an empty one.
+- **Assert** on `traced()`. After the combined page:
+  1. **Commit A:** the page's lines through `cp-t0`'s `done`/cursor (atomic), **plus** `cp-tm1` and its pending `kids` step with `afterKidOrd: null`. This commit happens before any child read.
+  2. **Then** `read_reporting_children` with `p_parent_ids: ["cp-tm1"]`, `p_after_parent_id: null`, `p_after_event_id: null`.
+  3. **Commit B:** `cp-tm1-k1` with `kids(afterKid=k1)`. Then the read after `k1`. Then **commit C** (`k2`). Then the empty read.
+  4. **Commit D:** `done{effective}` and cursor = `cp-tm1`.
+  - No other children read for `cp-t3…cp-t0` (their kids were included).
+- **Crash boundaries** (`crashAt` in both modes at commits A, B, C and D, then `resume`):
+  - **Before A:** the combined page is re-read at the same `p_at`.
+  - **After A** (response lost): the first resumed read is exactly the children read of item 2.
+  - **After B:** `p_after_parent_id: "cp-tm1"`, `p_after_event_id: "cp-tm1-k1"`.
+  - **After D:** the next read is the combined or plain page at cursor `cp-tm1`.
+  - Every resume equals `buildOwnerInput`, and the exact-argument guard passes throughout.
+- **Prompt mutation.** In the combined-page loop, replace `if (kids === null) {` with `if (false) {`, so a missing kid set is treated as empty. Parity fails at once (`cp-tm1`'s kids are absent, or its effectiveness differs), and so does the commit-A/children-read ordering assertion.
+
+### Proof 3 — the conservative Unicode instant-only certain bound
+
+- **Rule** (`durableOwnerInput`, matching `buildOwnerInput`): `certain = { createdAt: isoOfMicros(earliest.us), id: /^[\u0000-퟿]*$/.test(earliest.ev.id) ? earliest.ev.id : null }`.
+- **Fixture.** Three single-worker owners, each with a fresh worker (W7–W9), two member lines and one predecessor, inserted with **`String.fromCodePoint` built in TypeScript**, never `\u` escapes inside a Python edit script (the 02:45 attempt failed exactly there). A lone surrogate cannot be stored in PostgreSQL text, so U+D800 itself is probed with an astral character (UTF-16 `D83D DE00`) and with U+E000.
+  - **`U7FF`:** the earliest member id is `"cu" + String.fromCodePoint(0xD7FF)`. **Expect** `p_certain_event_id` equal to that exact id, and `p_certain_at = isoOfMicros(earliest.us)`.
+  - **`UE000`:** the earliest member id is `"cu" + String.fromCodePoint(0xE000)` (above U+D7FF in the BMP). **Expect** `p_certain_event_id: null`, the same instant.
+  - **`UASTRAL`:** the earliest member id is `"cu" + String.fromCodePoint(0x1F600)` (contains U+D83D ≥ U+D800). **Expect** `null`.
+- **Assert.** For each owner, every `read_reporting_predecessor_page` call carries `p_staff` = that worker, the expected `p_certain_event_id` and `p_certain_at`. `durableOwnerInput` equals `buildOwnerInput`. The `buildOwnerInput` run's own predecessor calls carry the **same** certain arguments (parity of the bound, not only of the result).
+- **Prompt mutation.** Change the durable route's test to `/^[\u0000-￿]*$/`, so surrogates are accepted as exact. `UASTRAL` must fail at once on `p_certain_event_id` (an id instead of null). A second mutation, `/^[\u0000-퟾]*$/`, must fail `U7FF`, which proves the boundary is inclusive at U+D7FF.
+
+**Order:** Proof 3 (smallest), then 2, then 1. Each is its own focused-gate, common-gate and commit unit.
