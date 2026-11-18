@@ -34,11 +34,11 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
+import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerInput, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
 import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
-import { buildChunks, claimReportingWork, packStageRequests, stageReportingResults, type StageEntry } from "./reporting-stage.js";
+import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type StageEntry } from "./reporting-stage.js";
 import { checkpointOwnerInput, cleanupHistory, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
@@ -581,11 +581,13 @@ export class OwnerInputPurposeError extends ReportingJobError {
  * persisted heavy proof or a reload cost above 120 BEFORE any reload or discard; open the journal if there is none;
  * discard only NON-heavy pending data of an unfinished page (a new process never re-sends an unpersisted payload);
  * then the snapshot-pinned reload. Returns the handle, the current seq and a resumable snapshot (null when the journal
- * is past reading, i.e. hashing/complete: the caller continues with the hash step).
+ * is past reading, i.e. hashing/complete: the caller continues with the hash step). For a journal past reading it also
+ * returns the already reloaded and validated INPUT (member prefix and evidence, bytewise, exactly as buildOwnerInput), so
+ * the next hash/stage unit needs no second event reload and no source read.
  */
 export async function recoverOwnerJournal(
   client: RpcClient, batchId: string, fence: number, owner: Owner, site: string, purpose: "plan" | "stage",
-): Promise<{ handle: string; seq: string; snapshot: OwnerJournalSnapshot | null; discarded: number; header: OwnerInputHeader; reloadCalls: number }> {
+): Promise<{ handle: string; seq: string; snapshot: OwnerJournalSnapshot | null; input: OwnerInput | null; discarded: number; header: OwnerInputHeader; reloadCalls: number }> {
   const [found] = await lookupOwnerInputs(client, batchId, fence, [owner]);
   const j = found.journal;
   if (j && (j.heavyProven || j.reloadCalls > MAX_RELOAD_CALLS || j.provisionalReloadCalls > MAX_RELOAD_CALLS)) {
@@ -604,5 +606,16 @@ export async function recoverOwnerJournal(
   // re-verified after the reload with the same rule: an incompatible header is rejected, never adopted
   if (!purposeCompatible(back.header.purpose, purpose)) throw new OwnerInputPurposeError(owner, back.header.purpose, purpose);
   const snapshot = back.header.phase === "reading" ? ownerJournalSnapshot(back) : null;
-  return { handle, seq: back.header.seq, snapshot, discarded, header: back.header, reloadCalls: back.calls };
+  let input: OwnerInput | null = null;
+  if (!snapshot) {
+    // a finished read: the committed journal IS the input (ordinals contiguous, the member prefix fixed by members_count)
+    const n = back.header.membersCount;
+    if (n === null || n > back.events.length) throw new ReportingJobError("a finished journal has no valid member prefix");
+    back.events.forEach((e, i) => {
+      if (e.ord !== i + 1) throw new ReportingJobError("journal ordinals are not contiguous");
+    });
+    const byId = (x: { id: string }, y: { id: string }) => compareUtf8(x.id, y.id);
+    input = { owner, members: back.events.slice(0, n).map((e) => e.ev).sort(byId), events: back.events.map((e) => e.ev).sort(byId) };
+  }
+  return { handle, seq: back.header.seq, snapshot, input, discarded, header: back.header, reloadCalls: back.calls };
 }

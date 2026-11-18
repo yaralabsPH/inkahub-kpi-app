@@ -848,6 +848,36 @@ describe("worker seams over the journal (T15P-4d step 3a)", () => {
     expect(errors.every((e) => !isTransient(e))).toBe(true);
   });
 
+  it("a partially hashed or complete journal recovers its validated input once: zero source reads, exactly the accounted reload, no second event reload (scope review Should-fix 1)", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "OQ-3" }; // 202 audiences: hashing spans three units
+    await wipe("OQ-3");
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    await durableOwnerInput(rpcFrozenReader(c(), ref), o, ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs()));
+    const old = await readOwnerOldStaff(c(), ref.batchId, ref.fence, o, null);
+    const hashes = ownerWorksFromInput(rpcFrozenReader(c(), ref), o, want, old).map((w) => ({ audienceKind: w.desc.audienceKind, audienceStaff: w.desc.audienceStaff, inputHash: w.desc.inputHash }));
+    await hashOwnerInput(c(), ref.batchId, ref.fence, h.handle, hashes, { unit: 100, maxSteps: 1 }); // now partially hashed
+    for (const phase of ["hashing", "complete"] as const) {
+      const calls: string[] = [];
+      const rec: RpcClient = { rpc: async (fn, a) => (calls.push(fn), c().rpc(fn, a)) };
+      const r = await recoverOwnerJournal(rec, ref.batchId, ref.fence, o, SITE, "plan");
+      expect(r.header.phase).toBe(phase);
+      expect(r.snapshot).toBeNull();
+      expect(r.input).toEqual(want); // exactly buildOwnerInput's input, from the journal alone
+      const eventLoads = calls.filter((x) => x === "load_reporting_owner_input_events").length;
+      expect(1 + eventLoads).toBe(r.header.reloadCalls); // header + event pages = the accounted reload, once
+      expect(r.reloadCalls).toBe(r.header.reloadCalls);
+      // the next unit is computed from the returned input: no source read and no further event reload
+      calls.length = 0;
+      const works = ownerWorksFromInput(rpcFrozenReader(rec, ref), o, r.input!, old);
+      expect(works.map((w) => w.desc.inputHash)).toEqual(hashes.map((x) => x.inputHash));
+      if (phase === "hashing") await hashOwnerInput(rec, ref.batchId, ref.fence, r.handle, hashes);
+      const SOURCE_FNS = ["read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream", "read_reporting_predecessor_page"];
+      expect(calls.filter((x) => SOURCE_FNS.includes(x))).toEqual([]);
+      expect(calls.filter((x) => x === "load_reporting_owner_input_events")).toEqual([]);
+    }
+  }, 120_000);
+
   it("a heavy journal fails fast after lookup, before any reload or discard", async () => {
     const o: Owner = { partitionKind: "order", partitionKey: "OQ-4" };
     await wipe("OQ-4");

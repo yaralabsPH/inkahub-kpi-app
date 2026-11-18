@@ -6445,3 +6445,13 @@ Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) sa
 - **Mutation checks** (confirmed applied, restored with no diff): dropping the phase from renewals fails in 3 s (`expected 4000 to be 5000`); relabelling transient errors as unsupported fails in 6 s.
 - **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2384/2384**; `npm run build` 0.
 - **Still open from the scope review.** The rest of Must-fix 3 (with the wiring); Must-fix 4 (a direct complete multi-line 0045 atomic/crash proof); Should-fix 1 (recovery returns the reloaded input; next); Should-fix 2 (the independent oracle, in 4e).
+
+## Coder log — T15P-4d scope-review Should-fix 1: recovery returns the reloaded input (local commit), 2026-11-19
+
+- **`recoverOwnerJournal`** (`production-reporting-worker.ts`). For a journal past reading (`hashing` or `complete`) it now also returns the **already reloaded, validated input**: contiguous ordinals, the member prefix fixed by `members_count`, and members and evidence sorted bytewise exactly as `buildOwnerInput`. The next hash or stage unit therefore needs no second event reload and no source read. A reading journal still returns its resumable snapshot.
+- **Test** (`reportingOwnerContinuation.test.ts`, +1). Owner OQ-3 (202 audiences) is recovered **partially hashed**, then **complete**. Each time:
+  - the returned input equals `buildOwnerInput`;
+  - header + event pages = exactly `reload_calls`, once;
+  - computing all works and hashing the rest make **zero source reads and zero further event loads**.
+- **Mutation checks** (confirmed applied, restored with no diff): no input returned fails in 6 s; a second reload inside recovery fails in 5 s (`expected 5 to be 3`).
+- **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2385/2385**; `npm run build` 0.
