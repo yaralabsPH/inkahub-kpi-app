@@ -3600,3 +3600,186 @@ This is an exact proposal deliverable, not approval of an unspecified 0046 imple
 Updated path to app testing: **T15P-4 persistence proposal and review → durable continuation implementation and review → reviewed staging schema/identity/preflight and authorised AU runtime rehearsal → staging generation, Preview and remaining role/parity/dry-digest/growth gates → CJ can test it in the app**.
 
 STATUS: COMPLETE
+
+## Coder proposal — T15P-4 durable owner-input continuation (persistence contract for review), 2026-11-18
+
+Plan-only handoff under the planner's 2026-11-18 authorisation. No migration, application or test file is changed by this proposal. Every name below is a proposal for review.
+
+### 0. Idea in one paragraph
+
+Today an owner's input (`buildOwnerInput`: members → parents → members' children → each worker's predecessor walk) lives only in memory, so an interrupted owner restarts from its beginning. The proposal journals the owner's **consumed evidence events**, in consumption order, together with an exact **continuation state** for the next read. Each event is stored in the reduced form `imageToEvent` already produces: the 11 projector/hash fields, not the source image. This journal is used only by owners that are still unfinished after a checkpoint interval. On resume, the worker reloads the compact journal, rebuilds the in-memory `context` and `DependencyBudget` exactly, and continues with the next source read. When the input is complete, the journal is marked `complete` with the per-audience input hashes. Stage then reuses it: it reloads the events and verifies every recomputed hash against the sealed descriptors instead of reading the source again. The reducer, descriptor/input-hash semantics and read order are unchanged. Only *where the in-memory state lives between invocations* changes.
+
+Why the reload is not "an equally expensive full reload": the byte-capped case is caused by large **source images** (notes and other unused columns), but the journal stores only the reduced event (about 250–450 bytes of JSON). The 300-cancellation owner reloads in **1 call** (≤1,000 rows, ≤1 MiB), where reading the source needed 301 children pages. A 50,000-event owner reloads in at most 50 calls, against at least 50 source pages plus their dependencies.
+
+### 1. Persistence schema (additive migration `0046_reporting_owner_inputs.sql`; the number is unused at `7ad2df5`)
+
+```sql
+CREATE TABLE reporting_private.owner_inputs (
+  batch_id         uuid        NOT NULL,
+  partition_kind   text        NOT NULL CHECK (partition_kind IN ('order', 'event')),
+  partition_key    text        NOT NULL CHECK (partition_key <> ''),
+  site             text        NOT NULL CHECK (site IN ('au', 'uk', 'us')),
+  source_cutoff    timestamptz NOT NULL,        -- copied from the batch; checked equal on every access
+  rule_version     text        NOT NULL CHECK (rule_version <> ''),
+  format_version   smallint    NOT NULL CHECK (format_version = 1),
+  phase            text        NOT NULL CHECK (phase IN ('reading', 'complete')),
+  seq              bigint      NOT NULL CHECK (seq >= 1),        -- checkpoints applied (expected-to-next)
+  state            jsonb       NOT NULL CHECK (pg_catalog.octet_length(state::text) <= 8192),
+  event_count      integer     NOT NULL CHECK (event_count BETWEEN 0 AND 50000),
+  input_hashes     jsonb,                        -- complete only: [{audienceKind, audienceStaff, inputHash}], at most 1,000
+  last_payload_md5 text        NOT NULL CHECK (last_payload_md5 ~ '^[0-9a-f]{32}$'),  -- replay identity of seq
+  written_fence    bigint      NOT NULL CHECK (written_fence >= 1),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (batch_id, partition_kind, partition_key),
+  FOREIGN KEY (batch_id, partition_kind, partition_key) REFERENCES reporting_private.worker_owners (batch_id, partition_kind, partition_key),
+  CHECK ((phase = 'complete') = (input_hashes IS NOT NULL))
+);
+CREATE TABLE reporting_private.owner_input_events (
+  batch_id         uuid    NOT NULL,
+  partition_kind   text    NOT NULL,
+  partition_key    text    NOT NULL,
+  ord              integer NOT NULL CHECK (ord BETWEEN 1 AND 50000),   -- consumption ordinal of the FIRST consumption
+  event_id         text    NOT NULL CHECK (event_id <> ''),
+  event            jsonb   NOT NULL CHECK (pg_catalog.octet_length(event::text) <= 16384),  -- the reduced evidence event
+  PRIMARY KEY (batch_id, partition_kind, partition_key, ord),
+  UNIQUE (batch_id, partition_kind, partition_key, event_id),
+  FOREIGN KEY (batch_id, partition_kind, partition_key) REFERENCES reporting_private.owner_inputs (batch_id, partition_kind, partition_key)
+);
+-- RLS enabled on both, no policies; REVOKE ALL ON both FROM PUBLIC, anon, authenticated;
+-- GRANT SELECT, INSERT, UPDATE, DELETE TO service_role (the 0043 pattern). The PKs serve every access path
+-- (keyset by ord; owner lookups); list by batch uses the owner_inputs PK prefix.
+```
+
+- **Bounds.** At most 50,000 event rows per owner: the 50,001st distinct id raises the existing `partition_too_large` *before* anything is written. Each `event` is ≤16 KiB; real reduced events are about 0.4 KiB, and the check guards against a malformed writer. `state` is ≤8 KiB, in line with the existing `KEY_PROGRESS_MAX_BYTES` approach.
+- **Binding.** Batch, owner and site are the key, and the FK goes to that batch's `worker_owners` row. Cutoff and rule version are copied and checked equal to the batch and to `REPORTING_RULE_VERSION` on every call; a mismatch is an error, never an adoption. The rows can never be used by another batch. One journal covers both the plan and the stage phase (§2).
+- **Format versioning.** `format_version = 1` and `state.v = 1`. New code that finds an unknown version refuses with `owner_input_format`: it does not adopt, delete or rewrite the row, and the invocation fails as `conflicting_work`. The operator path is an evidence-preserving abandon.
+- **Fence validation.** Every RPC first calls the existing `reporting_private.worker_batch(p_batch, p_fence, p_unsealed)`, which locks the batch, rejects an obsolete fence or an expired lease, and requires `frozen`. Planning writes need `p_unsealed = true`; stage reads and the post-publish release use the appropriate non-planning check (§3).
+- **Old code / missing migration.** Old code never touches these tables, so the change is purely additive. If new code calls a 0046 RPC that doesn't exist (SQLSTATE `42883`), the adapter maps it to `migration_missing` and the invocation ends `failed` (fail-closed). A silent fallback to the non-durable path is deliberately not used, because it would reintroduce the liveness defect without anyone seeing it (open point §7.2). The T15P-3 inspection mode gains the 0046 objects in its expected set at its next maintenance change.
+
+### 2. Serializable state and transitions
+
+`state` (JSON, `v: 1`) holds exactly what `buildOwnerInput` keeps in local variables between reads. Events already consumed are **not** in `state`; they are the `owner_input_events` rows. On reload, the worker rebuilds `context` (id → event) and the `DependencyBudget` id set from them in `ord` order. Every budget-taken id is also put into `context` (`keep`, and exactWalk's take + `onEvent`), so the `context` keys equal the budget's ids.
+
+| step | `state` before the step | bounded unit | after |
+|---|---|---|---|
+| M members | `{step:"members", afterIndex, afterId}`: the 0041/0042 member keyset of the one-owner group (`afterId:null` after cap+1) | one `read_reporting_owner_members` page | rows appended to the journal; the keyset advanced; an empty page → P |
+| P parents | `{step:"parents", parentAfter}`: the last requested parent id (bytewise). The sorted parent list is recomputed from the journaled members | one `read_reporting_events_by_id` page (byte-capped continuation, as today) | found parents appended. **Absent ids are implied, not guessed:** a parent id ≤ `parentAfter` that is not in the journal was absent. byIds already treats an empty page as "the remaining ids are absent", and that empty page is what advances P → C |
+| C member children | `{step:"children", afterParent, afterId}`: the `read_reporting_children` keyset over all member ids (bytewise) | one children page | new ids appended. Ids already in `context` are re-charged as today (`take` is a no-op for a seen id, so the order and the overflow point are unchanged) |
+| W worker walks | `{step:"walk", worker, cursor:{createdAt,id}, stopAt, need:[…], line:{id, kidsAfter} or null}`. Workers are the journaled members' staff, bytewise; `earliest`/`latest`/`types` are recomputed from the journaled members | one stream page, one 0045 page, or one line's children page | the consumed events are appended. Resume uses `cursor` = the **last consumed** event (exclusive): the unconsumed rest of a page is fetched again, and unconsumed lookahead is never stored. A consumed line whose cancellations are still being read keeps `line.kidsAfter`. Its kids so far are journaled, and `siteEffective` is evaluated only once they are complete, from the journaled kids plus the remainder. `stopAt` and `need` persist exactly. The end of worker *i* → worker *i+1*; the end of the last worker → X |
+| X input complete | `{step:"complete"}` | — | `phase='complete'`; `input_hashes` = `sha256(canonicalJson(partitionInput(audience, sorted events)))` for site + each member's staff + the **old self staff supplied by the caller** (`worker_owners.old_staff` in plan, the claims in stage, as today; old self audiences are not part of the input) |
+
+- **Ordering preserved.** The resumed read sequence is the uninterrupted sequence with pauses at page or line boundaries, so the distinct-id order (and therefore the 50,001st id and the `PartitionTooLargeError` attribution) is identical. Microsecond instants, projector ties and the UTF-16 versus bytewise `certain` rule (`/^[\u0000-퟿]*$/` on the earliest id) are recomputed from the same journaled members. Hidden cancellations stay correct because the children pages are the same pages.
+- **Reducer unchanged.** The final `events` are the same sorted set, and `partitionInput`, `projectReportingPartition` and `canonicalJson` are untouched, so descriptors, hashes and all five result families are identical by construction. Tests also compare them against the uninterrupted oracle (§6).
+- **Completion proofs.** A `phase='reading'` journal never produces a descriptor (`plan_reporting_owner` is called only after X), never satisfies `seal`, and never stages. Stage reuse requires `phase='complete'` **and** recomputed hashes equal to the claimed descriptors' `inputHash` for every claimed audience (the existing check in `stage`). Otherwise it throws, as today.
+- **Source input vs reduction vs planning vs staging.** X means only that the *source input* is complete. Reduction is recomputed in memory from the events (deterministic and cheap). Planning (`plan_reporting_owner`) and staging keep their existing durable records; the journal adds no completion meaning to them.
+
+### 3. RPC contract
+
+All are `SECURITY INVOKER` with `SET search_path = ''`, `service_role` EXECUTE only, and PUBLIC/anon/authenticated revoked.
+
+1. `public.list_reporting_owner_inputs(p_batch uuid, p_fence bigint, p_after_kind text, p_after_key text, p_limit integer)` → `TABLE (partition_kind text, partition_key text, phase text, seq bigint, event_count integer)`.
+   - At most 1,000 rows, with keyset `(kind, key)` in `COLLATE "C"`.
+   - It is called once per invocation (paged), so the worker knows which owners have a journal without a per-owner probe. It normally returns 0 rows.
+2. `public.load_reporting_owner_input(p_batch, p_fence, p_kind, p_key, p_after_ord integer, p_limit integer)` → `TABLE (row_kind text, ord integer, event_id text, event jsonb, seq bigint, phase text, state jsonb, input_hashes jsonb)`.
+   - The first row (`row_kind='header'`) carries seq, phase, state and the hashes. The rest are event rows with `ord > p_after_ord`, in `ord` order.
+   - The whole response, header included, is cut at 1,000 rows / 1 MiB, accounted the same way as the 0041 envelope.
+   - Only a page with no event rows proves the end. A missing journal returns zero rows.
+3. `public.checkpoint_reporting_owner_input(p_batch, p_fence, p_kind, p_key, p_expected_seq bigint, p_state jsonb, p_events jsonb, p_complete boolean, p_input_hashes jsonb)` → `TABLE (seq bigint, event_count integer, replay boolean)`.
+   - **Atomic.** It locks the batch via `worker_batch`, then the `owner_inputs` row `FOR UPDATE`; it inserts at most 1,000 events (≤1 MiB) at `ord = event_count+1…` and sets `state`, `phase`, `seq = p_expected_seq + 1`, `last_payload_md5` and `written_fence`, all in ONE transaction, so data and cursor commit together. `p_expected_seq = 0` creates the row.
+   - **Identical replay.** If the row already has `seq = p_expected_seq + 1` and `last_payload_md5 = md5(canonical payload)`, it returns `replay = true` and writes nothing. This covers a committed write whose response was lost.
+   - **Conflicting replay.** The same seq with a different payload, or any other seq mismatch, fails with `owner_input_conflict: expected seq n, found m`. The worker maps it to `conflicting_work` and stops the invocation.
+   - **Obsolete fence or expired lease.** `worker_batch` raises its existing errors (`fence … is obsolete`, `lease expired`), and nothing is written.
+   - **Takeover with a new fence.** The data belongs to the batch's frozen view, not to a fence, so the new holder continues from the stored seq; `written_fence` records who wrote each step (as evidence).
+   - **Simultaneous attempts.** Only the lease holder passes `worker_batch`. Two calls from the same holder serialize on the row lock; the second sees seq advanced and is a replay or a conflict.
+   - **Validation.** It rejects `p_events` that are not contiguous from `event_count+1`, that duplicate an existing journal id, or whose JSON keys are outside the 11 reduced fields. `p_complete` requires a valid `p_input_hashes` (site exactly once, unique audiences, 64-hex hashes, at most 1,000) and an empty or final `p_events`.
+4. `public.release_reporting_owner_inputs(p_batch uuid, p_limit integer)` → `TABLE (deleted integer, remaining integer)`.
+   - It is allowed only when the batch is `published` (no fence needed: the batch is final) and deletes that batch's journal rows in bounded pages (≤5,000 rows per call).
+
+### 4. Bounded recovery in planning and staging (seams)
+
+- **Reader (`api/_lib/production-reporting-reader.ts`).** Its behaviour is unchanged. It gains optional start positions on the existing keysets (`members` from `(afterIndex, afterId)`, `children` from `(afterParent, afterId)`, and `byIds` continuing after an id); stream and predecessorPage already take a cursor. The T15P-1 per-RPC guard stays in front of every call.
+- **Materializer (`api/_lib/production-reporting-materialize.ts`).**
+  - `buildOwnerInput` becomes a resumable step machine: the same reads in the same order, with optional `{ resume, checkpoint(delta), due() }`.
+  - Without these options it is byte-for-byte today's behaviour (memory readers, all existing tests, short owners).
+  - `exactWalk` gains an optional resume state (cursor, stopAt, need, line) and reports each consumed event through `onEvent`. It never stores lookahead.
+  - `materializeOwnerWorks` gains `fromJournal(complete)`: it recomputes the works from reloaded events with no source reads.
+- **Worker (`api/_lib/production-reporting-worker.ts`).**
+  - After acquire, it calls `list_reporting_owner_inputs` (normally 1 call, 0 rows).
+  - In `plan`, an owner with a `reading` journal resumes from it. An owner with a `complete` journal recomputes from the reload, then plans.
+  - In `stage`, an owner with a `complete` journal reloads, recomputes and hash-checks against the claims, and is never re-read from the source. An owner without one is materialized as today.
+  - An owner without a journal runs as today. If it is still unfinished when `due()` first fires (the first heartbeat boundary reached inside that owner's own reads, i.e. at least 30 s), it creates its journal with everything consumed so far. From then on it checkpoints at least every 30 s and whenever the delta reaches 1,000 rows / 1 MiB.
+  - Checkpoint, load and list calls go through the same per-RPC `pageGuard` (budget + heartbeat, T15P-1/1a), so they count against the 240 s budget. `OutOfTime` between two checkpoints loses at most one interval of reads, never the prefix.
+  - After a successful publish, it calls `release_reporting_owner_inputs` until `remaining = 0`, continuing in later invocations if it runs out of time.
+- **Worker-state adapters (`api/_lib/reporting-jobs.ts`).** Add typed callers for the four RPCs with the existing error mapping (`fence_obsolete`, `lease_expired`, `conflicting_work`), plus `migration_missing` for SQLSTATE 42883 on these names.
+- **Time, memory and transport.**
+  - Memory is the same as today: one owner's input (≤50,000 reduced events) plus the current delta.
+  - A reload costs `ceil(rows/1000)` calls, or more only if the compact events exceed 1 MiB per call (≥2,300 events per MiB at about 450 bytes).
+  - A checkpoint is 1 call per interval, carrying the delta.
+  - Hashing and reduction are in-memory CPU, the same as today. Every call respects the 1,000-row / 1 MiB envelope.
+- **Plan/stage reuse verification.** Stage never trusts the journal blindly: it recomputes `sha256(canonicalJson(partitionInput(...)))` for every claimed audience from the reloaded events and requires equality with the claim's `inputHash` (fixed at plan time and covered by the sealed descriptor manifest). Any mismatch throws `ReportingJobError`, as the existing check does.
+
+### 5. Lifecycle and rollback
+
+- **Retention.** Journal rows live while their batch is unpublished. After a successful publish, the worker releases them in bounded pages (§4); the published generation never depends on them.
+- **Failed or abandoned batches.** Their journals are **retained** as recovery evidence, consistent with the planner's UK/US preservation instruction. They are never adopted by another batch: the key and FK are batch-scoped. Bulk cleanup of abandoned batches stays an explicitly authorised operator step outside this task.
+- **Retained generations.** They are unaffected, and so is the existing `cleanup_reporting_history`.
+- **Stale checkpoints.** These are impossible across batches. Within a batch, the binding check (cutoff, rule version, format) plus the fence decide.
+- **Fallback.** Legacy reads and `set_reporting_site_mode(..., p_processor_enabled => false)` remain the off switch.
+- **Rollback.** Deploy the previous worker; it ignores the 0046 objects. 0046 stays installed (expand-only, no destructive down migration). It adds no source or inventory writes, no new dependency, no UI or Repository change, and needs no production access.
+
+### 6. Executable acceptance map and cost bound
+
+**Primary case** (new `tests/reporting/reportingOwnerContinuation.test.ts`, real SQL in PGlite with 0037–0046): the existing 300-cancellation owner (a line plus 300 `cancelled` children, all in one order), with the `read_reporting_children` limit forced to 1 (byte-capped). Each invocation is a fresh `runReportingCycle` with no in-memory carry-over and the unchanged 240,000 ms budget. **Every RPC costs 1,000 simulated ms**, including list, load, checkpoint, release, renewals, claims, stage and publish. Between invocations the lease is expired in the database clock (as in `walk-resume.test.ts`).
+
+Phase cost model, at 1 s per RPC:
+
+| invocation | work | calls (≈) |
+|---|---|---|
+| 1 | status, acquire, copy and freeze (fixture-dependent, ≈10), enumeration (≈3). Plan starts the owner: members 1, parents 0, then children pages until the budget. The journal is created at the first heartbeat boundary inside the owner (≈30 s), then checkpointed every ≈30 reads; renewals ≈8 | ≈240 in total, of which ≈190 are children pages, with ≈6 checkpoints → **pending**, with ≈180/301 children pages durable (at most one interval lost) |
+| 2 | status/acquire ≈3, list 1, load 1 (≤301 compact rows ≪ 1 MiB), the remaining ≈121 children pages + ≈4 checkpoints, the walk (1 worker, ≈2 stream pages + the 0045 or line-children reads, ≈5), the complete checkpoint 1, `plan_reporting_owner` 1, seal ≈4, claim 1, load 1 (the complete journal), the hash check (CPU), stage ≈2, publish 1, release 1, renewals ≈5 | ≈155 → **published** |
+
+- **Declared bound.** At most **4 invocations** for this case (2 expected; 4 allows for checkpoint-interval loss and different copy/enumeration costs), against the planner's ceiling of 20. The test asserts `invocations ≤ 20` and records the actual number.
+- **Durable progress.** `event_count` strictly increases between unfinished invocations, and reads in invocation k+1 start strictly after the journaled position. In total, `read_reporting_children` is called with `p_after_event_id = null` for that owner at most once.
+- **No rescan.** The total number of `read_reporting_children` calls across invocations is ≤ 301 + (interruptions × the reads in one checkpoint interval).
+- **Exact output.** The descriptors, `inputHash` values and all five result families are compared with the uninterrupted oracle (a separate fresh DB, the same fixture, one invocation with a budget large enough not to interrupt), plus `parityProblems` for the site and the worker.
+
+**Further cases (same file):**
+
+1. **Interruption in plan and in stage:** the clocks are chosen so one run stops inside `buildOwnerInput` during plan, and another stops after X but before staging completes. Stage must reuse the complete journal (0 source children reads for that owner in stage).
+2. **Process loss:** a fresh worker instance per invocation, with no module-level state.
+3. **A lost checkpoint response:** the client throws after the checkpoint's COMMIT but before the response. The next invocation replays the same checkpoint, gets `replay = true`, and adds no duplicate rows.
+4. **A conflicting replay** (the same seq with a different payload) gives `owner_input_conflict` → `conflicting_work`, and nothing is written.
+5. **Fences:**
+   - an obsolete fence and an expired lease both write nothing;
+   - takeover with a new fence continues from the stored seq;
+   - two concurrent same-holder checkpoints serialize (one wins, the other is a replay or a conflict).
+6. **Small and byte-capped pages:** members limit 1, byIds one per page, and 0045 cut pages that force the plain-page fallback.
+7. **Format and missing migration:**
+   - an unknown `format_version` refuses with no mutation;
+   - a missing-0046 database (PGlite through 0045) gives `migration_missing`, the invocation fails closed, and nothing is written.
+8. **SQL role/refusal tests** (`tests/reporting/pg/owner-inputs.test.ts`):
+   - anon, authenticated and PUBLIC can neither execute nor select, and RLS is on;
+   - invoker and empty search_path;
+   - the envelope bound of 1,000 rows / 1 MiB including the header;
+   - checkpoint validation: `ord` gaps, duplicate ids, unknown keys, bad hashes, complete without hashes;
+   - release refused for an unpublished batch.
+9. **Preserved suites (they must stay green, and gain checkpoint variants):**
+   - the 50,000/50,001 boundary, including a checkpoint at 49,999 (the overflow still throws at the same id, and nothing over 50,000 is ever written);
+   - microsecond and UTF-16/bytewise ties, with a checkpoint between tie members;
+   - hidden cancellations;
+   - no-lookahead (unconsumed lookahead is never journaled);
+   - old-self empty replacement (old_staff audiences hashed at X);
+   - overflow attribution;
+   - and the existing walk-resume, predecessor-page, materialize-batching, page-guard and worker-recovery suites.
+10. **Old-code compatibility:** the full existing suite on 0037–0046 with no journal in use behaves identically, and the T15P-1/1a page-guard cases still pass with checkpoints in the call stream.
+
+### 7. Open points for the planner (no improvisation)
+
+1. **The checkpoint trigger:** time-based (the first heartbeat boundary inside an owner, then every 30 s), so short owners pay nothing. Alternative: also every fixed number of reads. Please confirm or choose.
+2. **Fail-closed on a missing 0046** (proposed) versus falling back to the current non-durable path.
+3. **The journal release after publish** inside the worker (proposed) versus a separate scheduled cleanup.
+4. **Reduced events versus full source images.** The proposal stores the reduced events, which are exactly what the input hash covers. Storing full source images (for audit) would remove the reload advantage in the byte-capped case and change the cost bound.
+5. **The release check.** `release_reporting_owner_inputs` checks `state = 'published'` without a fence. If you prefer it fenced or folded into the existing publication cleanup, say so.
+
+STATUS: COMPLETE
