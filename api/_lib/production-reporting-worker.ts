@@ -408,6 +408,8 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         const pageGuard = async () => {
           b.need();
           await b.beat(a.batchId, a.fence);
+          // T15P-1a: a renewal (or its retry) can cross the deadline; check again so no new frozen read starts after expiry.
+          b.need();
         };
         const src = env.source ? env.source(ref, pageGuard) : { reader: rpcFrozenReader(env.client, ref), pages: rpcEnumerationPages(env.client, ref) };
         // Planning and staging materialize owner groups over ONE coalescing view of the frozen reads (enumeration stays sequential

@@ -225,3 +225,105 @@ describe("the real worker wires the per-RPC guard: one line with 300 cancellatio
     expect((await db.query<{ m: string }>("select read_mode as m from reporting_private.site_state where site = 'au'")).rows[0].m).toBe("legacy");
   }, 600_000);
 });
+
+describe("T15P-1a: the deadline is checked again after a lease renewal (real worker, real SQL, simulated clock)", () => {
+  const S = (i: number) => `${String(i).padStart(8, "0")}-dddd-4ddd-8ddd-dddddddddddd`;
+  const FROZEN = /^(read_reporting_|list_reporting_owners$)/;
+  const MATERIALIZE = /^read_reporting_(owner_members|events_by_id|children|staff_stream|predecessor_page)$/;
+  let db: PGlite;
+  beforeAll(async () => {
+    db = await reportingDb();
+    // ONE owner whose children are read one row per page (byte-capped), so a due renewal lands INSIDE its reads,
+    // i.e. in the per-RPC page guard, not at the between-group checkpoints (which already check the deadline).
+    await db.query("insert into auth.users (id, email) values ($1, 'd0@x')", [S(0)]);
+    const ins = `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+      values ('au', $1, $2, 'framed', 'DL-LONG', $3, $4, $5, 's', '', $6, $7)`;
+    await db.query(ins, ["dl-line", S(0), "INKA-KAN0566-A4-FB", 1, "line_verified", "2026-10-01T00:00:00Z", null]);
+    for (let i = 0; i < 300; i++) await db.query(ins, [`dl-c${pad(i)}`, S(0), null, null, "cancelled", new Date(Date.parse("2026-10-01T00:00:01Z") + i * 1000).toISOString(), "dl-line"]);
+    const c = pgRpc(db);
+    expect((await c.rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
+    expect((await c.rpc("set_reporting_site_mode", { p_site: "au", p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
+  }, 300_000);
+  afterAll(async () => db?.close());
+
+  /** Expire any held lease (database clock), so each scenario starts or resumes cleanly. */
+  const expire = async () => {
+    await db.query("update reporting_private.batches set lease_expires_at = now() - interval '1 second' where site = 'au' and state in ('active', 'frozen', 'publishing')");
+    await db.query("update reporting_private.site_state set lease_expires_at = now() - interval '1 second' where site = 'au' and active_batch_id is not null");
+  };
+
+  /**
+   * Runs one invocation. `renew` decides what the FIRST renewal that happens during materialization does:
+   * it may move the clock and/or fail transiently. Returns the calls made after that renewal completed.
+   */
+  async function scenario(renew: (ctx: { t: number; deadline: number; attempt: number }) => { t: number; fail?: boolean }) {
+    await expire();
+    let t = Date.parse("2026-11-18T06:00:00Z") + Math.floor(Math.random() * 1e6) * 1000;
+    const start = t;
+    const deadline = start + WORKER_BUDGET_MS;
+    const inner = pgRpc(db);
+    let materializing = false;
+    let target = false; // the targeted renewal has been reached
+    let done = false; // the targeted renewal has completed
+    let attempt = 0;
+    let renewedAt: number | null = null;
+    let prev = "";
+    const after: Array<{ fn: string; at: number }> = [];
+    const client = {
+      rpc: async (fn: string, a: Record<string, unknown>) => {
+        if (done) after.push({ fn, at: t });
+        if (MATERIALIZE.test(fn)) materializing = true;
+        const midOwner = prev === "read_reporting_children";
+        if (fn !== "renew_reporting_lease") prev = fn;
+        if (fn === "renew_reporting_lease" && materializing && midOwner && !done) {
+          target = true;
+          attempt++;
+          const r = renew({ t, deadline, attempt });
+          t = r.t;
+          if (r.fail) return { data: null, error: { message: "fetch failed", code: null } };
+          const out = await inner.rpc(fn, a);
+          done = true;
+          renewedAt = t;
+          return out;
+        }
+        t += 1000;
+        return inner.rpc(fn, fn === "read_reporting_children" ? { ...a, p_limit: 1 } : a);
+      },
+    };
+    const r = await runReportingCycle({ client, now: () => t, sleep: async (ms: number) => void (t += ms) }, { site: "au", mode: "rebuild" });
+    return { r, after, target, renewedAt, deadline };
+  }
+
+  it("a successful renewal that crosses the deadline: zero frozen reads start afterwards and the cycle returns pending", async () => {
+    const { r, after, target, renewedAt, deadline } = await scenario(({ deadline }) => ({ t: deadline + 500 }));
+    expect(target).toBe(true);
+    expect(renewedAt!).toBeGreaterThan(deadline);
+    expect(r.problems).toEqual([]);
+    expect(r.state).toBe("pending");
+    expect(after.filter((c) => FROZEN.test(c.fn))).toEqual([]);
+  }, 300_000);
+
+  it("readers awaiting the same (single-flight) renewal all stop: still zero frozen reads after it", async () => {
+    // Concurrent reads in the coalescing view wait on the one in-flight renewal; none may dispatch after it.
+    const { r, after } = await scenario(({ deadline }) => ({ t: deadline + 1 }));
+    expect(OWNER_GROUP).toBeGreaterThan(1);
+    expect(r.state).toBe("pending");
+    expect(after.filter((c) => FROZEN.test(c.fn))).toEqual([]);
+  }, 300_000);
+
+  it("a renewal retry that crosses the deadline: zero frozen reads after the retried renewal", async () => {
+    // attempt 1 fails transiently well before the deadline; the 30 s retry wait plus a slow attempt 2 ends past it
+    const { r, after, renewedAt, deadline } = await scenario(({ t, deadline, attempt }) =>
+      attempt === 1 ? { t: Math.min(t, deadline - 40_000), fail: true } : { t: deadline + 2_000 });
+    expect(renewedAt!).toBeGreaterThan(deadline);
+    expect(r.state).toBe("pending");
+    expect(after.filter((c) => FROZEN.test(c.fn))).toEqual([]);
+  }, 300_000);
+
+  it("a renewal that completes before the deadline lets materialization continue", async () => {
+    const { r, after, target } = await scenario(({ t }) => ({ t: t + 500 }));
+    expect(target).toBe(true);
+    expect(r.problems).toEqual([]);
+    expect(after.filter((c) => MATERIALIZE.test(c.fn)).length).toBeGreaterThan(0);
+  }, 300_000);
+});
