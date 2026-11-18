@@ -3521,3 +3521,17 @@ Failure and retry safety require durable progress, idempotent checkpoint writes 
 Updated path to app testing: **guard correction → durable owner continuation and review → fresh AU identity/preflight plus authorised runtime rehearsal → controlled staging generation and Preview/summary-mode setup with remaining role/parity/dry-digest/growth gates → CJ can test Reports, Welcome and live counting in the app**.
 
 STATUS: COMPLETE
+
+## Coder log — T15P-1a post-renewal deadline check, 2026-11-18
+
+- **Repair (commit below this entry's parent; see `git log` for `task 15 (T15P-1a)`).** `api/_lib/production-reporting-worker.ts` `pageGuard`: `b.need()` before and immediately after `await b.beat(...)`. Nothing else changed: the reader's awaited per-RPC hook, outer guards, single-flight renewal, settled-group handling, deadlines, leases, retry delays and page limits are as reviewed.
+- **Regressions** in `tests/reporting/reportingPageGuard.test.ts` (now 11 tests), through the real worker over real SQL in PGlite with a simulated clock. The fixture is one owner whose children are read one row per page, so the due renewal lands inside the per-RPC guard rather than at the between-group checkpoints, which already check the deadline. The first fixture attempt hit only those checkpoints and did not detect the defect; that is why it was replaced.
+  1. A successful renewal ending at deadline + 500 ms: no frozen-read RPC is dispatched afterwards, and the cycle returns `pending`.
+  2. Readers awaiting the same single-flight renewal: no frozen read afterwards.
+  3. Attempt 1 fails transiently before the deadline, then the 30 s retry wait plus a slow attempt 2 ends past it: no frozen read afterwards, and the cycle returns `pending`.
+  4. A renewal completing before the deadline: materialization continues.
+- **Mutation:** removing the post-renewal `b.need()` fails cases 1–3.
+- **Common gate:** `npx tsc -b`, `npm run typecheck:digest`, strict ES2020 staging runners, `npm run test -- --run` 2,289/2,289 (77 files), `npm run build` pass.
+- **Not done:** T15P-4 (durable per-owner continuation) is queued behind planner review of this repair, as instructed. No staging action.
+
+STATUS: COMPLETE
