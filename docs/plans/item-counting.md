@@ -6497,6 +6497,8 @@ Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) sa
      - **Transient, then recovered:** a code-only `40001` on the version call, then version 1. Expect a bounded retry (30 s), then normal work.
      - **Transient, exhausted:** the transient is exhausted. Expect `pending` (deferred) with no unsupported diagnosis.
    - **Implement:** call `requireOwnerInputProtocol` through `b.retry` **before** `acquire`, and return early without `recordRun` for `OwnerInputUnsupportedError` only.
+   - *(Self-review correction.)* `recordRun` (`:457`) runs unconditionally after the main catch, so the unsupported case must **return from `runReportingCycle` before that block** with a completed result (`state`, `failureKind`, `durationMs`). Classifying it inside the catch is not enough.
+   - *(Self-review correction.)* The existing `fail.transientAt` injection returns code `57014`. The code-only `40001` version case needs its own version mode in the fake; both codes must stay transient.
 3. **Routed planning.** Replace `materializeOwnerGroup(coalesced, ...)` in `plan()`.
    - **Red tests:**
      - **Under the limits:** an owner under the limits plans with zero journal RPCs and an unchanged trace/descriptors (light).
@@ -6510,11 +6512,13 @@ Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) sa
      - **Same, 5,000 ms left:** it renews once, commits, and keeps the 2,000 ms reserve.
      - **Cannot fit fresh:** an owner whose smallest path cannot fit a fresh 240,000 ms run fails `owner_input_capacity`. Expect retained journal evidence, no publication, and a key-free problem string.
      - **Fits fresh:** an owner that fits fresh but not now is parked first; the next uninterrupted invocation advances its durable position (seq/cursor/hash). Repeated `pending` with an unchanged position is a failure.
-   - **Implement:** pass `b`'s actual time since the last heartbeat to `admitDurableUnit`. Build `AdmissionPath` from **actual** counts: the fixed calls made, `lookup`, `reload_calls`, measured reload CPU, old-staff pages, the unit's page/pieces/checkpoint calls, its measured CPU and serialization. Do not hand-feed totals in the worker test; assert the derived path for one fixed owner.
+   - **Implement:** pass `b`'s actual time since the last heartbeat to `admitDurableUnit`.
+   - *(Self-review correction.)* `Budget.lastBeat` is private, and `Budget` has no remaining-time accessor. Add `sinceBeat()` and `remainingMs()` accessors to `Budget` in the worker file (authorised). Call **`b.beat()` before each admission**, so a due renewal is taken first and `sinceBeatMs < HEARTBEAT_MS` (`withRenewals` refuses a full interval). `lastBeat` starts at invocation start, when acquisition establishes the lease. Build `AdmissionPath` from **actual** counts: the fixed calls made, `lookup`, `reload_calls`, measured reload CPU, old-staff pages, the unit's page/pieces/checkpoint calls, its measured CPU and serialization. Do not hand-feed totals in the worker test; assert the derived path for one fixed owner.
 5. **Atomic 0045 progression through the worker.** The red test is a worker-driven rebuild over the authorised PGlite fixture (`reportingOwnerContinuation`, or `walk-resume.test.ts` if a real worker trace is needed; both are authorised). An activating owner's combined page commits in one checkpoint and makes no child read for included kids. A deadline that falls between that page's read and commit leaves nothing durable and re-reads the page on takeover. A deadline right after the commit resumes at the cursor with no re-read.
 6. **Staging** (`stage()`).
    - **Red tests:**
-     - **Missing chunks only:** claimed work for a durable owner reuses its complete plan journal (stage upgrade on the first sealed write) and its returned input, and uploads only the missing chunks.
+     - **Missing chunks only:** claimed work for a durable owner reuses its **complete** plan journal through the read gate (no write and no purpose upgrade; a complete journal is immutable) and its returned input, and uploads only the missing chunks.
+     - **Incomplete takeover:** an **incomplete** plan journal taken over by stage is upgraded to `stage` on its first sealed write (the plan → stage rule; stage requests accept plan or stage journals, plan requests only plan).
      - **Discovery cost:** `read_reporting_staged_chunks` discovery costs `floor(stored/1000) + 1` calls (0/1/999/1,000/1,001 and sparse cases).
      - **Completed work:** completed one-chunk work is omitted from the claim and not re-claimed.
      - **Crash after a non-final upload:** a multi-chunk crash after a non-final upload reclaims and skips only the stored chunk.
