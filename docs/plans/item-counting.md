@@ -5055,3 +5055,393 @@ List exact paths for all proposed test changes. In addition to r4's new files an
 The review is complete; its verdict is changes required. The following status permits only the plan-only r5 handoff above.
 
 STATUS: COMPLETE
+
+## Coder proposal r5 — T15P-4 durable owner-input continuation (authoritative; supersedes r1–r4), 2026-11-18
+
+Plan-only, local commit, no push. **This section is the single authoritative contract.** Earlier proposals apply only where restated here.
+
+**Kept as final:**
+
+- the two r2 decisions: `R_complete > 120` is a visible `owner_input_too_heavy` with retained evidence and blocked publication; activation is the first of 16 source attempts, 1,000 distinct rows or 900 KiB (one page of overshoot);
+- reduced evidence; the owner handle; ordinal references;
+- the FK to `batches` only;
+- the read/plan/stage gates over `lock_batch`;
+- expected-seq replay excluding the fence;
+- service-only invoker/empty-search-path/RLS;
+- worker-state adapters;
+- the missing/unsupported-version early return with no run record;
+- 999 self + site;
+- durable hash progress;
+- sparse hash-verified chunk reuse;
+- cleanup via control → site `FOR UPDATE` → ordered locks with a generation recheck.
+
+The measured 649-RPC current-worker baseline stays unchanged as coder evidence. §13 maps each r4-review correction 1–8 to its section here.
+
+### 0. Three simplifications (they remove the contradictions the r4 review found)
+
+1. **No spill.** At activation the owner **discards its in-memory progress once and restarts in durable mode** from the owner's first source read. Every durable page is checkpointed before the next dependent read. That removes spill attempts, spill resets and the spill bound.
+   - **The cost** is the bounded **activation replay**: at most the reads made before activation (≤ 16 source attempts, plus any allowance-bounded flush pages, §4), once per owner per journal creation. The r2/r3 reviews already accepted this as the "initial activation replay" exception.
+   - A crash before the journal's first checkpoint replays only that window again.
+2. **One storage form for every event.**
+   - Every event is stored as **one or more pieces** in `owner_input_pieces`. The text is `event_json` = the adapter's `JSON.stringify` of the reduced event with keys in the fixed `imageToEvent` order. That is the exact text uploaded, stored and returned, and the canonical hash later re-canonicalizes from the parsed object, as today.
+   - **Pieces are cut by one deterministic rule (§2), used only by the adapter, on upload.** The server stores the pieces as given, validates them, and returns them unchanged on load.
+   - There is no SQL re-splitting and no second layout. The "whole versus fragmented" distinction disappears, because an event is simply n ≥ 1 pieces.
+3. **Page commits are atomic across several calls.** One durable source page may need several checkpoint calls when its events are large. Its pieces are written in "pending" calls that **never** change `state` (seq advances). The page's **final** call advances `state` and marks those pieces committed, in one transaction.
+   - A fresh process that finds pending pieces calls the same checkpoint with variant `discard_pending`, which deletes uncommitted pieces (bounded: one source page, ≤ 1,000 rows / ≤ 1 MiB of source, at most `S` pieces, §2), and then re-reads that page from the unchanged cursor.
+   - There is no matching of a "pending event within a replayed page". The page is redone.
+
+### 1. Schema (`supabase/migrations/0046_reporting_owner_inputs.sql`, offline draft only after approval)
+
+```sql
+CREATE TABLE reporting_private.owner_inputs (
+  handle            bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  batch_id          uuid        NOT NULL REFERENCES reporting_private.batches (batch_id),
+  partition_kind    text        NOT NULL CHECK (partition_kind IN ('order', 'event')),
+  partition_key     text        NOT NULL CHECK (partition_key <> ''),
+  site              text        NOT NULL CHECK (site IN ('au', 'uk', 'us')),
+  source_cutoff     timestamptz NOT NULL,
+  rule_version      text        NOT NULL CHECK (rule_version <> ''),
+  format_version    smallint    NOT NULL CHECK (format_version = 1),
+  purpose           text        NOT NULL CHECK (purpose IN ('plan', 'stage')),
+  phase             text        NOT NULL CHECK (phase IN ('reading', 'hashing', 'complete')),
+  seq               bigint      NOT NULL DEFAULT 0 CHECK (seq >= 0),
+  state             jsonb       NOT NULL,
+  members_count     integer     CHECK (members_count BETWEEN 0 AND 50000),
+  event_count       integer     NOT NULL DEFAULT 0 CHECK (event_count BETWEEN 0 AND 50000),   -- committed events only
+  pending_pieces    integer     NOT NULL DEFAULT 0 CHECK (pending_pieces >= 0),
+  audiences         jsonb,                                  -- set on entering hashing
+  hashes_done       integer     NOT NULL DEFAULT 0 CHECK (hashes_done BETWEEN 0 AND 1000),
+  input_hashes      jsonb       NOT NULL DEFAULT '[]',
+  load_pages        integer     NOT NULL DEFAULT 0,          -- §3 maintained packer (committed pieces only)
+  page_rows         integer     NOT NULL DEFAULT 0,
+  page_bytes        integer     NOT NULL DEFAULT 0,
+  reload_calls      integer     NOT NULL DEFAULT 2,          -- 1 header + load_pages + 1 EOF
+  last_payload_md5  text        CHECK (last_payload_md5 ~ '^[0-9a-f]{32}$'),
+  last_writer_fence bigint      NOT NULL CHECK (last_writer_fence >= 1),
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (batch_id, partition_kind, partition_key),
+  CHECK (phase = 'reading' OR (members_count IS NOT NULL AND audiences IS NOT NULL AND pending_pieces = 0)),
+  CHECK (phase <> 'complete' OR hashes_done = pg_catalog.jsonb_array_length(audiences))
+);
+CREATE INDEX owner_inputs_keyset     ON reporting_private.owner_inputs (batch_id, partition_kind COLLATE "C", partition_key COLLATE "C");
+CREATE INDEX owner_inputs_site_batch ON reporting_private.owner_inputs (site, batch_id, handle);
+CREATE TABLE reporting_private.owner_input_events (      -- one row per committed event (metadata)
+  handle      bigint  NOT NULL REFERENCES reporting_private.owner_inputs (handle),
+  ord         integer NOT NULL CHECK (ord BETWEEN 1 AND 50000),
+  event_id    text    NOT NULL,
+  pieces      integer NOT NULL CHECK (pieces >= 1),
+  text_bytes  integer NOT NULL CHECK (text_bytes >= 1),
+  text_sha256 text    NOT NULL CHECK (text_sha256 ~ '^[0-9a-f]{64}$'),
+  src_at      text    NOT NULL,                          -- the event's created_at text (transport-key part)
+  PRIMARY KEY (handle, ord),
+  UNIQUE (handle, event_id)
+);
+CREATE TABLE reporting_private.owner_input_pieces (
+  handle     bigint  NOT NULL REFERENCES reporting_private.owner_inputs (handle),
+  ord        integer NOT NULL,
+  piece_no   integer NOT NULL CHECK (piece_no >= 0),
+  piece      text    NOT NULL CHECK (piece <> ''),
+  row_bytes  integer NOT NULL,                           -- the server's exact accounted load-row bytes (§3)
+  committed  boolean NOT NULL,
+  PRIMARY KEY (handle, ord, piece_no)
+);
+CREATE INDEX owner_input_pieces_pending ON reporting_private.owner_input_pieces (handle) WHERE NOT committed;
+-- RLS on all three (no policies); REVOKE ALL FROM PUBLIC, anon, authenticated; service_role S/I/U/D.
+```
+
+### 2. The one piece rule (adapter-owned; the server validates)
+
+- **The text.** `event_json = JSON.stringify(reduced)` with keys in the order `id, location, staff_id, department, order_number, line_sku, line_quantity, event_type, created_at, parent_event_id, cs_case_id`.
+- **The split.** Walk the text by Unicode code points. Close the current piece when appending the next code point would make **the piece's own JSON-escaped string literal** (`JSON.stringify(piece)`, quotes included) exceed **P = 196,608 bytes** (192 KiB). Every escape (`\\`, `\"`, `\uXXXX` for controls) is therefore inside the bound, whatever the content.
+  - The piece count `n` is whatever this produces. It is never assumed equal to `ceil(bytes / P)`.
+  - The r4-review counterexample (a backslash-heavy 400,221-byte event) yields pieces whose escaped literal is ≤ 196,608 B each. The tests include that exact event.
+- **Server validation** (in the page's final call): for each event, the pieces `0..n-1` are present and contiguous. `octet_length(to_jsonb(piece)::text)` ≤ 196,608 + 4 slack is checked for each piece (the jsonb text adds no escaping beyond JSON's). The concatenation's `octet_length` = `text_bytes` and its sha256 = `text_sha256`. The parsed JSON has exactly the 11 keys, with `id = event_id`, `location = site` and `created_at = src_at`.
+- **A rejected "maliciously tiny" split.** The server recomputes the split rule's **maximality** cheaply: every piece except the last must be unable to take the next code point (that is, its escaped length + the next code point's escaped length > P). It rejects otherwise, so piece counts are canonical and bounded: `n ≤ ⌈escaped_bytes / (P − 12)⌉`.
+- **The worst case per event.** An admissible reduced event is ≤ the source row, which fit in 1 MiB of source response. Its escaped text is ≤ 6 × 1 MiB in the pathological all-control-character case, so `n ≤ ⌈6 MiB / 196,596⌉ = 33` pieces. That bound is stated, not a new limit; any admissible event is storable.
+
+### 3. Exact accounting and the maintained packer (shared by load and `R_complete`)
+
+- **The load row.** The event loader returns rows `(ord integer, piece_no integer, pieces integer, event_id text, text_bytes integer, text_sha256 text, piece text, eof boolean)`. `pieces`, `event_id`, `text_bytes` and `text_sha256` are present on piece 0 and NULL on later pieces.
+- **Accounted bytes** of a row = the exact `octet_length` of `json_build_object(…)::text` of that row in the PostgREST response shape (field names, nulls, escaping, numeric widths). The server computes it **at insert**, with the same expression the loader's response uses, and stores it as `row_bytes`. +1 for the array separator.
+- **The packer** (maintained in the header on each committed piece, in `(ord, piece_no)` order). The current page has `(page_rows, page_bytes)`. A piece starts a new page if `page_rows = 1,000` or `page_bytes + row_bytes + 1 > 1,048,574`. `load_pages`, `page_rows` and `page_bytes` update in O(1).
+  - **Header channel:** 1 call. **EOF:** 1 call (one row with `eof = true` and nulls). So `reload_calls = 1 + load_pages + 1`.
+  - A piece's row is ≤ 196,608 + ~200 B, so it always fits an empty page.
+- **Early heavy detection.** `reload_calls` is exact for **committed** pieces. Pending pieces are counted by the same packer into a provisional total, which is a lower bound on the final one because committed pieces can only be added.
+  - If the provisional total exceeds 120, the page's final call **commits** and returns `heavy = true`. A pending call that already proves the overrun also returns `heavy = true` without rollback, keeping its pieces as pending evidence.
+  - Reopening a header with `reload_calls > 120` (`lookup` returns it) fails `owner_input_too_heavy` **before** any reload.
+  - Fragments are never double-counted: there is only one piece representation.
+- **Load snapshot.** `load_reporting_owner_input_events(p_batch, p_fence, p_handle, p_seq text, p_after_ord, p_after_piece)` requires `p_seq = seq` (otherwise `owner_input_snapshot`) and returns only committed pieces, packed exactly as the maintained packer. The client:
+  - pins the header's `seq` text and uses it on every page;
+  - requires contiguous `(ord, piece_no)`, piece 0 metadata, a final `eof` row, the count of events = `event_count` and the number of calls = `reload_calls`;
+  - reassembles each event and verifies `text_bytes`/`text_sha256`, then parses it and checks the 11 keys.
+- **Tests:** a production-limit traversal equals `reload_calls` for: the backslash counterexample, control-character text, 4-byte emoji, 999/1,000-row edges and the 1 MiB edge; a genuinely near-120 input (**119** calls) succeeds; a **121**-call input fails heavy with its evidence retained. Small-page injection stays a separate stress test.
+
+### 4. Activation seams and the durable route
+
+**The light route** (unchanged code paths, plus counting). Every owner starts on today's optimized path: aggregated readers, `coalescingChildren`, `provenChildren` and 0045 combined pages.
+
+- **Counters:** `calls` counts the RPC attempts made for the owner (retries and discarded pages included). `rows` and `bytes` count the distinct consumed rows and their reduced bytes, evaluated row by row as rows are consumed, with page boundaries retained (the buffer keeps per-response groups).
+- **Allowance-bounded shared reads.** A coalesced flush issues at most `min over waiters w of (16 − calls_w)` pages, and each page adds 1 to every waiter's `calls`. This is *allowance accounting*: an upper bound per owner, not physical attribution. `provenChildren` issues at most `16 − calls` pages.
+- **What survives a bounded flush:** only the parents proven complete inside the window, exactly the current rule. The unproven last parent's prefix is **discarded**. On the light route that is harmless: the owner either continues with its own fallback reads, or activates. On activation, everything is discarded anyway (simplification 1).
+- **Activation check points** — before the next dependent source call, and in particular:
+  - after every source response;
+  - **inside `exactWalk` before calling `consumeChildren` for a `kids === null` line of a combined page**;
+  - before the plain fallback.
+
+  Whichever trigger fires first activates. If it fires on the response that also finished the owner, the owner still activates. A completed owner skips the journal only if no trigger ever fired.
+
+**Activation** = abandon the light attempt (release its arrays), `open` the journal (or find it), and restart the owner on the **durable route**.
+
+**The durable route** uses page methods only (`membersPage`, `byIdsPage`, `childrenPage`, `stream`, `childPage`, and `predecessorPage` treated as one page). It uses **no** coalescing, **no** `provenChildren` and **no** multi-page helpers. Each source response is one durable page, checkpointed (one final call, or pending calls + one final) before the next dependent read.
+
+- A combined 0045 page is consumed only if all its included lines' kids are complete. A cut page is discarded (counted, uncharged) and the plain route continues, exactly as today.
+- **Durable walk order.** The line is journaled as a pending line before its kids are read. Each kids page is checkpointed. When the line's kids end, it is marked done with `effective`. Only then does the stop rule run and the cursor advance.
+
+### 5. State, step graph and validation ownership
+
+**State** (ordinals reference committed events of the same journal):
+
+```
+{v:1, step:"members",  m:{afterOrd:int|null}}                         // the members keyset = (owner_index 0, event_id of afterOrd)
+{v:1, step:"parents",  p:{group:int, afterOrd:int|null}}              // afterOrd = last FOUND parent of the current group
+{v:1, step:"children", c:{group:int, afterOrd:int|null}}              // afterOrd = the last child row's event; its parent is read from that event
+{v:1, step:"walk",     w:{worker:int, cursorOrd:int|null, stopAt:"<digits>"|null, need:[string],
+                          line:null|{ord:int, afterKidOrd:int|null, phase:"kids"|"done", effective:bool|null}}}
+{v:1, step:"done"}
+```
+
+**The step graph** (SQL-enforced; there is no skipping):
+
+| from | to | condition |
+|---|---|---|
+| (open) | `members` `{afterOrd:null}` | — |
+| `members` | `members` | page with ≥ 1 row: `afterOrd` = the last new or seen member ordinal of this page |
+| `members` | `parents {group:0, afterOrd:null}` | empty page; sets `members_count = event_count` exactly once |
+| `parents` | `parents` | a page in the same group with `afterOrd` set, or an empty page → `group+1`, `afterOrd: null` |
+| `parents` | `children {group:0, afterOrd:null}` | the server-computed parent group count is exhausted (`group` = ⌈parents/500⌉) |
+| `children` | `children` | the same group with a new `afterOrd`, or an empty page → `group+1` |
+| `children` | `walk {worker:0, cursorOrd:null, …}` | `group` = ⌈members/1,000⌉ |
+| `walk` | `walk` | any of the walk sub-transitions below |
+| `walk` | `done` | `worker` = the number of distinct member staff (server-computed) |
+| `done` | (phase `hashing`) | in the same call: `audiences` set |
+| hashing | hashing / complete | §6 |
+
+**Walk sub-transitions** (SQL checks reference binding, the adapter checks source order):
+
+- `line: null` → a pending line with `{ord, afterKidOrd: null, phase: "kids"}`. SQL requires `ord` to be a committed event whose `staff_id` = the current worker's staff (the server derives the worker's staff from the members).
+- `kids` → `kids` with a new `afterKidOrd`. SQL requires `afterKidOrd` to be a committed event with `parent_event_id` = the line's event id.
+- `kids` → `done` with a boolean `effective`.
+- `done` → `line: null` with `cursorOrd` = that line's ordinal (or the next consumed non-candidate's ordinal); `stopAt`/`need` may change.
+- `worker` → `worker + 1` with `cursorOrd: null`, `line: null` — **a legal cursor reset**.
+- A line may not be replaced while it is `kids`.
+
+**Validation ownership (stated explicitly).**
+
+- **SQL** checks the structure, the step graph, the group/worker bounds, reference existence and binding (a member ordinal for `m`; a parent belonging to the current group's frozen list for `p`; a child of a member in the current group for `c`; the line/kid parent binding; the worker staff), `members_count` set once, and the hash order.
+- **SQL does not compare positions by ordinal number.** Ordinals are first-insertion order, and a legal walk visits them in descending `(created_at, bytewise id)`, e.g. ordinal 2 → 1.
+- **The adapter** checks **source-position monotonicity**: the referenced events' transport keys in the RPC's own order and direction. That is bytewise ids for member, parent and child keysets, and `(created_at desc, id desc)` bytewise for the stream. It checks projector UTF-16 order where `exactWalk` uses `projectorOrder`, with the exact existing comparison functions.
+- **Hash input order.** Before hashing, the reconstructed events are **sorted bytewise by id** (`compareUtf8`), exactly as `buildOwnerInput`'s final sort. Append order is never used.
+- **Tests:**
+  - a legal decreasing-ordinal walk (two member lines);
+  - mixed seen/new children in one page;
+  - reference-binding rejections (a kid of another parent, a line of another worker, a parent outside its group);
+  - hash-input order equal to the oracle;
+  - every illegal step via direct service RPC (skipping a step, a premature `done`, a second `members_count`, a replaced pending line, backwards hash progress).
+
+### 6. Checkpoint payload (discriminated) and replay
+
+`checkpoint_reporting_owner_input(p_batch uuid, p_fence bigint, p_handle text, p_expected_seq text, p_payload jsonb)` → `(seq text, event_count integer, pending_pieces integer, reload_calls integer, heavy boolean, replay boolean)`.
+
+- **Wire types.** Handles, seqs and work ids travel as **decimal text** (`::text` on results; text arguments cast server-side to `bigint` with range checks `1..9223372036854775807`), as 0038 `claim_reporting_work` does. The adapter keeps them as strings and never converts them to `Number`.
+
+`p_payload` variants (canonical JSON; the md5 is over `p_payload::text`; the fence is never inside it):
+
+| `kind` | fields | effect |
+|---|---|---|
+| `"pieces"` | `pieces: [[ord, piece_no, piece], …]` (contiguous continuation of pending pieces) | inserts pending pieces; `state` unchanged; `seq + 1` |
+| `"page"` | `events: [[ord, event_id, pieces, text_bytes, text_sha256, src_at], …]` (new ordinals `event_count+1…`, contiguous; may be empty), `seen: [ord…]` (optional, for adapter bookkeeping; not stored), `state`, optional `members_count` | validates and assembles every pending piece of the listed events (§2), marks them committed, inserts the event metadata rows, advances `state` per §5, updates the packer, `seq + 1` |
+| `"discard_pending"` | `{}` | deletes uncommitted pieces of this handle (bounded by §2: one source page's pieces); `pending_pieces = 0`; `state` unchanged; `seq + 1` |
+| `"hash"` | `audiences` (first hash call only; the exact canonical list), `hashes: [{audienceKind, audienceStaff, inputHash}, …]` (the next 1..100 in list order) | `phase: reading → hashing` on the first call (requires `step: "done"`), appends hashes; `→ complete` when all are done |
+
+- **Deduplicated ids.** An event already committed is never re-sent. A `page` whose `events` contain an `event_id` already present is `owner_input_invalid`. Seen ids are the adapter's concern.
+- **Acceptance.** If `header.seq = p_expected_seq`, validate and apply, then set `last_payload_md5` and `last_writer_fence = p_fence`.
+- **Replay.** If `header.seq = p_expected_seq + 1` **and** `last_payload_md5 = md5(p_payload::text)`, return the current values with `replay = true`. Nothing changes, and `last_writer_fence` is **not** updated. This includes the final `hash` call that set `complete`, so the complete journal stays immutable while its lost response is replayed.
+- **Conflict.** Anything else is `owner_input_conflict`.
+- **Takeover.** The new fence passes the gate; a fresh process reads the header and continues from its seq. An in-flight identical payload from the new holder is a replay.
+- **Final-fragment exception (the only one).** Only a `page` call may advance `state`, and it must assemble all pending pieces of its events. `pieces` and `discard_pending` never change `state`. A `hash` call is rejected while `pending_pieces > 0`.
+- **Tests:**
+  - a lost response after every variant (`pieces`, `page`, `discard_pending`, the first and the final `hash`);
+  - a repeated `discard_pending`;
+  - an old `discard_pending` after new progress (conflict);
+  - complete-journal replay;
+  - takeover between pending pieces and the final page.
+
+### 7. All other RPCs (exact)
+
+| function | args | result | notes |
+|---|---|---|---|
+| `reporting_owner_input_version()` | — | `(version integer)` = 1 | first RPC in every mode |
+| `open_reporting_owner_input` | `(p_batch uuid, p_fence bigint, p_kind text, p_key text, p_purpose text)` | `(handle text, created boolean, phase text, seq text, reload_calls integer)` | the plan or stage gate by purpose; idempotent on (batch, kind, key); checks `worker_owners`; the request ≤ 1 MiB because key JSON ≤ `MAX_CLAIM_KEY_JSON_BYTES` + ≤ 300 B |
+| `lookup_reporting_owner_inputs` | `(p_batch uuid, p_fence bigint, p_owners jsonb)` (1..100 `[kind, key]`; the adapter splits by request bytes; a single over-budget key is looked up alone) | `(idx integer, handle text, phase text, seq text, purpose text, reload_calls integer, old_staff_count integer)`, exactly one row per idx (nulls = no journal) | read gate; ≤ 100 × 200 B |
+| `read_reporting_owner_old_staff` | `(p_batch uuid, p_fence bigint, p_kind text, p_key text, p_after uuid, p_limit integer)` | `(staff uuid)` ≤ 1,000, ordered | read gate; **by key**, so it works when no journal exists yet (stage-origin) |
+| `load_reporting_owner_input_header` | `(p_batch uuid, p_fence bigint, p_handle text)` | `(phase, purpose, seq text, state, members_count, event_count, pending_pieces, audiences, hashes_done, input_hashes, reload_calls)`, exactly one row | read gate; ≤ 410 KiB |
+| `load_reporting_owner_input_events` | §3 | §3 | read gate; snapshot-pinned |
+| `read_reporting_staged_chunks` | `(p_batch uuid, p_fence bigint, p_work_ids text[], p_after_work text, p_after_chunk integer, p_limit integer)` | `(work_id text, chunk_no integer, chunk_hash text)` | read gate; ids 1..100, distinct, positive bigint, in `partition_work` of the batch; paired-null keyset; `p_limit` 1..1,000; `ORDER BY work_id::bigint, chunk_no` |
+| `release_reporting_owner_inputs` | `(p_site text, p_limit integer)` | `(deleted integer, more boolean)` | §10 |
+
+- **One-reconstruction discipline.** The header, events, old staff and hashes used together must come from one `seq` (pinned on the events channel). Old staff is re-read **after** opening a stage journal and is bound to the owner by key.
+- **Stage-origin coverage.** A claimed owner without a journal reads `old_staff` by key, opens a stage journal, and computes **all** audiences (site + member staff ∪ old_staff). The server re-derives that set and cross-checks every audience with sealed `partition_work` against its `input_hash`.
+
+### 8. Admission, progress and the measured CPU
+
+**Measured** (offline, this machine: AMD Ryzen 7 5700X; `projectReportingPartition` + `sha256(canonicalJson)`):
+
+| input | site audience: project / hash (canonical bytes) | one self audience: project / hash |
+|---|---|---|
+| 10,000 events | 314 / 31 ms (2.9 MB) | 20 / 2 ms |
+| 50,000 events | 1,356 / 148 ms (14.6 MB) | 73 / 8 ms |
+| 50,000 events, 2 KB ids (byte-heavy) | 8,182 / 403 ms (139.6 MB) | 444 / 17 ms |
+
+These are offline acceptance inputs, not hosted capacity claims. Hosted CPU is measured at the later staging gate.
+
+**Admission.** Before each unit, `remaining_ms ≥ rpc_ms + cpu_est + reserve`, with `reserve = 2 × 1,000 ms` (a renewal + the run record) and `cpu_est` = 2 × the measured per-event cost × the unit's events, plus a safety factor of 2.
+
+- **Hashing units** choose `n` = the largest count of next audiences in [1, 100] whose estimate fits. If `n = 0` at the **start of a fresh invocation**, the outcome is a visible `owner_input_capacity` (a distinct kind; never `owner_input_too_heavy`). If `n = 0` mid-invocation, the worker returns pending.
+- **Stage units are per chunk upload.** Per audience: project + verify the hash + `buildChunks` + one staged-chunk read (its CPU is admitted as one unit), then **each missing chunk upload request** is its own admitted unit. Every committed upload is durable progress (sparse reuse), so a partial audience is never redone except for its projection.
+- **Retries.** The existing 30/60/120 s backoffs are not reserved. A retry that doesn't fit the remaining time defers (`Deferred` → pending), as today. Fixture tests run without retries; separate tests inject one transient failure.
+- **Progress.**
+  - With `R ≤ 120` and a fresh 240,000 ms invocation, the worker's fixed overhead (≤ 11 calls) + the reload (R calls) + renewals (⌈(11 + R)/30⌉) ≤ 136 s, leaving ≥ 100 s.
+  - That admits one hashing unit even for the byte-heavy 50,000-event site audience (8.6 s × 4 = 34 s with the factor), or one stage chunk upload.
+  - **The claim:** under the measured CPU and 1,000 ms per RPC, every owner with `R ≤ 120` advances ≥ 1 durable unit per uninterrupted invocation. It is not claimed beyond those assumptions.
+
+**Peak memory** (bytes, under the light route's activation thresholds):
+
+- **The light group:** ≤ 8 owners × (evidence ≤ 1,999 rows; buffered responses ≤ 1 MiB each; the per-response groups kept in the coalescing buffer ≤ 1 MiB shared). Descriptors are retained after hashing, ≤ 1,000 × (key ≤ 1 MiB + 150 B) per owner. Keys are shared string references, so they are counted once per owner. Projections are released after each audience.
+- **The durable owner** (one at a time, in its ordered position): events ≤ 50,000 objects + their sorted array + one audience's canonical string (≤ 139.6 MB measured worst) + one projection + one chunk array + one serialized request ≤ 1 MiB.
+- **Parking.** When an owner activates in a group, its light arrays are released at once. It runs durably at its ordered position; the other owners' plan results are descriptors only, and their stage rows aren't built until their turn.
+- **On failure or deadline** the durable state is the journal. Nothing else is retained across invocations.
+
+### 9. Guards, version, errors, counts
+
+- **Guard.** `need → due single-flight beat → need` runs before every source **and** journal and chunk RPC, and before each retry attempt. Renewal bypasses it. Cleanup mode uses `need` only.
+- **Version** (the first RPC in every mode). `PGRST202`, or the message `Could not find the function public.reporting_owner_input_version`, or `42883` maps to `migration_missing`. Version ≠ 1 maps to `migration_unsupported`. Both return early with **no `recordRun`** and no mutation.
+- **Errors:**
+  - `conflicting_work` ← `owner_input_conflict`, `owner_input_snapshot`, `owner_input_format`, and a stored chunk hash mismatch;
+  - `owner_input_too_heavy` and `owner_input_capacity` keep their own names;
+  - `error` ← `owner_input_binding`, `owner_input_invalid`, `owner_input_transition`, `owner_input_args`, `owner_input_lookup`.
+- **Counts (numeric):** `journalOpens`, `journalCheckpoints`, `journalReloadCalls`, `activationReplays`, `pendingDiscards`, `heavyInputs`, `heavyReloadCalls`, `capacityRefusals`, `hashUnits`, `stageUploads`, `chunksSkipped`, `ownerInputsPending` (0/1).
+- **Diagnostics.** `problems` carries `handle=<text> reload_calls=<n>`, with no key.
+
+### 10. Published cleanup (bounded discovery and locks)
+
+`release_reporting_owner_inputs(p_site text, p_limit integer DEFAULT 5000)`:
+
+1. Validates `p_site ∈ {au, uk, us}` and `p_limit` in 1..10,000.
+2. Locks control `FOR SHARE`, then site_state `FOR UPDATE`.
+3. Selects at most **20 candidate headers** via `owner_inputs_site_batch` (`ORDER BY site, batch_id, handle`), joined to `batches b` (`b.site = p_site`, `b.state = 'published'`) and to `generations g` (`g.generation_id = b.published_generation_id`, `g.site = p_site`, `g.state IN ('published','superseded','expired')`).
+4. Locks their distinct batches (≤ 20) `FOR UPDATE` in `batch_id` order, then re-checks.
+5. For each header in `(batch_id, handle)` order, it deletes pieces `ORDER BY ord, piece_no`, then event metadata `ORDER BY ord`, then the header once it has no child rows. It stops as soon as the aggregate physical deletes reach `p_limit`. There are no cascades.
+6. `more` = EXISTS(an eligible header) LIMIT 1, via the same index.
+
+- **The post-publish attempt** is wrapped in its own `try`/`catch` **after** the publish result is recorded. Its failure sets `counts.ownerInputsPending = 1` and leaves `state = 'published'`, never falling through to the generic catch.
+- **Kept:** failed and abandoned retention, independence from 0043's 30-day cleanup, and generation reads. True concurrent-session serialization stays a later staging-gate item.
+
+### 11. Traces: observed versus proposed
+
+- **Observed (current worker, uninterrupted PG-LONG): 649 RPCs, unchanged**, as accepted.
+- **Proposed** (a model of the r5 algorithm: deterministic 1,000 ms per RPC, renewal due at ≥ 30,000 ms since the last successful renewal and taken at the next guarded call, no retries). These are integer **upper bounds**, which the tests assert exactly against a deterministic clock.
+
+**PG-LONG** (owner order PG-LONG; the line + 300 cancellations are all members; the children request covers all 301 member ids; the `read_reporting_children` limit forced to 1; 1 worker):
+
+- **Light attempt** (invocation 1, plan): `list_reporting_worker_owners` 1, `lookup` 1, members 2 (light `members()`), then children through the coalescing view. The flush allowance is `16 − 2 = 14` pages, after which the light attempt has `calls = 16`. **Activation.** The 14 pages are discarded (the line is not proven complete), so the activation replay is 16 calls.
+- **Durable route:**
+
+| unit | source | journal |
+|---|---|---|
+| open | — | 1 |
+| members page 1 (301 rows) | 1 | pieces: 301 events × 1 piece, ≈ 135 KiB → 1 `page` call (no pending calls needed) |
+| members empty | 1 | 1 `page` (step `parents`, `members_count` = 301) |
+| parents: none (every parent is a member) | 0 | 0 (the server counts 0 groups, so the next `page` moves straight to `children`) |
+| children: 300 one-row pages (all seen) + 1 empty | 301 | 301 `page` calls (no new events; `afterOrd` advances; the last moves to `walk`) |
+| walk: combined 0045 page (line + 300 kids + end; all kids complete) | 1 | 1 `page` (the line done with effective = false; `exactWalk` returns at end, so step `done`) |
+| hash: 2 audiences (site, self) | — | 1 `hash` (`→ complete`) |
+
+- Plan totals for the owner: source 304, journal 306. The plan tail: `plan_reporting_owner` 1, `list_reporting_worker_owners` 1, verify 1, descriptors 2, seal 1.
+- **Stage:** claim 1, lookup 1, header 1, events 1 (301 rows, 1 page) + EOF 1, then **per audience** (2): staged-chunk read 1 + upload 1 (each audience is 1 chunk) = 4. Then claim 1 (empty), publish 1, release 1, record 1.
+
+**Per invocation, at 240 RPC-seconds, admission reserve 2 s, CPU < 1 s per unit for this fixture:**
+
+| inv | calls | detail | durable position at end |
+|---|---|---|---|
+| 1 | status 1, begin 1, copy 1, freeze 1, progress 1, list_owners 2, save_enum 2, version 1 (first) = 10; light attempt 4 + 14 = 18; open 1; members 2 + 2; children pairs; renewals (at calls 30, 60, …, 210) 7; record 1 | 240 − 10 − 18 − 1 − 4 − 7 − 1 − 2 (reserve) = 197 → 98 children pairs (196) | children 98/301 |
+| 2 | version 1, status 1, resume 1, progress 1, `list_reporting_worker_owners` 1, lookup 1, header 1 (no events reload needed for children: the state needs only the stored ordinals; the evidence is reloaded only at hashing) = 7; renewals 8; record 1; reserve 2 | 240 − 18 = 222 → 111 pairs | children 209/301 |
+| 3 | 7 + 92 pairs (184) + walk 2 + **events reload 2** (header taken; events page + EOF, needed for hashing) + hash 1 + plan tail 6 + stage (claim 1, lookup 1, header 1, events 2, per audience 4, claim 1, publish 1, release 1) 12 + renewals 7 + record 1 = 222 | ≤ 238 | **published** |
+
+- **Uninterrupted bound: 3 invocations.**
+- **Correction to r4:** children progress needs no evidence reload, because the state references only ordinals and the server holds the binding. The **evidence reload happens once per process that hashes or stages** (cost `R`).
+
+**Finite crash schedule** (each crash at a pinned boundary; then uninterrupted):
+
+- **C1:** in invocation 1, after the light attempt and `open` (before the first `page` commits). It loses the activation replay, ≤ 16 + 1 calls.
+- **C2:** in invocation 2, the response of a `page` call is lost (after commit); the next invocation replays it (replay = true, 1 call).
+- **C3:** in invocation 3, the response of the 1st stage upload is lost; the resume skips it via the hash-equal stored chunk.
+
+The tests assert ≤ 5 invocations for C1 + C2 + C3: each crash costs ≤ 1 extra invocation by the table, and C1's invocation makes **no** durable progress beyond `open`, as stated, not hidden. A separate hashing interruption (a 1,000-self-audience variant, §12) and a stage interruption are scheduled likewise. The ceiling is ≤ 20.
+
+**PG-CUT** (fully pinned):
+
+- **Data.**
+  - Staff W = `00000007-eeee-4eee-8eee-eeeeeeeeeeee`, department `framed`, station `s`, note `''`, cutoff `2026-11-15T12:00:00.000000Z`.
+  - L2: id `pc-l2`, order `PG-CUT`, `line_verified`, SKU `INKA-KAN0566-A4-FB`, qty 1, at `2026-10-02T00:00:00Z`.
+  - Kids `pc-k0000..pc-k1099`: `cancelled`, order `PG-CUT-X`, sku/qty null, parent `pc-l2`, at L2 + (i+1) s.
+  - L1: id `pc-l1`, order `PG-OTHER`, `line_verified`, same SKU, qty 1, at `2026-10-01T00:00:00Z`, no kids.
+  - The full rebuild enumerates three owners (PG-CUT, PG-CUT-X, PG-OTHER). The trace below is the isolated owner-input route of PG-CUT; the full-rebuild test asserts the per-owner subtotals plus enumeration.
+- **The owner PG-CUT route** (no overrides):
+  - light members 2 (1 row + empty);
+  - light children page 1 (1,000 rows): evidence 1,001 > 1,000 triggers **activation** after that response (calls 3; the replay is 3 calls);
+  - durable: open 1; members 1 + empty 1; parents 0; children 1,000 + 100 + empty = 3 source, each with a `page` (the first page's 1,000 new events at ≈ 450 B ≈ 440 KiB: 1 call; plus 2);
+  - walk:
+    1. combined page (cut: 1,100 kids > 1,000 rows; discarded) 1;
+    2. plain page (L2, L1) 1 + `page` (L2 pending);
+    3. L2 kids: 1,000 + 100 + empty = 3, each with a `page`;
+    4. L2 done (effective = false);
+    5. L1 (seen on the same plain page), pending → its kids: 1 empty + `page` → done (effective = true below the earliest member; `need` satisfied, `stopAt` set);
+    6. the **next plain page** (empty, proving the end/tie) 1 + `page` → `done`;
+  - hash 1.
+- **Totals:** source 3 (light) + 2 + 3 + 1 + 1 + 3 + 1 + 1 = **15**; journal 1 + 2 + 3 + 1 + 3 + 1 + 1 + 1 + 1 ≈ **14**.
+- **Bound:** 1 invocation (asserted ≤ 2).
+
+### 12. Tests and files (exact paths)
+
+- **New tests:**
+  - `tests/reporting/pg/owner-inputs.test.ts`: schema and roles (anon, and authenticated with owner/manager/staff/kiosk/CS claims, denied; PUBLIC revoked; invoker/search_path/RLS); gates; `open`; the step graph and reference binding; the payload variants and replay/conflict/takeover; pieces/maximality/packer equal to traversal (incl. the backslash counterexample, 119/121); `discard_pending`; hashing order and completeness, 999 self + site and the 1,000-self refusal; bigint text above 2^53 and range limits; staged-chunk validation; release bounds/order and the published-after-failure path; 30-day old cleanup for all terminal states.
+  - `tests/reporting/reportingOwnerInputState.test.ts`: the state parser, the piece rule, the packer, the snapshot loader, source-position monotonicity, errors and version mapping.
+  - `tests/reporting/reportingOwnerContinuation.test.ts`: PG-LONG (the §11 table and the C1–C3 schedule), PG-CUT (full rebuild + isolated), the seams (counter 15 shared flush, unequal waiters, zero-new-ID pages, a byte trigger in a proven prefix, multi-response buffers, a combined page → a dependent child), three simultaneous activations, admission (`owner_input_capacity` by an injected CPU estimate; 1,000 self audiences hashed across invocations), stage per-upload progress, missing/unsupported 0046 with no mutation, guards on journal calls (deadline-crossing renewal, observable shared waiters), and a separately labelled small-page stress test.
+- **Changed tests:**
+  - `tests/reporting/reportingPageGuard.test.ts` (deterministic clock, observable shared renewal, the former pending case becoming positive publication);
+  - checkpoint variants in `tests/reporting/pg/walk-resume.test.ts`, `tests/reporting/pg/predecessor-page.test.ts`, `tests/reporting/reportingPredecessorPage.test.ts`, `tests/reporting/reportingMaterializeBatching.test.ts`, `tests/reporting/reportingWalkBatching.test.ts` and `tests/reporting/reportingMaterialize.test.ts` (the 50,000/50,001 boundary with a durable restart at 49,999, ties, hidden cancellations, no-lookahead, old-self).
+- **App files:**
+  - `supabase/migrations/0046_reporting_owner_inputs.sql` (new);
+  - `api/_lib/production-reporting-reader.ts` (page methods);
+  - `api/_lib/production-reporting-materialize.ts` (counters/allowance, activation points, the durable step machine, per-audience units);
+  - `api/_lib/reporting-worker-state.ts` (adapters, the piece rule, the packer mirror, the snapshot loader, the parser);
+  - `api/_lib/production-reporting-worker.ts` (version-first, activation/ordered durable processing, admission, chunk reuse, post-publish release, `failureKind`, counts);
+  - `package.json` (`typecheck:digest` lists all new and changed API modules and the tests above).
+  - **No change:** `reporting-jobs.ts`, `reporting-stage.ts`, 0037–0045.
+- **Commit order** (local; each with focused and common gates and a log line): 4a 0046 + SQL tests (with 0037–0045 immutability hashes) → 4b reader page methods → 4c state machine/adapters/pieces/packer → 4d worker integration → 4e integrated acceptance + page-guard corrections → log.
+
+### 13. Cross-reference to the r4 review
+
+| correction | r5 |
+|---|---|
+| 1 source-position (not ordinal) comparisons, step graph, resets, binding, hash order | §5 |
+| 2 one piece representation, escaped-literal split, metadata, packer from units, early heavy lower bound, reopen fail-fast | §2, §3 |
+| 3 the discriminated payload, replay/fence rules, the final-page exception, spill removed (activation restart), discard-pending bound | §0, §6 |
+| 4 discarded flush prefix, per-response buffer boundaries, the check before `consumeChildren` | §4, §11 |
+| 5 decimal-text bigint wire types, snapshot discipline | §6, §7 |
+| 6 admission picks n ≥ 1, per-upload stage units, retries, measured CPU, byte-aware peaks | §8 |
+| 7 bounded candidates/locks, delete order, published-after-failure | §10 |
+| 8 observed vs proposed, corrected trace (no evidence reload for children), the PG-CUT end page, a pinned crash schedule, exact test paths | §11, §12 |
+
+STATUS: COMPLETE
