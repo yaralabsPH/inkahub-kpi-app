@@ -6475,3 +6475,67 @@ Astra's scope review (`docs/reviews/item-counting-t15p4-scope.md`, `6c76bd6`) sa
   - the line-without-included-kids path inside a combined page;
   - the conservative Unicode certain bound.
 - **Next session, in order:** the rest of Must-fix 4; the rest of Must-fix 3 (no-run-record path) together with the step-3 `runReportingCycle` wiring and the authorised `tests/api/reporting-worker.test.ts` fakes; then 4e, including Should-fix 2's independent oracle.
+
+## Coder checkpoint — T15P-4d step 3 main-loop wiring: integration preflight and TDD plan (doc only; no code changed), 2026-11-19
+
+**Inspected, read-only, at `c0b7413`.**
+- **`runReportingCycle`** (`api/_lib/production-reporting-worker.ts:378`): budget, then `acquire`, then `copyAndFreeze` (rebuild), then the frozen ref and `pageGuard`, then `readWorkerProgress`; if unsealed, `enumerate` → `plan(coalesced)` → `seal`; then `stage(coalesced)` and publish.
+  - `OutOfTime` and `Deferred` become `pending`; any other error becomes `failed` with `failureKind`.
+  - The run record (`recordRun`, `:457`) is written **unconditionally** after the main catch.
+- **`plan`** (`:302`) and **`stage`** (`:337`) materialize bounded owner groups with `materializeOwnerGroup` over one `coalescingChildren` view and plan/stage in list or claim order.
+- **`tests/api/reporting-worker.test.ts`.** Its `FakeServer` (`rpc` at `:93`, `handle()` switch at `:145`) models 0038/0043 only. It ticks a deterministic clock per call, records `calls`, injects transient failures by function name, and enforces fence and lease in `live()`. It has no owner-input RPCs; an unknown function falls through to the switch's error. The authorised edit is defined in `docs/reviews/item-counting-t15p4-scope.md` §1.
+
+**TDD order.** Each step: write the red test, run only it and see the intended failure, implement within the authorised files, run focused then common gates, run mutation checks (prompt assertion failures only), make one local commit, and append a log line here.
+
+1. **Fake journal in the API test (no behaviour change yet).** Add a minimal, faithful owner-input model to `FakeServer`:
+   - **RPCs:** `reporting_owner_input_version` (configurable: 1, 2, missing, or a code-only transient), `open_reporting_owner_input`, `lookup_reporting_owner_inputs`, `read_reporting_owner_old_staff`, `load_reporting_owner_input_header`, `load_reporting_owner_input_events` (pinned `p_seq`, one page plus a lone eof), `checkpoint_reporting_owner_input` (`pieces`, `page`, `discard_pending`, `hash`; expected-seq replay over the payload; `owner_input_conflict`; plan → stage upgrade under a sealed batch), `read_reporting_staged_chunks` and `release_reporting_owner_inputs`.
+   - **Shared behaviour:** fence/lease through `live()`; unknown functions still fail.
+   - **Red test:** none. Green: all 41 existing tests unchanged. Gate and commit as the fixture-only step.
+2. **Version first, no run record** (scope review Must-fix 1 and 3).
+   - **Red tests:**
+     - **Missing and version 2:** the protocol is missing or is version 2. Expect `failed`, `failureKind = "owner_input_unsupported"`, and **zero** acquire/begin/resume, source, journal, publish **and `record_reporting_run`** calls.
+     - **Transient, then recovered:** a code-only `40001` on the version call, then version 1. Expect a bounded retry (30 s), then normal work.
+     - **Transient, exhausted:** the transient is exhausted. Expect `pending` (deferred) with no unsupported diagnosis.
+   - **Implement:** call `requireOwnerInputProtocol` through `b.retry` **before** `acquire`, and return early without `recordRun` for `OwnerInputUnsupportedError` only.
+3. **Routed planning.** Replace `materializeOwnerGroup(coalesced, ...)` in `plan()`.
+   - **Red tests:**
+     - **Under the limits:** an owner under the limits plans with zero journal RPCs and an unchanged trace/descriptors (light).
+     - **Over 16 attempts:** an owner over 16 attempts activates. Expect exactly one `open`, journal pages, the hash checkpoint and `planOwner` descriptors identical to `materializeOwnerWorks`.
+     - **Two activating owners:** a group with two activating owners never runs two durable owners concurrently (ordered parking; the second waits its turn).
+     - **Retry keeps the count:** a transient during a light owner retries **with the same watch** (the attempt count carries over).
+   - **Implement:** per-owner `routedOwnerInput` with `sharedChildren(...).forOwner`, one durable owner at a time, `recoverOwnerJournal` for the durable restart (`purpose: "plan"`), `ownerAudiences`/`audienceWork` per audience, and `hashOwnerInputStep` per admitted unit. **The input returned by `recoverOwnerJournal` is used directly:** assert in the test that `load_reporting_owner_input_events` occurs once per recovery, never again before hashing.
+4. **Elapsed heartbeat phase and admission** (Must-fix 2).
+   - **Red tests** (deterministic fake clock):
+     - **29,500 ms since the last beat, 4,000 ms left:** a two-RPC durable unit (source plus checkpoint) **parks before starting**. Expect `pending`, with no partial page or orphan pending events.
+     - **Same, 5,000 ms left:** it renews once, commits, and keeps the 2,000 ms reserve.
+     - **Cannot fit fresh:** an owner whose smallest path cannot fit a fresh 240,000 ms run fails `owner_input_capacity`. Expect retained journal evidence, no publication, and a key-free problem string.
+     - **Fits fresh:** an owner that fits fresh but not now is parked first; the next uninterrupted invocation advances its durable position (seq/cursor/hash). Repeated `pending` with an unchanged position is a failure.
+   - **Implement:** pass `b`'s actual time since the last heartbeat to `admitDurableUnit`. Build `AdmissionPath` from **actual** counts: the fixed calls made, `lookup`, `reload_calls`, measured reload CPU, old-staff pages, the unit's page/pieces/checkpoint calls, its measured CPU and serialization. Do not hand-feed totals in the worker test; assert the derived path for one fixed owner.
+5. **Atomic 0045 progression through the worker.** The red test is a worker-driven rebuild over the authorised PGlite fixture (`reportingOwnerContinuation`, or `walk-resume.test.ts` if a real worker trace is needed; both are authorised). An activating owner's combined page commits in one checkpoint and makes no child read for included kids. A deadline that falls between that page's read and commit leaves nothing durable and re-reads the page on takeover. A deadline right after the commit resumes at the cursor with no re-read.
+6. **Staging** (`stage()`).
+   - **Red tests:**
+     - **Missing chunks only:** claimed work for a durable owner reuses its complete plan journal (stage upgrade on the first sealed write) and its returned input, and uploads only the missing chunks.
+     - **Discovery cost:** `read_reporting_staged_chunks` discovery costs `floor(stored/1000) + 1` calls (0/1/999/1,000/1,001 and sparse cases).
+     - **Completed work:** completed one-chunk work is omitted from the claim and not re-claimed.
+     - **Crash after a non-final upload:** a multi-chunk crash after a non-final upload reclaims and skips only the stored chunk.
+   - **Implement:** a per-audience stage unit admitted with `admitDurableUnit`, including discovery and at least the first missing upload.
+7. **Publication cleanup and diagnostics.**
+   - **Red tests:**
+     - **Release after publish:** `release_reporting_owner_inputs` runs after publish in an isolated catch (its failure never changes the published result) and is bounded by `more`.
+     - **Heavy, capacity and purpose failures:** each has its exact `failureKind`, retained evidence, zero publication, and run arguments/problems containing no raw `partitionKey`.
+     - **Trace update:** call traces are updated only for demonstrated new calls; all existing substantive assertions are kept.
+8. **Then T15P-4e** (separate checkpoints):
+   - PG-LONG/PG-CUT traces against the original targets;
+   - the 119/121 reload boundary;
+   - 50,000/50,001;
+   - 999 self + site success and 1,000 refusal;
+   - sampled peak memory and CPU;
+   - Should-fix 2's independent five-family oracle;
+   - the remaining Must-fix 4 assertions: explicit cut and stop-lookahead ids absent from the journal and outside the 50,000 allowance, the line-without-included-kids path inside a combined page, and the Unicode instant-only certain bound.
+
+**Scope boundaries for every step.**
+- Only the r6-authorised files, plus the narrow `tests/api/reporting-worker.test.ts` edit.
+- If any other worker-driven PGlite test fails (`worker-e2e`, `reads-parity`, `report-view-parity`, `welcome-parity`, the detail/digest/summary/timing suites), stop and record the exact failing assertion and a minimal proposed edit for the planner. Changed counting, hashes or parity output is a regression, never a reason to change expectations.
+- No harness edits. No hosted systems. 0046 stays a draft.
+
+**State at this checkpoint.** The worktree is clean at `c0b7413` and no mutation is active. The last common gate was 80 files, **2387/2387**. A Unicode-bound test was attempted at 02:45 but **not applied**: the edit script failed on an escape before writing, and its follow-up run selected 0 tests, so nothing changed. It is listed in step 8.
