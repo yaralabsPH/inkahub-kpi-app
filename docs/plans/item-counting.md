@@ -6306,3 +6306,21 @@ STATUS: COMPLETE
    - The first parent-cursor attempt only **timed out**: the unguarded uninterrupted pass looped. It was not counted. The pass is now guarded too, and the rerun failed in 5 s.
 - **Results.** Continuation 12/12 (≈109 s). Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2356/2356**; `npm run build` 0. 0046 unchanged (`4641d7cd…`).
 - **Should-fix 1 (independent works oracle)** remains for 4e as the review allows.
+
+## Coder log — T15P-4d step 1a: single-owner light-route activation (local commit; step 1b shared flush next), 2026-11-19
+
+- **Code** (`api/_lib/production-reporting-materialize.ts`):
+  - **Limits.** `ACTIVATION_LIMITS = {calls: 16, rows: 1000, bytes: 921,600}` (900 KiB). `reducedBytes(e)` is the UTF-8 length of the canonical reduced text (condition 4).
+  - **Counters.** `activationWatch(owner, limits)` has a `beforeRead` that runs before **every** source RPC attempt through rpcFrozenReader's per-RPC hook, so retries, discarded pages, `exactWalk`'s dependent child reads and fallbacks are all counted and checked there. `consumed(e)` counts distinct rows and bytes.
+  - **Trigger.** It fires at the first check after it is reached, so `OwnerActivation` is raised **before the next dependent source call**. The triggering response is the only overshoot.
+  - **`routedOwnerInput(lightReader, owner, durable, limits)`.** The light route reads members page by page (each response's consumption is counted) and then runs `buildOwnerInput` unchanged, with a consumption hook. On activation it releases the light attempt and restarts **once** on `durableOwnerInput`.
+  - **Behaviour unchanged elsewhere.** `DependencyBudget` gains an optional `onNew` observer and `buildOwnerInput` an optional `watch`; both are behaviour-neutral when absent.
+- **Tests** (`reportingOwnerContinuation.test.ts`, +5; every routed result equals `buildOwnerInput`):
+  - **OQ-1** stays light (fewer than 16 calls) and opens no journal.
+  - **O-1** activates on `calls` at exactly 16, with **no 17th light RPC**, and opens exactly one journal.
+  - **BIG** activates on `rows` (≥ 1,000 and < 2,000) after exactly one member RPC.
+  - **NOTE** activates on `bytes` with a 500,000 test limit, using its 300,000-backslash SKU.
+  - The UTF-8 counter exceeds string length for `é`, and the default limits are the approved ones.
+- **Mutation checks** (confirmed applied, restored with no diff): letting a 17th call through fails in 8 s (`expected 17 to be 16`); not counting member pages fails in 6 s (three member RPCs instead of one).
+- **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2361/2361**; `npm run build` 0.
+- **Remaining for step 1.** 1b, the allowance-bounded shared flush for simultaneous owners (min-waiter allowance, per-page charge to every waiter, discarded prefix, fallback to the owner's own checked reader). The worker does not call `routedOwnerInput` yet; that is step 3.

@@ -8,7 +8,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { PGlite } from "@electric-sql/pglite";
 import { beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, type RpcClient } from "../../api/_lib/reporting-jobs";
-import { buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
+import { ACTIVATION_LIMITS, buildOwnerInput, durableOwnerInput, materializeOwnerWorks, ownerKey, ownerWorksFromInput, reducedBytes, routedOwnerInput, type ActivationLimits, type Owner, type OwnerJournal } from "../../api/_lib/production-reporting-materialize";
 import { rpcFrozenReader, type FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
 import { checkpointOwnerInput, hashOwnerInput, hashOwnerInputStep, loadOwnerInputHeader, openOwnerInput, ownerJournal, ownerJournalSnapshot, readOwnerOldStaff, reloadOwnerInput, saveEnumeration } from "../../api/_lib/reporting-worker-state";
 import type { ProductionEvidenceEvent as Ev } from "../../src/lib/domain/productionCounts";
@@ -579,4 +579,73 @@ describe("resumable hashing (review r3 Must-fix 1): 202 audiences across three c
       await bump(old);
     }
   }, 300_000);
+});
+
+describe("light-route activation (T15P-4d step 1)", () => {
+  async function wipe(key: string) {
+    const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key}'`;
+    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+    await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key}'`);
+  }
+  /** Run one owner through the routed read, recording the LIGHT route's source RPCs and whether the journal was opened. */
+  async function routed(key: string, limits?: ActivationLimits) {
+    const o: Owner = { partitionKind: "order", partitionKey: key };
+    await wipe(key);
+    const lightCalls: string[] = [];
+    const lightClient: RpcClient = { rpc: async (fn, a) => (lightCalls.push(fn), c().rpc(fn, a)) };
+    let opened = 0;
+    const r = await routedOwnerInput((beforeRead) => rpcFrozenReader(lightClient, ref, { beforeRead }), o, async () => {
+      opened++;
+      const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
+      return { reader: rpcFrozenReader(c(), ref), journal: ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs()), resume: null };
+    }, limits);
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    expect(r.input, key).toEqual(want);
+    const journals = (await db.query<{ n: number }>("select count(*)::int as n from reporting_private.owner_inputs where partition_key = $1", [key])).rows[0].n;
+    return { r, lightCalls, opened, journals };
+  }
+
+  it("an owner that never crosses a trigger completes on the light route and never opens a journal", async () => {
+    const { r, lightCalls, opened, journals } = await routed("OQ-1");
+    expect(r.route).toBe("light");
+    expect(r.activation).toBeNull();
+    expect(r.light.calls).toBe(lightCalls.length);
+    expect(r.light.calls).toBeLessThan(16);
+    expect([opened, journals]).toEqual([0, 0]);
+  });
+
+  it("16 source attempts: activates before the 17th, then the durable route reproduces buildOwnerInput", async () => {
+    const { r, lightCalls, opened, journals } = await routed("O-1");
+    expect(r.route).toBe("durable");
+    expect(r.activation?.trigger).toBe("calls");
+    expect(r.activation?.counts.calls).toBe(16);
+    expect(lightCalls).toHaveLength(16); // no 17th light RPC was sent
+    expect([opened, journals]).toEqual([1, 1]);
+  });
+
+  it("1,000 distinct consumed rows: activates before the next dependent call, with at most one page of overshoot", async () => {
+    const { r, lightCalls } = await routed("BIG");
+    expect(r.activation?.trigger).toBe("rows");
+    expect(r.activation!.counts.rows).toBeGreaterThanOrEqual(1000);
+    expect(r.activation!.counts.rows).toBeLessThanOrEqual(2000); // the triggering page is the only overshoot
+    expect(lightCalls).toEqual(["read_reporting_owner_members"]); // the member page that crossed it; nothing after
+    expect(r.route).toBe("durable");
+  });
+
+  it("reduced bytes (UTF-8 of the canonical text): activates on the byte trigger", async () => {
+    const big = (await db.query<{ n: number }>("select octet_length(line_sku)::int as n from public.production_events where id = 'nt-big'")).rows[0].n;
+    expect(big).toBeGreaterThan(300_000);
+    const { r } = await routed("NOTE", { calls: 16, rows: 1000, bytes: 500_000 });
+    expect(r.activation?.trigger).toBe("bytes");
+    expect(r.activation!.counts.bytes).toBeGreaterThanOrEqual(500_000);
+    expect(r.route).toBe("durable");
+    // the counter is UTF-8 bytes of the reduced text, not string length
+    expect(reducedBytes({ ...((await buildOwnerInput(rpcFrozenReader(c(), ref), { partitionKind: "order", partitionKey: "OQ-1" })).events[0]), line_sku: "é" })).toBeGreaterThan(
+      JSON.stringify({ ...((await buildOwnerInput(rpcFrozenReader(c(), ref), { partitionKind: "order", partitionKey: "OQ-1" })).events[0]), line_sku: "é" }).length);
+  });
+
+  it("the default limits are the approved ones", () => {
+    expect(ACTIVATION_LIMITS).toEqual({ calls: 16, rows: 1000, bytes: 921_600 });
+  });
 });

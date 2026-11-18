@@ -378,11 +378,13 @@ function siteEffective(reader: FrozenReader, l: StreamLine, kids: readonly Ev[])
  */
 export class DependencyBudget {
   private readonly ids = new Set<string>();
-  constructor(readonly owner: Owner) {}
+  /** `onNew` (T15P-4d activation) observes each newly charged distinct event; it never changes the charge. */
+  constructor(readonly owner: Owner, private readonly onNew?: (e: Ev) => void) {}
   take(e: Pick<Ev, "id">): boolean {
     if (this.ids.has(e.id)) return false;
     this.ids.add(e.id);
     if (this.ids.size > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError(this.owner, this.ids.size);
+    this.onNew?.(e as Ev);
     return true;
   }
   get size(): number {
@@ -565,9 +567,9 @@ export interface OwnerInput {
   events: Ev[];
 }
 
-export async function buildOwnerInput(reader: FrozenReader, owner: Owner, membersIn?: Ev[]): Promise<OwnerInput> {
+export async function buildOwnerInput(reader: FrozenReader, owner: Owner, membersIn?: Ev[], watch?: { consumed?: (e: Ev) => void }): Promise<OwnerInput> {
   const members = membersIn ?? (await reader.members([owner], MAX_PARTITION_EVENTS)).get(ownerKey(owner)) ?? [];
-  const budget = new DependencyBudget(owner);
+  const budget = new DependencyBudget(owner, watch?.consumed);
   const context = new Map<string, Ev>();
   const keep = (e: Ev) => {
     budget.take(e);
@@ -1365,4 +1367,88 @@ export async function durableOwnerInput(
   if (state.step !== "done") throw new Error(`the durable read stopped at ${state.step}`);
   const events = [...context.values()].sort((x, y) => compareUtf8(x.id, y.id));
   return { owner, members: [...members].sort((x, y) => compareUtf8(x.id, y.id)), events };
+}
+
+// ---------------------------------------------------------------------------
+// T15P-4d step 1: light-route activation (r6 approval: the first of 16 source attempts, 1,000 distinct consumed
+// rows or 900 KiB reduced evidence, checked before the next dependent source call; one bounded page of overshoot)
+// ---------------------------------------------------------------------------
+
+export interface ActivationLimits { calls: number; rows: number; bytes: number }
+export const ACTIVATION_LIMITS: ActivationLimits = Object.freeze({ calls: 16, rows: 1000, bytes: 900 * 1024 });
+/** UTF-8 bytes of a reduced evidence event (its canonical 11-key text: imageToEvent's key order). */
+export const reducedBytes = (e: Ev): number => new TextEncoder().encode(JSON.stringify(e)).length;
+
+/** Raised before the next dependent source call once a light owner crosses a trigger; the light attempt is abandoned. */
+export class OwnerActivation extends Error {
+  constructor(readonly owner: Owner, readonly trigger: keyof ActivationLimits, readonly counts: { calls: number; rows: number; bytes: number }) {
+    super(`owner ${ownerKey(owner).replace("\u0000", ":")} activates the durable route (${trigger}: ${JSON.stringify(counts)})`);
+  }
+}
+
+/**
+ * One light owner's activation counters. `beforeRead` runs before EVERY source RPC attempt of that owner (retries and
+ * discarded pages included, through rpcFrozenReader's per-RPC hook); `consumed` runs for each newly consumed distinct
+ * event. A trigger fires at the first check after it is reached, i.e. before the next dependent source call.
+ */
+export function activationWatch(owner: Owner, limits: ActivationLimits = ACTIVATION_LIMITS) {
+  const seen = new Set<string>();
+  const w = {
+    calls: 0,
+    rows: 0,
+    bytes: 0,
+    trigger(): keyof ActivationLimits | null {
+      return w.calls >= limits.calls ? "calls" : w.rows >= limits.rows ? "rows" : w.bytes >= limits.bytes ? "bytes" : null;
+    },
+    async beforeRead() {
+      const t = w.trigger();
+      if (t) throw new OwnerActivation(owner, t, { calls: w.calls, rows: w.rows, bytes: w.bytes });
+      w.calls++;
+    },
+    consumed(e: Ev) {
+      if (seen.has(e.id)) return;
+      seen.add(e.id);
+      w.rows++;
+      w.bytes += reducedBytes(e);
+    },
+  };
+  return w;
+}
+
+/**
+ * The routed owner read: every owner starts on the light route (buildOwnerInput's aggregated readers) with its own
+ * activation counters; members are read page by page so their consumption is counted per response. On activation the
+ * light attempt is released and the owner restarts ONCE on the durable route (`durable()` opens or finds its journal
+ * and returns the reader, journal and any resumable snapshot). An owner that completes without a trigger never touches
+ * the journal.
+ */
+export async function routedOwnerInput(
+  lightReader: (beforeRead: () => Promise<void>) => FrozenReader & { pages: FrozenReaderPages },
+  owner: Owner,
+  durable: () => Promise<{ reader: FrozenReader & { pages: FrozenReaderPages }; journal: OwnerJournal; resume: OwnerJournalSnapshot | null }>,
+  limits: ActivationLimits = ACTIVATION_LIMITS,
+): Promise<{ input: OwnerInput; route: "light" | "durable"; activation: OwnerActivation | null; light: { calls: number; rows: number; bytes: number } }> {
+  const w = activationWatch(owner, limits);
+  const reader = lightReader(() => w.beforeRead());
+  try {
+    const members: Ev[] = [];
+    let after: { index: number; id: string | null } | null = null;
+    for (;;) {
+      const page = await reader.pages.membersPage([owner], after);
+      if (page.empty) break;
+      for (const r of page.rows) {
+        members.push(r.ev);
+        w.consumed(r.ev);
+        if (members.length > MAX_PARTITION_EVENTS) throw new PartitionTooLargeError(owner, members.length);
+      }
+      after = page.next;
+    }
+    const input = await buildOwnerInput(reader, owner, members, { consumed: (e) => w.consumed(e) });
+    return { input, route: "light", activation: null, light: { calls: w.calls, rows: w.rows, bytes: w.bytes } };
+  } catch (e) {
+    if (!(e instanceof OwnerActivation)) throw e;
+    const d = await durable();
+    const input = await durableOwnerInput(d.reader, owner, d.journal, d.resume);
+    return { input, route: "durable", activation: e, light: e.counts };
+  }
 }
