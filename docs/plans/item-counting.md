@@ -6043,3 +6043,16 @@ All five Must-fix items are repaired within the authorised files. Each new regre
 - Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **79 files, 2336/2336**; `npm run build` 0.
 
 **Should-fix 1 (4b compatibility at group rollover)** follows in its own commit. On the 4b log: early whole-page validation applies to `members` as well as `children`. A malformed trailing member row that the old cap+1 loop never reached now fails the call. That is a stricter failure, never a different successful result.
+
+## Coder log — T15P-4 interim Should-fix 1 (4b compatibility at group rollover), 2026-11-19
+
+`tests/reporting/reportingPageGuard.test.ts` gains 2 tests.
+
+- **Rollover comparison.** The rebuilt `members`/`byIds`/`children` are compared against a verbatim copy of the pre-4b loops on a short-page fake source:
+  - 101 owners, with a cap+1 overflow at the last owner of group 0;
+  - 501 by-ID requests with every 7th id absent;
+  - 1,001 parents with 0–2 kids each.
+  - Results, every RPC argument, the 100+1 and 1000+1 group splits, and guard count = RPC count are all identical.
+- **Whole-page rejection.** A malformed trailing member row and a malformed trailing child row fail the whole page, and no row of that page is yielded.
+- **Deliberate break.** Changing the overflow skip `(idx, NULL)` to `(idx, id)` fails the comparison; the file was restored.
+- **Gate:** `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **79 files, 2338/2338**; `npm run build` 0.

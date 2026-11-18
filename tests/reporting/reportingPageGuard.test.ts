@@ -437,3 +437,147 @@ describe("T15P-4b one-call page methods and the aggregators rebuilt on them", ()
     expect(guards.n).toBe(4 + 2 + 2 + 3);
   });
 });
+
+describe("T15P-4b compatibility at group rollover (interim Should-fix 1): the rebuilt aggregators vs the pre-4b loops", () => {
+  const tiny = (id: string, parent: string | null = null) => ({ id, location: "au", staff_id: null, department: "framed", order_number: "O-1", line_sku: null, line_quantity: null, event_type: parent ? "cancelled" : "line_verified", created_at: "2026-10-01T00:00:00.000000Z", parent_event_id: parent, cs_case_id: null });
+  const cmp = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+  const p4 = (n: number) => String(n).padStart(4, "0");
+  const OWN = Array.from({ length: 101 }, (_, i) => ({ partitionKind: "order" as const, partitionKey: `G${p4(i)}` }));
+  const MEMBERS = OWN.flatMap((o, i) => Array.from({ length: i === 99 ? 6 : (i % 4) + 1 }, (_, j) => ({ owner: `order:${o.partitionKey}`, id: `m${p4(i)}-${j}` })));
+  const IDS = Array.from({ length: 501 }, (_, i) => `i${p4(i)}`);
+  const PRESENT = new Set(IDS.filter((_, i) => i % 7 !== 3));
+  const PARENTS = Array.from({ length: 1001 }, (_, i) => `p${p4(i)}`);
+  const KIDS = PARENTS.flatMap((p, i) => Array.from({ length: i % 3 }, (_, j) => ({ parent: p, id: `${p}-k${j}` })));
+  /** Short pages: members 7, by-id 50, children 40 rows per call (whatever the requested limit). */
+  function source(bad?: { fn: string; call: number; row: number }) {
+    const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const guards = { n: 0 };
+    const client = {
+      rpc: async (fn: string, a: Record<string, unknown>) => {
+        const { p_batch: _b, p_fence: _f, ...args } = a;
+        calls.push({ fn, args: JSON.parse(JSON.stringify(args)) });
+        let data: Array<Record<string, unknown>>;
+        if (fn === "read_reporting_owner_members") {
+          const owners = (a.p_owners as string[][]).map((p) => `${p[0]}:${p[1]}`);
+          const ai = a.p_after_index as number | null;
+          const aid = a.p_after_event_id as string | null;
+          data = MEMBERS.map((m) => ({ idx: owners.indexOf(m.owner), id: m.id })).filter((m) => m.idx >= 0)
+            .filter((m) => ai === null || m.idx > ai || (m.idx === ai && aid !== null && cmp(m.id, aid) > 0)).slice(0, 7)
+            .map((m) => ({ owner_index: m.idx, event_id: m.id, image: tiny(m.id) }));
+        } else if (fn === "read_reporting_events_by_id") {
+          data = (a.p_ids as string[]).filter((id) => PRESENT.has(id)).slice(0, 50).map((id) => ({ event_id: id, image: tiny(id) }));
+        } else if (fn === "read_reporting_children") {
+          const ps = a.p_parent_ids as string[];
+          const ap = a.p_after_parent_id as string | null;
+          const aid = a.p_after_event_id as string | null;
+          data = KIDS.filter((k) => ps.includes(k.parent)).filter((k) => ap === null || cmp(k.parent, ap) > 0 || (k.parent === ap && cmp(k.id, aid!) > 0)).slice(0, 40)
+            .map((k) => ({ parent_event_id: k.parent, event_id: k.id, image: tiny(k.id, k.parent) }));
+        } else throw new Error(`unexpected ${fn}`);
+        if (bad && bad.fn === fn && calls.filter((c) => c.fn === fn).length === bad.call && data[bad.row]) data[bad.row] = { ...data[bad.row], owner_index: 999, parent_event_id: "zzz" };
+        return { data, error: null };
+      },
+    };
+    return { client, calls, guards };
+  }
+  /** The pre-4b aggregators, verbatim in behaviour (same RPC arguments, same validation per row). */
+  function pre4b(client: { rpc: (fn: string, a: Record<string, unknown>) => Promise<{ data: unknown; error: unknown }> }) {
+    const call = async (fn: string, args: Record<string, unknown>) => (await client.rpc(fn, { p_batch: REF.batchId, p_fence: REF.fence, ...args })).data as Array<Record<string, unknown>>;
+    return {
+      async members(owners: typeof OWN, cap: number) {
+        const out = new Map<string, string[]>(owners.map((o) => [`${o.partitionKind}\u0000${o.partitionKey}`, []]));
+        for (let g = 0; g < owners.length; g += 100) {
+          const group = owners.slice(g, g + 100);
+          const pairs = group.map((o) => [o.partitionKind, o.partitionKey]);
+          let afterIndex: number | null = null;
+          let afterId: string | null = null;
+          for (;;) {
+            const rows = await call("read_reporting_owner_members", { p_owners: pairs, p_after_index: afterIndex, p_after_event_id: afterId, p_limit: 1000 });
+            if (!rows.length) break;
+            for (const r of rows) {
+              const idx = r.owner_index as number;
+              if (idx < 0 || idx >= group.length) throw new Error("bad owner_index");
+              const list = out.get(`${group[idx].partitionKind}\u0000${group[idx].partitionKey}`)!;
+              list.push(r.event_id as string);
+              afterIndex = idx;
+              afterId = r.event_id as string;
+              if (list.length > cap) {
+                afterId = null;
+                break;
+              }
+            }
+          }
+        }
+        return out;
+      },
+      async byIds(ids: string[]) {
+        const out: string[] = [];
+        const want = [...new Set(ids)].sort(cmp);
+        for (let g = 0; g < want.length; g += 500) {
+          let pending = want.slice(g, g + 500);
+          while (pending.length) {
+            const rows = await call("read_reporting_events_by_id", { p_ids: pending });
+            if (!rows.length) break;
+            let last = "";
+            for (const r of rows) {
+              out.push(r.event_id as string);
+              last = r.event_id as string;
+            }
+            pending = pending.filter((id) => cmp(id, last) > 0);
+          }
+        }
+        return out;
+      },
+      async children(parentIds: string[]) {
+        const out: string[] = [];
+        const ids = [...new Set(parentIds)].sort(cmp);
+        for (let g = 0; g < ids.length; g += 1000) {
+          const group = ids.slice(g, g + 1000);
+          let afterParent: string | null = null;
+          let afterId: string | null = null;
+          for (;;) {
+            const rows = await call("read_reporting_children", { p_parent_ids: group, p_after_parent_id: afterParent, p_after_event_id: afterId, p_limit: 1000 });
+            if (!rows.length) break;
+            for (const r of rows) {
+              afterParent = r.parent_event_id as string;
+              afterId = r.event_id as string;
+              out.push(afterId);
+            }
+          }
+        }
+        return out;
+      },
+    };
+  }
+
+  it("101 owners (overflow at the group edge), 501 by-id requests with absent ids, 1,001 parents: same results, RPC arguments and guards", async () => {
+    const now = source();
+    const old = source();
+    const reader = rpcFrozenReader(now.client, REF, { beforeRead: async () => void now.guards.n++ });
+    const ref = pre4b(old.client);
+    const m = await reader.members(OWN, 3);
+    const mo = await ref.members(OWN, 3);
+    expect([...m.entries()].map(([k, v]) => [k, v.map((e) => e.id)])).toEqual([...mo.entries()]);
+    expect([...m.values()][99].length).toBe(4); // cap+1 at the last owner of group 0
+    const b = await reader.byIds([...IDS].reverse());
+    expect([...b.keys()]).toEqual(await ref.byIds([...IDS].reverse()));
+    expect(b.size).toBe(PRESENT.size);
+    const kids: string[] = [];
+    for await (const e of reader.children([...PARENTS].reverse())) kids.push(e.id);
+    expect(kids).toEqual(await ref.children([...PARENTS].reverse()));
+    expect(now.calls).toEqual(old.calls);
+    expect(now.guards.n).toBe(now.calls.length);
+    expect(new Set(now.calls.filter((c) => c.fn === "read_reporting_owner_members").map((c) => (c.args.p_owners as unknown[]).length))).toEqual(new Set([100, 1]));
+    expect(new Set(now.calls.filter((c) => c.fn === "read_reporting_children").map((c) => (c.args.p_parent_ids as unknown[]).length))).toEqual(new Set([1000, 1]));
+  });
+
+  it("a malformed trailing row fails its whole page before any of its rows is used (members and children)", async () => {
+    const m = source({ fn: "read_reporting_owner_members", call: 1, row: 6 });
+    await expect(rpcFrozenReader(m.client, REF).members(OWN, 3)).rejects.toThrow(/bad owner_index/);
+    const c = source({ fn: "read_reporting_children", call: 1, row: 39 });
+    const seen: string[] = [];
+    await expect((async () => {
+      for await (const e of rpcFrozenReader(c.client, REF).children(PARENTS)) seen.push(e.id);
+    })()).rejects.toThrow(/another parent/);
+    expect(seen).toEqual([]); // no row of the malformed page was yielded
+  });
+});
