@@ -208,3 +208,11 @@ CJ decided: fix removal now. Done without a migration:
 
 Open questions 2 (barcode/rate redesign) and 3 (non-atomic add recovery) are
 unchanged and still need CJ's call.
+
+### Staging verification by CJ (2026-11-18)
+
+On staging (`add-member` v3, `remove-member` v1, local UI on this branch):
+added a new Staff member with Australia access, issued a lanyard, then
+removed them. The member disappeared from the Team page and signing in as
+them afterwards fails with "User is banned". Add, lanyard and remove all
+worked end to end.
