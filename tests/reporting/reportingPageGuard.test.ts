@@ -327,3 +327,113 @@ describe("T15P-1a: the deadline is checked again after a lease renewal (real wor
     expect(after.filter((c) => MATERIALIZE.test(c.fn)).length).toBeGreaterThan(0);
   }, 300_000);
 });
+
+describe("T15P-4b one-call page methods and the aggregators rebuilt on them", () => {
+  const small = (id: string, parent: string | null = null, order = "O-1") => ({ id, location: "au", staff_id: null, department: "framed", order_number: order, line_sku: null, line_quantity: null, event_type: parent ? "cancelled" : "line_verified", created_at: "2026-10-01T00:00:00.000000Z", parent_event_id: parent, cs_case_id: null });
+  const cmp = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+  /** An in-memory 0040 source that returns at most PER rows per call (a byte-capped short page), recording every call. */
+  function source(per: number) {
+    const members: Array<{ owner: string; id: string }> = [
+      ...["a1", "a2", "a3", "a4", "a5"].map((id) => ({ owner: "order:A", id })),
+      ...["b1", "b2"].map((id) => ({ owner: "order:B", id })),
+    ];
+    const present = new Set(["a", "b", "c", "e"]);
+    const kids: Array<{ parent: string; id: string }> = [{ parent: "p1", id: "k1" }, { parent: "p1", id: "k2" }, { parent: "p1", id: "k3" }, { parent: "p2", id: "k4" }];
+    const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const guards = { n: 0 };
+    const client = {
+      rpc: async (fn: string, a: Record<string, unknown>) => {
+        const { p_batch: _b, p_fence: _f, ...args } = a;
+        calls.push({ fn, args });
+        if (fn === "read_reporting_owner_members") {
+          const owners = (a.p_owners as string[][]).map((p) => `${p[0]}:${p[1]}`);
+          const ai = a.p_after_index as number | null;
+          const aid = a.p_after_event_id as string | null;
+          const rows = members
+            .map((m) => ({ idx: owners.indexOf(m.owner), id: m.id }))
+            .filter((m) => m.idx >= 0)
+            .filter((m) => ai === null || m.idx > ai || (m.idx === ai && aid !== null && cmp(m.id, aid) > 0))
+            .slice(0, Math.min(per, a.p_limit as number));
+          return { data: rows.map((m) => ({ owner_index: m.idx, event_id: m.id, image: small(m.id) })), error: null };
+        }
+        if (fn === "read_reporting_events_by_id") {
+          const rows = (a.p_ids as string[]).filter((id) => present.has(id)).slice(0, per);
+          return { data: rows.map((id) => ({ event_id: id, image: small(id) })), error: null };
+        }
+        if (fn === "read_reporting_children") {
+          const ps = a.p_parent_ids as string[];
+          const ap = a.p_after_parent_id as string | null;
+          const aid = a.p_after_event_id as string | null;
+          const rows = kids.filter((k) => ps.includes(k.parent)).filter((k) => ap === null || cmp(k.parent, ap) > 0 || (k.parent === ap && cmp(k.id, aid!) > 0)).slice(0, Math.min(per, a.p_limit as number));
+          return { data: rows.map((k) => ({ parent_event_id: k.parent, event_id: k.id, image: small(k.id, k.parent) })), error: null };
+        }
+        throw new Error(`unexpected ${fn}`);
+      },
+    };
+    const reader = rpcFrozenReader(client, REF, { beforeRead: async () => void guards.n++ });
+    return { reader, calls, guards };
+  }
+  const A = { partitionKind: "order" as const, partitionKey: "A" };
+  const B = { partitionKind: "order" as const, partitionKey: "B" };
+
+  it("each page method makes exactly one guarded RPC and returns its keyset", async () => {
+    const { reader, calls, guards } = source(2);
+    const m = await reader.pages.membersPage([A, B], null);
+    expect(m.rows.map((r) => [r.ownerIndex, r.ev.id])).toEqual([[0, "a1"], [0, "a2"]]);
+    expect(m).toMatchObject({ next: { index: 0, id: "a2" }, empty: false });
+    const m2 = await reader.pages.membersPage([A, B], { index: 0, id: null }, 1);
+    expect(m2.rows.map((r) => [r.ownerIndex, r.ev.id])).toEqual([[1, "b1"]]);
+    expect(calls[1].args).toMatchObject({ p_after_index: 0, p_after_event_id: null, p_limit: 1 });
+    const b = await reader.pages.byIdsPage(["a", "b", "c", "d", "e"]);
+    expect(b).toMatchObject({ pending: ["c", "d", "e"], empty: false });
+    expect(b.rows.map((e) => e.id)).toEqual(["a", "b"]);
+    const none = await reader.pages.byIdsPage(["d"]);
+    expect(none).toMatchObject({ rows: [], pending: ["d"], empty: true });
+    const c = await reader.pages.childrenPage(["p1", "p2"], { parent: "p1", id: "k2" });
+    expect(c.rows.map((e) => e.id)).toEqual(["k3", "k4"]);
+    expect(c).toMatchObject({ next: { parent: "p2", id: "k4" }, empty: false });
+    const end = await reader.pages.childrenPage(["p1", "p2"], c.next);
+    expect(end).toEqual({ rows: [], next: null, empty: true });
+    expect(calls).toHaveLength(6);
+    expect(guards.n).toBe(6);
+    expect(reader.requests()).toBe(6);
+  });
+
+  it("rejects bad page arguments before any RPC", async () => {
+    const { reader, calls, guards } = source(2);
+    await expect(reader.pages.membersPage([], null)).rejects.toThrow(/1\.\.100 owners/);
+    await expect(reader.pages.membersPage([A], null, 1001)).rejects.toThrow(/page limit/);
+    await expect(reader.pages.byIdsPage(["b", "a"])).rejects.toThrow(/sorted/);
+    await expect(reader.pages.byIdsPage(["a", "a"])).rejects.toThrow(/unique/);
+    await expect(reader.pages.byIdsPage(Array.from({ length: 501 }, (_, i) => `i${String(i).padStart(4, "0")}`))).rejects.toThrow(/1\.\.500/);
+    await expect(reader.pages.childrenPage([], null)).rejects.toThrow(/1\.\.1000/);
+    await expect(reader.pages.childrenPage(["p1"], null, 0)).rejects.toThrow(/page limit/);
+    expect(calls).toHaveLength(0);
+    expect(guards.n).toBe(0);
+  });
+
+  it("members (cap+1 overflow skip), byIds (byte-cap continuation) and children (lazy) keep their exact results and RPC sequences", async () => {
+    const { reader, calls, guards } = source(2);
+    const mem = await reader.members([A, B], 3);
+    expect([...mem.values()].map((l) => l.map((e) => e.id))).toEqual([["a1", "a2", "a3", "a4"], ["b1", "b2"]]);
+    expect(calls.map((c) => [c.args.p_after_index, c.args.p_after_event_id])).toEqual([[null, null], [0, "a2"], [0, null], [1, "b2"]]);
+    calls.length = 0;
+    const by = await reader.byIds(["e", "c", "a", "d", "b", "a"]);
+    expect([...by.keys()].sort()).toEqual(["a", "b", "c", "e"]);
+    expect(calls.map((c) => c.args.p_ids)).toEqual([["a", "b", "c", "d", "e"], ["c", "d", "e"]]); // c,e returned; nothing pending after e
+    calls.length = 0;
+    const seen: string[] = [];
+    for await (const e of reader.children(["p2", "p1", "p1"])) {
+      seen.push(e.id);
+      if (seen.length === 3) break; // a consumer that stops reads no more pages
+    }
+    expect(seen).toEqual(["k1", "k2", "k3"]);
+    expect(calls.map((c) => [c.args.p_parent_ids, c.args.p_after_parent_id, c.args.p_after_event_id])).toEqual([[["p1", "p2"], null, null], [["p1", "p2"], "p1", "k2"]]);
+    calls.length = 0;
+    const all: string[] = [];
+    for await (const e of reader.children(["p1", "p2"])) all.push(e.id);
+    expect(all).toEqual(["k1", "k2", "k3", "k4"]);
+    expect(calls).toHaveLength(3); // two pages + the empty end page
+    expect(guards.n).toBe(4 + 2 + 2 + 3);
+  });
+});

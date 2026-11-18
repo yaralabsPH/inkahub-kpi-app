@@ -63,7 +63,38 @@ export interface FrozenReaderOptions {
   beforeRead?: () => Promise<void>;
 }
 
-export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: FrozenReaderOptions = {}): FrozenReader {
+/** Keyset of a member page: the last row's owner index and id; `id: null` skips the rest of that owner (index, NULL). */
+export interface MembersAfter { index: number; id: string | null }
+export interface MembersPage { rows: Array<{ ownerIndex: number; ev: Ev }>; next: MembersAfter | null; empty: boolean }
+export interface ByIdsPage { rows: Ev[]; /** The requested ids after the last returned one (what a byte-capped response left). */ pending: string[]; /** Nothing returned: the remaining requested ids are absent. */ empty: boolean }
+export interface ChildrenAfter { parent: string; id: string }
+export interface ChildrenPage { rows: Ev[]; next: ChildrenAfter | null; empty: boolean }
+
+/**
+ * T15P-4b: one-call page methods. Each makes EXACTLY one frozen-read RPC (through the same guarded `call`,
+ * so `beforeRead` and the request counter see it), validates the whole page, and returns its keyset. Only an
+ * EMPTY page means the end; a short page may be byte-capped. The durable owner route uses these directly.
+ */
+export interface FrozenReaderPages {
+  /** One page of `read_reporting_owner_members` for 1..100 owners (owner_index is into `owners`). */
+  membersPage(owners: readonly Owner[], after: MembersAfter | null, limit?: number): Promise<MembersPage>;
+  /** One `read_reporting_events_by_id` call for 1..500 ids, already unique and bytewise sorted. */
+  byIdsPage(ids: readonly string[]): Promise<ByIdsPage>;
+  /** One page of `read_reporting_children` for 1..1,000 parent ids, already unique and bytewise sorted. */
+  childrenPage(parentIds: readonly string[], after: ChildrenAfter | null, limit?: number): Promise<ChildrenPage>;
+}
+
+const pageLimit = (limit: number | undefined): number => {
+  const l = limit ?? 1000;
+  if (!Number.isInteger(l) || l < 1 || l > 1000) throw new ReportingJobError("a page limit must be an integer in 1..1000");
+  return l;
+};
+const sortedUnique = (ids: readonly string[], max: number, what: string): void => {
+  if (ids.length < 1 || ids.length > max) throw new ReportingJobError(`${what} must have 1..${max} ids`);
+  for (let i = 1; i < ids.length; i++) if (compareUtf8(ids[i - 1], ids[i]) >= 0) throw new ReportingJobError(`${what} must be unique and bytewise sorted`);
+};
+
+export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: FrozenReaderOptions = {}): FrozenReader & { pages: FrozenReaderPages } {
   if (!UUID.test(ref.batchId)) throw new ReportingJobError("batchId must be a uuid");
   if (!Number.isSafeInteger(ref.fence) || ref.fence < 1) throw new ReportingJobError("fence must be a positive integer");
   let n = 0;
@@ -79,8 +110,53 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
     if (bytes > MAX_RESPONSE_BYTES) throw new ReportingJobError(`${fn} returned ${bytes} bytes; a response must be at most ${MAX_RESPONSE_BYTES}`);
     return data as Array<Record<string, unknown>>;
   };
+  const pages: FrozenReaderPages = {
+    async membersPage(owners, after, limit) {
+      if (owners.length < 1 || owners.length > 100) throw new ReportingJobError("a member page needs 1..100 owners");
+      const rows = await call("read_reporting_owner_members", {
+        p_owners: owners.map((o) => [o.partitionKind, o.partitionKey]), p_after_index: after?.index ?? null, p_after_event_id: after?.id ?? null, p_limit: pageLimit(limit),
+      });
+      const out: MembersPage["rows"] = rows.map((r) => {
+        const idx = r.owner_index;
+        if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0 || idx >= owners.length) throw new ReportingJobError("read_reporting_owner_members returned a bad owner_index");
+        const id = str(r.event_id, "event_id");
+        return { ownerIndex: idx, ev: imageToEvent(r.image, ref.site, id) };
+      });
+      const last = out.at(-1);
+      return { rows: out, next: last ? { index: last.ownerIndex, id: last.ev.id } : null, empty: out.length === 0 };
+    },
+    async byIdsPage(ids) {
+      sortedUnique(ids, 500, "a by-id page");
+      const rows = await call("read_reporting_events_by_id", { p_ids: [...ids] });
+      const out: Ev[] = [];
+      let last = "";
+      for (const r of rows) {
+        const id = str(r.event_id, "event_id");
+        if (!ids.includes(id)) throw new ReportingJobError(`read_reporting_events_by_id returned an id that was not requested`);
+        out.push(imageToEvent(r.image, ref.site, id));
+        last = id;
+      }
+      // A byte-capped response stops early: what remains is only the ids after the last returned one.
+      return { rows: out, pending: out.length ? ids.filter((id) => compareUtf8(id, last) > 0) : [...ids], empty: out.length === 0 };
+    },
+    async childrenPage(parentIds, after, limit) {
+      sortedUnique(parentIds, 1000, "a children page");
+      const rows = await call("read_reporting_children", { p_parent_ids: [...parentIds], p_after_parent_id: after?.parent ?? null, p_after_event_id: after?.id ?? null, p_limit: pageLimit(limit) });
+      let prev: ChildrenAfter | null = after;
+      const out = rows.map((r) => {
+        const parent = str(r.parent_event_id, "parent_event_id");
+        const id = str(r.event_id, "event_id");
+        const e = imageToEvent(r.image, ref.site, id);
+        if (e.parent_event_id !== parent || !parentIds.includes(parent)) throw new ReportingJobError("read_reporting_children returned a row for another parent");
+        if (prev !== null && (compareUtf8(parent, prev.parent) < 0 || (parent === prev.parent && compareUtf8(id, prev.id) <= 0))) throw new ReportingJobError("read_reporting_children is not in keyset order");
+        prev = { parent, id };
+        return e;
+      });
+      return { rows: out, next: out.length ? prev : null, empty: out.length === 0 };
+    },
+  };
   return {
-    site: ref.site, cutoff: ref.cutoff, kind: ref.kind,
+    site: ref.site, cutoff: ref.cutoff, kind: ref.kind, pages,
     async *changedKeys() {
       if (ref.kind !== "refresh") throw new ReportingJobError("changedKeys is a refresh read");
       let after: string | null = null;
@@ -116,25 +192,20 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
       }
     },
     async members(owners, cap) {
+      // T15P-4b: a loop over membersPage (same groups of 100, same keysets, same cap+1 overflow skip).
       const out = new Map<string, Ev[]>(owners.map((o) => [ownerKey(o), []]));
       for (let g = 0; g < owners.length; g += 100) {
         const group = owners.slice(g, g + 100);
-        const pairs = group.map((o) => [o.partitionKind, o.partitionKey]);
-        let afterIndex: number | null = null;
-        let afterId: string | null = null;
+        let after: MembersAfter | null = null;
         for (;;) {
-          const rows = await call("read_reporting_owner_members", { p_owners: pairs, p_after_index: afterIndex, p_after_event_id: afterId, p_limit: 1000 });
-          if (!rows.length) break;
-          for (const r of rows) {
-            const idx = r.owner_index;
-            if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0 || idx >= group.length) throw new ReportingJobError("read_reporting_owner_members returned a bad owner_index");
-            const id = str(r.event_id, "event_id");
-            const list = out.get(ownerKey(group[idx]))!;
-            list.push(imageToEvent(r.image, ref.site, id));
-            afterIndex = idx;
-            afterId = id;
+          const page = await pages.membersPage(group, after);
+          if (page.empty) break;
+          for (const r of page.rows) {
+            const list = out.get(ownerKey(group[r.ownerIndex]))!;
+            list.push(r.ev);
+            after = { index: r.ownerIndex, id: r.ev.id };
             if (list.length > cap) {
-              afterId = null; // cap+1 proves the overflow: skip the rest of THIS owner (keyset (idx, NULL) = next owner)
+              after = { index: r.ownerIndex, id: null }; // cap+1 proves the overflow: skip the rest of THIS owner (keyset (idx, NULL) = next owner)
               break;
             }
           }
@@ -143,46 +214,33 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
       return out;
     },
     async byIds(ids) {
+      // T15P-4b: a loop over byIdsPage (same groups of 500, same byte-cap continuation).
       const out = new Map<string, Ev>();
       const want = [...new Set(ids)].sort(compareUtf8);
       for (let g = 0; g < want.length; g += 500) {
         let pending = want.slice(g, g + 500);
         while (pending.length) {
-          const rows = await call("read_reporting_events_by_id", { p_ids: pending });
-          if (!rows.length) break; // the remaining ids are absent
-          let last = "";
-          for (const r of rows) {
-            const id = str(r.event_id, "event_id");
-            if (!pending.includes(id)) throw new ReportingJobError(`read_reporting_events_by_id returned an id that was not requested`);
-            out.set(id, imageToEvent(r.image, ref.site, id));
-            last = id;
-          }
-          // A byte-capped response stops early: request again only the ids after the last returned one.
-          pending = pending.filter((id) => compareUtf8(id, last) > 0);
+          const page = await pages.byIdsPage(pending);
+          if (page.empty) break; // the remaining ids are absent
+          for (const e of page.rows) out.set(e.id, e);
+          pending = page.pending;
         }
       }
       return out;
     },
     async *children(parentIds) {
       // Lazy: the next page is requested only when the consumer asks for more (a budget overflow stops reading at once).
+      // T15P-4b: a loop over childrenPage (same groups of 1,000 parents, same keyset). The whole page is validated
+      // before its first row is yielded.
       const ids = [...new Set(parentIds)].sort(compareUtf8);
       for (let g = 0; g < ids.length; g += 1000) {
         const group = ids.slice(g, g + 1000);
-        let afterParent: string | null = null;
-        let afterId: string | null = null;
+        let after: ChildrenAfter | null = null;
         for (;;) {
-          const rows = await call("read_reporting_children", { p_parent_ids: group, p_after_parent_id: afterParent, p_after_event_id: afterId, p_limit: 1000 });
-          if (!rows.length) break;
-          for (const r of rows) {
-            const parent = str(r.parent_event_id, "parent_event_id");
-            const id = str(r.event_id, "event_id");
-            const e = imageToEvent(r.image, ref.site, id);
-            if (e.parent_event_id !== parent || !group.includes(parent)) throw new ReportingJobError("read_reporting_children returned a row for another parent");
-            if (afterParent !== null && (compareUtf8(parent, afterParent) < 0 || (parent === afterParent && compareUtf8(id, afterId!) <= 0))) throw new ReportingJobError("read_reporting_children is not in keyset order");
-            afterParent = parent;
-            afterId = id;
-            yield e;
-          }
+          const page = await pages.childrenPage(group, after);
+          if (page.empty) break;
+          after = page.next;
+          for (const e of page.rows) yield e;
         }
       }
     },

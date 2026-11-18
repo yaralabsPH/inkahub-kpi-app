@@ -5899,3 +5899,21 @@ STATUS: COMPLETE
 - Migration hashes: 0037–0045 before and after are byte-identical (`531bb2c5…`, `002d6e58…`, `05d7eff1…`, `4e39243e…`, `dfa49d59…`, `e38aba76…`, `156ee4d5…`, `84a07d1b…`, `5f42f300…`).
 
 **Not done or not claimed.** T15P-4a covers the SQL protocol and its SQL tests only. No TypeScript adapter yet consumes 0046; that is T15P-4b–4e. 0046 has run only in isolated PGlite. Nothing is pushed, and no hosted system, CI or worker was used. Next: T15P-4b (bounded reader pages).
+
+## Coder log — T15P-4b bounded reader pages (local commit), 2026-11-19
+
+- **Code.** `api/_lib/production-reporting-reader.ts`: `rpcFrozenReader` now also returns `pages: FrozenReaderPages` with `membersPage(owners 1..100, after {index, id|null}, limit)`, `byIdsPage(ids 1..500, sorted unique)` and `childrenPage(parentIds 1..1000, after {parent, id}, limit)`.
+  - Each makes exactly one RPC through the same guarded `call`, so `beforeRead`, the 1,000-row/1 MiB checks and `requests()` see it. Each validates the whole page and returns its keyset (`next`/`pending`) and `empty`.
+  - Bad arguments (owner count, id count, order, uniqueness, limit) are rejected before any RPC.
+- **Aggregators rebuilt.** `members`, `byIds` and `children` are now loops over these methods, with the same groups (100/500/1,000), keysets, cap+1 overflow skip (`(idx, NULL)`) and byte-cap continuation. The `FrozenReader` interface and every other reader, wrapper and helper are unchanged; the durable route will use `pages` in 4c/4d.
+  - Only difference: `children` validates a whole page before yielding its first row. A malformed server page now fails before its first row instead of at the bad row; successful results are identical.
+- **Tests** (`tests/reporting/reportingPageGuard.test.ts`, +3):
+  - one guarded RPC per page method, with exact keysets;
+  - argument rejection with zero RPCs or guards;
+  - exact results and exact RPC argument sequences for `members` (cap 3 → `[null,null]`, `[0,"a2"]`, `[0,null]`, `[1,"b2"]`), `byIds` (byte-capped continuation, absent ids) and lazy `children` (a consumer that stops reads no further page); guard count = RPC count.
+- **Results.** Focused 14/14. Gate:
+  - `npx tsc -b`: 0.
+  - `npm run typecheck:digest` (it covers the reader): 0.
+  - `npm run test -- --run`: **78 files, 2315/2315**.
+  - `npm run build`: 0.
+- **Not fixed (pre-existing).** A strict standalone `tsc` of `reportingPageGuard.test.ts` reports one error at line 293 (a fake client's `code: null` vs `RpcClient`). It is identical at HEAD and the file is not in any type-check gate; out of scope.
