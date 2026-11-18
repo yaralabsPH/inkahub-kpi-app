@@ -70,7 +70,8 @@ export interface WorkerEnv {
   now(): number;
   sleep(ms: number): Promise<void>;
   /** Frozen reads for a batch (default: the 0040/0041 RPCs). */
-  source?: (ref: FrozenBatchRef) => { reader: FrozenReader; pages: EnumerationPages };
+  /** Test source. `pageGuard` is the worker's per-RPC budget/heartbeat guard; a source should await it before each page it reads. */
+  source?: (ref: FrozenBatchRef, pageGuard?: () => Promise<void>) => { reader: FrozenReader; pages: EnumerationPages };
   /** Resumable-walk page sizes (tests use small pages; default KEY_WALK_PAGES). */
   walkPages?: KeyWalkPages;
   /** Redaction for problem text (default: strip anything that looks like a secret). */
@@ -403,14 +404,19 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         if (a.kind === "rebuild" && a.state === "active") await copyAndFreeze(env, b, a, counts);
         if (a.cutoff === null) throw new ReportingJobError("the batch has no frozen cutoff");
         const ref: FrozenBatchRef = { batchId: a.batchId, fence: a.fence, site: req.site, cutoff: canonicalInstant(a.cutoff), kind: a.kind };
-        const src = env.source ? env.source(ref) : { reader: rpcFrozenReader(env.client, ref), pages: rpcEnumerationPages(env.client, ref) };
-        // Planning and staging materialize owner groups over ONE coalescing view of the frozen reads (enumeration stays sequential).
-        // Every read inside an owner's materialization first checks the budget and renews the lease when due, so one long
-        // owner can neither starve the 30 s heartbeat nor run past the 240 s budget (OutOfTime -> pending, owners before it kept).
-        const coalesced = guardedReader(coalescingChildren(src.reader), async () => {
+        // T15P-1: the budget check + due heartbeat, awaited before every actual frozen-read RPC of planning/staging.
+        const pageGuard = async () => {
           b.need();
           await b.beat(a.batchId, a.fence);
-        });
+        };
+        const src = env.source ? env.source(ref, pageGuard) : { reader: rpcFrozenReader(env.client, ref), pages: rpcEnumerationPages(env.client, ref) };
+        // Planning and staging materialize owner groups over ONE coalescing view of the frozen reads (enumeration stays sequential
+        // on the unguarded reader, with its own per-page checks). For the production RPC reader, the guard also runs before
+        // EACH internal page (members/byIds/children pages, coalesced flushes, fallbacks, 0045), so one long owner can neither
+        // starve the 30 s heartbeat nor run past the 240 s budget (OutOfTime -> pending, owners before it kept). The outer guard
+        // stays for injected readers and non-RPC work.
+        const materializing = env.source ? src.reader : rpcFrozenReader(env.client, ref, { beforeRead: pageGuard });
+        const coalesced = guardedReader(coalescingChildren(materializing), pageGuard);
         const prog = await b.retry(() => readWorkerProgress(env.client, a.batchId, a.fence));
         if (!prog.sealed) {
           if (!prog.complete) await enumerate(env, b, a, src.reader, src.pages, prog.cursor, counts);

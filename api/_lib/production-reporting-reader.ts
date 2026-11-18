@@ -51,11 +51,24 @@ export const responseBytes = (data: unknown): number => new TextEncoder().encode
 
 export interface FrozenBatchRef { batchId: string; fence: number; site: string; cutoff: string; kind: "refresh" | "rebuild" }
 
-export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef): FrozenReader {
+export interface FrozenReaderOptions {
+  /**
+   * T15P-1: awaited before EVERY actual frozen-read RPC (each internal member /
+   * by-id / children page, coalesced flushes, fallbacks and 0045 pages). The
+   * worker passes its deadline check + single-flight heartbeat here; a throw
+   * stops the read before another page is requested. Lease renewals go
+   * through the worker's own client, never through this reader, so the guard
+   * cannot recurse.
+   */
+  beforeRead?: () => Promise<void>;
+}
+
+export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: FrozenReaderOptions = {}): FrozenReader {
   if (!UUID.test(ref.batchId)) throw new ReportingJobError("batchId must be a uuid");
   if (!Number.isSafeInteger(ref.fence) || ref.fence < 1) throw new ReportingJobError("fence must be a positive integer");
   let n = 0;
   const call = async (fn: string, args: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
+    if (opts.beforeRead) await opts.beforeRead();
     n++;
     const { data, error } = await client.rpc(fn, { p_batch: ref.batchId, p_fence: ref.fence, ...args });
     if (error) throw new ReportingJobError(`${fn}: ${error.message}`, error.code ?? null);
