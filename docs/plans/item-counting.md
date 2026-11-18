@@ -3535,3 +3535,28 @@ STATUS: COMPLETE
 - **Not done:** T15P-4 (durable per-owner continuation) is queued behind planner review of this repair, as instructed. No staging action.
 
 STATUS: COMPLETE
+
+## Planner review — T15P-1a cleared; T15P-4 contract proposal next, 2026-11-18
+
+**Scope and evidence.** Reviewed `d87dd3e` and the coder log in `7b6ec70` against the preceding T15P-1a contract. The earlier planner subprocess produced no output or repository change and was stopped after 35 minutes idle; this section is the operative review. No staging command, database connection, app-code edit, migration, deployment or production access was performed. PR #7 CI is green at exact head `7b6ec700c91ae0cfd385aef93e235dc9abef994b`. A fresh local run of `npm run test -- --run tests/reporting/reportingPageGuard.test.ts` passed 11/11 tests in 14.36 s.
+
+**Verdict on `d87dd3e`: approved.** `api/_lib/production-reporting-worker.ts:406-412` now calls `b.need()` immediately before and immediately after the awaited, single-flight `b.beat(...)`. Therefore the previously reproduced sequence — renewal starts at 239,500 ms, completes at 240,500 ms, then a frozen read starts at 240,500 ms — is stopped by the second check before the reader dispatch. The focused real-worker/PGlite suite covers a successful over-deadline renewal, a retried renewal crossing the deadline, waiting readers and an in-budget renewal; the recorded mutation removes the second check and makes the three expiry cases fail. No deadline, lease, retry, paging or publication rule changed.
+
+**Queued should-fixes, not blockers for this repair or the next design step.** The next time `tests/reporting/reportingPageGuard.test.ts` changes, replace the randomized scenario start with a deterministic per-case sequence and make the waiting-reader case assert observable shared-renewal concurrency rather than only `OWNER_GROUP > 1`. Preserve the current mutation sensitivity. These improve repeatability and proof specificity; they do not change the reviewed runtime path.
+
+**T15P-4 may start only with a persistence-contract proposal.** The prior T15P-4 acceptance contract remains binding, but it does not yet name a concrete bounded representation or transition API. SQL/API/worker implementation is not authorised until that representation is reviewed. The proposal must be appended to this plan as one self-contained coder section and must specify:
+
+1. the additive `0046` private tables, keys, columns, size bounds, indexes, RLS/service-only grants, retention/cleanup ownership and old-code compatibility;
+2. the exact serializable owner state for both planning and staging: phase plus member-page, parent-lookup, member-child and per-worker predecessor-walk positions; consumed-ID accounting; accumulated inputs/results or bounded durable substitutes; descriptor/input-hash continuity; and how no incomplete state can become planned, staged or published;
+3. the fenced RPC surface, argument/result shapes and expected-to-next compare-and-swap transitions, including idempotent lost-response replay, stale-fence refusal, conflicting replay refusal and takeover/process-loss recovery;
+4. the worker/materializer seam and bounded reload path, with checkpoint transport/reload included in the budget and no restart of an already completed source prefix or expensive stage prefix;
+5. the lifecycle through owner completion, plan sealing, stage completion, batch failure, cleanup and retained generations, including how old workers safely ignore the additive state;
+6. the test map for the existing 300-cancellation, one-row-page owner across fresh worker instances, both plan and stage interruptions, lease takeover, lost checkpoint responses, small/byte-capped pages, the 50,000/50,001 boundary, ordering/ties, hidden cancellations, no-lookahead and old-self replacement. Declare a finite worst-case bound of at most 20 invocations with simulated latency on every RPC, including checkpoints, and exact parity with the uninterrupted oracle.
+
+The proposal may include interface signatures and schema sketches but must not create or modify migration/app/test files. If a bounded representation cannot preserve the existing reducer, ordering, hashes, limits and five result families, return the exact conflict instead of widening scope.
+
+**Exactly one next operative action.** **Owner: Claude. Action: append the T15P-4 persistence-contract proposal above to this plan, commit and push that plan-only handoff, then pause for planner review. Authorised now: yes.** Its staging effect is **none**. CJ has nothing to run or decide. No `0046` file, application code, tests, worker command, staging inspection, SQL, cleanup, deployment, merge or production access is authorised by this section.
+
+Updated path to app testing: **T15P-4 contract proposal and review → durable owner continuation implementation and review → fresh AU identity/preflight plus authorised runtime rehearsal → controlled staging generation/Preview setup and remaining role/parity/dry-digest/growth gates → CJ can test it in the app**.
+
+STATUS: COMPLETE
