@@ -6347,3 +6347,35 @@ STATUS: COMPLETE
   | allowance cap ignored | 14 s: `expected 2 to be ≤ 0` |
 
 - **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2365/2365**; `npm run build` 0.
+
+## Coder log — T15P-4d step 2: per-audience seam and phase-specific cumulative admission (local commit), 2026-11-19
+
+- **Per-audience seam** (`production-reporting-materialize.ts`).
+  - `ownerAudiences(input, oldStaff)` gives the required audiences without projecting: site, then member and old-staff selves in bytewise order. An empty replacement keeps its old selves.
+  - `audienceWork(reader, owner, input, audience)` computes ONE audience (projection, canonical hash, rows) on demand.
+  - `ownerWorksFromInput` is now a loop over the two, with identical behaviour. The worker can admit and compute one audience unit at a time and release it, instead of holding the eager array.
+- **Admission** (`production-reporting-worker.ts`; pure, not yet called by `runReportingCycle`), per approval condition 3.
+  - **`admitDurableUnit(path, remainingMs, budgetMs)`** prices the smallest legal path to the next durable boundary as `prerequisites` (fixed calls, owner list or claim, lookup, reload calls, reload CPU, old-staff reads, preparation) plus `unit` (including its committing RPC; for stage, the first missing upload; for hashing, the checkpoint).
+  - **Verdicts.** `capacity` when even a fresh 240,000 ms invocation cannot reach the boundary; `pending` when it fits fresh but not the time left now; otherwise `run`. Paid prerequisites are not charged twice.
+  - **Cost.** `withRenewals` adds due renewals (one RPC each, to a fixed point) and the 2,000 ms run-record reserve. RPCs cost the deterministic 1,000 ms.
+  - **CJ hardening: every input is validated at runtime.**
+    - RPC counts must be non-negative safe integers. NaN, ±Infinity, negative, fractional and > 2^53 values are refused.
+    - CPU, `remainingMs`, `budgetMs` and `withRenewals(workMs)` must be finite and non-negative, and the budget must exceed the reserve. A malformed path is refused.
+    - NaN can no longer loop `withRenewals`, and negative or fractional estimates can no longer under-admit.
+- **Tests** (`reportingOwnerInputState.test.ts`, +10).
+  - **Renewal fixed point:** each case charges exactly the renewals due over its whole span.
+  - **Near-ceiling cases** (approval condition 3):
+    - nonzero reconstruction CPU turns a fitting unit into `capacity` (127 RPCs plus 120 s);
+    - stage preparation that fits alone is `capacity` once its first upload is included;
+    - the hash-checkpoint overhead and an unfinished 8-call page are part of their units.
+  - **Pending, then admitted:** a unit that fits fresh but not now is pending, and a fresh invocation then admits it, so it cannot stay pending forever. Paid prerequisites are not double-charged.
+  - **Rejections:** NaN, ±Infinity and negative values for every numeric input; fractional and unsafe RPC counts; zero and reserve-only budgets; a malformed path. A fractional CPU value is still accepted.
+  - **The seam:** audience order, lazy equals eager, and an empty replacement with an old self.
+  - Two fixture CPU values were first on the wrong side of the ceiling (once renewals and the reserve are counted), and were corrected.
+- **Mutation checks** (confirmed applied, restored with no diff; all failed within ≤ 3 s on assertions, none by timeout):
+  - prerequisites dropped from the fresh cost;
+  - renewals not charged;
+  - paid flag ignored;
+  - RPC-count check removed (NaN then reached the `workMs` guard with the wrong message);
+  - `remainingMs` check removed.
+- **Results.** Gate: `npx tsc -b` 0; `npm run typecheck:digest` 0; `npm run test -- --run` **80 files, 2375/2375**; `npm run build` 0.

@@ -963,7 +963,7 @@ export async function walkChangedKey(reader: FrozenReader, k: ChangedKey, resume
 export interface MaterializedWork { desc: WorkDescriptor; rows: ResultRows; inputRows: number }
 export interface MaterializeStats { owners: number; works: number; maxInput: number; totalInput: number; requests: number; peakInput: number }
 
-function partitionInput(reader: FrozenReader, audience: ReportingAudience, events: readonly Ev[]): FrozenPartitionInput {
+function partitionInput(reader: Pick<FrozenReader, "site" | "cutoff">, audience: ReportingAudience, events: readonly Ev[]): FrozenPartitionInput {
   const visible = audience.kind === "self" ? events.filter((e) => e.staff_id === audience.staffId) : events;
   return { site: reader.site, audience, ruleVersion: REPORTING_RULE_VERSION, sourceCutoffUtc: reader.cutoff, events: visible };
 }
@@ -996,18 +996,25 @@ export function ownerWorksFromInput(reader: FrozenReader, owner: Owner, input: O
     stats.peakInput = Math.max(stats.peakInput, input.events.length);
     stats.totalInput += input.events.length;
   }
+  return ownerAudiences(input, oldStaff).map((audience) => audienceWork(reader, owner, input, audience));
+}
+
+/** T15P-4d step 2: an owner's required audiences (site, then member and old-staff self audiences bytewise), without projecting any. */
+export function ownerAudiences(input: OwnerInput, oldStaff: Iterable<string>): ReportingAudience[] {
   const staff = new Set<string>(input.members.map((e) => e.staff_id).filter((s): s is string => !!s));
   for (const s of oldStaff) staff.add(s);
-  const audiences: ReportingAudience[] = [{ kind: "site" }, ...[...staff].sort(compareUtf8).map((staffId) => ({ kind: "self" as const, staffId }))];
-  return audiences.map((audience) => {
-    const pin = partitionInput(reader, audience, input.events);
-    const result = projectReportingPartition(pin);
-    return {
-      desc: { audienceKind: audience.kind, audienceStaff: audience.kind === "self" ? audience.staffId : null, partitionKind: owner.partitionKind, partitionKey: owner.partitionKey, inputHash: sha256Hex(canonicalJson(pin)) },
-      rows: ownerRows(result, owner),
-      inputRows: pin.events.length,
-    };
-  });
+  return [{ kind: "site" }, ...[...staff].sort(compareUtf8).map((staffId) => ({ kind: "self" as const, staffId }))];
+}
+
+/** T15P-4d step 2: ONE audience's work (projection, canonical input hash, owner rows), computed on demand and releasable. */
+export function audienceWork(reader: Pick<FrozenReader, "site" | "cutoff">, owner: Owner, input: OwnerInput, audience: ReportingAudience): MaterializedWork {
+  const pin = partitionInput(reader, audience, input.events);
+  const result = projectReportingPartition(pin);
+  return {
+    desc: { audienceKind: audience.kind, audienceStaff: audience.kind === "self" ? audience.staffId : null, partitionKind: owner.partitionKind, partitionKey: owner.partitionKey, inputHash: sha256Hex(canonicalJson(pin)) },
+    rows: ownerRows(result, owner),
+    inputRows: pin.events.length,
+  };
 }
 
 /**

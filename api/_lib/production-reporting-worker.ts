@@ -457,3 +457,66 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// T15P-4d step 2: phase-specific cumulative admission to the NEXT durable progress boundary (approval condition 3)
+// ---------------------------------------------------------------------------
+
+/** The deterministic RPC cost (ms) used by admission, and the run-record reserve kept back from every budget. */
+export const ADMISSION_RPC_MS = 1_000;
+export const ADMISSION_RESERVE_MS = 2_000;
+/** One leg of a path to durable progress: RPCs (each at ADMISSION_RPC_MS) plus measured/estimated CPU and serialization. */
+export interface AdmissionCost { rpcs: number; cpuMs: number }
+/**
+ * The smallest legal path to the next durable boundary for one unit:
+ *  - `prerequisites`: what a FRESH invocation must redo first (version/status/acquire/progress, the owner list or claim,
+ *    lookup, every reload call, reload parsing/reassembly/digests/sorting, old-staff reads, preparation CPU);
+ *  - `unit`: the unit itself INCLUDING its committing RPC (reading: the source page plus its pending/final checkpoint
+ *    calls; hashing: the chosen hashes and their hash checkpoint; stage: projection/hash/chunks, complete sparse
+ *    discovery and at least the first missing upload).
+ * `prerequisitesPaid` is true when this invocation already holds the prerequisites (they are then not charged again).
+ */
+export interface AdmissionPath { prerequisites: AdmissionCost; unit: AdmissionCost; prerequisitesPaid: boolean }
+/** Every admission input is validated at runtime: NaN/Infinity/negative/fractional estimates are refused, never admitted. */
+function admissionMs(v: unknown, what: string): number {
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw new ReportingJobError(`admission ${what} must be a finite non-negative number`);
+  return v;
+}
+function admissionRpcs(v: unknown, what: string): number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) throw new ReportingJobError(`admission ${what} must be a non-negative safe integer`);
+  return v;
+}
+const legMs = (c: AdmissionCost, what: string) => {
+  if (!c || typeof c !== "object") throw new ReportingJobError(`admission ${what} is missing`);
+  return admissionRpcs(c.rpcs, `${what}.rpcs`) * ADMISSION_RPC_MS + admissionMs(c.cpuMs, `${what}.cpuMs`);
+};
+/** Elapsed time including every due lease renewal (each one RPC), to a fixed point, plus the run-record reserve. */
+export function withRenewals(workMs: number): number {
+  admissionMs(workMs, "workMs");
+  let renewals = 0;
+  for (;;) {
+    const total = workMs + renewals * ADMISSION_RPC_MS;
+    const due = Math.floor(total / HEARTBEAT_MS);
+    if (due === renewals) return total + ADMISSION_RESERVE_MS;
+    renewals = due;
+  }
+}
+export type AdmissionVerdict = { verdict: "run" } | { verdict: "pending"; freshMs: number; nowMs: number } | { verdict: "capacity"; freshMs: number };
+/**
+ * Admit a unit: `capacity` (visible `owner_input_capacity`, evidence retained, publication blocked) when even a fresh
+ * uninterrupted invocation could not reach the boundary; `pending` (the owner is parked first for the next invocation)
+ * when it fits fresh but not the time left now; otherwise `run`. Every cost counts once.
+ */
+export function admitDurableUnit(path: AdmissionPath, remainingMs: number, budgetMs = WORKER_BUDGET_MS): AdmissionVerdict {
+  admissionMs(remainingMs, "remainingMs");
+  admissionMs(budgetMs, "budgetMs");
+  if (budgetMs <= ADMISSION_RESERVE_MS) throw new ReportingJobError("admission budgetMs must leave a usable budget after the run-record reserve");
+  if (!path || typeof path !== "object" || typeof path.prerequisitesPaid !== "boolean") throw new ReportingJobError("admission path is malformed");
+  const pre = legMs(path.prerequisites, "prerequisites");
+  const unit = legMs(path.unit, "unit");
+  const freshMs = withRenewals(pre + unit);
+  if (freshMs > budgetMs) return { verdict: "capacity", freshMs };
+  const nowMs = withRenewals((path.prerequisitesPaid ? 0 : pre) + unit);
+  if (nowMs > remainingMs) return { verdict: "pending", freshMs, nowMs };
+  return { verdict: "run" };
+}
