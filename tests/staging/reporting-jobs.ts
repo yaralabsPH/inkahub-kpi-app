@@ -13,6 +13,7 @@
  *   npm run staging:reporting-jobs -- --explain-source-versions --site=uk [--max-pages=N]   (plan-only I4 diagnostic; reportingPlanDiagnostic.ts)
  *   npm run staging:reporting-jobs -- --rehearse-worker-state --site=X   (Task 15 0043 rollback rehearsal; reportingWorkerHarness.ts)
  *   npm run staging:reporting-jobs -- --worker-runtime --site=X [--pace-calls=N] [--max-invocations=N] [--max-lease-wait-ms=N]   (Task 15 post-install runtime gate; reportingWorkerScenario.ts)
+ *   npm run staging:reporting-jobs -- --inspect-installed --sites=au,uk,us   (read-only installed-state inspection; reportingInstalledState.ts)
  *
  * The last three are Task 13 Part B2b's publication evidence
  * (tests/staging/reportingPublication.ts): the full 0038 draft applied inside
@@ -55,6 +56,8 @@ import { newRuntimeOwnership } from "./reportingWorkerRuntime";
 import { auditRuntime, cleanupRuntime, newRuntimeEvidence, runWorkerRuntime, type RuntimeCtx } from "./reportingWorkerScenario";
 import { parseRunReport, recoverWorkerRun, type RecoveredRun } from "./reportingWorkerRecovery";
 import { serviceRpcClient } from "./serviceRpc";
+import { CONTRACT_SQL, INSPECT_FLAG, inspectInstalled, inspectionMarkdown, inspectionStatus, parseInspectArgs, summarisePriorRun, type InspectionReport } from "./reportingInstalledState";
+import { readdirSync } from "node:fs";
 import {
   compareFullState,
   durableEvidence,
@@ -599,8 +602,75 @@ async function workerMain(argv: string[]): Promise<number> {
   return status === "STATUS: COMPLETE" ? 0 : 1;
 }
 
+/**
+ * Planner checkpoint 2026-11-18 (T15P-3): read-only installed-state inspection.
+ * Its own dispatch: no capture lifecycle, worker, recovery, rehearsal or cleanup.
+ * Every flag is validated before reading settings or connecting.
+ */
+async function inspectMain(argv: string[]): Promise<number> {
+  const args = parseInspectArgs(argv);
+  if (!args.ok) {
+    console.error(args.problems.join("; "));
+    return 2;
+  }
+  const revision = (() => {
+    try {
+      return execSync("git rev-parse HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      return "unknown";
+    }
+  })();
+  const startedAt = new Date().toISOString();
+  const out = `staging-results-reporting-installed-${startedAt.replace(/[^0-9TZ]/g, "")}-${randomBytes(4).toString("hex")}.md`;
+  if (existsSync(out)) throw new Error(`refusing to overwrite ${out}`);
+  const save = (r: InspectionReport) => {
+    writeFileSync(`${out}.tmp`, inspectionMarkdown(r));
+    renameSync(`${out}.tmp`, out);
+  };
+  console.log(`report: ${out}`);
+  const errors: string[] = [];
+  let open: () => Promise<pg.Client>;
+  try {
+    const s = readSettings();
+    assertStagingSupabaseUrl(s.STAGING_SUPABASE_URL);
+    const target = stagingTarget(s.STAGING_DB_URL);
+    const watch = newConnectionWatch(errors, redactSecrets, () => undefined);
+    open = () => openGuarded(s.STAGING_DB_URL, target, watch);
+  } catch (e) {
+    console.error(redactSecrets(e instanceof Error ? e.message : String(e)));
+    return 1;
+  }
+  const report = await inspectInstalled({
+    revision,
+    read: (p) => readFileSync(p, "utf8"),
+    open: () => open(),
+    // Local expected catalog: the REAL migration files applied to an in-process PGlite (never a network database).
+    expectedContracts: async (names) => {
+      const { reportingDb } = await import("../reporting/pg/harness");
+      const db = await reportingDb();
+      try {
+        return (await db.query(CONTRACT_SQL, [names])).rows as Array<Record<string, unknown>>;
+      } finally {
+        await db.close();
+      }
+    },
+    priorRuns: () => readdirSync(".").filter((f) => /^staging-results-reporting-worker-.*\.md$/.test(f)).sort().map((f) => summarisePriorRun(f, readFileSync(f))),
+    now: () => new Date(),
+    redact: redactSecrets,
+    save,
+  });
+  for (const e of errors) if (!report.errors.includes(e)) report.errors.push(e);
+  save(report);
+  const status = inspectionStatus(report);
+  console.log(`runtimeReady: ${report.runtimeReady}`);
+  for (const s of report.sites) console.log(`${s.site}: ${s.eligible ? "eligible" : `not eligible (${s.failedR0.length} R0 condition(s) fail)`}`);
+  console.log(status);
+  return status === "STATUS: COMPLETE" ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const flags = process.argv.slice(2).filter((a) => a.startsWith("--"));
+  if (process.argv.slice(2).some((a) => a === INSPECT_FLAG)) return inspectMain(process.argv.slice(2));
   if (flags.some((f) => (WORKER_FLAGS as readonly string[]).includes(f))) return workerMain(flags);
   if (flags.some((f) => f === "--baseline-smoke" || f === "--rehearse-migration" || f === "--check-installed" || f === "--interleavings" || f === "--committed-interleavings" || f === "--explain-source-versions" || f === "--rehearse-rebuild-repair" || f === "--rehearse-dependency-reads" || f === "--diagnose-dependency-plans" || f === "--diagnose-access-paths")) return publicationMain(flags);
   if (flags.join(" ") !== "--fence") {
