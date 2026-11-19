@@ -6829,3 +6829,35 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - Must-fix 5: the further boundary-evidence tests (the real packing seam, the synchronous preparation seams, the empty-page and fence-loss controls, more contamination comparisons, the event-owner visibility case). Recorded here as accepted gaps, not as done.
   - **Gate:** tsc -b exit 0; typecheck:digest exit 0; 80 files, 2438/2438; build exit 0.
   - **Step 4 status:** complete under CJ's waiver.
+- **Trim task 1 (`docs/reviews/item-counting-t15p4-trim.md`): durable staging and publication housekeeping (steps 6 and 7), 2026-11-19, Claude.**
+  - [x] Done.
+  - **Shared owner read:** `routedGroup` is now shared by planning and staging. It takes `purpose` and a `finish` callback; `planFinish` holds the descriptors and hash units, `stageFinish` the staging work. The callback runs inside the owner's durable turn. A staged owner with a journal (`journaled`) is recovered directly with `recoverOwnerJournal(..., "stage")`, with no light re-read, and `durableOwnerInput` continues an incomplete journal.
+  - **`stage()`:**
+    - ONE `lookup_reporting_owner_inputs` per owner group (behind the unit guard) splits the owners.
+    - **Owners without a journal** (light in planning, small by construction) keep the proven coalesced `materializeOwnerGroup` path.
+    - **Durable owners:** one audience at a time via `audienceWork`, with the input hash checked against the claim. Discovery (`readStagedChunks`, `floor(s/1000)+1` calls, skipped when the claim reports 0 stored) verifies each stored chunk hash; a differing stored chunk fails visibly and is not overwritten. Only MISSING chunks are uploaded, and a durable owner flushes per audience.
+    - Each audience's discovery plus first upload is admitted as a `stage` unit: counted calls for capacity, its own wall sample for parking. Every RPC runs behind the unit guard.
+  - **Surprise 1 (fixed):** an all-routed staging path (every owner through the per-owner light reader) never progressed in a 60 s invocation, because the fake's serial clock sums concurrent reads. That is why light owners stay on the coalesced path.
+  - **Surprise 2 (fixed):** concurrent staged owners could use up the heartbeat phase between a renewal and the admission sample. This raised a hard "sinceBeatMs" error. Admission now renews again until the sample is within the interval.
+  - **Step 7:** after publication, ONE bounded `release_reporting_owner_inputs` pass runs if a call fits (`Budget.fitsCall`). `more=true` is left for later (`counts.releaseMore`). A failure never changes the published state: it adds the allowlisted warning `owner input release deferred (<kind>)` and `counts.releaseFailed`. Explicit `cleanup` mode also makes one bounded pass.
+  - **Fake (test file):**
+    - `read_reporting_staged_chunks` (sealed batches only, sha-256 chunk hashes, `(work, chunk)` keyset);
+    - `release_reporting_owner_inputs` (marks released journals; options `releaseFails`/`releaseMore`);
+    - load pages now byte-capped like 0046 (≤ 500 rows, ~1 MiB), which `reloadCalls` uses too;
+    - `journalCalls("plan"|"stage")`.
+    - Step-3 tests were scoped to planning where staging now legitimately looks up journals or admits uploads. No expected count or hash was changed.
+  - **New tests:**
+    - complete-journal staging (one reload, zero source reads after seal, no journal write, reference published);
+    - a tampered claim fails `conflicting_work`;
+    - an interrupted multi-chunk upload (3 chunks; the second reply lost, then out of time): pending, never published; the resume discovers 2 stored chunks and sends only chunk 2;
+    - a tampered stored chunk fails, is not overwritten, and nothing is published;
+    - a staging stop before a durable owner's uploads stays pending, then publishes the reference;
+    - one bounded release after publish (success / `more` / failure), plus cleanup mode;
+    - `owner_input_too_heavy` and `owner_input_purpose` recovered journals: retained, not published, key-free results and run log.
+  - **Mutations (each fails a test, restored):**
+    - re-upload stored chunks;
+    - skip the stored-hash check;
+    - no release;
+    - durable owners treated as light at stage (4 tests fail).
+  - **Not done (per the trim):** stage takeover of an INCOMPLETE plan journal (purpose upgrade on first write). The worker routes it through `recoverOwnerJournal(..., "stage")` plus `durableOwnerInput`, but it cannot be reached in this fake's flow: planning completes every journal before sealing. It is covered by the existing SQL continuation and purpose tests, not by a new worker test.
+  - **Gate:** tsc -b exit 0; typecheck:digest exit 0; 80 files, **2445/2445**; build exit 0.

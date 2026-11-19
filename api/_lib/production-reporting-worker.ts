@@ -34,12 +34,12 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { ACTIVATION_LIMITS, activationWatch, coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerDescriptors, ownerKey, PartitionTooLargeError, routedOwnerInput, sharedChildren, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerInput, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
+import { ACTIVATION_LIMITS, activationWatch, audienceWork, coalescingChildren, durableOwnerInput, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerDescriptors, ownerKey, PartitionTooLargeError, routedOwnerInput, sharedChildren, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerInput, type OwnerJournal, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
 import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef, type FrozenReaderPages } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
-import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type StageEntry, type WorkDescriptor } from "./reporting-stage.js";
-import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
+import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type ClaimedWork, type StageEntry, type WorkDescriptor } from "./reporting-stage.js";
+import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readStagedChunks, readWalkLine, readWorkerProgress, recordRun, releaseOwnerInputs, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
 export const HEARTBEAT_MS = 30_000;
@@ -87,7 +87,7 @@ export interface WorkerEnv {
 /** One admission decision, as the worker derived it (simplification §2-3). */
 export interface AdmissionRecord {
   owner: Owner;
-  unit: "read" | "commit" | "hash";
+  unit: "read" | "commit" | "hash" | "stage";
   /** The exactly counted calls of the FRESH path (the only capacity input) and their time with renewals and reserve. */
   fresh: FreshCalls;
   freshMs: number;
@@ -179,6 +179,11 @@ class Budget {
   }
   hasTime(): boolean {
     return this.now() < this.deadline;
+  }
+  /** Whether the next nominal call (and any renewal due during it) still leaves the run-record reserve. */
+  fitsCall(): boolean {
+    const at = this.now();
+    return this.remainingMs(at) >= withRenewals(ADMISSION_RPC_MS, Math.min(this.sinceBeat(at), HEARTBEAT_MS - 1));
   }
   /** OutOfTime unless the next nominal call (and any renewal due during it) still leaves the run-record reserve. */
   needCall(): void {
@@ -375,7 +380,7 @@ async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenRea
     b.need();
     await b.beat(a.batchId, a.fence);
     const settled: Array<PromiseSettledResult<WorkDescriptor[]>> = routing
-      ? await routedGroup(env, b, a, routing, group, stats, counts, attempt)
+      ? await routedGroup(env, b, a, routing, group, counts, attempt, "plan", planFinish(env, b, a, routing, stats, counts))
       : (await materializeOwnerGroup(reader, group, stats, (f) => b.retry(f))).map((s) => (s.status === "fulfilled" ? { status: "fulfilled", value: s.value.map((w) => w.desc) } : s));
     for (let k = 0; k < group.length; k++) {
       const s = settled[k];
@@ -482,11 +487,13 @@ const JOURNAL_WRITES = new Set(["open_reporting_owner_input", "checkpoint_report
  * time. No CPU measurement takes part in either. A light owner never touches the journal. Results come back in group
  * order, settled each on its own.
  */
-async function routedGroup(
+async function routedGroup<I extends { owner: Owner; oldStaff: Iterable<string>; journaled?: boolean }, T>(
   env: WorkerEnv, b: Budget, a: ActiveBatch, routing: OwnerRouting,
-  items: ReadonlyArray<{ owner: Owner; oldStaff: Iterable<string> }>, stats: MaterializeStats, counts: Record<string, number>,
-  attempt: FreshAttempt | null = null,
-): Promise<Array<PromiseSettledResult<WorkDescriptor[]>>> {
+  items: ReadonlyArray<I>, counts: Record<string, number>,
+  attempt: FreshAttempt | null, purpose: "plan" | "stage",
+  /** What to do with the owner's input, while its durable turn (if any) is still held. */
+  finish: (o: OwnerReady<I>) => Promise<T>,
+): Promise<Array<PromiseSettledResult<T>>> {
   const shared = sharedChildren(routing.base);
   let turn: Promise<void> = Promise.resolve();
   /** Wait for the group's durable turn; resolves to its release. */
@@ -524,12 +531,18 @@ async function routedGroup(
      */
     const cost = { fixed: 0, reload: 0 };
     /** This invocation's largest COMPLETED unit of each kind for this owner (wall ms; absent until one completes). */
-    const samples: { read: number | null; hash: number | null } = { read: null, hash: null };
+    const samples: Record<UnitKind, number | null> = { read: null, hash: null, stage: null };
     /** When the current read+commit leg started (its first admitted source read), until its commit is acknowledged. */
     let legStart: number | null = null;
-    const admit = async (unit: AdmissionRecord["unit"], kind: "read" | "hash", freshUnitRpcs: number, currentRpcs: number) => {
-      await routing.beat(); // a due renewal first, then ONE clock sample for every field of the decision
-      const at = b.now();
+    const admit = async (unit: AdmissionRecord["unit"], kind: UnitKind, freshUnitRpcs: number, currentRpcs: number) => {
+      // a due renewal first, then ONE clock sample for every field of the decision; concurrent owners can use up the phase
+      // between the renewal and the sample, so a sample that is already a full interval past the beat renews again
+      let at = b.now();
+      for (;;) {
+        await routing.beat();
+        at = b.now();
+        if (b.sinceBeat(at) < HEARTBEAT_MS) break;
+      }
       const remainingMs = b.remainingMs(at);
       const sinceBeatMs = b.sinceBeat(at);
       const fresh: FreshCalls = { fixed: cost.fixed, reload: cost.reload, unit: freshUnitRpcs };
@@ -554,10 +567,7 @@ async function routedGroup(
     let freshLight = 0;
     /** This attempt's committed position at its first recovery. */
     let startPos: string | null = null;
-    try {
-      const r = await b.retry(() => {
-        attemptStart = watch.calls;
-        return routedOwnerInput((before, share) => shared.forOwner(routing.light(before), share), item.owner, async () => {
+    const durable = async (): Promise<{ reader: FrozenReader & { pages: FrozenReaderPages }; journal: OwnerJournal; resume: OwnerJournalSnapshot | null } | { input: OwnerInput }> => {
           if (!held.release) {
             // counted at activation (a parked or failed owner is counted too)
             counts.ownersActivated = (counts.ownersActivated ?? 0) + 1;
@@ -567,7 +577,7 @@ async function routedGroup(
             freshLight = watch.trigger() === "calls" ? ACTIVATION_LIMITS.calls : watch.calls - attemptStart;
             held.release = await durableTurn();
           }
-          const rec = await recoverOwnerJournal(jc, a.batchId, a.fence, item.owner, routing.site, "plan");
+          const rec = await recoverOwnerJournal(jc, a.batchId, a.fence, item.owner, routing.site, purpose);
           // the committed semantic position (pending pieces were discarded before this reload): a later recovery that
           // finds it advanced adopts progress a lost response hid; either way the outcome is now known
           const pos = JSON.stringify([rec.header.phase, rec.header.state, rec.header.eventCount, rec.header.hashesDone]);
@@ -605,34 +615,136 @@ async function routedGroup(
             },
             resume: rec.snapshot,
           };
-        }, ACTIVATION_LIMITS, watch);
-      });
-      // one audience projected at a time; only descriptors (identity + input hash) are kept for ordered planning
-      const descs = ownerDescriptors(routing.base, item.owner, r.input, item.oldStaff, stats);
-      if (r.route === "durable") {
-        counts.ownersDurable = (counts.ownersDurable ?? 0) + 1;
-        // a journal recovered complete needs no further checkpoint: it is reused as it is, never admitted for one
-        if (!held.complete) {
-          const hashes = descs.map((d) => ({ audienceKind: d.audienceKind, audienceStaff: d.audienceStaff, inputHash: d.inputHash }));
-          for (;;) {
-            await admit("hash", "hash", HASH_UNIT_RPCS, HASH_UNIT_RPCS);
-            const h0 = b.now();
-            const step = await b.retry(() => hashOwnerInputStep(jc, a.batchId, a.fence, held.handle!, hashes));
-            // committed hashes, or a completion a lost response hid (a journal recovered complete never enters this loop)
-            progressed();
-            if (attempt) attempt.unresolved = false;
-            samples.hash = Math.max(samples.hash ?? 0, b.now() - h0);
-            if (step.result) cost.reload = step.result.reloadCalls;
-            counts.durableUnits = (counts.durableUnits ?? 0) + 1;
-            if (step.complete) break;
-          }
+    };
+    try {
+      const r: { input: OwnerInput; route: "light" | "durable" } = await b.retry(async () => {
+        attemptStart = watch.calls;
+        if (item.journaled && !held.release) {
+          // a known durable owner (its journal exists) is recovered directly: no light attempt is repeated before it
+          held.release = await durableTurn();
+          counts.stageDurable = (counts.stageDurable ?? 0) + 1;
         }
-      }
-      return descs;
+        if (held.release) {
+          const d = await durable();
+          return { input: "input" in d ? d.input : await durableOwnerInput(d.reader, item.owner, d.journal, d.resume), route: "durable" as const };
+        }
+        const lr = await routedOwnerInput((before, share) => shared.forOwner(routing.light(before), share), item.owner, durable, ACTIVATION_LIMITS, watch);
+        // a light owner's fresh path: the restart prerequisites, the stage lookup and its own no-failure light reads
+        if (lr.route === "light") cost.fixed = FIXED_PREREQUISITE_RPCS + 1 + (watch.calls - attemptStart);
+        return lr;
+      });
+      return await finish({
+        item, input: r.input, route: r.route, complete: held.complete, handle: held.handle, admit, progressed,
+        sample: (kind, ms) => void (samples[kind] = Math.max(samples[kind] ?? 0, ms)),
+        resolved: () => void (attempt && (attempt.unresolved = false)),
+        setReload: (n) => void (cost.reload = n),
+        client: jc,
+      });
     } finally {
       held.release?.();
     }
   }));
+}
+
+/** The admitted unit kinds whose completed wall samples are kept (per owner, per invocation). */
+type UnitKind = "read" | "hash" | "stage";
+/** One owner's input, ready for its phase's own work (inside the owner's durable turn, when it has one). */
+interface OwnerReady<I> {
+  item: I;
+  input: OwnerInput;
+  route: "light" | "durable";
+  /** The recovered journal was already complete (no checkpoint is due), and its handle. */
+  complete: boolean;
+  handle: string | null;
+  admit(unit: AdmissionRecord["unit"], kind: UnitKind, freshUnitRpcs: number, currentRpcs: number): Promise<void>;
+  sample(kind: UnitKind, ms: number): void;
+  progressed(): void;
+  resolved(): void;
+  setReload(n: number): void;
+  /** The guarded client: the unit guard runs before every call. */
+  client: RpcClient;
+}
+
+/** Planning's own work for one owner: its descriptors and, for a durable owner, its audience hashes (bounded units). */
+function planFinish(env: WorkerEnv, b: Budget, a: ActiveBatch, routing: OwnerRouting, stats: MaterializeStats, counts: Record<string, number>) {
+  return async (o: OwnerReady<{ owner: Owner; oldStaff: Iterable<string> }>): Promise<WorkDescriptor[]> => {
+    // one audience projected at a time; only descriptors (identity + input hash) are kept for ordered planning
+    const descs = ownerDescriptors(routing.base, o.item.owner, o.input, o.item.oldStaff, stats);
+    if (o.route === "durable") {
+      counts.ownersDurable = (counts.ownersDurable ?? 0) + 1;
+      // a journal recovered complete needs no further checkpoint: it is reused as it is, never admitted for one
+      if (!o.complete) {
+        const hashes = descs.map((d) => ({ audienceKind: d.audienceKind, audienceStaff: d.audienceStaff, inputHash: d.inputHash }));
+        for (;;) {
+          await o.admit("hash", "hash", HASH_UNIT_RPCS, HASH_UNIT_RPCS);
+          const h0 = b.now();
+          const step = await b.retry(() => hashOwnerInputStep(o.client, a.batchId, a.fence, o.handle!, hashes));
+          // committed hashes, or a completion a lost response hid (a journal recovered complete never enters this loop)
+          o.progressed();
+          o.resolved();
+          o.sample("hash", b.now() - h0);
+          if (step.result) o.setReload(step.result.reloadCalls);
+          counts.durableUnits = (counts.durableUnits ?? 0) + 1;
+          if (step.complete) break;
+        }
+      }
+    }
+    return descs;
+  };
+}
+
+/**
+ * Staging's own work for one owner (T15P-4 trim, step 6): each claimed audience is projected ONE at a time from the
+ * owner's input, its input hash checked against the claimed descriptor, and only its MISSING chunks uploaded. Chunks
+ * already stored (a lost reply, an interrupted invocation) are discovered and verified, never sent again; a stored
+ * chunk that differs fails visibly without overwriting it. Each audience's discovery plus its first upload is admitted
+ * as one unit (counted calls for capacity, observed wall time for parking); every RPC runs behind the unit guard.
+ */
+function stageFinish(b: Budget, a: ActiveBatch, routing: OwnerRouting, counts: Record<string, number>) {
+  return async (o: OwnerReady<{ owner: Owner; oldStaff: Iterable<string>; works: ClaimedWork[] }>): Promise<void> => {
+    let pending: StageEntry[] = [];
+    const flush = async () => {
+      for (const req of packStageRequests(pending)) await b.retry(() => stageReportingResults(o.client, a.batchId, a.fence, req));
+      pending = [];
+    };
+    for (const c of o.item.works) {
+      const audience: Parameters<typeof audienceWork>[3] = c.audienceKind === "site" ? { kind: "site" } : { kind: "self", staffId: c.audienceStaff! };
+      const w = audienceWork(routing.base, o.item.owner, o.input, audience);
+      if (w.desc.inputHash !== c.inputHash) throw new ReportingJobError(`claimed work ${c.workId}: the frozen input hash differs from the planned descriptor`);
+      const chunks = buildChunks(w.rows);
+      // discovery of s stored chunks takes floor(s / 1000) + 1 calls; none when the claim reports none stored
+      const discovery = c.stagedChunks > 0 ? Math.floor(c.stagedChunks / 1000) + 1 : 0;
+      await o.admit("stage", "stage", discovery + 1, discovery + 1);
+      const t0 = b.now();
+      const stored = new Map<number, string>();
+      if (discovery) {
+        let after: { work: string; chunk: number } | null = null;
+        for (;;) {
+          const page = await b.retry(() => readStagedChunks(o.client, a.batchId, a.fence, [c.workId], after, 1000));
+          for (const x of page) stored.set(x.chunkNo, x.chunkHash);
+          if (page.length < 1000) break;
+          after = { work: c.workId, chunk: page[page.length - 1].chunkNo };
+        }
+      }
+      for (const [n, h] of stored) {
+        if (!chunks[n] || chunks[n].chunkHash !== h) throw new ReportingJobError(`claimed work ${c.workId}: a stored chunk differs from the frozen result (not overwritten)`);
+      }
+      for (const chunk of chunks) if (!stored.has(chunk.chunkNo)) pending.push({ partition: c.workId, chunk });
+      counts.reusedChunks = (counts.reusedChunks ?? 0) + stored.size;
+      counts.uploadedChunks = (counts.uploadedChunks ?? 0) + chunks.length - stored.size;
+      // a durable owner keeps only one audience's output in memory; a light owner's small works share requests
+      if (o.route === "durable") await flush();
+      o.sample("stage", b.now() - t0);
+    }
+    await flush();
+  };
+}
+
+/** ONE bounded release of a site's published journals; `more` is left for a later publication or cleanup (no loop). */
+async function releasePass(env: WorkerEnv, site: ReportingSite, counts: Record<string, number>): Promise<void> {
+  const r = await releaseOwnerInputs(env.client, site);
+  counts.releasedJournalRows = (counts.releasedJournalRows ?? 0) + r.deleted;
+  if (r.more) counts.releaseMore = 1;
 }
 
 /** Seal only with the exact completeness proof and the saved-descriptor manifest. */
@@ -647,7 +759,7 @@ async function seal(env: WorkerEnv, b: Budget, a: ActiveBatch, counts: Record<st
 }
 
 /** Claim bounded work, re-materialize each claimed owner once from the frozen view, stage its chunks. Returns true when nothing is left. */
-async function stage(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>): Promise<boolean> {
+async function stage(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>, routing: OwnerRouting | null = null): Promise<boolean> {
   for (;;) {
     if (!b.hasTime()) return false;
     await b.beat(a.batchId, a.fence);
@@ -668,11 +780,32 @@ async function stage(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenRe
       const items = part.map((group) => ({
         owner: { partitionKind: group[0].partitionKind, partitionKey: group[0].partitionKey } as Owner,
         oldStaff: group.filter((c) => c.audienceKind === "self").map((c) => c.audienceStaff!),
+        works: group,
       }));
-      const settled = await materializeOwnerGroup(reader, items, stats, (f) => b.retry(f));
+      // T15P-4 trim step 6: ONE lookup per owner group tells which owners are durable. A durable owner's complete journal
+      // is reused (never re-read light), one audience at a time, with only its MISSING chunks uploaded. Owners without
+      // a journal were light in planning (small by construction) and keep the proven coalesced path.
+      let journaled = items.map(() => false);
+      if (routing) {
+        const guarded: RpcClient = { rpc: async (fn, args) => (await routing.unitGuard(), env.client.rpc(fn, args)) };
+        const found = await b.retry(() => lookupOwnerInputs(guarded, a.batchId, a.fence, items.map((x) => x.owner)));
+        journaled = items.map((_, i) => !!found[i]?.journal);
+      }
+      const lightItems = items.filter((_, i) => !journaled[i]);
+      const durableItems = items.filter((_, i) => journaled[i]).map((x) => ({ ...x, journaled: true }));
+      const lightSettled = lightItems.length ? await materializeOwnerGroup(reader, lightItems, stats, (f) => b.retry(f)) : [];
+      const durableSettled = routing && durableItems.length ? await routedGroup(env, b, a, routing, durableItems, counts, null, "stage", stageFinish(b, a, routing, counts)) : [];
+      let li = 0;
+      let di = 0;
       for (let k = 0; k < part.length; k++) {
         const group = part[k];
-        const s = settled[k];
+        if (journaled[k]) {
+          const s = durableSettled[di++];
+          if (s.status === "rejected") throw s.reason; // the first failure in claim order
+          counts.staged = (counts.staged ?? 0) + group.length;
+          continue;
+        }
+        const s = lightSettled[li++];
         if (s.status === "rejected") throw s.reason;
         await b.beat(a.batchId, a.fence);
         const entries: StageEntry[] = [];
@@ -708,6 +841,8 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         counts.deletedWorkerRows = (counts.deletedWorkerRows ?? 0) + p.deletedWorkerRows;
         if (!p.more) break;
       }
+      // one bounded release pass, so a quiet site's published journals are also released (a failure is visible)
+      if (b.fitsCall()) await releasePass(env, req.site, counts);
       out.state = "done";
     } else {
       // T15P-4d step 3: the 0046 owner-input protocol FIRST, before any batch work (a transient probe failure keeps its code
@@ -759,13 +894,23 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
           await plan(env, b, a, coalesced, stats, counts, routing, fresh);
           await seal(env, b, a, counts);
         }
-        if (await stage(env, b, a, coalesced, stats, counts)) {
+        if (await stage(env, b, a, coalesced, stats, counts, routing)) {
           b.need();
           const p = await b.retry(() => publishReportingBatch(env.client, a.batchId, a.fence));
           out.generationId = p.generationId;
           counts.receipts = p.receipts;
           counts.acknowledged = p.acknowledged;
           out.state = "published";
+          // T15P-4 trim step 7: AFTER publication, at most one bounded release of published journals, only if a call fits.
+          // Housekeeping never turns a committed publication into a failure: a failed release is a safe warning.
+          if (b.fitsCall()) {
+            try {
+              await releasePass(env, req.site, counts);
+            } catch (e) {
+              counts.releaseFailed = 1;
+              problems.push(`owner input release deferred (${failureKind(e)})`);
+            }
+          }
         } else out.state = "pending";
       }
     }
