@@ -444,6 +444,18 @@ export async function writeOwnerPage(
   return { result: await checkpointOwnerInput(client, batchId, fence, handle, s, page([])), calls: calls + 1 };
 }
 
+/**
+ * T15P-4d step 4: the EXACT number of checkpoint calls `writeOwnerPage` makes for a page (a heavy proof can only stop
+ * it earlier): one inline `page` call when the body fits, otherwise every `pieces` body plus the final `page` call.
+ * Same packer, same fixed bytes; nothing is sent.
+ */
+export function ownerPageCalls(entries: readonly PieceEntry[], steps: readonly unknown[], membersCount?: number): number {
+  if (!steps.length) throw new ReportingJobError("a page needs at least one step");
+  const tail: Record<string, unknown> = { kind: "page", pieces: [], steps, ...(membersCount === undefined ? {} : { members_count: membersCount }) };
+  if (packEntries(entries, utf8(JSON.stringify(tail))).length <= 1) return 1;
+  return packEntries(entries, utf8(JSON.stringify({ kind: "pieces", pieces: [] }))).length + 1;
+}
+
 export interface JournalEvent { ord: number; ev: ProductionEvidenceEvent }
 /** The loader's row shape (r5 §3): metadata only on piece 0; a lone eof row with every other field null. */
 const LOAD_FIELDS = ["ord", "piece_no", "pieces", "event_id", "text_bytes", "text_sha256", "piece", "eof"] as const;
@@ -595,20 +607,34 @@ export function parseOwnerState(v: unknown): OwnerStepState {
  * (`writeOwnerPage`), with the adapter-authoritative stream flag against the batch's frozen cutoff.
  * A `heavy` result stops the owner visibly (`owner_input_too_heavy`, its evidence retained).
  */
-export function ownerJournal(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, cutoffUs: bigint): OwnerJournal & { seq: string; calls: number } {
+export function ownerJournal(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, cutoffUs: bigint, reloadCalls = 0): OwnerJournal & { seq: string; calls: number; reloadCalls: number; pageCalls(p: OwnerPage): number } {
+  // the entries of the page last sized by pageCalls, reused by its commit (serialized once)
+  let sized: { page: OwnerPage; entries: PieceEntry[] } | null = null;
+  const entriesOf = (p: OwnerPage) => (sized && sized.page === p ? sized.entries : eventEntries(p.events, p.firstOrd, (e) => isStreamCandidate(e, cutoffUs)));
   const j = {
     seq: parseSeq(seq),
     calls: 0,
-    async commit(p: { events: ProductionEvidenceEvent[]; firstOrd: number; steps: OwnerStepState[]; membersCount?: number }) {
-      const entries = eventEntries(p.events, p.firstOrd, (e) => isStreamCandidate(e, cutoffUs));
+    /** The committed journal's reload cost (header + load pages + eof), as the last checkpoint accounted it. */
+    reloadCalls,
+    /** The exact checkpoint calls committing `p` will take (T15P-4d step 4 admission). */
+    pageCalls(p: OwnerPage): number {
+      const entries = entriesOf(p);
+      sized = { page: p, entries };
+      return ownerPageCalls(entries, p.steps, p.membersCount);
+    },
+    async commit(p: OwnerPage) {
+      const entries = entriesOf(p);
+      sized = null;
       const w = await writeOwnerPage(client, batchId, fence, handle, j.seq, entries, p.steps, p.membersCount);
       j.calls += w.calls;
       j.seq = w.result.seq;
+      j.reloadCalls = w.result.reloadCalls;
       if (w.result.heavy) throw new ReportingJobError(`owner input ${handle} is too heavy to reload (${w.result.provisionalReloadCalls} calls)`, "owner_input_too_heavy");
     },
   };
   return j;
 }
+type OwnerPage = { events: ProductionEvidenceEvent[]; firstOrd: number; steps: OwnerStepState[]; membersCount?: number };
 /** The resumable snapshot of a reloaded journal (the stored state parsed exactly as the server validates it). */
 export function ownerJournalSnapshot(r: { header: OwnerInputHeader; events: JournalEvent[] }): OwnerJournalSnapshot {
   if (r.header.phase !== "reading") throw new ReportingJobError(`owner input is ${r.header.phase}, not reading`);

@@ -106,3 +106,22 @@ None.
 (Coder records repairs and verification in the active plan under the existing workflow.)
 
 STATUS: COMPLETE
+
+### Coder response (Claude, 2026-11-19)
+
+All five Must-fix items and the Should-fix item were fixed. Details, tests and mutation results are in the plan log entry "Astra wiring-step-4 review fixes".
+
+- **Must-fix 1, exact commit:** `READ_UNIT_RPCS` is gone. Reads are admitted at `READ_LEG_RPCS` = 2, and each commit is admitted with its exact `ownerPageCalls` before its first call. This answers the counterexample: a 5-RPC unit is now priced exactly, because the commit is sized after the page is known.
+- **Must-fix 2, CPU:** the default clock is process CPU; each segment is measured once; descriptor CPU is charged once (exact counter-clock test); the first-unit estimate is 1,000 ms. **Limit:** process CPU includes the concurrent light owners of the same group (conservative). This is recorded for 4e.
+- **Must-fix 3, live prerequisites:**
+  - The reload cost follows every checkpoint and hash result, with no repeated open or discard.
+  - The prediction matches the next invocation's actual recovery reload.
+  - **Not separately exercised here:** pending-discard and partially-hashed journals. The fake models no heavy or pending recovery beyond discard, and partial hashing needs more than 100 audiences. The same formula covers them (the discard leg is never repeated; reload follows `reloadCalls`). This is left for 4e real-SQL evidence.
+- **Must-fix 4, no idle rule:** a transient-delayed standard run parks (never capacity), and so does a shortened run. A real over-budget recovery (CPU and wall time together) fails `owner_input_capacity` once, instead of hitting the deadline check first.
+- **Must-fix 5, renewal inside the unit:**
+  - Every journal and hash RPC runs the guard first.
+  - The worker-level 29,500 ms read leg parks with 5,000 ms left. With 6,000 ms it renews before the checkpoint, keeps the reserve, and the next invocation publishes.
+  - A multi-call commit at 29,500 ms runs `checkpoint, renew, checkpoint`.
+  - **Not separately exercised:** the hash path at the boundary. It uses the same guarded client.
+- **Should-fix 1:** `action` is the single authoritative decision.
+- **Gate:** 80 files, 2421/2421; tsc, digest and build exit 0. One earlier full run timed out an unchanged first test under load (1.8–1.9 s alone); this is recorded.

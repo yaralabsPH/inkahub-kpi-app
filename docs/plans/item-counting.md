@@ -6695,3 +6695,34 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - hash units not admitted;
     - reads not admitted.
   - **Gate:** 80 files, **2416/2416**; tsc, typecheck:digest and build exit 0.
+- **Astra wiring-step-4 review fixes (`docs/reviews/item-counting-t15p4-wiring-step4.md`), 2026-11-19:**
+  - **Must-fix 1:** the `READ_UNIT_RPCS` bound is removed. A read is admitted at its smallest legal size (`READ_LEG_RPCS` = source + a one-call commit). Its commit is admitted separately with the EXACT call count, using the new `ownerPageCalls` (worker-state: the same packer and fixed bytes as `writeOwnerPage`, nothing sent) through `ownerJournal.pageCalls`, which caches the entries so they are serialized once. If that commit does not fit, the owner parks before its first call; the read is redone later and no partial upload is left behind.
+  - **Must-fix 2:**
+    - The default CPU clock is `processCpuMs` (`process.cpuUsage`, user + system), so I/O waits, sleeps and backoff do not count. Recovery CPU, read-processing CPU (read end to commit start), serialization CPU, hash-step CPU and descriptor CPU are each measured once.
+    - Descriptor CPU is charged only to legs after reading.
+    - A unit kind not yet measured uses `FIRST_UNIT_CPU_MS` (1,000 ms), never zero.
+    - **Limit:** process CPU also counts the other owners of a planning group that are working at the same time (and other threads in a test runner). That errs on the conservative side and is recorded for 4e sampling.
+  - **Must-fix 3:** the prerequisites are kept live. They are the fixed calls + light attempts + lookup + the committed journal's CURRENT `reload_calls` (from each checkpoint and hash result), with no open or discard once done; their CPU is the recovery CPU + serialization CPU so far (+ descriptor CPU once hashing).
+  - **Must-fix 4:** the idle-invocation rule is removed. Admission takes the due renewal with `beat()` and only then judges, without a prior deadline check, so an over-budget recovery reaches its capacity verdict instead of a generic timeout. Capacity comes only from the fresh standard-run path.
+  - **Must-fix 5:** journal and hash RPCs go through a client that runs the heartbeat/deadline guard before EACH call, so a renewal falling due inside a multi-call unit is taken at that call boundary.
+  - **Should-fix 1:** `AdmissionRecord.action` (`run`/`park`/`fail`) is the one authoritative decision. Activation counters are recorded at activation, so parked owners are counted too.
+  - **Tests (API):**
+    - **Live derived path:** prerequisites equal fixed + the fake's live reload cost at every admission. Each commit's unit equals the checkpoint calls that actually follow it. 1 s of I/O per RPC never becomes CPU. The real phase and time left are used. The reload cost grows.
+    - The process-CPU clock is checked with a spy.
+    - Descriptor CPU is charged exactly once (counter clock: exactly +2 over the last commit).
+    - **Worker-level 29,500 ms read leg:** with 5,000 ms left it parks before its read (seq 0, no pending, no checkpoint). With 6,000 ms left the renewal comes first and then the checkpoint, the 2,000 ms reserve is kept, it parks at the next leg, and the next invocation publishes.
+    - **Multi-call commit at 29,500 ms:** the call order is `checkpoint, renew, checkpoint`.
+    - A transient-delayed standard invocation parks (pending, never capacity), and the next one publishes.
+    - A shortened invocation parks.
+    - Recovery costing 250 s of CPU and wall time gives `owner_input_capacity`: evidence kept, nothing published, no key.
+    - The predicted reload legs match the next invocation's actual recovery reload.
+  - **Mutations (all prompt assertion failures, restored):**
+    - no guard inside the unit;
+    - commit not admitted;
+    - stale prerequisites;
+    - descriptor CPU charged twice;
+    - phase ignored;
+    - capacity ignored;
+    - first-unit CPU zero.
+  - **Observed:** one full run timed out the first API test ("a refresh enumerates…", 5 s limit) under suite load. It takes 1.8–1.9 s alone (about 1.6–2.0 s before this step), and the rerun passed. Recorded, with no timeout raised.
+  - **Gate:** 80 files, **2421/2421**; tsc, typecheck:digest and build exit 0.
