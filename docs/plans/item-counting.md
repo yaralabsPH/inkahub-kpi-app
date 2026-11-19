@@ -6773,3 +6773,45 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - **Round-3 Must-fix 2b:** the reconstruction estimate is a measured subset (`reloadWork`). It omits the loader's per-piece validation, the map/budget rebuild and the hashing-recovery sort; predicted CPU components must be compared with an actual fresh recovery across a growing prefix and the reading-to-hashing transition.
     - **Round-3 Should-fix 1:** keep both timeout observations precisely: the first API test under suite load, and the round-2 transient-retry test (64/65, one 5,000 ms timeout, 1,953 ms alone). Suite contention is unconfirmed.
   - **State:** all work is committed through `80e9c51`; the gate there was 80 files, 2429/2429. Steps 5–7 and 4e are not started.
+- **T15P-4d wiring step 4, simplified admission (CJ's decision; Astra scope decision `docs/reviews/item-counting-t15p4-wiring-step4-simplify.md`), 2026-11-19, Claude:** CJ chose to replace the measured-CPU model ("make it simpler, more reliable and better"). The scope decision supersedes the CPU requirements of rounds 1–3 and authorizes ONE review of this implementation.
+  - **Capacity from counted calls only:** `admitUnit` / `freshCallsMs`. `freshMs = withRenewals((fixed + reload + unit) × 1,000)`, and capacity is `freshMs > 240,000`, always against the standard budget. `fixed` = 5 + the owner's no-failure light path + lookup. A retried light read is not a fresh call: the call limit when "calls" triggered, otherwise this attempt's own calls. `reload` = the committed journal's exact count. `unit` = `READ_LEG_RPCS` before a read, `1 + pageCalls` at the exact commit, `HASH_UNIT_RPCS` per hash unit. No CPU value enters.
+  - **Parking from observed wall time:** park unless `remaining ≥ withRenewals(unpaid calls × 1,000 + E, sinceBeat)`. `E` = this owner's largest COMPLETED unit of the same kind in this invocation (read+commit leg from the first admitted read to the acknowledged commit; hash unit from admission to the acknowledged checkpoint), or `FIRST_UNIT_WALL_MS` = 1,000. Samples are per owner, per kind, per invocation. The commit admission does not add the leg's elapsed read again.
+  - **Clock:** one nondecreasing `Budget.now()` over `env.now()` (non-finite refused; a backward step never grants budget back). A due renewal is taken before admission, and the clock is sampled once per decision.
+  - **Per-RPC guard:** `unitGuard` (`needCall`: the next call plus the reserve must fit, then a due renewal, then again) runs before every durable source, journal, recovery and hash RPC.
+  - **Fresh attempt / `owner_input_no_progress`:** only in a standard-budget invocation that did no copy or enumeration and whose startup took at most `FRESH_STARTUP_MS` (5,000 ms). Its first pending owner runs ALONE first. If a budget stop (`OutOfTime`/`Parked`) ends it after owner work started and before substantive progress (an acknowledged page commit, a committed hash unit, or the plan save), the run fails with `owner_input_no_progress`: key-free, journal kept, publication blocked. Pending pieces, discard, open and reload are not progress. `Deferred`, fence, heavy, capacity and validation errors keep their own kinds. No persisted strike state and no schema change.
+  - **A journal recovered complete** is reused without any hash admission.
+  - **Removed:** `CpuMeter`, `CpuLedger`, `meteredReader`, the reader `io` hook (the reader is back to its pre-meter form), `reloadWork`, `lastEntries`, `WorkerEnv.cpuNow`/`cpuProbe`, `processCpuMs`, `AdmissionPath`/`AdmissionCost`/`admitDurableUnit`/`admissionAt`. The loader's validation, reconstruction and hashing sort are unchanged. `AdmissionRecord` now carries `fresh`, `freshMs`, `currentRpcs`, `wallMs`, the sampled times, the verdict, the action, `freshAttempt` and `progressed`; it is test-only (raw owner).
+  - **Tests** (`tests/api/reporting-worker.test.ts` step-4 block rewritten; `tests/reporting/reportingOwnerInputState.test.ts` admission section rewritten):
+    - live exact counts and independently measured per-kind wall maxima;
+    - `process.cpuUsage` throwing never consulted;
+    - samples per owner and per invocation;
+    - read boundary at 29,500 ms (5,000 and 5,999 park, 6,000 runs, renewal then checkpoint, reserve kept);
+    - renewal between a multi-call commit's calls;
+    - transient-delayed and shortened invocations park;
+    - synthetic count-only capacity before any unit RPC;
+    - exact-commit capacity at exact equality (231 calls run, the commit refused with zero uploads);
+    - post-admission overrun → no-progress twice (no strike state), then the same journal publishes;
+    - reload and hash-unit overruns → no-progress;
+    - negative controls (shortened, copy+enumeration, after one page, late acknowledged commit) → pending;
+    - a late owner gets the isolated fresh attempt on the next resume;
+    - pending pieces alone → no-progress, then one discard and completion;
+    - a deferred transient → pending;
+    - retried light read: watch +1, fresh path unchanged;
+    - production `rpcFrozenReader` route with no injected source, slow renewals and a transient light read: no capacity, published;
+    - backward clock;
+    - long read commits, then the long sample only parks;
+    - kept: discard once, partial-hash resume, complete-journal reuse (new), hash 29,500, real reader/writer, live reload prediction.
+  - **Fixture limits:** the oversized reload counts in the two capacity tests are SYNTHETIC (injected checkpoint results). Legal caps (16 light calls, 120 reload calls, a 1 MiB page) keep a real fresh path below 231 calls. The 700 KB rows remain planning-only evidence. The production-route fixture is staff-less (members, by-id and children pages only).
+  - **Not covered yet:** an acknowledged empty-page cursor advance as the first progress, and a fence loss during the fresh attempt. Both follow from the same code path: any acknowledged commit counts as progress, and only `OutOfTime` is converted.
+  - **Mutations (each restored):**
+    - capacity also counts the wall allowance: 7 failed;
+    - no exact commit admission: 7;
+    - fresh attempt allowed after copy/enumeration: 2;
+    - an acknowledged commit is not progress: 2;
+    - journal RPCs without the per-call guard: 6;
+    - no startup check: 1;
+    - the clock may run backward: 1;
+    - retried light calls count as fresh: 2.
+    - One mutation survived: dropping only `!copied`. It is redundant, because an invocation that copies always enumerates too, and the enumeration check is what the M3 mutation above removes. Kept as a defensive check.
+  - **Timeout history (round-3 Should-fix 1):** both earlier observations stand. The first API test timed out under full-suite load (5,000 ms limit; 1.8–1.9 s alone). Round 2's transient-retry test showed 64/65 passed, with one 5,000 ms timeout and 1,953 ms alone (`docs/reviews/item-counting-t15p4-wiring-step4-r2.md`). Suite contention as the cause is unconfirmed. This gate had no timeout, and no timeout was changed.
+  - **Gate:** `npx tsc -b` exit 0; `npm run typecheck:digest` exit 0; `npm run test -- --run`: 80 files, **2435/2435**; `npm run build` exit 0. No hosted CI.

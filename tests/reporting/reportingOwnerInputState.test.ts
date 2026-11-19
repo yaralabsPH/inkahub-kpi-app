@@ -15,7 +15,7 @@ import {
   parseHandle, parseOwnerState, parseSeq, PIECE_LITERAL_BYTES, readOwnerOldStaff, reloadOwnerInput, REQUEST_BODY_BYTES, saveEnumeration, splitPieces, writeOwnerPage, type PieceEntry,
 } from "../../api/_lib/reporting-worker-state";
 import { MAX_RESPONSE_BYTES, responseBytes } from "../../api/_lib/production-reporting-reader";
-import { ADMISSION_RESERVE_MS, ADMISSION_RPC_MS, admitDurableUnit, HEARTBEAT_MS, withRenewals, WORKER_BUDGET_MS, type AdmissionPath } from "../../api/_lib/production-reporting-worker";
+import { ADMISSION_RESERVE_MS, ADMISSION_RPC_MS, admitUnit, FRESH_STARTUP_MS, freshCallsMs, HEARTBEAT_MS, withRenewals, WORKER_BUDGET_MS, type FreshCalls, type UnitAdmission } from "../../api/_lib/production-reporting-worker";
 import { audienceWork, ownerAudiences, ownerWorksFromInput, type OwnerInput } from "../../api/_lib/production-reporting-materialize";
 import { reportingDb } from "./pg/harness";
 import { pgRpc } from "./pg/rpc";
@@ -355,11 +355,10 @@ describe("strict reload rows (Must-fix 5): metadata only on piece 0, a lone all-
   });
 });
 
-// ---- T15P-4d step 2: phase-specific cumulative admission and the per-audience seam ----
+// ---- T15P-4d step 4 (simplification): call-count-only capacity and wall-only parking ----
 const FIXED = 5; // version, status, acquire, progress, owner list
-const path = (prereqRpcs: number, prereqCpu: number, unitRpcs: number, unitCpu: number, paid = false): AdmissionPath => ({
-  prerequisites: { rpcs: prereqRpcs, cpuMs: prereqCpu }, unit: { rpcs: unitRpcs, cpuMs: unitCpu }, prerequisitesPaid: paid,
-});
+const calls = (fixed: number, reload: number, unit: number): FreshCalls => ({ fixed, reload, unit });
+const at = (fresh: FreshCalls, currentRpcs: number, wallMs: number): UnitAdmission => ({ fresh, currentRpcs, wallMs });
 
 describe("cumulative admission to the next durable boundary", () => {
   it("renewals are charged to a fixed point, plus the reserve", () => {
@@ -373,103 +372,92 @@ describe("cumulative admission to the next durable boundary", () => {
     }
   });
 
-  it("nonzero reconstruction CPU: a unit that fits without it but not with it is a visible capacity failure, not pending forever", () => {
-    // 1 lookup + 120 reload calls + 5 fixed, one 1-call unit, 0 CPU: fits
-    expect(admitDurableUnit(path(FIXED + 1 + 120, 0, 1, 0), WORKER_BUDGET_MS).verdict).toBe("run");
-    // the same with 120 s of reload parse/reassembly/digest CPU: the fresh path no longer fits -> capacity
-    // (127 RPCs + 120 s = 247 s before renewals and the reserve)
-    const v = admitDurableUnit(path(FIXED + 1 + 120, 120_000, 1, 0), WORKER_BUDGET_MS);
-    expect(v.verdict).toBe("capacity");
+  it("capacity comes from counted calls only: 231 calls fit at exact equality (7 renewals + one reserve), 232 refuse", () => {
+    // 231 calls = 231,000 ms; 7 renewals fall due (238,000 / 30,000 = 7.9); + 2,000 reserve = 240,000 = the budget
+    expect(freshCallsMs(calls(FIXED, 120, 106))).toBe(WORKER_BUDGET_MS);
+    expect(admitUnit(at(calls(FIXED, 120, 106), 2, 0), WORKER_BUDGET_MS).verdict).toBe("run");
+    // one more counted call: 239,000 + 2,000 = 241,000 > 240,000 (still 7 renewals) -> visible capacity
+    expect(admitUnit(at(calls(FIXED, 120, 107), 2, 0), WORKER_BUDGET_MS)).toEqual({ verdict: "capacity", freshMs: 241_000 });
+    // the reserve is charged exactly once
+    expect(freshCallsMs(calls(0, 0, 0))).toBe(ADMISSION_RESERVE_MS);
   });
 
-  it("stage preparation that fits alone but not with its first upload is capacity (preparation alone is not progress)", () => {
-    const prereq = { rpcs: FIXED + 1 + 20, cpu: 150_000 };
-    // preparation + discovery only (wrongly treated as the unit) would fit...
-    expect(admitDurableUnit(path(prereq.rpcs, prereq.cpu, 2, 40_000), WORKER_BUDGET_MS).verdict).toBe("run");
-    // ...but the unit must include the first missing upload (one RPC plus its serialization)
-    expect(admitDurableUnit(path(prereq.rpcs, prereq.cpu, 2 + 1, 40_000 + 45_000), WORKER_BUDGET_MS).verdict).toBe("capacity");
+  it("capacity is judged against the STANDARD budget, whatever the time left now", () => {
+    const over = at(calls(FIXED, 120, 107), 1, 0);
+    for (const remaining of [0, 1_000, WORKER_BUDGET_MS, 10 * WORKER_BUDGET_MS]) expect(admitUnit(over, remaining).verdict, String(remaining)).toBe("capacity");
+    const fits = at(calls(FIXED, 120, 106), 1, 0);
+    expect(admitUnit(fits, 0).verdict).toBe("pending"); // fits a fresh run: never capacity, however little is left
   });
 
-  it("hash checkpoint overhead and an unfinished multi-call page are part of their units", () => {
-    const prereq = FIXED + 1 + 60;
-    // 100 hashes worth 160 s CPU fit; the checkpoint RPC is charged too
-    const fits = path(prereq, 0, 1, 160_000);
-    expect(admitDurableUnit(fits, WORKER_BUDGET_MS).verdict).toBe("run");
-    // a source page needing 6 pieces calls + 1 page call, near the ceiling
-    const page = path(prereq, 100_000, 1 + 6 + 1, 50_000); // 66 + 8 RPCs + 150 s = 224 s, + 7 renewals + reserve = 233 s
-    expect(admitDurableUnit(page, WORKER_BUDGET_MS).verdict).toBe("run");
-    expect(admitDurableUnit(path(prereq, 100_000, 1 + 6 + 1, 75_000), WORKER_BUDGET_MS).verdict).toBe("capacity");
-  });
-
-  it("fits fresh but not now -> pending; and a FRESH uninterrupted invocation then always admits it (no pending forever)", () => {
-    for (const [pr, pc, ur, uc] of [[FIXED + 1 + 10, 5_000, 3, 20_000], [FIXED + 1 + 110, 90_000, 8, 10_000], [FIXED, 0, 1, 1]] as const) {
-      const p = path(pr, pc, ur, uc);
-      const fresh = admitDurableUnit(p, WORKER_BUDGET_MS);
-      expect(fresh.verdict).toBe("run");
-      // late in an invocation that already holds the prerequisites, with too little time left
-      const late = admitDurableUnit({ ...p, prerequisitesPaid: true }, withRenewals(ur * ADMISSION_RPC_MS + uc) - 1);
-      expect(late.verdict).toBe("pending");
-      // the next fresh invocation (budget minus nothing spent yet) is admitted by construction
-      expect(admitDurableUnit(p, WORKER_BUDGET_MS).verdict).toBe("run");
+  it("no wall allowance, however large, can turn a fitting path into capacity: it only parks", () => {
+    const fits = calls(FIXED + 16 + 1, 120, 2);
+    for (const wallMs of [0, 1_000, 230_000, 250_000, 10_000_000]) {
+      const v = admitUnit(at(fits, 2, wallMs), WORKER_BUDGET_MS);
+      expect(v.verdict, String(wallMs)).not.toBe("capacity");
+      expect(v.verdict, String(wallMs)).toBe(wallMs <= 200_000 ? "run" : "pending");
     }
   });
 
-  it("paid prerequisites are not charged twice", () => {
-    const p = path(FIXED + 1 + 100, 50_000, 2, 1_000);
-    const need = withRenewals(2 * ADMISSION_RPC_MS + 1_000);
-    expect(admitDurableUnit({ ...p, prerequisitesPaid: true }, need).verdict).toBe("run");
-    expect(admitDurableUnit({ ...p, prerequisitesPaid: false }, need).verdict).toBe("pending");
+  it("parking: the unit's unpaid calls plus the wall allowance, with the renewals due from the current phase and the reserve", () => {
+    const fresh = calls(FIXED, 0, 3);
+    // just after a beat: 2 calls + 1,000 wall + 2,000 reserve = 5,000
+    expect(admitUnit(at(fresh, 2, 1_000), 5_000, 0)).toEqual({ verdict: "run", freshMs: 10_000, nowMs: 5_000 });
+    expect(admitUnit(at(fresh, 2, 1_000), 4_999, 0).verdict).toBe("pending");
+    // 29,500 ms after a beat a renewal falls due inside the unit: 6,000 (equality runs, one ms less parks)
+    expect(admitUnit(at(fresh, 2, 1_000), 6_000, 29_500).verdict).toBe("run");
+    expect(admitUnit(at(fresh, 2, 1_000), 5_999, 29_500).verdict).toBe("pending");
+    // paid prerequisites are never charged to the current remainder: only the unit's own unpaid calls
+    expect(admitUnit(at(calls(FIXED, 120, 3), 2, 1_000), 5_000, 0).verdict).toBe("run");
+  });
+
+  it("a path that fits fresh is admitted by a fresh invocation with the initial wall allowance", () => {
+    for (const [f, r, u] of [[FIXED + 1, 10, 3], [FIXED + 17, 110, 8], [FIXED, 0, 1]] as const) {
+      expect(admitUnit(at(calls(f, r, u), u, 1_000), WORKER_BUDGET_MS - FRESH_STARTUP_MS).verdict).toBe("run");
+    }
   });
 });
 
 describe("admission inputs are validated at runtime (NaN, Infinity, negative, fractional are refused, never admitted)", () => {
-  const ok = path(FIXED, 1_000, 1, 1_000);
+  const ok = at(calls(FIXED, 1, 1), 1, 1_000);
   const BAD_NUMBERS = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, -0.5];
   it("withRenewals refuses non-finite and negative work (NaN would never reach its fixed point)", () => {
     for (const v of BAD_NUMBERS) expect(() => withRenewals(v), String(v)).toThrow(/workMs must be a finite non-negative number/);
     expect(withRenewals(0.5)).toBe(0.5 + ADMISSION_RESERVE_MS); // fractional milliseconds are a valid duration
   });
-  it("RPC counts must be non-negative safe integers (NaN, Infinity, negative, fractional, unsafe)", () => {
+  it("call counts must be non-negative safe integers (NaN, Infinity, negative, fractional, unsafe)", () => {
     for (const v of [...BAD_NUMBERS, 1.5, 0.1, 2 ** 53, Number.MAX_VALUE]) {
-      expect(() => admitDurableUnit({ ...ok, unit: { rpcs: v, cpuMs: 0 } }, WORKER_BUDGET_MS), `unit.rpcs ${v}`).toThrow(/unit\.rpcs must be a non-negative safe integer/);
-      expect(() => admitDurableUnit({ ...ok, prerequisites: { rpcs: v, cpuMs: 0 } }, WORKER_BUDGET_MS), `prerequisites.rpcs ${v}`).toThrow(/prerequisites\.rpcs must be a non-negative safe integer/);
+      for (const k of ["fixed", "reload", "unit"] as const) {
+        expect(() => admitUnit({ ...ok, fresh: { ...ok.fresh, [k]: v } }, WORKER_BUDGET_MS), `${k} ${v}`).toThrow(`fresh.${k} must be a non-negative safe integer`);
+      }
+      expect(() => admitUnit({ ...ok, currentRpcs: v }, WORKER_BUDGET_MS), `currentRpcs ${v}`).toThrow(/currentRpcs must be a non-negative safe integer/);
     }
+    expect(() => freshCallsMs(calls(2 ** 52, 2 ** 52, 0))).toThrow(/overflow/);
   });
-  it("CPU estimates, remainingMs and budgetMs must be finite and non-negative; the budget must be usable after the reserve", () => {
+  it("the wall allowance and remainingMs must be finite and non-negative; malformed inputs are refused", () => {
     for (const v of BAD_NUMBERS) {
-      expect(() => admitDurableUnit({ ...ok, unit: { rpcs: 1, cpuMs: v } }, WORKER_BUDGET_MS), `unit.cpuMs ${v}`).toThrow(/unit\.cpuMs must be a finite non-negative number/);
-      expect(() => admitDurableUnit({ ...ok, prerequisites: { rpcs: 1, cpuMs: v } }, WORKER_BUDGET_MS), `prerequisites.cpuMs ${v}`).toThrow(/prerequisites\.cpuMs must be a finite non-negative number/);
-      expect(() => admitDurableUnit(ok, v), `remainingMs ${v}`).toThrow(/remainingMs must be a finite non-negative number/);
-      expect(() => admitDurableUnit(ok, WORKER_BUDGET_MS, v), `budgetMs ${v}`).toThrow(/budgetMs must be a finite non-negative number/);
+      expect(() => admitUnit({ ...ok, wallMs: v }, WORKER_BUDGET_MS), `wallMs ${v}`).toThrow(/wallMs must be a finite non-negative number/);
+      expect(() => admitUnit(ok, v), `remainingMs ${v}`).toThrow(/remainingMs must be a finite non-negative number/);
     }
-    for (const b of [0, ADMISSION_RESERVE_MS]) expect(() => admitDurableUnit(ok, WORKER_BUDGET_MS, b), `budgetMs ${b}`).toThrow(/usable budget/);
-    expect(() => admitDurableUnit({ ...ok, prerequisitesPaid: "yes" as unknown as boolean }, WORKER_BUDGET_MS)).toThrow(/path is malformed/);
-    expect(() => admitDurableUnit({ ...ok, unit: null as unknown as AdmissionPath["unit"] }, WORKER_BUDGET_MS)).toThrow(/unit is missing/);
-    // fractional CPU milliseconds are valid and still admitted by the same arithmetic
-    expect(admitDurableUnit({ ...ok, unit: { rpcs: 1, cpuMs: 0.25 } }, WORKER_BUDGET_MS).verdict).toBe("run");
+    expect(() => admitUnit(null as unknown as UnitAdmission, WORKER_BUDGET_MS)).toThrow(/malformed/);
+    expect(() => admitUnit({ ...ok, fresh: null as unknown as FreshCalls }, WORKER_BUDGET_MS)).toThrow(/fresh calls are missing/);
+    // fractional wall milliseconds are valid and still admitted by the same arithmetic
+    expect(admitUnit({ ...ok, wallMs: 0.25 }, WORKER_BUDGET_MS).verdict).toBe("run");
   });
-});
-
-describe("current-invocation admission counts the time since the last heartbeat (Astra scope review Must-fix 2)", () => {
-  it("29,500 ms after a beat a two-RPC unit needs a renewal: 5,000 ms, not 4,000", () => {
-    const unit = path(FIXED, 0, 2, 0, true);
-    expect(withRenewals(2_000, 29_500)).toBe(2_000 + ADMISSION_RPC_MS + ADMISSION_RESERVE_MS);
-    expect(admitDurableUnit(unit, 4_000, WORKER_BUDGET_MS, 29_500).verdict).toBe("pending"); // park before starting it
-    expect(admitDurableUnit(unit, 5_000, WORKER_BUDGET_MS, 29_500).verdict).toBe("run");
-    expect(admitDurableUnit(unit, 4_000, WORKER_BUDGET_MS, 0).verdict).toBe("run"); // just after a beat no renewal is due
+  it("the elapsed phase is validated: NaN, negative, or a full interval (a due renewal is taken first) are refused", () => {
+    for (const v of [Number.NaN, -1, Number.POSITIVE_INFINITY]) expect(() => withRenewals(1_000, v), String(v)).toThrow(/sinceBeatMs must be a finite non-negative number/);
+    expect(() => withRenewals(1_000, HEARTBEAT_MS)).toThrow(/below the heartbeat interval/);
+    expect(() => admitUnit(ok, WORKER_BUDGET_MS, Number.NaN)).toThrow(/sinceBeatMs/);
+    expect(() => admitUnit(ok, WORKER_BUDGET_MS, HEARTBEAT_MS)).toThrow(/below the heartbeat interval/);
   });
   it("a renewal whose own cost crosses the next boundary is charged too (once each)", () => {
-    // 29,500 ms elapsed + 30,000 ms work: one renewal falls due; its 1,000 ms pushes past the second boundary as well
     expect(withRenewals(30_000, 29_500)).toBe(30_000 + 2 * ADMISSION_RPC_MS + ADMISSION_RESERVE_MS);
     for (const [w, since] of [[0, 29_999], [1_000, 29_000], [59_000, 1_000], [100_000, 15_000]] as const) {
       const t = withRenewals(w, since) - ADMISSION_RESERVE_MS;
       expect((t - w) / ADMISSION_RPC_MS, `${w}/${since}`).toBe(Math.floor((since + t) / HEARTBEAT_MS));
     }
   });
-  it("the elapsed phase is validated: NaN, negative, or a full interval (a due renewal is taken first) are refused", () => {
-    for (const v of [Number.NaN, -1, Number.POSITIVE_INFINITY]) expect(() => withRenewals(1_000, v), String(v)).toThrow(/sinceBeatMs must be a finite non-negative number/);
-    expect(() => withRenewals(1_000, HEARTBEAT_MS)).toThrow(/below the heartbeat interval/);
-    expect(() => admitDurableUnit(path(FIXED, 0, 1, 0), WORKER_BUDGET_MS, WORKER_BUDGET_MS, Number.NaN)).toThrow(/sinceBeatMs/);
+  it("the fresh-attempt startup allowance is the fixed prerequisites at the nominal call cost", () => {
+    expect(FRESH_STARTUP_MS).toBe(5 * ADMISSION_RPC_MS);
   });
 });
 

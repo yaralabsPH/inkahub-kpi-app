@@ -456,32 +456,6 @@ export function ownerPageCalls(entries: readonly PieceEntry[], steps: readonly u
   return packEntries(entries, utf8(JSON.stringify({ kind: "pieces", pieces: [] }))).length + 1;
 }
 
-/**
- * T15P-4d step 4: the per-event CPU work a reload of these entries performs (reassembly of the pieces, UTF-8 length,
- * sha-256, canonical parse), done here on the committed entries so the reconstruction cost is MEASURED, not inferred.
- * Throws exactly as a reload would on a malformed entry.
- */
-export function reloadWork(entries: readonly PieceEntry[], site: string): number {
-  let cur: { meta: PieceMeta; parts: string[] } | null = null;
-  let n = 0;
-  const finish = () => {
-    if (!cur) return;
-    const text = cur.parts.join("");
-    if (utf8(text) !== cur.meta.text_bytes || sha256(text) !== cur.meta.text_sha256) throw new ReportingJobError("a journal entry does not match its length/digest");
-    parseEventText(text, site, cur.meta.event_id);
-    n++;
-    cur = null;
-  };
-  for (const e of entries) {
-    if (e[1] === 0) {
-      finish();
-      cur = { meta: (e as [number, 0, string, PieceMeta])[3], parts: [e[2]] };
-    } else cur!.parts.push(e[2]);
-  }
-  finish();
-  return n;
-}
-
 export interface JournalEvent { ord: number; ev: ProductionEvidenceEvent }
 /** The loader's row shape (r5 §3): metadata only on piece 0; a lone eof row with every other field null. */
 const LOAD_FIELDS = ["ord", "piece_no", "pieces", "event_id", "text_bytes", "text_sha256", "piece", "eof"] as const;
@@ -633,11 +607,9 @@ export function parseOwnerState(v: unknown): OwnerStepState {
  * (`writeOwnerPage`), with the adapter-authoritative stream flag against the batch's frozen cutoff.
  * A `heavy` result stops the owner visibly (`owner_input_too_heavy`, its evidence retained).
  */
-export function ownerJournal(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, cutoffUs: bigint, reloadCalls = 0): OwnerJournal & { seq: string; calls: number; reloadCalls: number; pageCalls(p: OwnerPage): number; lastEntries(): readonly PieceEntry[] } {
+export function ownerJournal(client: RpcClient, batchId: string, fence: number, handle: string, seq: string, cutoffUs: bigint, reloadCalls = 0): OwnerJournal & { seq: string; calls: number; reloadCalls: number; pageCalls(p: OwnerPage): number } {
   // the entries of the page last sized by pageCalls, reused by its commit (serialized once)
   let sized: { page: OwnerPage; entries: PieceEntry[] } | null = null;
-  /** The entries of the page last committed (for the caller's measured reload work). */
-  let last: PieceEntry[] = [];
   const entriesOf = (p: OwnerPage) => (sized && sized.page === p ? sized.entries : eventEntries(p.events, p.firstOrd, (e) => isStreamCandidate(e, cutoffUs)));
   const j = {
     seq: parseSeq(seq),
@@ -650,12 +622,9 @@ export function ownerJournal(client: RpcClient, batchId: string, fence: number, 
       sized = { page: p, entries };
       return ownerPageCalls(entries, p.steps, p.membersCount);
     },
-    /** The entries the last commit wrote. */
-    lastEntries: (): readonly PieceEntry[] => last,
     async commit(p: OwnerPage) {
       const entries = entriesOf(p);
       sized = null;
-      last = entries;
       const w = await writeOwnerPage(client, batchId, fence, handle, j.seq, entries, p.steps, p.membersCount);
       j.calls += w.calls;
       j.seq = w.result.seq;

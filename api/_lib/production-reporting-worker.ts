@@ -39,7 +39,7 @@ import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPag
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
 import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type StageEntry, type WorkDescriptor } from "./reporting-stage.js";
-import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, reloadWork, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
+import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
 export const HEARTBEAT_MS = 30_000;
@@ -78,18 +78,33 @@ export interface WorkerEnv {
   redact?: (s: string) => string;
   /** Owners materialized together in plan/stage (default OWNER_GROUP; 1 = one at a time). */
   ownerGroup?: number;
-  /** T15P-4d step 4: the CPU clock in ms (default: this process's user+system CPU, which excludes I/O waits and sleeps). */
-  cpuNow?: () => number;
   /**
-   * T15P-4d step 4 (tests): called right before the worker closes a measured CPU span (`serialized`: a page's entries
-   * and packing; `reconstructed`: recovery + snapshot rebuild; `described`: the descriptors), on the owner's own code.
+   * T15P-4d step 4: observes every durable-unit admission (IN-PROCESS TESTS ONLY; never changes the verdict). The record
+   * carries the raw owner, so it must never be serialized into a production log.
    */
-  cpuProbe?: (point: "serialized" | "reconstructed" | "described") => void;
-  /** T15P-4d step 4: observes every durable-unit admission (tests; never changes the verdict). */
   onAdmission?: (a: AdmissionRecord) => void;
 }
-/** One admission decision, as the worker derived it. */
-export interface AdmissionRecord { owner: Owner; unit: "read" | "commit" | "hash"; /** The complete FRESH path (capacity). */ path: AdmissionPath; /** The still-unpaid remainder in this invocation (parking). */ now: AdmissionCost; nowMs: number; remainingMs: number; sinceBeatMs: number; budgetMs: number; verdict: AdmissionVerdict["verdict"]; /** What the worker did with it: one authoritative decision. */ action: "run" | "park" | "fail" }
+/** One admission decision, as the worker derived it (simplification §2-3). */
+export interface AdmissionRecord {
+  owner: Owner;
+  unit: "read" | "commit" | "hash";
+  /** The exactly counted calls of the FRESH path (the only capacity input) and their time with renewals and reserve. */
+  fresh: FreshCalls;
+  freshMs: number;
+  /** The unit's still-unpaid calls in this invocation, and the observed wall allowance (parking only). */
+  currentRpcs: number;
+  wallMs: number;
+  nowMs: number;
+  remainingMs: number;
+  sinceBeatMs: number;
+  budgetMs: number;
+  verdict: AdmissionVerdict["verdict"];
+  /** What the worker did with it: one authoritative decision. */
+  action: "run" | "park" | "fail";
+  /** Whether this is the invocation's qualified fresh attempt, and whether it had progressed before this admission. */
+  freshAttempt: boolean;
+  progressed: boolean;
+}
 
 const TRANSIENT_CODES = new Set(["57014", "55P03", "40001", "40P01", "53300", "57P01", "08000", "08001", "08003", "08006"]);
 /** A transient failure may succeed on retry; everything else is permanent for this batch. */
@@ -102,7 +117,7 @@ export function isTransient(e: unknown): boolean {
   return /fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|network error|\b50[234]\b|statement timeout|could not serialize|deadlock detected/i.test(m);
 }
 /** A short, stable failure kind for the run log and metadata. */
-const OWNER_INPUT_KINDS = new Set(["owner_input_unsupported", "owner_input_too_heavy", "owner_input_capacity", "owner_input_purpose"]);
+const OWNER_INPUT_KINDS = new Set(["owner_input_unsupported", "owner_input_too_heavy", "owner_input_capacity", "owner_input_purpose", "owner_input_no_progress"]);
 export function failureKind(e: unknown): string {
   if (e instanceof PartitionTooLargeError) return "partition_too_large";
   const ownerCode = (e as { code?: unknown } | null)?.code;
@@ -130,22 +145,46 @@ class OutOfTime extends Error {}
 /** A durable owner that fits a fresh run but not the time left now: parked first, continued by the next invocation. */
 class Parked extends OutOfTime {}
 
-/** One invocation's clock, budget, heartbeat and bounded retries. */
+/**
+ * One invocation's clock, budget, heartbeat and bounded retries. Every elapsed-time decision reads `now()`: the
+ * worker's `env.now()` made NONDECREASING for this invocation (a backward clock step never grants budget back or makes
+ * an invocation look fresher), and refused when not finite.
+ */
 class Budget {
   private lastBeat: number;
+  private last: number;
+  readonly startMs: number;
   constructor(private readonly env: WorkerEnv, private readonly deadline: number, readonly budgetMs: number) {
-    this.lastBeat = env.now();
+    this.last = Number.NEGATIVE_INFINITY;
+    this.startMs = this.now();
+    this.lastBeat = this.startMs;
+  }
+  now(): number {
+    const t = this.env.now();
+    if (!Number.isFinite(t)) throw new ReportingJobError("the worker clock returned a non-finite time");
+    if (t > this.last) this.last = t;
+    return this.last;
+  }
+  /** Milliseconds since the invocation started. */
+  elapsedMs(): number {
+    return this.now() - this.startMs;
   }
   /** Milliseconds since the last lease renewal (or since the invocation started). */
-  sinceBeat(): number {
-    return Math.max(0, this.env.now() - this.lastBeat);
+  sinceBeat(at = this.now()): number {
+    return Math.max(0, at - this.lastBeat);
   }
   /** Milliseconds left before this invocation's deadline (never negative). */
-  remainingMs(): number {
-    return Math.max(0, this.deadline - this.env.now());
+  remainingMs(at = this.now()): number {
+    return Math.max(0, this.deadline - at);
   }
   hasTime(): boolean {
-    return this.env.now() < this.deadline;
+    return this.now() < this.deadline;
+  }
+  /** OutOfTime unless the next nominal call (and any renewal due during it) still leaves the run-record reserve. */
+  needCall(): void {
+    const at = this.now();
+    const since = Math.min(this.sinceBeat(at), HEARTBEAT_MS - 1); // a due renewal is counted inside the fixed point
+    if (this.remainingMs(at) < withRenewals(ADMISSION_RPC_MS, since)) throw new OutOfTime();
   }
   need(): void {
     if (!this.hasTime()) throw new OutOfTime();
@@ -154,11 +193,11 @@ class Budget {
   /** Renew when 30 s have passed; single-flight, so concurrently materialized owners never send duplicate renewals. */
   async beat(batchId: string, fence: number): Promise<void> {
     if (this.beating) return this.beating;
-    if (this.env.now() - this.lastBeat < HEARTBEAT_MS) return;
+    if (this.now() - this.lastBeat < HEARTBEAT_MS) return;
     this.beating = (async () => {
       try {
         await this.retry(() => renewReportingLease(this.env.client, batchId, fence));
-        this.lastBeat = this.env.now();
+        this.lastBeat = this.now();
       } finally {
         this.beating = null;
       }
@@ -173,7 +212,7 @@ class Budget {
       } catch (e) {
         if (!isTransient(e)) throw e;
         const wait = RETRY_DELAYS_MS[attempt];
-        if (wait === undefined || this.env.now() + wait >= this.deadline) throw new Deferred(e);
+        if (wait === undefined || this.now() + wait >= this.deadline) throw new Deferred(e);
         await this.env.sleep(wait);
       }
     }
@@ -322,28 +361,56 @@ async function enumerate(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: Froz
  * are materialized in bounded groups (concurrently, over the coalescing
  * reader) and planned strictly in list order; the first failure in that order
  * is raised after the owners before it are planned, exactly as one at a time.
+ *
+ * T15P-4d step 4 (simplification §4): in a FRESH invocation (`fresh`: standard budget, no copy/enumeration done here)
+ * whose startup took at most FRESH_STARTUP_MS, the first pending owner runs ALONE first as the qualified fresh
+ * attempt. If a budget guard or admission stops it before its first substantive progress (an acknowledged page commit,
+ * a committed hash unit, or its plan save), the run fails visibly with `owner_input_no_progress` (journal kept,
+ * publication blocked) instead of parking unchanged forever. Every other stop stays an ordinary `pending`.
  */
-async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>, routing: OwnerRouting | null): Promise<void> {
+async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>, routing: OwnerRouting | null, fresh = false): Promise<void> {
   const size = ownerGroupSize(env);
+  let first = fresh;
+  const planGroup = async (group: ReadonlyArray<{ owner: Owner; oldStaff: Iterable<string> }>, attempt: FreshAttempt | null) => {
+    b.need();
+    await b.beat(a.batchId, a.fence);
+    const settled: Array<PromiseSettledResult<WorkDescriptor[]>> = routing
+      ? await routedGroup(env, b, a, routing, group, stats, counts, attempt)
+      : (await materializeOwnerGroup(reader, group, stats, (f) => b.retry(f))).map((s) => (s.status === "fulfilled" ? { status: "fulfilled", value: s.value.map((w) => w.desc) } : s));
+    for (let k = 0; k < group.length; k++) {
+      const s = settled[k];
+      if (s.status === "rejected") throw s.reason;
+      await b.beat(a.batchId, a.fence);
+      await b.retry(() => planOwner(env.client, a.batchId, a.fence, group[k].owner, s.value));
+      if (attempt) attempt.progressed = true; // the plan save is the light owner's progress boundary
+      counts.ownersPlanned = (counts.ownersPlanned ?? 0) + 1;
+    }
+  };
   for (;;) {
     b.need();
     const owners = await b.retry(() => listWorkerOwners(env.client, a.batchId, a.fence, true, null, PLAN_PAGE));
     if (!owners.length) return;
-    for (let i = 0; i < owners.length; i += size) {
-      b.need();
-      await b.beat(a.batchId, a.fence);
-      const group = owners.slice(i, i + size);
-      const settled: Array<PromiseSettledResult<WorkDescriptor[]>> = routing
-        ? await routedGroup(env, b, a, routing, group, stats, counts)
-        : (await materializeOwnerGroup(reader, group, stats, (f) => b.retry(f))).map((s) => (s.status === "fulfilled" ? { status: "fulfilled", value: s.value.map((w) => w.desc) } : s));
-      for (let k = 0; k < group.length; k++) {
-        const s = settled[k];
-        if (s.status === "rejected") throw s.reason;
-        await b.beat(a.batchId, a.fence);
-        await b.retry(() => planOwner(env.client, a.batchId, a.fence, group[k].owner, s.value));
-        counts.ownersPlanned = (counts.ownersPlanned ?? 0) + 1;
+    let i = 0;
+    if (first) {
+      first = false;
+      // the startup (only the fixed restart prerequisites ran) must have left essentially the whole standard budget
+      if (routing && b.elapsedMs() <= FRESH_STARTUP_MS) {
+        const attempt: FreshAttempt = { started: false, progressed: false };
+        counts.freshAttempts = (counts.freshAttempts ?? 0) + 1;
+        try {
+          await planGroup(owners.slice(0, 1), attempt);
+        } catch (e) {
+          // only a budget stop of an attempt that did owner work and made no durable progress; every other error keeps its kind
+          if (e instanceof OutOfTime && attempt.started && !attempt.progressed) {
+            counts.ownersNoProgress = (counts.ownersNoProgress ?? 0) + 1;
+            throw new OwnerInputNoProgressError(owners[0].owner, counts.durableUnits ?? 0);
+          }
+          throw e;
+        }
+        i = 1;
       }
     }
+    for (; i < owners.length; i += size) await planGroup(owners.slice(i, i + size), null);
   }
 }
 const ownerGroupSize = (env: WorkerEnv) => Math.max(1, Math.min(env.ownerGroup ?? OWNER_GROUP, 32));
@@ -351,42 +418,31 @@ const ownerGroupSize = (env: WorkerEnv) => Math.max(1, Math.min(env.ownerGroup ?
 /**
  * T15P-4d step 3: how planning reads an owner. `light(before)` is a fresh per-owner reader whose EVERY read first runs
  * `before` (the owner's activation check) and then the page guard; `base` (page guard only) serves the shared children
- * flushes and the durable route. Null when the source has no one-call pages (the legacy group path is used instead).
+ * flushes; `durable` is the activated owner's reader, whose every read first runs `unitGuard`. Null when the source has
+ * no one-call pages (the legacy group path is used instead).
  */
 interface OwnerRouting {
-  /** `io` (optional) is told when an RPC reader waits and resumes (CPU ownership; see FrozenReaderOptions.io). */
-  light(before: () => Promise<void>, io?: { wait(): void; resume(): void }): FrozenReader & { pages: FrozenReaderPages };
+  light(before: () => Promise<void>): FrozenReader & { pages: FrozenReaderPages };
   base: FrozenReader & { pages: FrozenReaderPages };
-  /** A durable owner's own reader (page guard only), whose waits and decoding feed `io` (its durable meter). */
-  durable(io: { wait(): void; resume(): void }): FrozenReader & { pages: FrozenReaderPages };
+  durable: FrozenReader & { pages: FrozenReaderPages };
   cutoffUs: bigint;
   site: ReportingSite;
-  guard: () => Promise<void>;
+  /** Before EVERY durable source/journal/hash RPC: the next call plus the reserve fits, a due renewal, then again. */
+  unitGuard: () => Promise<void>;
   /** A due lease renewal only (no deadline check): admission judges the time left itself. */
   beat: () => Promise<void>;
 }
 const hasPages = (r: FrozenReader): r is FrozenReader & { pages: FrozenReaderPages } => !!(r as { pages?: unknown }).pages;
-/**
- * An injected reader with `before` awaited ahead of every read, page methods included. With `io`, the wait is reported
- * and the caller's meter resumes IMMEDIATELY before the read itself, in the same synchronous step (no task hop between
- * the resume and an in-memory read, so its CPU is the caller's).
- */
-function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: () => Promise<void>, io?: { wait(): void; resume(): void }): FrozenReader & { pages: FrozenReaderPages } {
+/** An injected reader with `before` awaited ahead of every read, page methods included. */
+function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: () => Promise<void>): FrozenReader & { pages: FrozenReaderPages } {
   const at = async <T>(read: () => T | Promise<T>): Promise<T> => {
-    io?.wait();
     await before();
-    io?.resume();
     return read();
   };
   const it = <T>(f: () => AsyncIterable<T>): AsyncIterable<T> =>
     (async function* () {
-      const src = await at(() => f()[Symbol.asyncIterator]());
-      for (;;) {
-        const x = await src.next();
-        io?.resume();
-        if (x.done) return;
-        yield x.value;
-      }
+      await before();
+      yield* f();
     })();
   return {
     ...r,
@@ -406,22 +462,24 @@ function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: ()
   };
 }
 
+/** The qualified fresh attempt of one owner (simplification §4): did it start owner work, and did it make progress? */
+interface FreshAttempt { started: boolean; progressed: boolean }
+
 /**
  * Plan-phase reads of one bounded owner group (T15P-4d steps 3-4). Every owner first runs its light read (one
  * activation watch per owner, kept across transient retries) with an allowance-bounded shared children view. An
  * activating owner waits for the group's single durable turn (never two durable owners at once), recovers or opens its
- * plan journal, continues the read from it (every leg admitted first) and hashes its audiences one bounded unit at a
- * time. CPU is OWNED: each owner has a light meter and a durable meter that count only while that owner's own code
- * runs (every awaited read/RPC/guard is a wait), so concurrent light owners never charge each other. A light owner
- * never touches the journal. Results come back in group order, settled each on its own.
+ * plan journal, continues the read from it and hashes its audiences one bounded unit at a time, every unit admitted
+ * first (simplification §2-3): CAPACITY from exactly counted calls only; PARKING from this invocation's observed wall
+ * time. No CPU measurement takes part in either. A light owner never touches the journal. Results come back in group
+ * order, settled each on its own.
  */
 async function routedGroup(
   env: WorkerEnv, b: Budget, a: ActiveBatch, routing: OwnerRouting,
   items: ReadonlyArray<{ owner: Owner; oldStaff: Iterable<string> }>, stats: MaterializeStats, counts: Record<string, number>,
+  attempt: FreshAttempt | null = null,
 ): Promise<Array<PromiseSettledResult<WorkDescriptor[]>>> {
   const shared = sharedChildren(routing.base);
-  const cpuNow = env.cpuNow ?? processCpuMs;
-  const ledger = new CpuLedger();
   let turn: Promise<void> = Promise.resolve();
   /** Wait for the group's durable turn; resolves to its release. */
   const durableTurn = (): Promise<() => void> => {
@@ -430,265 +488,123 @@ async function routedGroup(
     turn = new Promise<void>((r) => (release = r));
     return prev.then(() => release);
   };
+  // journal, recovery and hash RPCs: the unit guard runs before EACH of them (a renewal due between a unit's calls is
+  // taken at that call boundary, and no call starts without its own time plus the reserve)
+  const jc: RpcClient = { rpc: async (fn, args) => (await routing.unitGuard(), env.client.rpc(fn, args)) };
   return Promise.allSettled(items.map(async (item) => {
-    const watch = activationWatch(item.owner, ACTIVATION_LIMITS);
-    // this owner's own CPU on its light attempt: counted only while it runs, never while it waits
-    const meter = new CpuMeter(cpuNow, ledger);
-    meter.resume();
-    // this owner's own CPU on its durable route (recovery, reads, page processing, serialization, hashing)
-    const dm = new CpuMeter(cpuNow, ledger);
-    const endLight = () => meter.wait();
-    /** Await `p` as a WAIT of the durable meter. */
-    const waiting = async <T>(f: () => Promise<T>): Promise<T> => {
-      dm.wait();
-      try {
-        return await f();
-      } finally {
-        dm.resume();
-      }
+    if (attempt) attempt.started = true;
+    const progressed = () => {
+      if (attempt) attempt.progressed = true;
     };
-    // journal and hash RPCs run inside an admitted unit: the heartbeat/deadline guard runs before EACH of them, so a
-    // renewal that falls due between a unit's calls is taken at that call boundary; both are waits of the meter
-    const jc: RpcClient = { rpc: (fn, args) => waiting(async () => (await routing.guard(), env.client.rpc(fn, args))) };
-    const mc: RpcClient = { rpc: (fn, args) => waiting(async () => env.client.rpc(fn, args)) };
+    const watch = activationWatch(item.owner, ACTIVATION_LIMITS);
+    /** The watch's count when the current (retried) attempt began: transient duplicates are not fresh calls. */
+    let attemptStart = 0;
     /**
-     * Each owner's fresh-restart costs, kept current as its journal grows (components and their owners):
-     * - `fixed`: the calls a fresh invocation makes before this owner (version, status, resume, progress, owner page),
-     *   its light attempts, and the lookup; `reloadCalls`: the committed journal's live reload calls;
-     * - `lightCpu`: this owner's own light-attempt CPU (metered); `reconCpu`: reconstruction CPU, measured at recovery
-     *   (reload + snapshot rebuild) plus the measured reload work of every later commit; `descCpu`: descriptor CPU,
-     *   repeated by a fresh invocation only once reading is done;
-     * - per leg: `readCpu` (source decode + page processing), `serializeCpu` (entries + packing), `hashCpu`, and the
-     *   largest commit `calls` seen: measured maxima (a not-yet-measured kind uses FIRST_UNIT_CPU_MS, never zero).
+     * The calls a FRESH standard invocation makes before this owner's next unit, kept current as its journal grows:
+     * `fixed` = the restart prerequisites + this owner's no-failure light path + lookup; `reload` = the committed
+     * journal's exact reload calls. Exact counts only (simplification §2).
      */
-    const cost = { fixed: 0, reloadCalls: 0, lightCpu: 0, reconCpu: 0, descCpu: 0, hashing: false, readCpu: null as number | null, serializeCpu: null as number | null, hashCpu: null as number | null, calls: 1 };
-    const prerequisites = (): AdmissionCost => ({ rpcs: cost.fixed + cost.reloadCalls, cpuMs: cost.lightCpu + cost.reconCpu + (cost.hashing ? cost.descCpu : 0) });
-    /**
-     * Admit the owner's next durable leg (T15P-4d step 4). A due renewal is taken first (the phase since the beat is then
-     * below one interval). `fresh` is the COMPLETE leg a fresh standard run would need on top of the prerequisites (work
-     * that must be repeated, such as re-reading and re-processing an uncommitted page, included); `now` is what is still
-     * UNPAID in this invocation. Capacity is judged on the fresh path only; parking on the current remainder only.
-     */
-    const admit = async (unit: AdmissionRecord["unit"], fresh: AdmissionCost, now: AdmissionCost) => {
-      await waiting(() => routing.beat());
-      const prereq = prerequisites();
-      const remainingMs = b.remainingMs();
-      const sinceBeatMs = b.sinceBeat();
-      const freshPath: AdmissionPath = { prerequisites: prereq, unit: fresh, prerequisitesPaid: false };
-      const freshV = admitDurableUnit(freshPath, WORKER_BUDGET_MS, WORKER_BUDGET_MS, 0); // "run" or "capacity"
-      const nowV = admitDurableUnit({ prerequisites: { rpcs: 0, cpuMs: 0 }, unit: now, prerequisitesPaid: true }, remainingMs, WORKER_BUDGET_MS, sinceBeatMs);
-      const verdict = freshV.verdict === "capacity" ? "capacity" : nowV.verdict === "run" ? "run" : "pending";
-      const action = verdict === "capacity" ? "fail" : verdict === "pending" ? "park" : "run";
-      env.onAdmission?.({ owner: item.owner, unit, path: freshPath, now, nowMs: env.now(), remainingMs, sinceBeatMs, budgetMs: WORKER_BUDGET_MS, verdict, action });
-      if (freshV.verdict === "capacity") throw new OwnerInputCapacityError(item.owner, freshV.freshMs, WORKER_BUDGET_MS);
-      if (verdict === "pending") {
+    const cost = { fixed: 0, reload: 0 };
+    /** This invocation's largest COMPLETED unit of each kind for this owner (wall ms; absent until one completes). */
+    const samples: { read: number | null; hash: number | null } = { read: null, hash: null };
+    /** When the current read+commit leg started (its first admitted source read), until its commit is acknowledged. */
+    let legStart: number | null = null;
+    const admit = async (unit: AdmissionRecord["unit"], kind: "read" | "hash", freshUnitRpcs: number, currentRpcs: number) => {
+      await routing.beat(); // a due renewal first, then ONE clock sample for every field of the decision
+      const at = b.now();
+      const remainingMs = b.remainingMs(at);
+      const sinceBeatMs = b.sinceBeat(at);
+      const fresh: FreshCalls = { fixed: cost.fixed, reload: cost.reload, unit: freshUnitRpcs };
+      const wallMs = samples[kind] ?? FIRST_UNIT_WALL_MS;
+      const v = admitUnit({ fresh, currentRpcs, wallMs }, remainingMs, sinceBeatMs);
+      const action = v.verdict === "capacity" ? "fail" : v.verdict === "pending" ? "park" : "run";
+      env.onAdmission?.({ owner: item.owner, unit, fresh, freshMs: v.freshMs, currentRpcs, wallMs, nowMs: at, remainingMs, sinceBeatMs, budgetMs: WORKER_BUDGET_MS, verdict: v.verdict, action, freshAttempt: !!attempt, progressed: attempt?.progressed ?? false });
+      if (v.verdict === "capacity") throw new OwnerInputCapacityError(item.owner, v.freshMs, WORKER_BUDGET_MS);
+      if (v.verdict === "pending") {
         counts.ownersParked = (counts.ownersParked ?? 0) + 1;
         throw new Parked();
       }
     };
-    let readStart: number | null = null;
-    /** A durable source read: admitted with the estimated read + commit (the exact commit is admitted again later). */
+    /** A durable source read: admitted at the minimum legal leg (the read plus a one-call commit); starts the leg's clock. */
     const read = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
-      const est: AdmissionCost = { rpcs: 1 + cost.calls, cpuMs: (cost.readCpu ?? FIRST_UNIT_CPU_MS) + (cost.serializeCpu ?? 0) };
-      await admit("read", est, est);
-      await waiting(() => routing.guard()); // any due renewal happens before the measured span
-      readStart = dm.read();
-      const out = f(...args); // its synchronous part (and a memory source's whole read) runs on this owner's meter
-      return waiting(() => out);
+      await admit("read", "read", READ_LEG_RPCS, READ_LEG_RPCS);
+      if (legStart === null) legStart = b.now();
+      return f(...args);
     };
-    // the durable turn's release and the journal handle (set inside the durable callback)
-    const held: { release: (() => void) | null; handle: string | null } = { release: null, handle: null };
+    // the durable turn's release, the journal handle and whether the recovered journal was already complete
+    const held: { release: (() => void) | null; handle: string | null; complete: boolean } = { release: null, handle: null, complete: false };
+    let freshLight = 0;
     try {
-      const r = await b.retry(() => routedOwnerInput((before, share) => meteredReader(meter, shared.forOwner(routing.light(async () => {
-        meter.wait();
-        try {
-          await before();
-        } finally {
-          meter.resume();
-        }
-      }, meter), share)), item.owner, async () => {
-        if (!held.release) {
-          // counted at activation (a parked or failed owner is counted too)
-          counts.ownersActivated = (counts.ownersActivated ?? 0) + 1;
-          counts.activationCalls = Math.max(counts.activationCalls ?? 0, watch.calls);
-          cost.lightCpu = meter.read();
-          endLight();
-          dm.resume();
-          held.release = await waiting(() => durableTurn());
-        }
-        await waiting(() => routing.guard());
-        const c0 = dm.read();
-        const rec = await recoverOwnerJournal(mc, a.batchId, a.fence, item.owner, routing.site, "plan");
-        cost.fixed = FIXED_PREREQUISITE_RPCS + watch.calls + 1; // + lookup
-        cost.reloadCalls = rec.reloadCalls;
-        held.handle = rec.handle;
-        let reconOpen = true; // the reconstruction span ends at the first admission (snapshot rebuild included)
-        const closeRecon = () => {
-          if (reconOpen) {
-            env.cpuProbe?.("reconstructed");
-            cost.reconCpu = Math.max(0, dm.read() - c0);
+      const r = await b.retry(() => {
+        attemptStart = watch.calls;
+        return routedOwnerInput((before, share) => shared.forOwner(routing.light(before), share), item.owner, async () => {
+          if (!held.release) {
+            // counted at activation (a parked or failed owner is counted too)
+            counts.ownersActivated = (counts.ownersActivated ?? 0) + 1;
+            counts.activationCalls = Math.max(counts.activationCalls ?? 0, watch.calls);
+            // the no-failure light path a fresh run would replay: the call limit when that is what triggered, otherwise
+            // this attempt's own calls (rows/bytes are deduplicated, so they trigger at the same read as a fresh run)
+            freshLight = watch.trigger() === "calls" ? ACTIVATION_LIMITS.calls : watch.calls - attemptStart;
+            held.release = await durableTurn();
           }
-          reconOpen = false;
-        };
-        if (rec.input) {
-          closeRecon();
-          return { input: rec.input }; // already read (hashing or complete): no source read, no second reload
-        }
-        const journal = ownerJournal(jc, a.batchId, a.fence, rec.handle, rec.seq, routing.cutoffUs, rec.reloadCalls);
-        const base = routing.durable(dm);
-        const first = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => read(async (...args: A) => f(...args));
-        const reading = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => {
-          const g = first(f);
-          return async (...args: A): Promise<R> => {
-            closeRecon();
-            return g(...args);
+          const rec = await recoverOwnerJournal(jc, a.batchId, a.fence, item.owner, routing.site, "plan");
+          cost.fixed = FIXED_PREREQUISITE_RPCS + freshLight + 1; // + lookup
+          cost.reload = rec.reloadCalls;
+          held.handle = rec.handle;
+          held.complete = rec.header.phase === "complete";
+          if (rec.input) return { input: rec.input }; // already read (hashing or complete): no source read, no second reload
+          const journal = ownerJournal(jc, a.batchId, a.fence, rec.handle, rec.seq, routing.cutoffUs, rec.reloadCalls);
+          const base = routing.durable;
+          const reader: FrozenReader & { pages: FrozenReaderPages } = {
+            ...base,
+            pages: { membersPage: read(base.pages.membersPage.bind(base.pages)), byIdsPage: read(base.pages.byIdsPage.bind(base.pages)), childrenPage: read(base.pages.childrenPage.bind(base.pages)) },
+            childPage: read(base.childPage.bind(base)),
+            stream: read(base.stream.bind(base)),
+            ...(base.predecessorPage ? { predecessorPage: read(base.predecessorPage.bind(base)) } : {}),
           };
-        };
-        const reader: FrozenReader & { pages: FrozenReaderPages } = {
-          ...base,
-          pages: { membersPage: reading(base.pages.membersPage.bind(base.pages)), byIdsPage: reading(base.pages.byIdsPage.bind(base.pages)), childrenPage: reading(base.pages.childrenPage.bind(base.pages)) },
-          childPage: reading(base.childPage.bind(base)),
-          stream: reading(base.stream.bind(base)),
-          ...(base.predecessorPage ? { predecessorPage: reading(base.predecessorPage.bind(base)) } : {}),
-        };
-        return {
-          reader,
-          journal: {
-            async commit(pg) {
-              closeRecon();
-              // this page's measured read (decode + processing) and serialization, then its EXACT commit
-              const c1 = dm.read();
-              const readCpu = readStart === null ? 0 : Math.max(0, c1 - readStart);
-              readStart = null;
-              const calls = journal.pageCalls(pg);
-              env.cpuProbe?.("serialized");
-              const serializeCpu = Math.max(0, dm.read() - c1);
-              cost.readCpu = Math.max(cost.readCpu ?? 0, readCpu);
-              cost.serializeCpu = Math.max(cost.serializeCpu ?? 0, serializeCpu);
-              cost.calls = Math.max(cost.calls, calls);
-              // fresh: re-read, re-process, re-serialize and all its calls; now: only the calls (the rest is paid)
-              await admit("commit", { rpcs: 1 + calls, cpuMs: readCpu + serializeCpu }, { rpcs: calls, cpuMs: 0 });
-              await journal.commit(pg);
-              cost.reloadCalls = journal.reloadCalls;
-              const w0 = dm.read();
-              reloadWork(journal.lastEntries(), routing.site); // the reload work these entries add, measured
-              cost.reconCpu += Math.max(0, dm.read() - w0);
-              counts.durableUnits = (counts.durableUnits ?? 0) + 1;
+          return {
+            reader,
+            journal: {
+              async commit(pg) {
+                // the EXACT commit, known now that the page is: fresh = re-read + every call; now = the unpaid calls
+                const calls = journal.pageCalls(pg);
+                await admit("commit", "read", 1 + calls, calls);
+                await journal.commit(pg);
+                cost.reload = journal.reloadCalls;
+                progressed();
+                counts.durableUnits = (counts.durableUnits ?? 0) + 1;
+                if (legStart !== null) samples.read = Math.max(samples.read ?? 0, b.now() - legStart);
+                legStart = null;
+              },
             },
-          },
-          resume: rec.snapshot,
-        };
-      }, ACTIVATION_LIMITS, watch));
-      endLight();
+            resume: rec.snapshot,
+          };
+        }, ACTIVATION_LIMITS, watch);
+      });
       // one audience projected at a time; only descriptors (identity + input hash) are kept for ordered planning
-      const d0 = dm.read();
       const descs = ownerDescriptors(routing.base, item.owner, r.input, item.oldStaff, stats);
-      if (r.route === "durable") env.cpuProbe?.("described");
       if (r.route === "durable") {
         counts.ownersDurable = (counts.ownersDurable ?? 0) + 1;
-        // a fresh invocation past reading recomputes every descriptor before its next hash unit: charged once, there
-        cost.descCpu = Math.max(0, dm.read() - d0);
-        cost.hashing = true;
-        const hashes = descs.map((d) => ({ audienceKind: d.audienceKind, audienceStaff: d.audienceStaff, inputHash: d.inputHash }));
-        for (;;) {
-          const est: AdmissionCost = { rpcs: HASH_UNIT_RPCS, cpuMs: cost.hashCpu ?? FIRST_UNIT_CPU_MS };
-          await admit("hash", est, est);
-          const h0 = dm.read();
-          const step = await b.retry(() => hashOwnerInputStep(jc, a.batchId, a.fence, held.handle!, hashes));
-          cost.hashCpu = Math.max(cost.hashCpu ?? 0, dm.read() - h0);
-          if (step.result) cost.reloadCalls = step.result.reloadCalls;
-          counts.durableUnits = (counts.durableUnits ?? 0) + 1;
-          if (step.complete) break;
+        // a journal recovered complete needs no further checkpoint: it is reused as it is, never admitted for one
+        if (!held.complete) {
+          const hashes = descs.map((d) => ({ audienceKind: d.audienceKind, audienceStaff: d.audienceStaff, inputHash: d.inputHash }));
+          for (;;) {
+            await admit("hash", "hash", HASH_UNIT_RPCS, HASH_UNIT_RPCS);
+            const h0 = b.now();
+            const step = await b.retry(() => hashOwnerInputStep(jc, a.batchId, a.fence, held.handle!, hashes));
+            if (step.payload) progressed(); // committed hashes (or completion)
+            samples.hash = Math.max(samples.hash ?? 0, b.now() - h0);
+            if (step.result) cost.reload = step.result.reloadCalls;
+            counts.durableUnits = (counts.durableUnits ?? 0) + 1;
+            if (step.complete) break;
+          }
         }
       }
       return descs;
     } finally {
-      endLight();
-      dm.wait();
       held.release?.();
     }
   }));
-}
-
-/**
- * One group's CPU ledger: at most ONE meter runs at a time. A meter that resumes stops whichever meter was running, so
- * code that runs after one owner's continuation and before another's is never charged to both, and an owner's meter
- * stops the moment another owner's code resumes.
- */
-class CpuLedger {
-  private current: CpuMeter | null = null;
-  switchTo(m: CpuMeter): void {
-    if (this.current === m) return;
-    this.current?.stop();
-    this.current = m;
-    m.start();
-  }
-  release(m: CpuMeter): void {
-    if (this.current !== m) return;
-    m.stop();
-    this.current = null;
-  }
-}
-/** An owner's own CPU: counted only while it is the ledger's running meter (its waits, and other owners' work, excluded). */
-class CpuMeter {
-  private total = 0;
-  private since: number | null = null;
-  constructor(private readonly now: () => number, private readonly ledger: CpuLedger) {}
-  start(): void {
-    if (this.since === null) this.since = this.now();
-  }
-  stop(): void {
-    if (this.since === null) return;
-    this.total += Math.max(0, this.now() - this.since);
-    this.since = null;
-  }
-  /** This owner's code is running again (after an await, or a reader's response). */
-  resume(): void {
-    this.ledger.switchTo(this);
-  }
-  /** This owner is about to wait. */
-  wait(): void {
-    this.ledger.release(this);
-  }
-  read(): number {
-    return this.total + (this.since === null ? 0 : Math.max(0, this.now() - this.since));
-  }
-}
-/** A light reader whose every awaited read is a WAIT for the owner's meter (the synchronous part of each call counts). */
-function meteredReader(m: CpuMeter, r: FrozenReader & { pages: FrozenReaderPages }): FrozenReader & { pages: FrozenReaderPages } {
-  const waitOn = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
-    const p = f(...args);
-    m.wait();
-    try {
-      return await p;
-    } finally {
-      m.resume();
-    }
-  };
-  const iter = <T>(src: AsyncIterable<T>): AsyncIterable<T> => (async function* () {
-    const it = src[Symbol.asyncIterator]();
-    for (;;) {
-      m.wait();
-      let x: IteratorResult<T>;
-      try {
-        x = await it.next();
-      } finally {
-        m.resume();
-      }
-      if (x.done) return;
-      yield x.value;
-    }
-  })();
-  return {
-    ...r,
-    pages: { membersPage: waitOn(r.pages.membersPage.bind(r.pages)), byIdsPage: waitOn(r.pages.byIdsPage.bind(r.pages)), childrenPage: waitOn(r.pages.childrenPage.bind(r.pages)) },
-    members: waitOn(r.members.bind(r)),
-    byIds: waitOn(r.byIds.bind(r)),
-    childPage: waitOn(r.childPage.bind(r)),
-    stream: waitOn(r.stream.bind(r)),
-    children: (ids) => iter(r.children(ids)),
-    ...(r.predecessorPage ? { predecessorPage: waitOn(r.predecessorPage.bind(r)) } : {}),
-  };
 }
 
 /** Seal only with the exact completeness proof and the saved-descriptor manifest. */
@@ -773,7 +689,8 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
       if (!a) out.state = "busy";
       else {
         out.batchId = a.batchId;
-        if (a.kind === "rebuild" && a.state === "active") await copyAndFreeze(env, b, a, counts);
+        const copiedHere = a.kind === "rebuild" && a.state === "active";
+        if (copiedHere) await copyAndFreeze(env, b, a, counts);
         if (a.cutoff === null) throw new ReportingJobError("the batch has no frozen cutoff");
         const ref: FrozenBatchRef = { batchId: a.batchId, fence: a.fence, site: req.site, cutoff: canonicalInstant(a.cutoff), kind: a.kind };
         // T15P-1: the budget check + due heartbeat, awaited before every actual frozen-read RPC of planning/staging.
@@ -792,16 +709,26 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         const materializing = env.source ? src.reader : rpcFrozenReader(env.client, ref, { beforeRead: pageGuard });
         const coalesced = guardedReader(coalescingChildren(materializing), pageGuard);
         const cutoffUs = exactInstant(ref.cutoff)!;
-        // memory light reader: the guard first and `before` (activation check + meter resume) LAST, right at the read
+        // T15P-4d step 4: before EVERY durable source/journal/hash RPC, the next call plus the reserve must fit, then a due
+        // renewal, then the same check again (a renewal can consume the time the call needed)
+        const unitGuard = async () => {
+          b.needCall();
+          await b.beat(a.batchId, a.fence);
+          b.needCall();
+        };
+        const beat = () => b.beat(a.batchId, a.fence);
         const routing: OwnerRouting | null = env.source
           ? hasPages(src.reader)
-            ? { light: (before, io) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, async () => { await pageGuard(); await before(); }, io), base: hookedReader(src.reader, pageGuard), durable: (io) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, pageGuard, io), cutoffUs, site: req.site, guard: pageGuard, beat: () => b.beat(a.batchId, a.fence) }
+            ? { light: (before) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, async () => { await pageGuard(); await before(); }), base: hookedReader(src.reader, pageGuard), durable: hookedReader(src.reader, unitGuard), cutoffUs, site: req.site, unitGuard, beat }
             : null
-          : { light: (before, io) => rpcFrozenReader(env.client, ref, { beforeRead: async () => { await before(); await pageGuard(); }, io }), base: materializing as FrozenReader & { pages: FrozenReaderPages }, durable: (io) => rpcFrozenReader(env.client, ref, { beforeRead: pageGuard, io }), cutoffUs, site: req.site, guard: pageGuard, beat: () => b.beat(a.batchId, a.fence) };
+          : { light: (before) => rpcFrozenReader(env.client, ref, { beforeRead: async () => { await before(); await pageGuard(); } }), base: materializing as FrozenReader & { pages: FrozenReaderPages }, durable: rpcFrozenReader(env.client, ref, { beforeRead: unitGuard }), cutoffUs, site: req.site, unitGuard, beat };
+        const copied = a.kind === "rebuild" && copiedHere;
         const prog = await b.retry(() => readWorkerProgress(env.client, a.batchId, a.fence));
         if (!prog.sealed) {
           if (!prog.complete) await enumerate(env, b, a, src.reader, src.pages, prog.cursor, counts);
-          await plan(env, b, a, coalesced, stats, counts, routing);
+          // simplification §4: only a standard-budget invocation that did no copy or enumeration may make the fresh attempt
+          const fresh = b.budgetMs === WORKER_BUDGET_MS && !copied && prog.complete;
+          await plan(env, b, a, coalesced, stats, counts, routing, fresh);
           await seal(env, b, a, counts);
         }
         if (await stage(env, b, a, coalesced, stats, counts)) {
@@ -849,19 +776,14 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
 /** The deterministic RPC cost (ms) used by admission, and the run-record reserve kept back from every budget. */
 export const ADMISSION_RPC_MS = 1_000;
 export const ADMISSION_RESERVE_MS = 2_000;
-/** One leg of a path to durable progress: RPCs (each at ADMISSION_RPC_MS) plus measured/estimated CPU and serialization. */
-export interface AdmissionCost { rpcs: number; cpuMs: number }
 /**
- * The smallest legal path to the next durable boundary for one unit:
- *  - `prerequisites`: what a FRESH invocation must redo first (version/status/acquire/progress, the owner list or claim,
- *    lookup, every reload call, reload parsing/reassembly/digests/sorting, old-staff reads, preparation CPU);
- *  - `unit`: the unit itself INCLUDING its committing RPC (reading: the source page plus its pending/final checkpoint
- *    calls; hashing: the chosen hashes and their hash checkpoint; stage: projection/hash/chunks, complete sparse
- *    discovery and at least the first missing upload).
- * `prerequisitesPaid` is true when this invocation already holds the prerequisites (they are then not charged again).
+ * The calls a FRESH standard invocation makes to reach a unit's durable boundary: `fixed` (the restart prerequisites,
+ * this owner's no-failure light path and lookup), `reload` (the committed journal's exact reload calls) and `unit` (the
+ * unit itself including its committing call(s); a commit also re-reads its source page). Exact counts only.
  */
-export interface AdmissionPath { prerequisites: AdmissionCost; unit: AdmissionCost; prerequisitesPaid: boolean }
-/** Every admission input is validated at runtime: NaN/Infinity/negative/fractional estimates are refused, never admitted. */
+export interface FreshCalls { fixed: number; reload: number; unit: number }
+/** One unit's admission inputs: its fresh calls (capacity), its unpaid calls now and the observed wall allowance (parking). */
+export interface UnitAdmission { fresh: FreshCalls; currentRpcs: number; wallMs: number }
 function admissionMs(v: unknown, what: string): number {
   if (typeof v !== "number" || !Number.isFinite(v) || v < 0) throw new ReportingJobError(`admission ${what} must be a finite non-negative number`);
   return v;
@@ -870,10 +792,6 @@ function admissionRpcs(v: unknown, what: string): number {
   if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) throw new ReportingJobError(`admission ${what} must be a non-negative safe integer`);
   return v;
 }
-const legMs = (c: AdmissionCost, what: string) => {
-  if (!c || typeof c !== "object") throw new ReportingJobError(`admission ${what} is missing`);
-  return admissionRpcs(c.rpcs, `${what}.rpcs`) * ADMISSION_RPC_MS + admissionMs(c.cpuMs, `${what}.cpuMs`);
-};
 /** Elapsed time including every due lease renewal (each one RPC), to a fixed point, plus the run-record reserve. */
 export function withRenewals(workMs: number, sinceBeatMs = 0): number {
   admissionMs(workMs, "workMs");
@@ -888,55 +806,61 @@ export function withRenewals(workMs: number, sinceBeatMs = 0): number {
     renewals = due;
   }
 }
-export type AdmissionVerdict = { verdict: "run" } | { verdict: "pending"; freshMs: number; nowMs: number } | { verdict: "capacity"; freshMs: number };
+export type AdmissionVerdict = { verdict: "run"; freshMs: number; nowMs: number } | { verdict: "pending"; freshMs: number; nowMs: number } | { verdict: "capacity"; freshMs: number };
+/** The standard-invocation time of a fresh path: every counted call at ADMISSION_RPC_MS, its renewals and the reserve. */
+export function freshCallsMs(c: FreshCalls): number {
+  if (!c || typeof c !== "object") throw new ReportingJobError("admission fresh calls are missing");
+  const total = admissionRpcs(c.fixed, "fresh.fixed") + admissionRpcs(c.reload, "fresh.reload") + admissionRpcs(c.unit, "fresh.unit");
+  if (!Number.isSafeInteger(total * ADMISSION_RPC_MS)) throw new ReportingJobError("admission fresh calls overflow");
+  return withRenewals(total * ADMISSION_RPC_MS, 0);
+}
+/**
+ * Admit a unit (simplification §2-3): `capacity` (visible `owner_input_capacity`, evidence retained, publication
+ * blocked) when its exactly counted fresh path exceeds the STANDARD budget, whatever this invocation's own deadline;
+ * `pending` (the owner is parked first) when the unit's unpaid calls plus the observed wall allowance, with the renewals
+ * due from the current phase and the reserve, exceed the time left now; otherwise `run`. No CPU value enters either.
+ */
+export function admitUnit(u: UnitAdmission, remainingMs: number, sinceBeatMs = 0): AdmissionVerdict {
+  if (!u || typeof u !== "object") throw new ReportingJobError("admission input is malformed");
+  admissionMs(remainingMs, "remainingMs");
+  admissionMs(sinceBeatMs, "sinceBeatMs");
+  if (sinceBeatMs >= HEARTBEAT_MS) throw new ReportingJobError("admission sinceBeatMs must be below the heartbeat interval (a due renewal is taken first)");
+  const freshMs = freshCallsMs(u.fresh);
+  if (freshMs > WORKER_BUDGET_MS) return { verdict: "capacity", freshMs };
+  const nowMs = withRenewals(admissionRpcs(u.currentRpcs, "currentRpcs") * ADMISSION_RPC_MS + admissionMs(u.wallMs, "wallMs"), sinceBeatMs);
+  return nowMs > remainingMs ? { verdict: "pending", freshMs, nowMs } : { verdict: "run", freshMs, nowMs };
+}
 /** Calls a fresh invocation makes before planning an owner: version, status, resume, progress and the owner page. */
 export const FIXED_PREREQUISITE_RPCS = 5;
+/** The startup a qualified fresh attempt may follow: just the fixed prerequisites at the nominal call cost (5,000 ms). */
+export const FRESH_STARTUP_MS = withRenewals(FIXED_PREREQUISITE_RPCS * ADMISSION_RPC_MS, 0) - ADMISSION_RESERVE_MS;
 /**
- * Reads are admitted with an ESTIMATE (the source RPC plus the largest commit seen so far, at least one call); each
- * page's EXACT commit is then admitted before its first call (`ownerJournal.pageCalls`), with the complete fresh path
- * (re-read + re-process + re-serialize + every call) for capacity and only the unpaid calls for parking.
+ * The smallest legal durable read: the source RPC plus a one-call commit. It can prove that even the minimum is over
+ * budget; the page's EXACT commit is admitted again before its first call (`ownerJournal.pageCalls`).
  */
 export const READ_LEG_RPCS = 1 + 1;
-/** An explicit CPU estimate for a unit kind not yet measured in this invocation (one RPC's worth), never zero. */
-export const FIRST_UNIT_CPU_MS = 1_000;
-/** This process's CPU time in ms (user + system): I/O waits, sleeps and backoff do not advance it. */
-export const processCpuMs = (): number => {
-  const u = process.cpuUsage();
-  return (u.user + u.system) / 1000;
-};
+/** The wall allowance for a unit kind not yet completed by this owner in this invocation (never zero). */
+export const FIRST_UNIT_WALL_MS = 1_000;
 /** One hash unit: the pinned header load plus its hash checkpoint. */
 export const HASH_UNIT_RPCS = 2;
-/** The current invocation's verdict from its actual clock: time left now and the phase since the last renewal. */
-export function admissionAt(path: AdmissionPath, nowMs: number, deadlineMs: number, lastBeatMs: number, budgetMs = WORKER_BUDGET_MS): AdmissionVerdict {
-  return admitDurableUnit(path, Math.max(0, deadlineMs - nowMs), budgetMs, Math.max(0, nowMs - lastBeatMs));
-}
 /** An owner whose next durable unit cannot fit even a fresh invocation: visible, journal retained, publication blocked. */
 export class OwnerInputCapacityError extends ReportingJobError {
-  constructor(owner: Owner, freshMs: number, budgetMs: number, why = "its smallest path to the next durable boundary does not fit a fresh run") {
+  constructor(owner: Owner, freshMs: number, budgetMs: number, why = "the counted calls to its next durable boundary do not fit a fresh run") {
     // diagnostics carry only the owner KIND and the times, never the raw order/event key
     super(`owner_input_capacity: an ${owner.partitionKind} owner cannot progress: ${why} (${Math.ceil(freshMs)} ms of ${budgetMs} ms)`, "owner_input_capacity");
   }
 }
-
 /**
- * Admit a unit: `capacity` (visible `owner_input_capacity`, evidence retained, publication blocked) when even a fresh
- * uninterrupted invocation could not reach the boundary; `pending` (the owner is parked first for the next invocation)
- * when it fits fresh but not the time left now; otherwise `run`. Every cost counts once.
+ * The invocation's qualified fresh attempt did not reach its first durable progress boundary within the guarded budget
+ * (simplification §4). An observation of THIS attempt, not a proof of permanent incapacity: the journal is kept, the
+ * batch stays resumable and publication is blocked. Diagnostics carry the owner KIND and counts only.
  */
-export function admitDurableUnit(path: AdmissionPath, remainingMs: number, budgetMs = WORKER_BUDGET_MS, sinceBeatMs = 0): AdmissionVerdict {
-  admissionMs(remainingMs, "remainingMs");
-  admissionMs(budgetMs, "budgetMs");
-  if (budgetMs <= ADMISSION_RESERVE_MS) throw new ReportingJobError("admission budgetMs must leave a usable budget after the run-record reserve");
-  if (!path || typeof path !== "object" || typeof path.prerequisitesPaid !== "boolean") throw new ReportingJobError("admission path is malformed");
-  const pre = legMs(path.prerequisites, "prerequisites");
-  const unit = legMs(path.unit, "unit");
-  const freshMs = withRenewals(pre + unit);
-  if (freshMs > budgetMs) return { verdict: "capacity", freshMs };
-  // the CURRENT invocation: the time already elapsed since its last heartbeat counts (the fresh path starts at a beat)
-  const nowMs = withRenewals((path.prerequisitesPaid ? 0 : pre) + unit, sinceBeatMs);
-  if (nowMs > remainingMs) return { verdict: "pending", freshMs, nowMs };
-  return { verdict: "run" };
+export class OwnerInputNoProgressError extends ReportingJobError {
+  constructor(owner: Owner, units: number) {
+    super(`owner_input_no_progress: an ${owner.partitionKind} owner's fresh attempt did not reach its first durable progress boundary within the guarded budget (${units} durable units)`, "owner_input_no_progress");
+  }
 }
+
 
 // ---------------------------------------------------------------------------
 // T15P-4d step 3a: worker seams over the 0046 journal (not yet called by runReportingCycle)
