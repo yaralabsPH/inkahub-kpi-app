@@ -159,7 +159,12 @@ describe("inspection against PGlite with 0037-0045 installed", () => {
   it.each([
     ["an ACL change", "GRANT EXECUTE ON FUNCTION public.read_reporting_generation(text, uuid) TO anon", /read_reporting_generation security differs/],
     ["a definer change", "ALTER FUNCTION reporting_private.utc_text(timestamptz) SECURITY DEFINER", /utc_text security differs/],
-    ["a missing receipt", "DELETE FROM supabase_migrations.schema_migrations WHERE name = '0045_reporting_predecessor_page'", /0 receipts for 0045/],
+    ["a missing 0046 receipt", "DELETE FROM supabase_migrations.schema_migrations WHERE name = '0046_reporting_owner_inputs'", /0 receipts for 0046/],
+    ["a duplicate 0045 receipt", "INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('29991231000000', '0045_reporting_predecessor_page')", /2 receipts for 0045/],
+    ["an absent 0046 function", "DROP FUNCTION public.reporting_owner_input_version()", /reporting_owner_input_version found 0 times/],
+    ["an authenticated grant on a 0046 function", "GRANT EXECUTE ON FUNCTION public.reporting_owner_input_version() TO authenticated", /reporting_owner_input_version security differs/],
+    ["an authenticated grant on a 0046 table", "GRANT SELECT ON reporting_private.owner_inputs TO authenticated", /table owner_inputs access differs/],
+    ["an altered 0046 body", "CREATE OR REPLACE FUNCTION public.reporting_owner_input_version() RETURNS TABLE (version integer) LANGUAGE sql STABLE SECURITY INVOKER SET search_path = '' AS $$ select 2 $$", /reporting_owner_input_version body is not the reviewed/],
     ["an extra overload", "CREATE FUNCTION reporting_private.safe_count(p integer) RETURNS bigint LANGUAGE sql AS $$ select 1::bigint $$", /safe_count found 2 times/],
     ["an absent function", "DROP FUNCTION reporting_private.utc_text(timestamptz) CASCADE", /utc_text found 0 times/],
     ["a volatility change", "ALTER FUNCTION reporting_private.safe_items(numeric) VOLATILE", /safe_items volatility differs/],
@@ -172,6 +177,37 @@ describe("inspection against PGlite with 0037-0045 installed", () => {
       expect(inspectionStatus(r)).toMatch(/^STATUS: FAILED/);
       expect([...r.identityProblems, ...r.receiptProblems].join(";")).toMatch(re);
       expect(writes(log)).toEqual([]);
+    } finally {
+      await t.close();
+    }
+  }, 120_000);
+
+  it("the staging exception: ABSENT 0044/0045 receipts are accepted and labelled when every effective check holds", async () => {
+    const t = await stagingLike();
+    try {
+      await t.exec("DELETE FROM supabase_migrations.schema_migrations WHERE name IN ('0044_reporting_reads', '0045_reporting_predecessor_page')");
+      const log: string[] = [];
+      const r = await inspectInstalled(deps(t, log));
+      expect(inspectionStatus(r)).toBe("STATUS: COMPLETE");
+      expect(r.receiptProblems).toEqual([]);
+      expect(r.rawReceiptFindings).toHaveLength(2); // the raw findings are kept, not suppressed
+      expect(r.acceptedReceiptFindings).toEqual(r.rawReceiptFindings);
+      expect(inspectionMarkdown(r)).toMatch(/Accepted receipt findings \(staging exception[^\n]*\n\n- migration history has 0 receipts for 0044_reporting_reads/);
+      expect(writes(log)).toEqual([]);
+    } finally {
+      await t.close();
+    }
+  }, 120_000);
+
+  it("the exception is void when anything else fails: an absent 0045 receipt beside an authenticated grant blocks", async () => {
+    const t = await stagingLike();
+    try {
+      await t.exec("DELETE FROM supabase_migrations.schema_migrations WHERE name = '0045_reporting_predecessor_page'; GRANT EXECUTE ON FUNCTION public.read_reporting_predecessor_page(uuid, bigint, uuid, timestamptz, text, timestamptz, text, integer) TO authenticated");
+      const r = await inspectInstalled(deps(t, []));
+      expect(inspectionStatus(r)).toMatch(/^STATUS: FAILED/);
+      expect(r.acceptedReceiptFindings).toEqual([]);
+      expect(r.receiptProblems.join(";")).toMatch(/0 receipts for 0045/);
+      expect(r.runtimeReady).toBe(false);
     } finally {
       await t.close();
     }

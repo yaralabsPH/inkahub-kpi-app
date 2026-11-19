@@ -53,7 +53,7 @@ import { rehearseDependencyReads } from "./reportingDependencyRehearsal";
 import { diagnoseAccessPaths, diagnoseDependencyPlans } from "./reportingDependencyPlans";
 import { HISTORY_SQL, MIGRATION_0043, newWorkerReport, parseWorkerArgs, rehearseWorkerState, sha256Lf, WORKER_FLAGS, workerMarkdown, workerStatus } from "./reportingWorkerHarness";
 import { newRuntimeOwnership } from "./reportingWorkerRuntime";
-import { auditRuntime, cleanupRuntime, newRuntimeEvidence, runWorkerRuntime, type RuntimeCtx } from "./reportingWorkerScenario";
+import { auditRuntime, cleanupRuntime, newRuntimeEvidence, runWorkerRuntime, type ClientRole, type RuntimeCtx, type RuntimeRole } from "./reportingWorkerScenario";
 import { parseRunReport, recoverWorkerRun, type RecoveredRun } from "./reportingWorkerRecovery";
 import { serviceRpcClient } from "./serviceRpc";
 import { CONTRACT_SQL, INSPECT_FLAG, inspectInstalled, inspectionMarkdown, inspectionStatus, parseInspectArgs, summarisePriorRun, type InspectionReport } from "./reportingInstalledState";
@@ -466,11 +466,17 @@ async function workerMain(argv: string[]): Promise<number> {
   if (!initialReport(save)) return 1;
   console.log(`report: ${out}`);
   let open: () => Promise<pg.Client>;
+  // T15P-4 trim task 3: the runtime's R6 denial checks use each staging identity's REAL signed-in claims (never stored)
+  let claims: Record<string, string> = {};
   try {
     const s = readSettings();
     assertStagingSupabaseUrl(s.STAGING_SUPABASE_URL);
     const target = stagingTarget(s.STAGING_DB_URL);
     open = () => openGuarded(s.STAGING_DB_URL, target, watch);
+    if (mode === "worker-runtime") {
+      const logins = Object.fromEntries(SESSION_ROLES.map((r) => [r, { email: s[`STAGING_${r.toUpperCase()}_EMAIL`], password: s[`STAGING_${r.toUpperCase()}_PASSWORD`] }])) as Record<SessionRole, { email: string; password: string }>;
+      claims = (await signInClaims(s.STAGING_SUPABASE_URL, s.STAGING_SUPABASE_ANON_KEY, logins)).text;
+    }
   } catch (e) {
     report.errors.push(redactSecrets(e instanceof Error ? e.message : String(e)));
     report.finishedAt = new Date().toISOString();
@@ -498,13 +504,23 @@ async function workerMain(argv: string[]): Promise<number> {
     save();
   };
   // No timeout is set or loosened: service_role gets only its claims and role; authenticated only its role (refusal checks).
-  const asRole = async (c: Db, role: "postgres" | "service_role" | "authenticated") => {
+  const asRole = async (c: Db, role: RuntimeRole) => {
     await c.query("reset role");
     if (role === "service_role") {
       await c.query("select set_config('request.jwt.claims', $1, true)", [JSON.stringify({ role: "service_role" })]);
       await c.query("set local role service_role");
     } else if (role === "authenticated") await c.query("set local role authenticated");
+    else if (role === "anon") {
+      await c.query("select set_config('request.jwt.claims', $1, true), set_config('request.jwt.claim.sub', '', true), set_config('request.jwt.claim.role', '', true)", [JSON.stringify({ role: "anon" })]);
+      await c.query("set local role anon");
+    } else if (role !== "postgres") {
+      // a signed-in staging identity: its real claims, then the authenticated role (denial checks only; rolled back)
+      if (!claims[role]) throw new Error(`no signed-in claims for ${role}`);
+      await c.query("select set_config('request.jwt.claims', $1, true), set_config('request.jwt.claim.sub', '', true), set_config('request.jwt.claim.role', '', true)", [claims[role]]);
+      await c.query("set local role authenticated");
+    }
   };
+  const clientRoles: ClientRole[] = ["anon", ...SESSION_ROLES.filter((r) => !!claims[r])];
   let before: FullState | null = null;
   // --worker-runtime ownership/evidence: in the report (saved) before the first commit.
   // Recovery reuses the interrupted run's ownership and baseline; its own receipts are appended to that ownership.
@@ -513,7 +529,7 @@ async function workerMain(argv: string[]): Promise<number> {
   let recoveryWrote = false;
   if (mode !== "rehearse-worker-state") report.ownership = own as unknown as Record<string, unknown>;
   const runtimeCtx = (staff: string): RuntimeCtx => ({
-    site, staff, record, redact: redactSecrets, asRole,
+    site, staff, record, redact: redactSecrets, asRole, clientRoles,
     open: () => open(),
     rpcClient: (c, opts) => serviceRpcClient(c, opts),
     // The run's OWN capture transition: control locked FOR UPDATE, receipt persisted BEFORE COMMIT (same helper as the fence runner).

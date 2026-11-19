@@ -12,6 +12,8 @@ import type { RuntimeCtx } from "../../staging/reportingWorkerScenario";
 import { pgDb, smallState, W1 } from "./runtimeFixtures";
 
 export const HISTORY_0043 = [...INSTALLED_HISTORY.map((h) => ({ ...h })), { version: "20261117000000", name: "0043_reporting_worker_state" }];
+/** As staging is expected to be after CJ installs the draft: 0044/0045 receipts ABSENT (the accepted exception), 0046 recorded once. */
+export const HISTORY_0046 = [...HISTORY_0043, { version: "20261119000000", name: "0046_reporting_owner_inputs" }];
 
 export function pgCtx(db: PGlite, own: RuntimeOwnership, over: Partial<RuntimeCtx> = {}) {
   const observations: Observation[] = [];
@@ -21,10 +23,16 @@ export function pgCtx(db: PGlite, own: RuntimeOwnership, over: Partial<RuntimeCt
     site: own.site, staff: W1,
     open: async () => conn(),
     rpcClient: (c, opts) => serviceRpcClient(c, opts),
+    // offline stand-ins for the client identities: anon as itself, each staging session role as authenticated with
+    // its own claims (the hosted runner uses the real signed-in claims)
     asRole: async (c, role) => {
       await c.query("reset role");
-      if (role !== "postgres") await c.query(`set local role ${role}`);
+      if (role === "postgres") return;
+      if (role === "service_role" || role === "authenticated" || role === "anon") return void (await c.query(`set local role ${role}`));
+      await c.query("select set_config('request.jwt.claims', $1, true)", [JSON.stringify({ role: "authenticated", sub: `offline-${role}` })]);
+      await c.query("set local role authenticated");
     },
+    clientRoles: ["anon", "owner", "manager", "staff", "kiosk", "cs"],
     toggle: async (enabled) => {
       const epoch = async () => String((await db.query<{ e: string }>("select capture_epoch::text as e from reporting_private.control")).rows[0].e);
       const before = await epoch();
@@ -34,7 +42,7 @@ export function pgCtx(db: PGlite, own: RuntimeOwnership, over: Partial<RuntimeCt
       own.captureTransitions.push({ enable: enabled, before, after, state: "confirmed" });
       return Number(after);
     },
-    history: async () => HISTORY_0043,
+    history: async () => HISTORY_0046,
     state: (c) => smallState(c),
     awaitLeaseExpiry: async (site) => {
       await db.query("update reporting_private.batches set lease_expires_at = now() - interval '1 second' where site = $1 and state in ('active', 'frozen', 'publishing')", [site]);

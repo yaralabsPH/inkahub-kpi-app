@@ -15,6 +15,8 @@ import { OWNERSHIP_SQL, ownershipParams, parityProblems, runtimeAllowance, runti
 import { runReportingCycle, WORKER_BUDGET_MS } from "../../api/_lib/production-reporting-worker";
 import { abandonReportingBatch } from "../../api/_lib/reporting-jobs";
 import type { ServiceRpcClient, ServiceRpcOptions } from "./serviceRpc";
+import { MIGRATION_0046, receiptFindings, REVIEWED_LF } from "./reportingInstalledState";
+import { SESSION_ROLES, type SessionRole } from "./stagingSessions";
 
 /** Task 15 scale contingency: the worker's predecessor walk reads 0045; the runtime refuses unless it is installed exactly. */
 export const MIGRATION_0045 = "supabase/migrations/0045_reporting_predecessor_page.sql";
@@ -27,7 +29,13 @@ export interface RuntimeCtx {
   /** A fresh guarded, marker-checked connection (runner). */
   open(): Promise<RuntimeConn>;
   rpcClient(c: RuntimeConn, opts?: ServiceRpcOptions): ServiceRpcClient;
-  asRole(c: Db, role: "postgres" | "service_role" | "authenticated"): Promise<void>;
+  /**
+   * Switch the open transaction's role. `anon` and each staging SESSION role (owner/manager/staff/kiosk/cs, with that
+   * identity's real signed-in claims) are client identities used only for denial checks, always rolled back.
+   */
+  asRole(c: Db, role: RuntimeRole): Promise<void>;
+  /** The client identities `asRole` can really take (anon plus every session role whose claims were obtained). */
+  clientRoles?: readonly ClientRole[];
   /** This run's OWN capture transition (receipt persisted before COMMIT into own.captureTransitions). */
   toggle(enabled: boolean, restoring?: boolean): Promise<number>;
   history(c: Db): Promise<Array<Record<string, unknown>>>;
@@ -45,6 +53,17 @@ export interface RuntimeCtx {
   /** Test hooks only (injected failures); never set by the runner. */
   hooks?: { afterStep?(id: string): Promise<void>; beforeCleanupStep?(label: string): Promise<void> };
 }
+export type ClientRole = "anon" | SessionRole;
+export type RuntimeRole = "postgres" | "service_role" | "authenticated" | ClientRole;
+/** R6 refuses to complete unless EVERY one of these client identities is denied the 0046 protocol and tables. */
+export const REQUIRED_CLIENT_ROLES: readonly ClientRole[] = ["anon", ...SESSION_ROLES];
+/** The 0046 surfaces a client identity must be refused: the protocol version RPC and a direct read of each private table. */
+export const CLIENT_DENIAL_SQL = [
+  "select * from public.reporting_owner_input_version()",
+  "select 1 from reporting_private.owner_inputs limit 1",
+  "select 1 from reporting_private.owner_input_events limit 1",
+  "select 1 from reporting_private.owner_input_pieces limit 1",
+] as const;
 export interface RuntimeEvidence {
   identities: Record<string, unknown> | null;
   stableBefore: Record<string, string> | null;
@@ -102,6 +121,7 @@ export async function preflightRuntime(main: Db, ctx: RuntimeCtx, own: RuntimeOw
   const check = checker(ctx, ev);
   const read = ctx.read ?? ((p: string) => readFileSync(p, "utf8"));
   const t43 = read(MIGRATION_0043);
+  const t46 = read(MIGRATION_0046);
   await check("R0", "identities and preflight: history 0040-0043, installed bodies, capture off, nothing active, the site clean, no fixture collision", "every check holds; nothing is written", async () => {
     const p: string[] = [];
     if (sha256Lf(t43) !== REVIEWED_0043_LF) p.push("the local 0043 file is not the reviewed draft");
@@ -113,6 +133,13 @@ export async function preflightRuntime(main: Db, ctx: RuntimeCtx, own: RuntimeOw
     const t45 = read(MIGRATION_0045);
     const cat45 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t45)))).rows[0].j as WorkerCatalog;
     p.push(...workerCatalogProblems(cat45, t45, "installed").map((x) => `0045: ${x}`));
+    // T15P-4 trim task 3: the reviewed 0046 draft, installed exactly (functions, tables, indexes, RLS and grants)
+    if (sha256Lf(t46) !== REVIEWED_LF["0046"].sha256) p.push("the local 0046 file is not the reviewed draft");
+    const cat46 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t46)))).rows[0].j as WorkerCatalog;
+    p.push(...workerCatalogProblems(cat46, t46, "installed").map((x) => `0046: ${x}`));
+    // receipts: the same rule as the inspection; absent 0044/0045 receipts are accepted only when everything else holds
+    const rf = receiptFindings(history, p.length === 0);
+    p.push(...rf.problems);
     const pre = (await main.query(PREFLIGHT_SQL, [[own.site], `${own.prefix}%`])).rows[0].j as PreflightSnapshot;
     p.push(...preflightProblems(pre, [own.site]));
     if (p.length) throw new Error(p.join("; "));
@@ -122,7 +149,7 @@ export async function preflightRuntime(main: Db, ctx: RuntimeCtx, own: RuntimeOw
     own.baselineMaxChangeId = String(t.m);
     own.original = { captureEnabled: pre.captureEnabled, captureEpoch: pre.captureEpoch, processor: Boolean(s?.processor), readMode: String(s?.readMode) };
     own.fixtureIds = fixtureIdsFor(own);
-    ev.identities = { history, captureEpoch: pre.captureEpoch };
+    ev.identities = { history, captureEpoch: pre.captureEpoch, rawReceiptFindings: rf.raw, acceptedReceiptFindings: rf.accepted };
     ev.before = await ctx.state(main);
     ev.stableBefore = await stableHashes(main, own);
     ctx.save(); // ownership and baseline are durable BEFORE the first commit
@@ -266,6 +293,7 @@ export async function scenarioRefreshAndCapture(main: Db, ctx: RuntimeCtx, own: 
   const check = checker(ctx, ev);
   const site = own.site;
   const t43 = (ctx.read ?? ((p: string) => readFileSync(p, "utf8")))(MIGRATION_0043);
+  const t46 = (ctx.read ?? ((p: string) => readFileSync(p, "utf8")))(MIGRATION_0046);
   await check("R5", "refresh after run-owned source changes (3 inserts, 1 update, 1 delete): exact journal, acknowledgement and publication", "5 journal rows acknowledged by the refresh batch; one more generation; parity", async () => {
     const [v1, v2, c1] = own.fixtureIds;
     const gens = own.generations.length;
@@ -285,7 +313,7 @@ export async function scenarioRefreshAndCapture(main: Db, ctx: RuntimeCtx, own: 
     if (p.length) throw new Error(p.join("; "));
     return invs.length;
   }, (n) => `${n} invocation(s); 5/5 journal rows acknowledged; parity holds`);
-  await check("R6", "run log, security and ACLs: one numeric-count run row per invocation; worker objects unchanged; client role refused", "exact", async () => {
+  await check("R6", "run log, security and ACLs: one numeric-count run row per invocation; worker objects (0043, 0046) unchanged; service uses 0046; anon and every signed-in role refused", "exact", async () => {
     const rows = (await main.query("select outcome, counts from reporting_private.worker_runs where site = $1 and started_at >= $2::timestamptz", [site, own.startedAt])).rows;
     if (rows.length !== own.invocations.length) throw new Error(`${rows.length} run rows, ${own.invocations.length} invocations`);
     const outcomes = rows.map((r) => String(r.outcome)).sort().join(",");
@@ -294,7 +322,41 @@ export async function scenarioRefreshAndCapture(main: Db, ctx: RuntimeCtx, own: 
     for (const r of rows) if (Object.values((r.counts ?? {}) as Record<string, unknown>).some((v) => typeof v !== "number")) throw new Error("a run row carries a non-numeric count (possible payload)");
     const cat = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t43)))).rows[0].j as WorkerCatalog;
     const p = workerCatalogProblems(cat, t43, "installed");
+    const cat46 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t46)))).rows[0].j as WorkerCatalog;
+    p.push(...workerCatalogProblems(cat46, t46, "installed").map((x) => `0046: ${x}`));
     if (p.length) throw new Error(p.join("; "));
+    // the service role uses the 0046 protocol
+    await withConn(ctx, async (c) => {
+      await c.query("begin");
+      try {
+        await ctx.asRole(c, "service_role");
+        const v = (await c.query(CLIENT_DENIAL_SQL[0])).rows[0];
+        if (Number(v?.version) !== 1) throw new Error(`the service role read owner-input protocol version ${String(v?.version)}, expected 1`);
+      } finally {
+        await c.query("rollback");
+      }
+    });
+    // EVERY client identity (anon and each signed-in staging role) is refused the protocol and each private table
+    const missing = REQUIRED_CLIENT_ROLES.filter((r) => !(ctx.clientRoles ?? []).includes(r));
+    if (missing.length) throw new Error(`R6 needs every client identity; missing: ${missing.join(", ")}`);
+    await withConn(ctx, async (c) => {
+      for (const role of REQUIRED_CLIENT_ROLES) {
+        for (const sql of CLIENT_DENIAL_SQL) {
+          await c.query("begin");
+          let allowed = false;
+          try {
+            await ctx.asRole(c, role);
+            await c.query(sql);
+            allowed = true;
+          } catch (e) {
+            if (!/permission denied/.test(e instanceof Error ? e.message : String(e))) throw e;
+          } finally {
+            await c.query("rollback");
+          }
+          if (allowed) throw new Error(`${role} was allowed: ${sql}`);
+        }
+      }
+    });
     await withConn(ctx, async (c) => {
       for (const sql of ["select * from public.get_reporting_job_status($1)", "select * from public.set_reporting_site_mode($1, null, true)"]) {
         await c.query("begin");

@@ -6885,3 +6885,35 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
   - **Gate:** tsc -b exit 0; typecheck:digest exit 0; build exit 0.
     - First full test run: 80 files, 2447/2448. The failure was the first API test ("a refresh enumerates changed keys durably..."), the test with the earlier full-suite timeout history. The captured output did not show its reason, and it passed alone in 1.8 s.
     - Immediate full rerun: 80 files, **2448/2448**. No timeout was changed, and the first run's failure is recorded here, not erased.
+- **Trim task 3 (`docs/reviews/item-counting-t15p4-trim.md`): staging handoff and final gate, 2026-11-19, Claude.**
+  - [x] Done.
+  - **Inspection (`tests/staging/reportingInstalledState.ts`):**
+    - The draft 0046 is pinned (LF SHA-256 `4641d7cd4dd3ca48d0ccf5350584bb6c23efec6bac4c5a4e6c26d60b7b0b6141`). Its functions (public and private helpers), tables (RLS on, no anon/authenticated access, service grants) and indexes are inspected by name, exactly like 0043–0045.
+    - The `0046_reporting_owner_inputs` receipt is required exactly once.
+    - `receiptFindings` keeps the raw findings and splits them. Only ABSENT 0044/0045 receipts are accepted (`acceptedReceiptFindings`, labelled in the report), and only when every effective identity check holds. A duplicate, a wrong version, an unexpected receipt, an absent 0046 receipt, or any other identity problem still blocks and keeps the runtime not ready.
+  - **Runtime R0 (`tests/staging/reportingWorkerScenario.ts`):** checks the local 0046 against the pin and the installed 0046 catalog (functions, tables, indexes, RLS, grants), and applies the same receipt rule. Raw and accepted findings are recorded in the R0 evidence.
+  - **Runtime R6:**
+    - checks the 0046 catalog again;
+    - the service role reads protocol version 1;
+    - **anon plus each signed-in staging identity** (owner, manager, staff, kiosk, cs) is refused `reporting_owner_input_version()` and a direct read of each new private table. Every probe is rolled back.
+    - R6 FAILS if any of the six identities is missing (`REQUIRED_CLIENT_ROLES`) or allowed.
+  - **Fresh audit (`tests/staging/reportingWorkerRuntime.ts`):** `OWNERSHIP_SQL` counts run-site `owner_inputs` rows whose batch is not this run's. Any such row fails the audit.
+  - **Runner (`tests/staging/reporting-jobs.ts`):**
+    - `--worker-runtime` signs in the five staging identities with the existing `signInClaims` and `STAGING_<ROLE>_EMAIL/PASSWORD`. The claims are held in memory only and never written.
+    - `asRole` takes anon and the session roles: real claims, then the `authenticated` role.
+    - `clientRoles` is passed to the scenario. No new CLI mode.
+  - **File the plan did not name:** `tests/reporting/pg/runtimeCtx.ts`, the offline context. Its `asRole` now plays anon and the session roles; it gains `clientRoles`; and its history `HISTORY_0046` records 0046 once with 0044/0045 receipts absent, as staging is expected to be after CJ installs the draft.
+  - **Tests:**
+    - **Inspection:** absent 0046 receipt, duplicate 0045 receipt, absent 0046 function, authenticated grant on a 0046 function, authenticated grant on a 0046 table, and an altered 0046 body all FAIL with no write. Absent 0044/0045 receipts are COMPLETE with labelled accepted findings. An absent 0045 receipt beside a grant drift FAILS, with nothing accepted and the runtime not ready.
+    - **Runtime:**
+      - R0 refuses an altered local 0046 and an authenticated grant on 0046 before any write;
+      - R6 fails with `cs` missing, and fails when kiosk is allowed;
+      - the fresh audit fails on a journal of a foreign batch;
+      - the end-to-end R0–R7 run stays COMPLETE.
+  - **Handoff facts:**
+    - No migration has changed since the trim decision (`git diff fa6cdae -- supabase/migrations` is empty), and 0040–0045 match their pinned reviewed hashes.
+    - Draft 0046 SHA-256 (LF): `4641d7cd4dd3ca48d0ccf5350584bb6c23efec6bac4c5a4e6c26d60b7b0b6141`.
+    - CJ's commands are in the trim decision (`--inspect-installed --sites=au,uk,us`, then `--worker-runtime --site=au --pace-calls=4 --max-invocations=12 --max-lease-wait-ms=420000`).
+  - **Covered or deferred:** as recorded in the trim decision and the task 1–2 entries. No hosted environment was contacted, and no SQL was applied.
+  - **Final gate (on the combined tree of tasks 1–3):** `npx tsc -b` exit 0; `npm run typecheck:digest` exit 0; the strict staging-runner check (`npx tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node tests/staging/reporting-jobs.ts tests/staging/reporting-capture.ts`) exit 0; `npm run test -- --run`: 80 files, **2459/2459**; `npm run build` exit 0. No hosted CI.
+  - **Ready for the single final review.** STATUS: COMPLETE

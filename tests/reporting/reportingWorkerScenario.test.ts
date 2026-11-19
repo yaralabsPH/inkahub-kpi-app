@@ -4,6 +4,7 @@
  * row (the hosted runner waits for real and never edits a lease); everything
  * else is the real worker, real RPCs and real SQL.
  */
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { PGlite } from "@electric-sql/pglite";
 import { serviceRpcClient } from "../staging/serviceRpc";
@@ -61,6 +62,19 @@ describe("runtime gate: preflight, R1-R4 and cleanup (PGlite, real SQL)", () => 
     const failures: string[] = [];
     await cleanupRuntime(drift.ctx, own, failures); // nothing committed: cleanup does nothing
     expect(failures).toEqual([]);
+    expect(await write()).toBe(0);
+  }, 120_000);
+  it("R0 refuses an altered local 0046 or an authenticated grant on 0046 before any write", async () => {
+    const write = async () => (await db.query<{ n: number }>("select count(*)::int as n from reporting_private.worker_runs")).rows[0].n;
+    const altered = pgCtx(db, own, { read: (path: string) => readFileSync(path, "utf8") + (/0046_/.test(path) ? "\n-- edited" : "") });
+    await expect(preflightRuntime(pgDb(db), altered.ctx, own, newRuntimeEvidence())).rejects.toThrow(/R0 failed/);
+    expect(altered.observations[0].result).toMatch(/the local 0046 file is not the reviewed draft/);
+    await db.query("grant execute on function public.reporting_owner_input_version() to authenticated");
+    const granted = pgCtx(db, own);
+    await expect(preflightRuntime(pgDb(db), granted.ctx, own, newRuntimeEvidence())).rejects.toThrow(/R0 failed/);
+    expect(granted.observations[0].result).toMatch(/0046: public\.reporting_owner_input_version security differs/);
+    await db.query("revoke execute on function public.reporting_owner_input_version() from authenticated");
+    expect(own.committedAnything).toBe(false);
     expect(await write()).toBe(0);
   }, 120_000);
   it("an injected worker failure mid-run stops the scenario; cleanup abandons the owned batch and restores capture and the processor", async () => {
@@ -121,6 +135,30 @@ describe("runtime gate end to end: R0-R7, cleanup, fresh audit (PGlite, real SQL
     expect(a.finalState.retained).toMatchObject({ generations: 3, fixtureJournalRows: 5, runLogRows: own.invocations.length });
     expect((await db.query<{ n: number }>("select count(*)::int as n from public.production_events where id like $1", [`${own.prefix}%`])).rows[0].n).toBe(0);
     expect(r7).toEqual(["failed/capture_disabled", "failed/rebuild_required"]);
+  }, 240_000);
+  it("R6 cannot complete with a missing client identity, or with one that is allowed the 0046 protocol", async () => {
+    const missing = pgCtx(db, own, { clientRoles: ["anon", "owner", "manager", "staff", "kiosk"] });
+    await expect(runWorkerRuntime(pgDb(db), missing.ctx, own, ev)).rejects.toThrow(/R6 failed/);
+    expect(missing.observations.find((o) => o.id === "R6")?.result).toMatch(/missing: cs/);
+    await cleanupRuntime(missing.ctx, own, []);
+  }, 240_000);
+  it("R6 fails when a client identity is actually allowed (here kiosk runs with the owner's privileges)", async () => {
+    const base = pgCtx(db, own);
+    const allowed = pgCtx(db, own, { asRole: async (c, role) => (role === "kiosk" ? void (await c.query("reset role")) : base.ctx.asRole(c, role)) });
+    await expect(runWorkerRuntime(pgDb(db), allowed.ctx, own, ev)).rejects.toThrow(/R6 failed/);
+    expect(allowed.observations.find((o) => o.id === "R6")?.result).toMatch(/kiosk was allowed: select \* from public\.reporting_owner_input_version/);
+    await cleanupRuntime(allowed.ctx, own, []);
+  }, 240_000);
+  it("the fresh audit fails on an owner-input journal tied to a batch this run does not own", async () => {
+    const { ctx } = pgCtx(db, own);
+    await runWorkerRuntime(pgDb(db), ctx, own, ev);
+    await cleanupRuntime(ctx, own, []);
+    // a journal of another (foreign) batch at the run site: a copy of this run's first batch under a new id, abandoned
+    const foreign = "99999999-9999-4999-8999-999999999999";
+    await db.query(`insert into reporting_private.batches select (jsonb_populate_record(null::reporting_private.batches, to_jsonb(b) || jsonb_build_object('batch_id', $1::text, 'state', 'abandoned', 'published_generation_id', null))).* from reporting_private.batches b where b.batch_id = $2::uuid`, [foreign, own.batches[0]]);
+    await db.query(`insert into reporting_private.owner_inputs (batch_id, partition_kind, partition_key, site, source_cutoff, rule_version, purpose, state, last_writer_fence) values ($1, 'order', 'FOREIGN', 'uk', now(), 'x', 'plan', '{"v":1,"step":"members","m":{"afterOrd":null}}'::jsonb, 1)`, [foreign]);
+    const a = await auditRuntime(pgDb(db), ctx, own, ev);
+    expect(a.problems.join("\n")).toMatch(/1 ownerInputs row\(s\) at uk do not belong to this run/);
   }, 240_000);
   it("the fresh audit reports a change the run does not own (another site) and a fixture left behind", async () => {
     const { ctx } = pgCtx(db, own, { hooks: { beforeCleanupStep: async (l) => { if (/fixture/.test(l)) throw new Error("injected: fixture deletion failed"); } } });

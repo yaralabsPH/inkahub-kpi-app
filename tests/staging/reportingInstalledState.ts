@@ -28,6 +28,11 @@ export const INSPECT_FLAG = "--inspect-installed";
 export const INSPECT_SITES = ["au", "uk", "us"] as const;
 export const MIGRATION_0044 = "supabase/migrations/0044_reporting_reads.sql";
 export const MIGRATION_0045 = "supabase/migrations/0045_reporting_predecessor_page.sql";
+export const MIGRATION_0046 = "supabase/migrations/0046_reporting_owner_inputs.sql";
+/** The migrations whose objects are inspected by name (functions, tables, indexes, security). */
+export const WORKER_MIGRATIONS = ["0043", "0044", "0045", "0046"] as const;
+/** The staging-only, already-accepted exception: these receipts may be ABSENT when every effective identity check holds. */
+export const ACCEPTED_ABSENT_RECEIPTS = ["0044_reporting_reads", "0045_reporting_predecessor_page"] as const;
 
 /** The reviewed files (LF SHA-256 at the reviewed head). No silent repinning: an edit must update this table and its test. */
 export const REVIEWED_LF: Readonly<Record<string, { path: string; sha256: string }>> = {
@@ -37,6 +42,8 @@ export const REVIEWED_LF: Readonly<Record<string, { path: string; sha256: string
   "0043": { path: MIGRATION_0043, sha256: "156ee4d525433c8999c52d83ac4175c44629ce6a8f848796a5638ed944c7f633" },
   "0044": { path: MIGRATION_0044, sha256: "84a07d1bd61d2e69df66bf6efa437f541a184512cb1820cc75217db20e5c9b07" },
   "0045": { path: MIGRATION_0045, sha256: "5f42f300ba391aa36845329e53d39581a56d4e60c94ab342bb95f91fe8ccefb8" },
+  // the reviewed DRAFT 0046 (T15P-4); CJ applies exactly these bytes to staging
+  "0046": { path: MIGRATION_0046, sha256: "4641d7cd4dd3ca48d0ccf5350584bb6c23efec6bac4c5a4e6c26d60b7b0b6141" },
 };
 
 /** Exact names expected in supabase_migrations.schema_migrations; 0040-0042 also with their recorded versions. */
@@ -45,6 +52,7 @@ export const EXPECTED_RECEIPTS = [
   { name: "0043_reporting_worker_state", version: null },
   { name: "0044_reporting_reads", version: null },
   { name: "0045_reporting_predecessor_page", version: null },
+  { name: "0046_reporting_owner_inputs", version: null },
 ] as const;
 
 /** The seven effective Task 14 dependency functions: 0040 for frozen_read_batch, 0042 for members/stream, 0041 for the rest. */
@@ -150,10 +158,14 @@ export function fileProblems(texts: Texts): { problems: string[]; files: Array<{
   return { files, problems: files.filter((f) => !f.ok).map((f) => `the local ${f.migration} file is not the reviewed one (LF SHA-256 ${f.sha256Lf}, pinned ${f.pinned})`) };
 }
 
-/** Every function the inspection must find exactly once: the 7 dependency reads plus all 0043/0044/0045 functions, private helpers included. */
+/** Every function the inspection must find exactly once: the 7 dependency reads plus all 0043-0046 functions, private helpers included. */
 export function expectedFunctions(texts: Texts): string[] {
   const fromFile = (m: string) => workerObjects(texts[m]).functions.map((f) => `${f.schema}.${f.name}`);
-  return [...new Set([...DEPENDENCY_FUNCTIONS, ...fromFile("0043"), ...fromFile("0044"), ...fromFile("0045")])].sort();
+  return [...new Set([...DEPENDENCY_FUNCTIONS, ...WORKER_MIGRATIONS.flatMap(fromFile)])].sort();
+}
+/** Every index the inspection must find valid and ready: the dependency indexes plus 0043's and 0046's. */
+export function expectedIndexes(texts: Texts): string[] {
+  return [...DEPENDENCY_INDEXES, ...workerObjects(texts["0043"]).indexes, ...workerObjects(texts["0046"]).indexes];
 }
 
 /** The local text that defines each expected function's effective body. */
@@ -161,7 +173,7 @@ export function effectiveSource(texts: Texts, qualified: string): string {
   if (qualified === "reporting_private.frozen_read_batch") return texts["0040"];
   if (qualified === "public.read_reporting_owner_members" || qualified === "public.read_reporting_staff_stream") return texts["0042"];
   if ((DEPENDENCY_FUNCTIONS as readonly string[]).includes(qualified)) return texts["0041"];
-  for (const m of ["0043", "0044", "0045"]) if (workerObjects(texts[m]).functions.some((f) => `${f.schema}.${f.name}` === qualified)) return texts[m];
+  for (const m of WORKER_MIGRATIONS) if (workerObjects(texts[m]).functions.some((f) => `${f.schema}.${f.name}` === qualified)) return texts[m];
   throw new Error(`${qualified} is not an expected function`);
 }
 
@@ -209,6 +221,19 @@ export function receiptProblems(rows: readonly Row[]): string[] {
   for (const r of rows) if (!EXPECTED_RECEIPTS.some((e) => e.name === String(r.name))) p.push(`unexpected 004x migration receipt ${String(r.version)}/${String(r.name)}`);
   return [...new Set(p)];
 }
+const ABSENT = (name: string) => `migration history has 0 receipts for ${name} (expected exactly one)`;
+/**
+ * The raw receipt findings split into BLOCKING problems and ACCEPTED findings: only an ABSENT 0044/0045 receipt can be
+ * accepted (the staging-specific, already-decided exception), and only when `effectiveOk` (every effective
+ * function/table/index/security check holds). A duplicate, a wrong version, an unexpected receipt, an absent 0046 or any
+ * other finding always blocks.
+ */
+export function receiptFindings(rows: readonly Row[], effectiveOk: boolean): { raw: string[]; problems: string[]; accepted: string[] } {
+  const raw = receiptProblems(rows);
+  const acceptable = new Set(ACCEPTED_ABSENT_RECEIPTS.map(ABSENT));
+  const accepted = effectiveOk ? raw.filter((x) => acceptable.has(x)) : [];
+  return { raw, accepted, problems: raw.filter((x) => !accepted.includes(x)) };
+}
 
 export function indexProblems(rows: readonly Row[], expected: readonly string[]): string[] {
   const p: string[] = [];
@@ -248,8 +273,8 @@ export async function collect(c: Db, texts: Texts): Promise<Snapshot> {
   const dependencyRows = await one(CASE_SQL.effective);
   const contracts = await one(CONTRACT_SQL, [expectedFunctions(texts)]);
   const catalogs: Record<string, WorkerCatalog> = {};
-  for (const m of ["0043", "0044", "0045"]) catalogs[m] = (await one(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(texts[m]))))[0].j as WorkerCatalog;
-  const indexes = await one(INDEX_SQL, [[...DEPENDENCY_INDEXES, ...workerObjects(texts["0043"]).indexes]]);
+  for (const m of WORKER_MIGRATIONS) catalogs[m] = (await one(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(texts[m]))))[0].j as WorkerCatalog;
+  const indexes = await one(INDEX_SQL, [expectedIndexes(texts)]);
   const collation = (await one(COLLATION_INVARIANT_SQL))[0];
   const preflight = (await one(PREFLIGHT_SQL, [[...INSPECT_SITES], "rw-%"]))[0].j as PreflightSnapshot;
   const state = (await one(STATE_SQL, [[...INSPECT_SITES]]))[0].j as Row;
@@ -311,6 +336,9 @@ export interface InspectionReport {
   priorRuns: PriorRun[];
   identityProblems: string[];
   receiptProblems: string[];
+  /** Every raw receipt finding, and the ones accepted under the staging exception (reported, never suppressed). */
+  rawReceiptFindings: string[];
+  acceptedReceiptFindings: string[];
   collationProblems: string[];
   drift: string[];
   errors: string[];
@@ -334,7 +362,7 @@ export function newInspectionReport(revision: string, startedAt: string): Inspec
   return {
     revision, startedAt, finishedAt: "", elapsedMs: 0, files: [], readOnly: { first: "", fresh: "", isolation: "", statementsSent: 0, nonSelect: [], rolledBack: false },
     settings: null, receipts: [], functions: [], indexes: [], collation: null, control: null, sites: [], activeBatches: [], priorRuns: [],
-    identityProblems: [], receiptProblems: [], collationProblems: [], drift: [], errors: [], runtimeReady: false, complete: false,
+    identityProblems: [], receiptProblems: [], rawReceiptFindings: [], acceptedReceiptFindings: [], collationProblems: [], drift: [], errors: [], runtimeReady: false, complete: false,
   };
 }
 
@@ -403,10 +431,13 @@ export async function inspectInstalled(deps: InspectDeps): Promise<InspectionRep
     ...fn.problems,
     ...(JSON.stringify(depNames) === JSON.stringify(wantDep) ? [] : [`dependency functions are ${JSON.stringify(depNames)}, expected ${JSON.stringify(wantDep)}`]),
     ...dependencyIdentityProblems(first.dependencyRows, texts["0040"], texts["0041"], texts["0042"]),
-    ...["0043", "0044", "0045"].flatMap((m) => workerCatalogProblems(first.catalogs[m], texts[m], "installed").map((x) => `${m}: ${x}`)),
-    ...indexProblems(first.indexes, [...DEPENDENCY_INDEXES, ...workerObjects(texts["0043"]).indexes]),
+    ...WORKER_MIGRATIONS.flatMap((m) => workerCatalogProblems(first.catalogs[m], texts[m], "installed").map((x) => `${m}: ${x}`)),
+    ...indexProblems(first.indexes, expectedIndexes(texts)),
   );
-  r.receiptProblems = receiptProblems(first.receipts);
+  const rf = receiptFindings(first.receipts, r.identityProblems.length === 0);
+  r.rawReceiptFindings = rf.raw;
+  r.acceptedReceiptFindings = rf.accepted;
+  r.receiptProblems = rf.problems;
   r.collationProblems = collationInvariantProblems(first.collation);
   r.drift = driftProblems(first, fresh);
   const identityOk = !r.identityProblems.length && !r.receiptProblems.length && !r.collationProblems.length;
@@ -483,6 +514,7 @@ export function inspectionMarkdown(r: InspectionReport): string {
     "",
     ...list("Identity problems", r.identityProblems),
     ...list("Receipt problems", r.receiptProblems),
+    ...list("Accepted receipt findings (staging exception: absent 0044/0045 receipts, every effective identity check holds)", r.acceptedReceiptFindings),
     ...list("Collation problems", r.collationProblems),
     ...list("Fresh-snapshot drift", r.drift),
     ...list("Errors", r.errors),

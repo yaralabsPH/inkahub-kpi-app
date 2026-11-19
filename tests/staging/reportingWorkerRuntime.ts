@@ -126,6 +126,7 @@ export const OWNERSHIP_SQL = `select json_build_object(
        union all select valid_from_seq, valid_to_seq from reporting_private.order_occurrences where site = $1 union all select valid_from_seq, valid_to_seq from reporting_private.daily_totals where site = $1
        union all select valid_from_seq, valid_to_seq from reporting_private.timing_facts where site = $1 union all select valid_from_seq, valid_to_seq from reporting_private.source_issue_facts where site = $1) x
      where x.f <> all($7::bigint[]) or (x.v is not null and x.v <> all($7::bigint[]))),
+  'ownerInputs', (select count(*) from reporting_private.owner_inputs t where t.site = $1 and t.batch_id <> all($2::uuid[])),
   'runLogRows', (select count(*) from reporting_private.worker_runs t where t.site = $1 and t.started_at >= $6::timestamptz)
 ) as j`;
 export const ownershipParams = (own: RuntimeOwnership, seqs: string[]) => [own.site, own.batches, own.generations, own.fixtureIds, own.baselineMaxChangeId, own.startedAt, seqs];
