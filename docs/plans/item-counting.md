@@ -929,6 +929,12 @@ STATUS: COMPLETE
 
 STATUS: COMPLETE
 
+- **T15P-4d step 3, wiring step 2 (version first) is BLOCKED on one test-file dependency (2026-11-19, Claude; planner decision needed):**
+  - **What was done (uncommitted, kept as `git stash` "T15P-4d wiring step 2 (version first) - blocked on paceCalls scope"):** `runReportingCycle` calls `requireOwnerInputProtocol` through `b.retry` before `acquire` (refresh/rebuild only, not cleanup) and returns without `recordRun` for `OwnerInputUnsupportedError`. Four new API tests (missing, version 2, code-only `40001` transient then version 1, exhausted transient) were red, then green; two trace updates for the demonstrated new call. API file 45/45; two mutations (no early return, no probe) fail promptly.
+  - **Failing regression:** `tests/reporting/reportingWorkerScenario.test.ts`, 5 tests. Exact error: `R3a failed; the run stops here`. The inner check is at `tests/staging/reportingWorkerScenario.ts:216`: `expected pending with a batch` / `no durable copy progress`.
+  - **Cause:** the paced invocation ends the 240 s budget after `paceCalls` RPCs (`tests/staging/reportingWorkerScenario.ts:162`). The value is `paceCalls: 3` (`tests/reporting/pg/runtimeCtx.ts:49`), so the calls were status, begin_rebuild and copy page. The version probe is now the first of the three, so no copy page fits. This is not a counting, hash or parity change.
+  - **Proposed minimal edit (needs authority; neither file is in the r6 or scope-review list):** `tests/reporting/pg/runtimeCtx.ts:49` `paceCalls: 3` → `4`. The staging CLI default `int("pace-calls", 3, 2, 50)` at `tests/staging/reportingWorkerHarness.ts:53` → `4`, so the live-staging rehearsal keeps the same meaning (one copy page before the budget ends). No assertion changes.
+
 ## Amendment implementation log
 
 - 2026-11-14 (Codex, CJ's overnight delegation): CJ authorized autonomous coordination and routine decisions while asleep. Claude remains the coder; Codex handles planner decisions/review. One writer at a time, commit before handoff. Authorized feature work and necessary staging validation target only `ybrzhrgfrnvtcwymjdrq`, checked before every SQL run; additive staging schema application requires planner review first. Production/other-account access, merges, deployment, purchases, secret disclosure, destructive source cleanup and weakened acceptance/security limits remain excluded.
