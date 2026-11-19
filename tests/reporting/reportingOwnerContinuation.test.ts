@@ -25,6 +25,7 @@ const W4 = "0000000b-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W7 = "0000000c-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W8 = "0000000d-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W9 = "0000000e-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W10 = "0000000f-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 /** scope review Must-fix 4, Proof 3: each owner's earliest member id ends in this code point (built, never escaped). */
 const UNI = [["U7FF", W7, 0xd7ff, true], ["UE000", W8, 0xe000, false], ["UASTRAL", W9, 0x1f600, false]] as const;
 const uniId = (cp: number) => "cu" + String.fromCodePoint(cp);
@@ -142,6 +143,17 @@ beforeAll(async () => {
     await ins({ id: `cv-${key}`, staff, order: key, at: u(20) });
     await ins({ id: `cw-${key}`, staff, order: `${key}-P`, at: u(0) });
   }
+  // scope review Must-fix 4, Proof 2: CQ-M of W10 mirrors CP-M (lines at T3/T1, another order's line at T2, a predecessor
+  // at T0, one small cancellation each; T0's cancels it), plus a second line below, cq-tm1 (effective: its three 400 KB
+  // cancellations carry another order). 0045 includes kids only through the FIRST line below the certain bound (T0), so
+  // cq-tm1 arrives in the same combined page with kids === null; its kids need byte-capped kid pages of its own.
+  await db.query("insert into auth.users (id, email) values ($1, 'w10@x')", [W10]);
+  const cq = (s: number) => new Date(Date.parse("2026-10-04T06:00:00Z") + s * 1000).toISOString();
+  for (const [id, order, t] of [["cq-t3", "CQ-M", 30], ["cq-t2", "CQ-X", 20], ["cq-t1", "CQ-M", 10], ["cq-t0", "CQ-Y", 0], ["cq-tm1", "CQ-Z", -10]] as const) {
+    await ins({ id, staff: W10, order, at: cq(t) });
+    if (id !== "cq-tm1") await ins({ id: `${id}-k`, staff: W2, order: order === "CQ-M" ? "CQ-K" : order, type: "cancelled", parent: id, at: cq(t + 1) });
+  }
+  for (let i = 1; i <= 3; i++) await noteRow(`cq-tm1-k${i}`, "cancelled", "CQ-W", cq(-9 + i / 10), "cq-tm1", null, W2);
   expect((await c().rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
   expect((await c().rpc("set_reporting_site_mode", { p_site: SITE, p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
   const r = await beginReportingRebuild(c(), SITE);
@@ -1056,4 +1068,78 @@ describe("the conservative Unicode certain bound: exact below U+D800, instant on
       expect(back.events.map((e) => e.ev).sort((x, y) => compareUtf8(x.id, y.id))).toEqual(want.events);
     });
   }
+});
+
+describe("a line without included kids inside a combined 0045 page (scope review Must-fix 4, Proof 2)", () => {
+  const o: Owner = { partitionKind: "order", partitionKey: "CQ-M" };
+  type Rpc = { rpc: string; args: Record<string, unknown> };
+  type Commit = { commit: number; ids: string[]; steps: Array<Record<string, any>> }; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const KIDS = ["cq-tm1-k1", "cq-tm1-k2", "cq-tm1-k3"];
+
+  async function shape() {
+    const { trace } = await traced(o);
+    const ords: string[] = [];
+    for (const x of trace) if ("commit" in x) ords.push(...x.ids);
+    const ordOf = (id: string) => ords.indexOf(id) + 1;
+    const i = trace.findIndex((x) => "rpc" in x && x.rpc === "read_reporting_predecessor_page");
+    return { trace, ordOf, i };
+  }
+
+  it("the page and cq-tm1's pending line commit first; then its own kid pages, each committed; then done and the cursor", async () => {
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    expect(want.events.map((e) => e.id)).toEqual(expect.arrayContaining(["cq-tm1", ...KIDS]));
+    const { trace, ordOf, i } = await shape();
+    expect(i).toBeGreaterThan(-1);
+    expect((trace[i] as Rpc).args).toMatchObject({ p_staff: W10, p_certain_event_id: "cq-t1" });
+    // commit A: the combined page through cq-t0, plus cq-tm1 and its pending kids step (no kid yet), before any kid read
+    const A = trace[i + 1] as Commit;
+    expect("commit" in A).toBe(true);
+    expect(A.ids).toEqual(expect.arrayContaining(["cq-t2", "cq-t2-k", "cq-t0", "cq-t0-k", "cq-tm1"]));
+    for (const k of KIDS) expect(A.ids).not.toContain(k);
+    const tm1 = ordOf("cq-tm1");
+    expect(A.steps.at(-1)).toMatchObject({ step: "walk", w: { line: { ord: tm1, phase: "kids", afterKidOrd: null } } });
+    // then cq-tm1's own kid pages: each non-empty page is committed before the next request, which continues after its last kid
+    let j = i + 2;
+    let after: string | null = null;
+    const kidPages: string[][] = [];
+    for (;;) {
+      const r = trace[j] as Rpc;
+      expect(r.rpc, `entry ${j}`).toBe("read_reporting_children");
+      expect(r.args).toMatchObject({ p_parent_ids: ["cq-tm1"], p_after_parent_id: after === null ? null : "cq-tm1", p_after_event_id: after });
+      const next = trace[j + 1] as Commit;
+      expect("commit" in next, `a commit follows the kid read at ${j}`).toBe(true);
+      const kids = next.ids.filter((id) => KIDS.includes(id));
+      if (!kids.length) {
+        // the empty kid page: commit D finishes the line (done{effective}), then moves the cursor to it
+        const phases = next.steps.map((st) => (st.step === "walk" ? (st.w.line ? `${st.w.line.ord === tm1 ? "tm1-" : ""}${st.w.line.phase}` : `cursor:${st.w.cursorOrd}`) : st.step));
+        expect(phases.slice(0, 2)).toEqual(["tm1-done", `cursor:${tm1}`]);
+        expect(next.steps[0].w.line.effective).toBe(true);
+        break;
+      }
+      kidPages.push(kids);
+      expect(next.ids).toEqual(kids); // a kid page's commit holds exactly that page
+      after = kids.at(-1)!;
+      expect(next.steps.at(-1)).toMatchObject({ w: { line: { ord: tm1, phase: "kids", afterKidOrd: ordOf(after) } } });
+      j += 2;
+    }
+    expect(kidPages.flat()).toEqual(KIDS);
+    expect(kidPages.length, "the 400 KB kids span more than one non-empty kid page").toBeGreaterThan(1);
+    // no kid request for the lines whose complete kids the combined page included
+    const included = trace.filter((x) => "rpc" in x && x.rpc === "read_reporting_children" && (x.args.p_parent_ids as string[]).some((p) => ["cq-t3", "cq-t2", "cq-t1", "cq-t0"].includes(p)) && (x.args.p_parent_ids as string[]).length === 1);
+    expect(included).toEqual([]);
+  }, 300_000);
+
+  it("a crash before or after each of those commits resumes to buildOwnerInput with the exact next request", async () => {
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const { trace, i } = await shape();
+    const first = (trace[i + 1] as Commit).commit;
+    const last = (trace.filter((x) => "commit" in x).at(-1) as Commit).commit;
+    for (let k = first; k <= last; k++) {
+      for (const mode of ["before", "after"] as const) {
+        const handle = await crashAt(o, k, mode);
+        const s = await resume(o, handle, want, `CQ-M ${mode} ${k}`);
+        if (mode === "after" && k === first) expect(s.w.line).toMatchObject({ phase: "kids", afterKidOrd: null }); // resumes at its first kid read
+      }
+    }
+  }, 600_000);
 });
