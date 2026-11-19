@@ -22,6 +22,12 @@ const W1 = "00000008-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W2 = "00000009-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W3 = "0000000a-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W4 = "0000000b-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W7 = "0000000c-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W8 = "0000000d-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W9 = "0000000e-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+/** scope review Must-fix 4, Proof 3: each owner's earliest member id ends in this code point (built, never escaped). */
+const UNI = [["U7FF", W7, 0xd7ff, true], ["UE000", W8, 0xe000, false], ["UASTRAL", W9, 0x1f600, false]] as const;
+const uniId = (cp: number) => "cu" + String.fromCodePoint(cp);
 /** 200 old-self audiences for owner OQ-3 (resumable hashing across three checkpoints). */
 const OLD200 = Array.from({ length: 200 }, (_, i) => `${(0x100 + i).toString(16).padStart(8, "0")}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`);
 const SITE = "au";
@@ -125,6 +131,16 @@ beforeAll(async () => {
   for (const [id, order, t] of [["cp-t3", "CP-M", 30], ["cp-t2", "CP-X", 20], ["cp-t1", "CP-M", 10], ["cp-t0", "CP-Y", 0]] as const) {
     await ins({ id, staff: W4, order, at: cp(t) });
     await ins({ id: `${id}-k`, staff: W2, order: order === "CP-M" ? "CP-K" : order, type: "cancelled", parent: id, at: cp(t + 1) });
+  }
+  // scope review Must-fix 4, Proof 3: three single-worker owners whose earliest member id is just below U+D800 (exact
+  // bound), above it in the BMP (instant only) and astral (a UTF-16 surrogate pair: instant only); each has a later member
+  // line and one predecessor below, so the walk reads a 0045 page with the certain bound.
+  for (const [key, staff, cp] of UNI) {
+    await db.query("insert into auth.users (id, email) values ($1, $2)", [staff, `${staff}@x`]);
+    const u = (s: number) => new Date(Date.parse("2026-10-03T06:00:00Z") + s * 1000).toISOString();
+    await ins({ id: uniId(cp), staff, order: key, at: u(10) });
+    await ins({ id: `cv-${key}`, staff, order: key, at: u(20) });
+    await ins({ id: `cw-${key}`, staff, order: `${key}-P`, at: u(0) });
   }
   expect((await c().rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
   expect((await c().rpc("set_reporting_site_mode", { p_site: SITE, p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
@@ -1012,4 +1028,32 @@ describe("a complete multi-line 0045 page is ONE atomic durable page (scope revi
       }
     }
   });
+});
+
+describe("the conservative Unicode certain bound: exact below U+D800, instant only otherwise (scope review Must-fix 4, Proof 3)", () => {
+  for (const [key, staff, cp, exact] of UNI) {
+    it(`${key}: every 0045 page of both routes carries the same certain bound, ${exact ? "with the exact id" : "instant only (null id)"}`, async () => {
+      const o: Owner = { partitionKind: "order", partitionKey: key };
+      const light = recording(c());
+      const want = await buildOwnerInput(rpcFrozenReader(light.client, ref), o);
+      const earliest = want.members.find((m) => m.id === uniId(cp))!;
+      expect(earliest, "the fixture's earliest member").toBeDefined();
+      const { trace, handle } = await traced(o);
+      const durable = trace.filter((x): x is { rpc: string; args: Record<string, unknown> } => "rpc" in x && x.rpc === "read_reporting_predecessor_page");
+      const plain = light.calls.filter((x) => x.fn === "read_reporting_predecessor_page");
+      expect(durable.length).toBeGreaterThan(0);
+      expect(plain.length).toBeGreaterThan(0);
+      for (const [route, pages] of [["durable", durable.map((x) => x.args)], ["light", plain.map((x) => x.args)]] as const) {
+        for (const a of pages) {
+          expect(a.p_staff, route).toBe(staff);
+          expect(a.p_certain_event_id, `${route}: certain id`).toBe(exact ? uniId(cp) : null);
+          // the certain instant is the earliest member line's exact microsecond
+          expect(exactInstant(a.p_certain_at as string), `${route}: certain instant`).toBe(exactInstant(earliest.created_at));
+        }
+      }
+      expect(durable.map((x) => [x.args.p_certain_at, x.args.p_certain_event_id])).toEqual(plain.map((x) => [x.args.p_certain_at, x.args.p_certain_event_id]));
+      const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
+      expect(back.events.map((e) => e.ev).sort((x, y) => compareUtf8(x.id, y.id))).toEqual(want.events);
+    });
+  }
 });
