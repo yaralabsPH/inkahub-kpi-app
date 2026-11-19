@@ -218,171 +218,195 @@ describe("durable owner read (journaled buildOwnerInput)", () => {
   }, 600_000);
 });
 
-describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash modes, exact resumed requests", () => {
-  type St = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-  const SOURCE = new Set(["read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream", "read_reporting_predecessor_page"]);
-  /** Wipe one owner's journal so a scenario starts from an empty journal. */
-  async function reset(key: string) {
-    const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`;
-    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
-    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
-    await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`);
-  }
-  /** What the journal has committed so far (state, events in ordinal order, members count), as a fresh process would see it. */
-  interface Track { state: St; events: Ev[]; membersCount: number | null }
-  const trackOf = (snap: { state: unknown; events: Ev[]; membersCount: number | null } | null): Track =>
-    snap ? { state: snap.state as St, events: [...snap.events], membersCount: snap.membersCount } : { state: { v: 1, step: "members", m: { afterOrd: null } }, events: [], membersCount: null };
-  const record = (t: Track, p: { events: Ev[]; steps: unknown[]; membersCount?: number }) => {
-    t.events.push(...p.events);
-    if (p.membersCount !== undefined) t.membersCount = p.membersCount;
-    t.state = p.steps[p.steps.length - 1] as St;
+// ---- shared recovery harness (hoisted from the recovery-boundaries describe; behaviour unchanged) ----
+type St = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+const SOURCE = new Set(["read_reporting_owner_members", "read_reporting_events_by_id", "read_reporting_children", "read_reporting_staff_stream", "read_reporting_predecessor_page"]);
+/** Wipe one owner's journal so a scenario starts from an empty journal. */
+async function reset(key: string) {
+  const sel = `select handle from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`;
+  await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
+  await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
+  await db.query(`delete from reporting_private.owner_inputs where partition_key = '${key.replace(/'/g, "''")}'`);
+}
+/** What the journal has committed so far (state, events in ordinal order, members count), as a fresh process would see it. */
+interface Track { state: St; events: Ev[]; membersCount: number | null }
+const trackOf = (snap: { state: unknown; events: Ev[]; membersCount: number | null } | null): Track =>
+  snap ? { state: snap.state as St, events: [...snap.events], membersCount: snap.membersCount } : { state: { v: 1, step: "members", m: { afterOrd: null } }, events: [], membersCount: null };
+const record = (t: Track, p: { events: Ev[]; steps: unknown[]; membersCount?: number }) => {
+  t.events.push(...p.events);
+  if (p.membersCount !== undefined) t.membersCount = p.membersCount;
+  t.state = p.steps[p.steps.length - 1] as St;
+};
+/**
+ * The EXACT arguments the next dependent source read must carry, derived only from the committed journal
+ * (checkpoint-before-dependent-read, no repeat of a completed member/parent/child unit). Null = not derivable
+ * (the first stream page of a worker starts at its latest member line + 1 µs; only the phase is checked then).
+ */
+function expectedArgs(t: Track, fn: string, args: Record<string, unknown>, owner: Owner): Record<string, unknown> | null {
+  const s = t.state;
+  const at = (ord: number) => t.events[ord - 1];
+  const members = () => t.events.slice(0, t.membersCount ?? 0);
+  const fail = (why: string): never => {
+    throw new Error(`${fn} ${JSON.stringify(args).slice(0, 200)} was requested while the committed state is ${JSON.stringify(s)}: ${why}`);
   };
-  /**
-   * The EXACT arguments the next dependent source read must carry, derived only from the committed journal
-   * (checkpoint-before-dependent-read, no repeat of a completed member/parent/child unit). Null = not derivable
-   * (the first stream page of a worker starts at its latest member line + 1 µs; only the phase is checked then).
-   */
-  function expectedArgs(t: Track, fn: string, args: Record<string, unknown>, owner: Owner): Record<string, unknown> | null {
-    const s = t.state;
-    const at = (ord: number) => t.events[ord - 1];
-    const members = () => t.events.slice(0, t.membersCount ?? 0);
-    const fail = (why: string): never => {
-      throw new Error(`${fn} ${JSON.stringify(args).slice(0, 200)} was requested while the committed state is ${JSON.stringify(s)}: ${why}`);
-    };
-    if (fn === "read_reporting_owner_members") {
-      if (s.step !== "members") fail("not in the members phase");
-      const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
-      return { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null };
-    }
-    if (fn === "read_reporting_events_by_id") {
-      if (s.step !== "parents") fail("not in the parents phase");
-      const ids = new Set(members().map((m) => m.id));
-      const parents = [...new Set(members().map((m) => m.parent_event_id).filter((x): x is string => !!x && !ids.has(x)))].sort(compareUtf8);
-      const group = parents.slice(s.p.group * 500, s.p.group * 500 + 500);
-      const a = s.p.afterOrd === null ? null : at(s.p.afterOrd);
-      return { p_ids: a ? group.filter((id) => compareUtf8(id, a.id) > 0) : group };
-    }
-    if (fn === "read_reporting_children" && s.step === "children") {
-      const group = members().map((m) => m.id).sort(compareUtf8).slice(s.c.group * 1000, s.c.group * 1000 + 1000);
-      const a = s.c.afterOrd === null ? null : at(s.c.afterOrd);
-      return { p_parent_ids: group, p_after_parent_id: a ? a.parent_event_id : null, p_after_event_id: a ? a.id : null };
-    }
-    if (fn === "read_reporting_children") {
-      if (s.step !== "walk" || !s.w.line || s.w.line.phase !== "kids") fail("no pending line is committed before its kid page");
-      const l = at(s.w.line.ord);
-      const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
-      return { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null };
-    }
-    if (fn === "read_reporting_predecessor_page") {
-      // step 4: the 0045 combined page is read only while the walk is unsatisfied, from the committed cursor
-      if (s.step !== "walk" || s.w.line !== null || s.w.stopAt !== null) fail("a combined page while a line is pending, after the stop or outside the walk");
-      if (s.w.cursorOrd === null) return null;
-      const cur = at(s.w.cursorOrd);
-      return { p_at: cur.created_at, p_at_event_id: cur.id };
-    }
-    if (fn === "read_reporting_staff_stream") {
-      if (s.step !== "walk" || s.w.line !== null) fail("a stream page while a line is pending or outside the walk");
-      if (s.w.cursorOrd === null) return null;
-      const cur = at(s.w.cursorOrd);
-      return { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id };
-    }
-    return fail("an unexpected source read");
+  if (fn === "read_reporting_owner_members") {
+    if (s.step !== "members") fail("not in the members phase");
+    const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
+    return { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null };
   }
-  /** A source client that checks EVERY source read's exact arguments against the committed journal, and records the reads. */
-  function guardedSource(t: Track, owner: Owner) {
-    const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
-    const client: RpcClient = {
-      rpc: async (fn, args) => {
-        const a = args ?? {};
-        if (SOURCE.has(fn)) {
-          const want = expectedArgs(t, fn, a, owner);
-          if (want) for (const [k, v] of Object.entries(want)) if (JSON.stringify(a[k]) !== JSON.stringify(v)) throw new Error(`${fn}: ${k} = ${JSON.stringify(a[k])?.slice(0, 120)}, the committed journal implies ${JSON.stringify(v)?.slice(0, 120)}`);
-          calls.push({ fn, args: a });
-        }
-        return c().rpc(fn, args);
-      },
-    };
-    return { client, calls };
+  if (fn === "read_reporting_events_by_id") {
+    if (s.step !== "parents") fail("not in the parents phase");
+    const ids = new Set(members().map((m) => m.id));
+    const parents = [...new Set(members().map((m) => m.parent_event_id).filter((x): x is string => !!x && !ids.has(x)))].sort(compareUtf8);
+    const group = parents.slice(s.p.group * 500, s.p.group * 500 + 500);
+    const a = s.p.afterOrd === null ? null : at(s.p.afterOrd);
+    return { p_ids: a ? group.filter((id) => compareUtf8(id, a.id) > 0) : group };
   }
-  /** The exact first source request a resume from `s` must make (null: none is predictable / no read at all). */
-  function expectedFirst(s: St, events: Ev[], owner: Owner, snapMembers: number | null): { fn: string; args: Record<string, unknown> } | "none" | null {
-    const at = (ord: number) => events[ord - 1];
-    if (s.step === "done") return "none";
-    if (s.step === "members") {
-      const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
-      return { fn: "read_reporting_owner_members", args: { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null } };
-    }
-    if (s.step === "parents" || s.step === "children") {
-      const t: Track = { state: s, events, membersCount: snapMembers };
-      const fn = s.step === "parents" ? "read_reporting_events_by_id" : "read_reporting_children";
-      const args = expectedArgs(t, fn, {}, owner)!;
-      if (fn === "read_reporting_events_by_id" && !(args.p_ids as string[]).length) return null; // the group ends without a read
-      return { fn, args };
-    }
-    if (s.step === "walk" && s.w.line && s.w.line.phase === "kids") {
-      const l = at(s.w.line.ord);
-      const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
-      return { fn: "read_reporting_children", args: { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null } };
-    }
-    if (s.step === "walk" && s.w.line === null && s.w.cursorOrd !== null) {
-      const cur = at(s.w.cursorOrd);
-      // while unsatisfied the walk reads the 0045 combined page; after the stop, plain pages for the ties
-      return s.w.stopAt === null
-        ? { fn: "read_reporting_predecessor_page", args: { p_at: cur.created_at, p_at_event_id: cur.id } }
-        : { fn: "read_reporting_staff_stream", args: { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id } };
-    }
-    return null;
+  if (fn === "read_reporting_children" && s.step === "children") {
+    const group = members().map((m) => m.id).sort(compareUtf8).slice(s.c.group * 1000, s.c.group * 1000 + 1000);
+    const a = s.c.afterOrd === null ? null : at(s.c.afterOrd);
+    return { p_parent_ids: group, p_after_parent_id: a ? a.parent_event_id : null, p_after_event_id: a ? a.id : null };
   }
-  /** Run `owner` to the k-th journal call boundary: mode "before" dies before commit k, "after" commits k then loses the response. */
-  async function crashAt(owner: Owner, k: number, mode: "before" | "after", truncateDone = false) {
-    await reset(owner.partitionKey);
-    const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
-    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
-    const t = trackOf(null);
-    let n = 0;
-    const src = guardedSource(t, owner);
-    const journal: OwnerJournal = {
-      async commit(p) {
-        n++;
-        let steps = p.steps;
-        // seed the legal intermediate state "done{effective}" (pending line finished, cursor not yet moved) through the adapter
-        if (truncateDone && n === k) {
-          const i = steps.findIndex((s) => s.step === "walk" && s.w.line?.phase === "done");
-          if (i < 0) throw new Error("no done line in this commit");
-          steps = steps.slice(0, i + 1);
-        }
-        if (mode === "before" && n === k) throw new Crash(`before ${k}`);
-        await j.commit({ ...p, steps });
-        record(t, { ...p, steps });
-        if ((mode === "after" || truncateDone) && n === k) throw new Crash(`after ${k}`);
-      },
-    };
-    await expect(durableOwnerInput(rpcFrozenReader(src.client, ref), owner, journal)).rejects.toBeInstanceOf(Crash);
-    return h.handle;
+  if (fn === "read_reporting_children") {
+    if (s.step !== "walk" || !s.w.line || s.w.line.phase !== "kids") fail("no pending line is committed before its kid page");
+    const l = at(s.w.line.ord);
+    const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
+    return { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null };
   }
-  async function resume(owner: Owner, handle: string, want: unknown, label: string) {
-    const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
-    const snap = ownerJournalSnapshot(back);
-    const t = trackOf(snap);
-    const j = ownerJournal(c(), ref.batchId, ref.fence, handle, back.header.seq, cutoffUs());
-    const src = guardedSource(t, owner);
-    const got = await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { await j.commit(p); record(t, p); } }, snap);
-    expect(got, label).toEqual(want);
-    const first = expectedFirst(snap.state as unknown as St, snap.events, owner, snap.membersCount);
-    if (first === "none") expect(src.calls, `${label}: a done journal reads nothing`).toEqual([]);
-    else if (first) expect(src.calls[0], `${label}: the first resumed request continues exactly at the saved cursor`).toMatchObject(first);
-    return snap.state as unknown as St;
+  if (fn === "read_reporting_predecessor_page") {
+    // step 4: the 0045 combined page is read only while the walk is unsatisfied, from the committed cursor
+    if (s.step !== "walk" || s.w.line !== null || s.w.stopAt !== null) fail("a combined page while a line is pending, after the stop or outside the walk");
+    if (s.w.cursorOrd === null) return null;
+    const cur = at(s.w.cursorOrd);
+    return { p_at: cur.created_at, p_at_event_id: cur.id };
   }
-  /** The steps of every commit of an uninterrupted durable read (journal-free). */
-  async function commitsOf(owner: Owner) {
-    const commits: St[][] = [];
-    // the uninterrupted pass is guarded too: every read must carry the exact arguments its committed prefix implies
-    const t = trackOf(null);
-    const src = guardedSource(t, owner);
-    await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { commits.push(p.steps as unknown as St[]); record(t, p); } });
-    return commits;
+  if (fn === "read_reporting_staff_stream") {
+    if (s.step !== "walk" || s.w.line !== null) fail("a stream page while a line is pending or outside the walk");
+    if (s.w.cursorOrd === null) return null;
+    const cur = at(s.w.cursorOrd);
+    return { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id };
   }
+  return fail("an unexpected source read");
+}
+/** A source client that checks EVERY source read's exact arguments against the committed journal, and records the reads. */
+function guardedSource(t: Track, owner: Owner) {
+  const calls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  const client: RpcClient = {
+    rpc: async (fn, args) => {
+      const a = args ?? {};
+      if (SOURCE.has(fn)) {
+        const want = expectedArgs(t, fn, a, owner);
+        if (want) for (const [k, v] of Object.entries(want)) if (JSON.stringify(a[k]) !== JSON.stringify(v)) throw new Error(`${fn}: ${k} = ${JSON.stringify(a[k])?.slice(0, 120)}, the committed journal implies ${JSON.stringify(v)?.slice(0, 120)}`);
+        calls.push({ fn, args: a });
+      }
+      return c().rpc(fn, args);
+    },
+  };
+  return { client, calls };
+}
+/** The exact first source request a resume from `s` must make (null: none is predictable / no read at all). */
+function expectedFirst(s: St, events: Ev[], owner: Owner, snapMembers: number | null): { fn: string; args: Record<string, unknown> } | "none" | null {
+  const at = (ord: number) => events[ord - 1];
+  if (s.step === "done") return "none";
+  if (s.step === "members") {
+    const a = s.m.afterOrd === null ? null : at(s.m.afterOrd);
+    return { fn: "read_reporting_owner_members", args: { p_owners: [[owner.partitionKind, owner.partitionKey]], p_after_index: a ? 0 : null, p_after_event_id: a ? a.id : null } };
+  }
+  if (s.step === "parents" || s.step === "children") {
+    const t: Track = { state: s, events, membersCount: snapMembers };
+    const fn = s.step === "parents" ? "read_reporting_events_by_id" : "read_reporting_children";
+    const args = expectedArgs(t, fn, {}, owner)!;
+    if (fn === "read_reporting_events_by_id" && !(args.p_ids as string[]).length) return null; // the group ends without a read
+    return { fn, args };
+  }
+  if (s.step === "walk" && s.w.line && s.w.line.phase === "kids") {
+    const l = at(s.w.line.ord);
+    const k = s.w.line.afterKidOrd === null ? null : at(s.w.line.afterKidOrd);
+    return { fn: "read_reporting_children", args: { p_parent_ids: [l.id], p_after_parent_id: k ? l.id : null, p_after_event_id: k ? k.id : null } };
+  }
+  if (s.step === "walk" && s.w.line === null && s.w.cursorOrd !== null) {
+    const cur = at(s.w.cursorOrd);
+    // while unsatisfied the walk reads the 0045 combined page; after the stop, plain pages for the ties
+    return s.w.stopAt === null
+      ? { fn: "read_reporting_predecessor_page", args: { p_at: cur.created_at, p_at_event_id: cur.id } }
+      : { fn: "read_reporting_staff_stream", args: { p_direction: "before", p_at: cur.created_at, p_at_event_id: cur.id } };
+  }
+  return null;
+}
+/** Run `owner` to the k-th journal call boundary: mode "before" dies before commit k, "after" commits k then loses the response. */
+async function crashAt(owner: Owner, k: number, mode: "before" | "after", truncateDone = false) {
+  await reset(owner.partitionKey);
+  const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
+  const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+  const t = trackOf(null);
+  let n = 0;
+  const src = guardedSource(t, owner);
+  const journal: OwnerJournal = {
+    async commit(p) {
+      n++;
+      let steps = p.steps;
+      // seed the legal intermediate state "done{effective}" (pending line finished, cursor not yet moved) through the adapter
+      if (truncateDone && n === k) {
+        const i = steps.findIndex((s) => s.step === "walk" && s.w.line?.phase === "done");
+        if (i < 0) throw new Error("no done line in this commit");
+        steps = steps.slice(0, i + 1);
+      }
+      if (mode === "before" && n === k) throw new Crash(`before ${k}`);
+      await j.commit({ ...p, steps });
+      record(t, { ...p, steps });
+      if ((mode === "after" || truncateDone) && n === k) throw new Crash(`after ${k}`);
+    },
+  };
+  await expect(durableOwnerInput(rpcFrozenReader(src.client, ref), owner, journal)).rejects.toBeInstanceOf(Crash);
+  return h.handle;
+}
+async function resume(owner: Owner, handle: string, want: unknown, label: string) {
+  const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
+  const snap = ownerJournalSnapshot(back);
+  const t = trackOf(snap);
+  const j = ownerJournal(c(), ref.batchId, ref.fence, handle, back.header.seq, cutoffUs());
+  const src = guardedSource(t, owner);
+  const got = await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { await j.commit(p); record(t, p); } }, snap);
+  expect(got, label).toEqual(want);
+  const first = expectedFirst(snap.state as unknown as St, snap.events, owner, snap.membersCount);
+  if (first === "none") expect(src.calls, `${label}: a done journal reads nothing`).toEqual([]);
+  else if (first) expect(src.calls[0], `${label}: the first resumed request continues exactly at the saved cursor`).toMatchObject(first);
+  return snap.state as unknown as St;
+}
+/** The steps of every commit of an uninterrupted durable read (journal-free). */
+async function commitsOf(owner: Owner) {
+  const commits: St[][] = [];
+  // the uninterrupted pass is guarded too: every read must carry the exact arguments its committed prefix implies
+  const t = trackOf(null);
+  const src = guardedSource(t, owner);
+  await durableOwnerInput(rpcFrozenReader(src.client, ref), owner, { commit: async (p) => { commits.push(p.steps as unknown as St[]); record(t, p); } });
+  return commits;
+}
 
+/** Interleaved trace of source RPCs and journal commits of a fresh durable read of `owner` (optionally crashing at commit k). */
+async function traced(owner: Owner, crash?: { k: number; mode: "before" | "after" }) {
+  await reset(owner.partitionKey);
+  const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
+  const trace: Array<{ rpc: string; args: Record<string, unknown> } | { commit: number; ids: string[]; steps: unknown[] }> = [];
+  const client: RpcClient = { rpc: async (fn, a) => (fn.startsWith("read_reporting_") && trace.push({ rpc: fn, args: a ?? {} }), c().rpc(fn, a)) };
+  const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+  let n = 0;
+  const journal: OwnerJournal = {
+    async commit(p) {
+      n++;
+      if (crash && crash.mode === "before" && n === crash.k) throw new Crash("before");
+      await j.commit(p);
+      trace.push({ commit: n, ids: p.events.map((e) => e.id), steps: p.steps });
+      if (crash && crash.mode === "after" && n === crash.k) throw new Crash("after");
+    },
+  };
+  const run = durableOwnerInput(rpcFrozenReader(client, ref), owner, journal);
+  if (crash) await expect(run).rejects.toBeInstanceOf(Crash);
+  else await run;
+  return { trace, handle: h.handle };
+}
+
+describe("recovery boundaries (review r2 Must-fix 4): every commit, both crash modes, exact resumed requests", () => {
   for (const key of ["EMPTY", "NOTE", "BIG"]) {
     it(`${key}: a crash before or after EVERY commit resumes to buildOwnerInput, with the exact next request and checkpoint-first reads`, async () => {
       const o: Owner = { partitionKind: "order", partitionKey: key };
@@ -933,38 +957,10 @@ describe("worker seams over the journal (T15P-4d step 3a)", () => {
 
 describe("a complete multi-line 0045 page is ONE atomic durable page (scope review Must-fix 4)", () => {
   const o: Owner = { partitionKind: "order", partitionKey: "CP-M" };
-  async function wipe() {
-    const sel = "select handle from reporting_private.owner_inputs where partition_key = 'CP-M'";
-    await db.query(`delete from reporting_private.owner_input_pieces where handle in (${sel})`);
-    await db.query(`delete from reporting_private.owner_input_events where handle in (${sel})`);
-    await db.query("delete from reporting_private.owner_inputs where partition_key = 'CP-M'");
-  }
-  /** Interleaved trace of source RPCs and journal commits. */
-  async function traced(crashAt?: { k: number; mode: "before" | "after" }) {
-    await wipe();
-    const h = await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan");
-    const trace: Array<{ rpc: string; args: Record<string, unknown> } | { commit: number; ids: string[]; steps: unknown[] }> = [];
-    const client: RpcClient = { rpc: async (fn, a) => (fn.startsWith("read_reporting_") && trace.push({ rpc: fn, args: a ?? {} }), c().rpc(fn, a)) };
-    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
-    let n = 0;
-    const journal: OwnerJournal = {
-      async commit(p) {
-        n++;
-        if (crashAt && crashAt.mode === "before" && n === crashAt.k) throw new Crash("before");
-        await j.commit(p);
-        trace.push({ commit: n, ids: p.events.map((e) => e.id), steps: p.steps });
-        if (crashAt && crashAt.mode === "after" && n === crashAt.k) throw new Crash("after");
-      },
-    };
-    const run = durableOwnerInput(rpcFrozenReader(client, ref), o, journal);
-    if (crashAt) await expect(run).rejects.toBeInstanceOf(Crash);
-    else await run;
-    return { trace, handle: h.handle };
-  }
 
   it("lines and included kids commit together in ordered steps, before the next dependent read, with no child request for them", async () => {
     const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
-    const { trace } = await traced();
+    const { trace } = await traced(o);
     const i = trace.findIndex((x) => "rpc" in x && x.rpc === "read_reporting_predecessor_page");
     expect(i).toBeGreaterThan(-1);
     const page = trace[i] as { rpc: string; args: Record<string, unknown> };
@@ -986,11 +982,11 @@ describe("a complete multi-line 0045 page is ONE atomic durable page (scope revi
 
   it("a crash just before that commit, or after it with the response lost, recovers from the saved cursor without re-reading the committed page", async () => {
     const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
-    const full = await traced();
+    const full = await traced(o);
     const i = full.trace.findIndex((x) => "rpc" in x && x.rpc === "read_reporting_predecessor_page");
     const k = (full.trace[i + 1] as { commit: number }).commit;
     for (const mode of ["before", "after"] as const) {
-      const { handle } = await traced({ k, mode });
+      const { handle } = await traced(o, { k, mode });
       const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
       const snap = ownerJournalSnapshot(back);
       const reads: Array<{ fn: string; args: Record<string, unknown> }> = [];
