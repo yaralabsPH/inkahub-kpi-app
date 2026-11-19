@@ -10,12 +10,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { buildOwnerInput, diffFrozenViews, materializeBatch, materializeOwnerWorks, memoryFrozenReader, ownerDescriptors, ownerKey, ownerOfEvent, ownerWorksFromInput, type ChangedKey, type Owner } from "../../api/_lib/production-reporting-materialize";
-import type { EnumerationPages, FrozenBatchRef, FrozenReaderPages } from "../../api/_lib/production-reporting-reader";
+import { MAX_RESPONSE_BYTES, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef, type FrozenReaderPages } from "../../api/_lib/production-reporting-reader";
 import { failureKind, FIRST_UNIT_CPU_MS, FIXED_PREREQUISITE_RPCS, HASH_UNIT_RPCS, HEARTBEAT_MS, isTransient, processCpuMs, READ_LEG_RPCS, runReportingCycle, WORKER_BUDGET_MS, type AdmissionRecord, type CycleResult, type WorkerEnv } from "../../api/_lib/production-reporting-worker";
 import { bearerMatches } from "../../api/_lib/reporting-auth";
 import { REPORTING_SITES, type RpcClient } from "../../api/_lib/reporting-jobs";
 import { compareUtf8, reportingManifestHash, sortDescriptors, type WorkDescriptor } from "../../api/_lib/reporting-stage";
-import { checkpointOwners, manifestFromSaved, parseEnumCursor } from "../../api/_lib/reporting-worker-state";
+import { checkpointOwners, eventEntries, manifestFromSaved, ownerPageCalls, parseEnumCursor, REQUEST_BODY_BYTES, writeOwnerPage } from "../../api/_lib/reporting-worker-state";
 import { AdminCommand, createAdminHandler, runAdminCommand } from "../../api/reports/reporting-admin";
 import { createRefreshHandler } from "../../api/reports/refresh-summaries";
 import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
@@ -514,12 +514,13 @@ class FakeDb implements RpcClient {
 }
 
 /** Frozen reads from memory with real paging (the enumeration pages honour the cursor). */
-function memorySource(view: Ev[], changed: ChangedKey[], counters: { keyPages: Array<string | null>; ownerPages: Array<string | null> }, pageSize = 37, clock?: { db: FakeDb; perRead: number }, fail?: { method: string; nth: number; seen?: number }) {
+function memorySource(view: Ev[], changed: ChangedKey[], counters: { keyPages: Array<string | null>; ownerPages: Array<string | null> }, pageSize = 37, clock?: { db: FakeDb; perRead: number }, fail?: { method: string; nth: number; seen?: number }, onRead?: (method: string, arg: unknown) => void) {
   return (ref: FrozenBatchRef): { reader: ReturnType<typeof memoryFrozenReader> & { pages: FrozenReaderPages }; pages: EnumerationPages } => {
     const inner = memoryFrozenReader({ site: ref.site, cutoff: ref.cutoff, kind: ref.kind, view, changed });
     const tick = () => void (clock && (clock.db.clock += clock.perRead));
     /** A transient on the nth call of `fail.method` (counted across invocations), thrown before the read. */
-    const maybeFail = (method: string) => {
+    const maybeFail = (method: string, arg?: unknown) => {
+      onRead?.(method, arg);
       if (!fail || fail.method !== method) return;
       fail.seen = (fail.seen ?? 0) + 1;
       if (fail.seen === fail.nth) throw new Error("fetch failed (injected)");
@@ -537,7 +538,7 @@ function memorySource(view: Ev[], changed: ChangedKey[], counters: { keyPages: A
     const pages: FrozenReaderPages = {
       async membersPage(owners, after, limit = 1000) {
         tick();
-        maybeFail("membersPage");
+        maybeFail("membersPage", owners[0]?.partitionKey);
         const rows = owners.flatMap((o, i) => (byOwner.get(ownerKey(o)) ?? []).map((ev) => ({ ownerIndex: i, ev })))
           .filter((r) => after === null || r.ownerIndex > after.index || (r.ownerIndex === after.index && after.id !== null && compareUtf8(r.ev.id, after.id) > 0)).slice(0, limit);
         const last = rows.at(-1);
@@ -1053,20 +1054,31 @@ describe("T15P-4d step 4: every durable leg is admitted against the actual heart
     expect(new Set(seen.map((x) => x.unit))).toEqual(new Set(["read", "commit", "hash"]));
     const fixed = FIXED_PREREQUISITE_RPCS + r.counts.activationCalls + 1;
     let readMeasured = false;
+    let hashMeasured = false;
+    let maxCalls = 1;
     seen.forEach((x, i) => {
       expect(x.owner).toEqual({ partitionKind: "order", partitionKey: "HEAVY-1" });
-      // prerequisites follow the journal as it grows: fixed + the CURRENT reload cost (no open/discard once done);
-      // wall-time I/O never becomes CPU (the CPU clock stands still)
+      // the FRESH path: prerequisites follow the journal as it grows (fixed + the CURRENT reload cost; no open or discard
+      // once done); wall-time I/O never becomes CPU (the CPU clock stands still)
       expect(x.path.prerequisites).toEqual({ rpcs: fixed + x.liveReload, cpuMs: 0 });
-      expect(x.path.prerequisitesPaid).toBe(true);
+      expect(x.path.prerequisitesPaid).toBe(false);
       if (x.unit === "read") {
-        expect(x.path.unit).toEqual({ rpcs: READ_LEG_RPCS, cpuMs: readMeasured ? 0 : FIRST_UNIT_CPU_MS });
+        // an estimate before the page is known: the read plus the largest commit so far; the same is still unpaid
+        expect(x.path.unit).toEqual({ rpcs: 1 + maxCalls, cpuMs: readMeasured ? 0 : FIRST_UNIT_CPU_MS });
+        expect(x.now).toEqual(x.path.unit);
       } else if (x.unit === "commit") {
         readMeasured = true;
-        // the admitted commit is EXACTLY the checkpoint calls that follow it, counted independently in the fake
+        // the admitted commit is EXACTLY the checkpoint calls that follow it, counted independently in the fake; fresh
+        // also re-reads the page, while only the calls are still unpaid now
         const until = seen[i + 1]?.callIndex ?? db.calls.length;
-        expect(x.path.unit.rpcs).toBe(db.calls.slice(x.callIndex, until).filter((c) => c.fn === "checkpoint_reporting_owner_input").length);
-      } else expect(x.path.unit.rpcs).toBe(HASH_UNIT_RPCS);
+        const calls = db.calls.slice(x.callIndex, until).filter((c) => c.fn === "checkpoint_reporting_owner_input").length;
+        expect(x.path.unit).toEqual({ rpcs: 1 + calls, cpuMs: 0 });
+        expect(x.now).toEqual({ rpcs: calls, cpuMs: 0 });
+        maxCalls = Math.max(maxCalls, calls);
+      } else {
+        expect(x.path.unit).toEqual({ rpcs: HASH_UNIT_RPCS, cpuMs: hashMeasured ? 0 : FIRST_UNIT_CPU_MS });
+        hashMeasured = true;
+      }
       const marks = [t0, ...db.calls.filter((c) => c.fn === "renew_reporting_lease" && c.at <= x.nowMs).map((c) => c.at)];
       expect(x.sinceBeatMs).toBe(x.nowMs - Math.max(...marks));
       expect(x.sinceBeatMs).toBeLessThan(HEARTBEAT_MS);
@@ -1235,10 +1247,21 @@ describe("T15P-4d step 4: every durable leg is admitted against the actual heart
     expect((await runReportingCycle(env(db, src()), { site: "uk", mode: "rebuild" })).state).toBe("pending");
     db.transientLeft = 0;
     db.clock += 400_000;
-    // the journal reload's parsing costs 250 s of CPU, which is also 250 s of wall time
-    const client: RpcClient = { rpc: async (fn, args) => (fn === "load_reporting_owner_input_header" && (db.clock += 250_000), db.rpc(fn, args)) };
+    // the journal reload's SYNCHRONOUS parsing after the header response costs 250 s of CPU, which is also 250 s of
+    // wall time (the RPC wait itself is not CPU: it is excluded by the owner's meter)
+    let cpu = 0;
+    let armed = -1;
+    const client: RpcClient = { rpc: async (fn, args) => { const out = await db.rpc(fn, args); if (fn === "load_reporting_owner_input_header" && armed < 0) armed = 0; return out; } };
+    const cpuNow = () => {
+      if (armed >= 0 && armed++ === 1) {
+        cpu += 250_000;
+        db.clock += 250_000;
+        armed = -2;
+      }
+      return cpu;
+    };
     const seen: AdmissionRecord[] = [];
-    const r = await runReportingCycle({ ...env(db, src()), client, cpuNow: () => db.clock, onAdmission: (x) => void seen.push(x) }, { site: "uk", mode: "rebuild" });
+    const r = await runReportingCycle({ ...env(db, src()), client, cpuNow, onAdmission: (x) => void seen.push(x) }, { site: "uk", mode: "rebuild" });
     expect(r).toMatchObject({ state: "failed", failureKind: "owner_input_capacity" });
     expect(seen.at(-1)).toMatchObject({ verdict: "capacity", action: "fail" });
     expect(r.problems.join()).toMatch(/owner_input_capacity: an order owner cannot progress/);
@@ -1247,6 +1270,272 @@ describe("T15P-4d step 4: every durable leg is admitted against the actual heart
     expect(db.journals.size).toBe(1); // the evidence stays
     expect(db.runs.at(-1)).toMatchObject({ p_outcome: "failed", p_failure_kind: "owner_input_capacity" });
     expect(JSON.stringify(db.runs.at(-1))).not.toMatch(/HEAVY/);
+  });
+
+  // ---- round 3 (Astra wiring-step-4 r2) ----
+  /** Invocation 1 copies and enumerates; planning's owner list then keeps failing (deferred): no journal yet. */
+  const enumerated = async (view: Ev[], tick = 50, fail?: Fail) => {
+    const db = new FakeDb("rebuild", { transientAt: "list_reporting_worker_owners", transientTimes: 9, ...fail }, tick);
+    expect((await runReportingCycle(env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), { site: "uk", mode: "rebuild" })).state).toBe("pending");
+    db.transientLeft = 0;
+    db.clock += 400_000;
+    return db;
+  };
+  const big2 = () => [0, 1].map((i) => ev(`hb-${i}`, { order_number: "HEAVY-2", created_at: `2026-02-22T08:00:0${i}+00:00`, line_sku: "X" + "y".repeat(700_000) }));
+
+  it("paid serialization is not charged again: 120 s spent sizing a page still lets its one remaining commit run, and the cursor advances", async () => {
+    const view = heavyOnly();
+    const db = await enumerated(view);
+    let cpu = 0;
+    let once = true;
+    const seen: AdmissionRecord[] = [];
+    const r = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), cpuNow: () => cpu, cpuProbe: (pt) => {
+      if (pt === "serialized" && once) {
+        once = false;
+        cpu += 120_000;
+        db.clock += 120_000; // CPU and wall time together
+      }
+    }, onAdmission: (x) => void seen.push(x) }, { site: "uk", mode: "rebuild" });
+    const c = seen.find((x) => x.unit === "commit")!;
+    expect(c.path.unit.cpuMs).toBeGreaterThanOrEqual(120_000); // a fresh run must redo it ...
+    expect(c.now.cpuMs).toBe(0); // ... but it is already paid now
+    expect(c.action).toBe("run");
+    expect([...db.journals.values()][0].seq).toBeGreaterThan(0n);
+    expect(["published", "pending"]).toContain(r.state);
+  });
+
+  it("a page whose pieces each fit but whose COMPLETE fresh path (re-read + process + serialize + all calls) does not: owner_input_capacity before any upload", async () => {
+    const view = big2();
+    const db = await enumerated(view);
+    let cpu = 0;
+    let once = true;
+    const seen: AdmissionRecord[] = [];
+    const r = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), cpuNow: () => cpu, cpuProbe: (pt) => {
+      if (pt === "serialized" && once) {
+        once = false;
+        cpu += 236_000; // CPU only: the invocation still has its time
+      }
+    }, onAdmission: (x) => void seen.push(x) }, { site: "uk", mode: "rebuild" });
+    const c = seen.find((x) => x.unit === "commit")!;
+    expect(c.now.rpcs).toBeGreaterThanOrEqual(3); // a multi-call page, whose remaining calls alone would fit now
+    expect(c.path.unit.rpcs).toBe(1 + c.now.rpcs);
+    expect([c.verdict, c.action]).toEqual(["capacity", "fail"]);
+    expect(r).toMatchObject({ state: "failed", failureKind: "owner_input_capacity" });
+    const j = [...db.journals.values()][0];
+    expect([j.seq, j.pieces.pending, j.events.size]).toEqual([0n, 0, 0]); // nothing uploaded; the evidence (journal) stays
+    expect(db.calls.filter((x) => x.fn === "checkpoint_reporting_owner_input")).toEqual([]);
+  });
+
+  it("a page that fits fresh but not now parks BEFORE uploading any piece; the next standard invocation advances it", async () => {
+    const view = big2();
+    const db = await enumerated(view);
+    let once = true;
+    const seen: AdmissionRecord[] = [];
+    const r = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), cpuNow: () => 0, cpuProbe: (pt) => {
+      if (pt === "serialized" && once) {
+        once = false;
+        db.clock += 237_000; // wall time only: the invocation is nearly over
+      }
+    }, onAdmission: (x) => void seen.push(x) }, { site: "uk", mode: "rebuild" });
+    expect(seen.find((x) => x.unit === "commit")).toMatchObject({ verdict: "pending", action: "park" });
+    expect(r.state).toBe("pending");
+    const j = [...db.journals.values()][0];
+    expect([j.seq, j.pieces.pending]).toEqual([0n, 0]);
+    expect(db.calls.filter((x) => x.fn === "checkpoint_reporting_owner_input")).toEqual([]);
+    db.clock += 400_000;
+    // the next standard invocation reads, commits and hashes it (its 700 KB fixture rows are later too big to STAGE,
+    // which is unrelated to admission: planning is what is checked here)
+    await runReportingCycle(env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), { site: "uk", mode: "rebuild" });
+    expect(j.seq).toBeGreaterThan(0n);
+    expect(j.phase).toBe("complete");
+    expect([...db.owners.values()].every((o) => o.count !== null)).toBe(true);
+  });
+
+  it("CPU ownership: light, decode, reconstruction and descriptor CPU are charged to the owner that spent them; other owners' light work and renewals are not", async () => {
+    const view = [...base, ...heavyOnly()];
+    const db = await enumerated(view, 1_000);
+    let cpu = 0;
+    let heavyPages = 0;
+    const onRead = (method: string, arg: unknown) => {
+      if (method !== "membersPage") return;
+      if (arg === "HEAVY-1") {
+        heavyPages++;
+        if (heavyPages === 1) cpu += 5_000; // HEAVY-1's own LIGHT member page
+        if (heavyPages === 2) cpu += 7_000; // HEAVY-1's first DURABLE member page: decode
+      } else if (arg === "O-1") cpu += 50_000; // another owner's concurrent light work
+    };
+    const client: RpcClient = { rpc: async (fn, args) => (fn === "renew_reporting_lease" && (cpu += 60_000), db.rpc(fn, args)) };
+    const probes: Record<string, number> = { reconstructed: 3_000, described: 4_000 };
+    const seen: AdmissionRecord[] = [];
+    const r = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37, undefined, undefined, onRead)), client, cpuNow: () => cpu, cpuProbe: (pt) => {
+      cpu += probes[pt] ?? 0;
+      probes[pt] = 0;
+    }, onAdmission: (x) => void seen.push(x) }, { site: "uk", mode: "rebuild" });
+    expect(r.state).toBe("published");
+    expect(db.calls.some((c) => c.fn === "renew_reporting_lease")).toBe(true); // renewals did happen (and spent "CPU")
+    const reads = seen.filter((x) => x.unit !== "hash");
+    const hashes = seen.filter((x) => x.unit === "hash");
+    // prerequisites: light 5,000 + reconstruction 3,000 (+ reload work of later commits, 0 here); never O-1's or renewal CPU
+    expect(reads[0].path.prerequisites.cpuMs).toBe(8_000);
+    for (const x of seen) expect(x.path.prerequisites.cpuMs).toBeLessThan(50_000);
+    // the first commit carries the 7,000 ms decode of its page (fresh must redo it); nothing of it is unpaid now
+    const c = reads.find((x) => x.unit === "commit")!;
+    expect(c.path.unit.cpuMs).toBe(7_000);
+    expect(c.now.cpuMs).toBe(0);
+    // the next read leg is estimated from that measurement; hash legs add the 4,000 ms descriptors once
+    expect(reads.filter((x) => x.unit === "read")[1]?.path.unit.cpuMs ?? 7_000).toBe(7_000);
+    expect(hashes[0].path.prerequisites.cpuMs).toBe(8_000 + 4_000);
+  });
+
+  it("an unfinished multi-call page (pending pieces) is discarded exactly once on recovery, the prediction drops the discard, and the cursor advances", async () => {
+    const view = big2();
+    const db = await enumerated(view);
+    // the second pieces call of HEAVY-2's first page keeps failing: the first stays pending, the cycle defers
+    // every SECOND consecutive pieces call fails, so each attempt leaves exactly its first pieces call pending
+    let lastWasPieces = false;
+    const flaky: RpcClient = { rpc: async (fn, args) => {
+      const kind = fn === "checkpoint_reporting_owner_input" ? (args.p_payload as { kind: string }).kind : null;
+      if (kind === "pieces") {
+        if (lastWasPieces) return { data: null, error: { message: "fetch failed", code: null as unknown as string } };
+        lastWasPieces = true;
+      } else if (kind) lastWasPieces = false;
+      return db.rpc(fn, args);
+    } };
+    const first = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), client: flaky }, { site: "uk", mode: "rebuild" });
+    expect(first.state).toBe("pending");
+    const j = [...db.journals.values()][0];
+    expect(j.pieces.pending).toBeGreaterThan(0);
+    expect(j.events.size).toBe(0);
+    db.clock += 400_000;
+    const from = db.calls.length;
+    const seen: Array<AdmissionRecord & { live: number }> = [];
+    const second = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), cpuNow: () => 0, onAdmission: (x) => void seen.push({ ...x, live: liveReload(db) }) }, { site: "uk", mode: "rebuild" });
+    // planning completes (the 700 KB fixture rows are later too big to STAGE: unrelated to recovery)
+    expect(j.phase).toBe("complete");
+    expect([...db.owners.values()].every((o) => o.count !== null)).toBe(true);
+    const calls = db.calls.slice(from).map((c) => [c.fn, (c.args.p_payload as { kind?: string } | undefined)?.kind ?? null]);
+    const lookup = calls.findIndex((c) => c[0] === "lookup_reporting_owner_inputs");
+    expect(calls.slice(lookup, lookup + 3)).toEqual([["lookup_reporting_owner_inputs", null], ["checkpoint_reporting_owner_input", "discard_pending"], ["load_reporting_owner_input_header", null]]);
+    expect(calls.filter((c) => c[1] === "discard_pending")).toHaveLength(1);
+    // after the discard, every admission's prediction is fixed + the live reload: no discard (or open) leg is charged
+    const fixed = FIXED_PREREQUISITE_RPCS + (second.counts.activationCalls ?? 0) + 1;
+    for (const x of seen) expect(x.path.prerequisites.rpcs).toBe(fixed + x.live);
+    expect(seen[0].path.prerequisites.rpcs).toBe(fixed + 2); // header + eof of the (still empty) committed journal
+    expect(j.seq).toBeGreaterThan(1n);
+    expect(j.pieces.pending).toBe(0);
+  });
+
+  /** WIDE: 101 members of distinct workers plus 1,000 of W1 (row trigger): 103 audiences, so hashing takes two checkpoints. */
+  const wide = (): Ev[] => Array.from({ length: 101 }, (_, i) => ev(`wd-${String(i).padStart(3, "0")}`, {
+    order_number: "WIDE", staff_id: `${(0x200 + i).toString(16).padStart(8, "0")}-cccc-4ccc-8ccc-cccccccccccc`, created_at: `2026-02-23T08:00:${String(i % 60).padStart(2, "0")}+00:00`,
+    event_type: "started", line_sku: null, line_quantity: null,
+  })).concat(Array.from({ length: 1000 }, (_, i) => ev(`wx-${String(i).padStart(4, "0")}`, { order_number: "WIDE", staff_id: W1, created_at: "2026-02-23T07:00:00+00:00", event_type: "started", line_sku: null, line_quantity: null })));
+  /** WIDE hashed once (100 of 103 audiences), then its 2nd hash checkpoint kept failing: pending, phase hashing. */
+  const halfHashed = async (tick = 50) => {
+    const view = wide();
+    const db = await enumerated(view, tick);
+    let hashes = 0;
+    const flaky: RpcClient = { rpc: async (fn, args) => {
+      if (fn === "checkpoint_reporting_owner_input" && (args.p_payload as { kind: string }).kind === "hash" && ++hashes >= 2 && hashes <= 5) return { data: null, error: { message: "fetch failed", code: null as unknown as string } };
+      return db.rpc(fn, args);
+    } };
+    expect((await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37)), client: flaky }, { site: "uk", mode: "rebuild" })).state).toBe("pending");
+    const j = [...db.journals.values()][0];
+    expect([j.phase, j.hashes.length, j.audiences?.length]).toEqual(["hashing", 100, 103]);
+    db.clock += 400_000;
+    return { db, view, j };
+  };
+
+  it("a partially hashed journal resumes first: one reload, no durable source read, the saved hash progress continues to complete", async () => {
+    const { db, view, j } = await halfHashed();
+    const seq0 = j.seq;
+    let durableReads = 0;
+    let recovered = false;
+    const client: RpcClient = { rpc: async (fn, args) => (fn === "lookup_reporting_owner_inputs" && (recovered = true), db.rpc(fn, args)) };
+    const from = db.calls.length;
+    const r = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37, undefined, undefined, () => void (recovered && durableReads++))), client }, { site: "uk", mode: "rebuild" });
+    expect(r.state).toBe("published");
+    const calls = db.calls.slice(from);
+    const firstPlan = calls.findIndex((c) => c.fn === "plan_reporting_owner");
+    const before = calls.slice(0, firstPlan);
+    expect(durableReads).toBe(0); // the journal IS the input: nothing re-read
+    expect(before.filter((c) => c.fn === "load_reporting_owner_input_events").length).toBe(Math.ceil(j.pieces.committed / 500) + 1); // ONE reload
+    expect(before.filter((c) => c.fn === "checkpoint_reporting_owner_input").map((c) => (c.args.p_payload as { kind: string; hashes: unknown[] }).hashes.length)).toEqual([3]); // only the missing 3
+    expect([j.phase, j.hashes.length]).toEqual(["complete", 103]);
+    expect(j.seq).toBe(seq0 + 1n);
+  });
+
+  it("the hash unit at 29,500 ms (worker level): 5,000 ms left parks before its header; 6,000 ms renews between header and checkpoint and keeps the reserve; a renewal that crosses the deadline sends nothing after it", async () => {
+    const run = async (latency: number, deadlineMs: number, renewDelay = 0) => {
+      const { db, view, j } = await halfHashed(1_000);
+      const seen: Array<AdmissionRecord & { callIndex: number }> = [];
+      const client: RpcClient = { rpc: async (fn, args) => {
+        if (fn === "list_reporting_worker_owners") db.clock += latency;
+        const out = await db.rpc(fn, args);
+        if (fn === "renew_reporting_lease") db.clock += renewDelay;
+        return out;
+      } };
+      const t0 = db.clock;
+      const r = await runReportingCycle({ ...env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37, { db, perRead: 500 })), client, cpuNow: () => 0, onAdmission: (x) => void seen.push({ ...x, callIndex: db.calls.length }) }, { site: "uk", mode: "rebuild", deadlineMs });
+      return { db, r, j, t0, h: seen.find((x) => x.unit === "hash")! };
+    };
+    const probe = await run(0, 240_000);
+    const latency = 29_500 - probe.h.sinceBeatMs;
+    expect(latency).toBeGreaterThan(0);
+    // 2 RPCs + the 1,000 ms first-unit CPU estimate cross 30 s: one renewal, then the 2,000 ms reserve = 6,000 ms
+    const short = async (left: number, renewDelay = 0) => {
+      const first = await run(latency, 240_000); // calibrates the absolute admission time for this latency
+      const at = first.h.nowMs - first.t0;
+      return run(latency, at + left, renewDelay);
+    };
+    const pk = await short(5_000);
+    expect([pk.h.sinceBeatMs, pk.h.remainingMs, pk.h.verdict, pk.h.action]).toEqual([29_500, 5_000, "pending", "park"]);
+    expect(pk.r.state).toBe("pending");
+    expect(pk.db.calls.slice(pk.h.callIndex).filter((c) => c.fn === "load_reporting_owner_input_header" || c.fn === "checkpoint_reporting_owner_input")).toEqual([]);
+    expect(pk.j.hashes.length).toBe(100);
+    const ok = await short(6_000);
+    expect([ok.h.sinceBeatMs, ok.h.remainingMs, ok.h.verdict]).toEqual([29_500, 6_000, "run"]);
+    const after = ok.db.calls.slice(ok.h.callIndex).map((c) => c.fn);
+    expect(after.slice(0, 3)).toEqual(["load_reporting_owner_input_header", "renew_reporting_lease", "checkpoint_reporting_owner_input"]);
+    const cp = ok.db.calls.slice(ok.h.callIndex).find((c) => c.fn === "checkpoint_reporting_owner_input")!;
+    expect(ok.t0 + (ok.h.nowMs - ok.t0) + ok.h.remainingMs - cp.at).toBeGreaterThanOrEqual(2_000);
+    expect([ok.j.phase, ok.j.hashes.length]).toEqual(["complete", 103]);
+    // the renewal itself crosses the deadline: no checkpoint (or read) may follow it
+    const late = await short(6_000, 10_000);
+    const tail = late.db.calls.slice(late.h.callIndex).map((c) => c.fn);
+    const renew = tail.indexOf("renew_reporting_lease");
+    expect(renew).toBeGreaterThan(-1);
+    expect(tail.slice(renew + 1).filter((f) => f === "checkpoint_reporting_owner_input" || f.startsWith("read_reporting_"))).toEqual([]);
+    expect(late.r.state).toBe("pending");
+    expect(late.j.hashes.length).toBe(100);
+  }, 120_000);
+
+  it("real reader + writer: near-1 MiB escaped and multibyte member pages are accepted, and ownerPageCalls equals the calls writeOwnerPage really makes, each body within the limit", async () => {
+    const ref: FrozenBatchRef = { batchId: "bbbbbbbb-bbbb-4bbb-8bbb-000000000001", fence: 1, site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild" };
+    for (const [label, sku] of [["escaped", '"'.repeat(520_000)], ["multibyte", "\u00e9".repeat(500_000)], ["astral", "\u{1F600}".repeat(240_000)]] as const) {
+      const image = { id: "m-1", location: "uk", staff_id: W1, department: "framed", order_number: "BIG-1", line_sku: sku, line_quantity: 1, event_type: "line_verified", created_at: "2026-02-10T08:00:00+00:00", parent_event_id: null, cs_case_id: null };
+      const row = { owner_index: 0, event_id: "m-1", image };
+      const bytes = Buffer.byteLength(JSON.stringify([row]), "utf8");
+      expect(bytes, label).toBeLessThan(MAX_RESPONSE_BYTES);
+      const src: RpcClient = { rpc: async () => ({ data: [row], error: null }) };
+      const page = await rpcFrozenReader(src, ref).pages.membersPage([{ partitionKind: "order", partitionKey: "BIG-1" }], null);
+      expect(page.rows).toHaveLength(1);
+      const entries = eventEntries(page.rows.map((x) => x.ev), 1, () => true);
+      const steps = [{ v: 1, step: "members", m: { afterOrd: 1 } }];
+      const predicted = ownerPageCalls(entries, steps);
+      const sent: number[] = [];
+      let seq = 0;
+      const sink: RpcClient = { rpc: async (_fn, args) => {
+        sent.push(Buffer.byteLength(JSON.stringify(args.p_payload), "utf8"));
+        seq++;
+        return { data: [{ seq: String(seq), event_count: 0, pending_events: 0, pending_pieces: 0, reload_calls: 2, provisional_reload_calls: 2, heavy: false, replay: false }], error: null };
+      } };
+      const w = await writeOwnerPage(sink, ref.batchId, 1, "1", "0", entries, steps);
+      expect(w.calls, label).toBe(predicted);
+      expect(sent.length, label).toBe(predicted);
+      for (const b of sent) expect(b, label).toBeLessThanOrEqual(REQUEST_BODY_BYTES);
+      if (label === "escaped") expect(predicted).toBe(4); // pieces, pieces, pieces, page: the round-1 counterexample
+    }
   });
 
   it("the live prerequisite prediction matches what the next invocation actually reloads", async () => {

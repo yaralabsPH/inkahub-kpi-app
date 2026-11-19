@@ -6726,3 +6726,42 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - first-unit CPU zero.
   - **Observed:** one full run timed out the first API test ("a refresh enumerates…", 5 s limit) under suite load. It takes 1.8–1.9 s alone (about 1.6–2.0 s before this step), and the rerun passed. Recorded, with no timeout raised.
   - **Gate:** 80 files, **2421/2421**; tsc, typecheck:digest and build exit 0.
+- **Astra wiring-step-4 round-2 fixes (`docs/reviews/item-counting-t15p4-wiring-step4-r2.md`), 2026-11-19:**
+  - **Must-fix 1 (fresh versus paid):** every admission now judges two paths.
+    - The **fresh path** decides capacity. It is the complete leg a fresh standard run needs on top of the prerequisites; a commit's fresh leg is `1 + calls` RPCs (re-read + every call) plus the page's measured read CPU and serialization CPU.
+    - The **current remainder** decides parking. It is only what is still unpaid; a commit's remainder is its `calls`, with CPU 0 (the work is already done).
+    - Reads are admitted with an estimate (the read plus the largest commit seen so far), and the exact commit is re-admitted before its first call.
+    - `AdmissionRecord.path` is the fresh path; `.now` is the remainder.
+  - **Must-fix 2 (CPU ownership):**
+    - **Two meters per owner:** each owner has a light meter and a durable meter on one `CpuLedger` per group. At most one meter runs at a time, and a resuming owner stops the one that was running.
+    - **What is a wait:** every awaited read, RPC, guard or turn is a wait. The RPC reader reports each wait and resume through the new `FrozenReaderOptions.io`, so its decoding counts. The memory reader resumes the meter immediately before the read, in the same synchronous step.
+    - **Measured components:**
+      - light-attempt CPU;
+      - reconstruction (from the start of recovery to the first admission: reload plus snapshot rebuild), plus the measured `reloadWork`, the new worker-state function that does a reload's per-event reassembly, digest and parse, run on each commit's entries;
+      - read CPU (decode plus processing);
+      - serialization;
+      - descriptor CPU, charged once and only to hash legs;
+      - hash CPU.
+    - **Not charged:** renewals, retries and other owners' work.
+    - **Test hook:** `env.cpuProbe` lets tests inject CPU at the close of a measured span.
+  - **Must-fix 3, tests now done:**
+    - pending-discard: exactly one discard after the lookup, then the reload; every prediction is fixed + the live reload; the cursor advances;
+    - partially hashed (103 audiences, 100 saved): one reload, zero durable source reads, only the 3 missing hashes, complete;
+    - hash unit at 29,500 ms: 5,000 ms left parks before its header; 6,000 ms runs `header, renew, checkpoint` with the reserve kept; a renewal that crosses the deadline sends no checkpoint or read after it;
+    - real reader and writer: escaped, multibyte and astral near-1 MiB member pages are accepted, `ownerPageCalls` equals the calls `writeOwnerPage` really sends, every body is within the limit, and the escaped case is 4 calls.
+  - **Further tests:**
+    - Paid serialization (120 s of CPU and wall time at the sizing point) still commits, and the cursor advances.
+    - A complete fresh path above 240 s (236 s of serialization CPU, a multi-call page) fails `owner_input_capacity` before any upload.
+    - A page that fits fresh but not now (237 s of wall time) parks before any upload, and the next invocation completes it.
+    - CPU ownership: light 5,000 + reconstruction 3,000 = 8,000 prerequisites; another owner's 50,000 light CPU and 60,000 of renewal CPU are not charged; the commit's fresh leg carries its own 7,000 decode, with 0 unpaid; hash legs add the 4,000 descriptor CPU once.
+  - **Fixture limit:** the 700 KB fixture rows used for multi-call pages are too big to STAGE (`a single event_facts row exceeds the chunk size limit`), so those tests assert completed planning, not publication.
+  - **Mutations (all prompt assertion failures, restored):**
+    - paid serialization charged to now;
+    - fresh commit without the re-read;
+    - no ledger switching;
+    - discard leg charged again;
+    - descriptor CPU on every leg;
+    - reconstruction not measured;
+    - hash RPCs unguarded.
+  - **Should-fix 1:** both earlier timeouts are recorded above; no timeout was changed. This gate had no timeout.
+  - **Gate:** 80 files, **2429/2429**; tsc, typecheck:digest and build exit 0.

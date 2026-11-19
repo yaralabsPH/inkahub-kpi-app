@@ -39,7 +39,7 @@ import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPag
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
 import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type StageEntry, type WorkDescriptor } from "./reporting-stage.js";
-import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
+import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, reloadWork, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
 export const HEARTBEAT_MS = 30_000;
@@ -80,11 +80,16 @@ export interface WorkerEnv {
   ownerGroup?: number;
   /** T15P-4d step 4: the CPU clock in ms (default: this process's user+system CPU, which excludes I/O waits and sleeps). */
   cpuNow?: () => number;
+  /**
+   * T15P-4d step 4 (tests): called right before the worker closes a measured CPU span (`serialized`: a page's entries
+   * and packing; `reconstructed`: recovery + snapshot rebuild; `described`: the descriptors), on the owner's own code.
+   */
+  cpuProbe?: (point: "serialized" | "reconstructed" | "described") => void;
   /** T15P-4d step 4: observes every durable-unit admission (tests; never changes the verdict). */
   onAdmission?: (a: AdmissionRecord) => void;
 }
 /** One admission decision, as the worker derived it. */
-export interface AdmissionRecord { owner: Owner; unit: "read" | "commit" | "hash"; path: AdmissionPath; nowMs: number; remainingMs: number; sinceBeatMs: number; budgetMs: number; verdict: AdmissionVerdict["verdict"]; /** What the worker did with it: one authoritative decision. */ action: "run" | "park" | "fail" }
+export interface AdmissionRecord { owner: Owner; unit: "read" | "commit" | "hash"; /** The complete FRESH path (capacity). */ path: AdmissionPath; /** The still-unpaid remainder in this invocation (parking). */ now: AdmissionCost; nowMs: number; remainingMs: number; sinceBeatMs: number; budgetMs: number; verdict: AdmissionVerdict["verdict"]; /** What the worker did with it: one authoritative decision. */ action: "run" | "park" | "fail" }
 
 const TRANSIENT_CODES = new Set(["57014", "55P03", "40001", "40P01", "53300", "57P01", "08000", "08001", "08003", "08006"]);
 /** A transient failure may succeed on retry; everything else is permanent for this batch. */
@@ -349,8 +354,11 @@ const ownerGroupSize = (env: WorkerEnv) => Math.max(1, Math.min(env.ownerGroup ?
  * flushes and the durable route. Null when the source has no one-call pages (the legacy group path is used instead).
  */
 interface OwnerRouting {
-  light(before: () => Promise<void>): FrozenReader & { pages: FrozenReaderPages };
+  /** `io` (optional) is told when an RPC reader waits and resumes (CPU ownership; see FrozenReaderOptions.io). */
+  light(before: () => Promise<void>, io?: { wait(): void; resume(): void }): FrozenReader & { pages: FrozenReaderPages };
   base: FrozenReader & { pages: FrozenReaderPages };
+  /** A durable owner's own reader (page guard only), whose waits and decoding feed `io` (its durable meter). */
+  durable(io: { wait(): void; resume(): void }): FrozenReader & { pages: FrozenReaderPages };
   cutoffUs: bigint;
   site: ReportingSite;
   guard: () => Promise<void>;
@@ -358,31 +366,62 @@ interface OwnerRouting {
   beat: () => Promise<void>;
 }
 const hasPages = (r: FrozenReader): r is FrozenReader & { pages: FrozenReaderPages } => !!(r as { pages?: unknown }).pages;
-/** An injected reader with `before` awaited ahead of every read, page methods included. */
-function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: () => Promise<void>): FrozenReader & { pages: FrozenReaderPages } {
+/**
+ * An injected reader with `before` awaited ahead of every read, page methods included. With `io`, the wait is reported
+ * and the caller's meter resumes IMMEDIATELY before the read itself, in the same synchronous step (no task hop between
+ * the resume and an in-memory read, so its CPU is the caller's).
+ */
+function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: () => Promise<void>, io?: { wait(): void; resume(): void }): FrozenReader & { pages: FrozenReaderPages } {
+  const at = async <T>(read: () => T | Promise<T>): Promise<T> => {
+    io?.wait();
+    await before();
+    io?.resume();
+    return read();
+  };
+  const it = <T>(f: () => AsyncIterable<T>): AsyncIterable<T> =>
+    (async function* () {
+      const src = await at(() => f()[Symbol.asyncIterator]());
+      for (;;) {
+        const x = await src.next();
+        io?.resume();
+        if (x.done) return;
+        yield x.value;
+      }
+    })();
   return {
-    ...guardedReader(r, before),
+    ...r,
+    changedKeys: () => it(() => r.changedKeys()),
+    owners: () => it(() => r.owners()),
+    children: (ids) => it(() => r.children(ids)),
+    members: (owners, cap) => at(() => r.members(owners, cap)),
+    byIds: (ids) => at(() => r.byIds(ids)),
+    childPage: (p, after, limit) => at(() => r.childPage(p, after, limit)),
+    stream: (staff, direction, from, limit) => at(() => r.stream(staff, direction, from, limit)),
+    ...(r.predecessorPage ? { predecessorPage: (staff: string, from: StreamPosition, certain: CertainBound | null, limit: number) => at(() => r.predecessorPage!(staff, from, certain, limit)) } : {}),
     pages: {
-      membersPage: async (o, after, limit) => (await before(), r.pages.membersPage(o, after, limit)),
-      byIdsPage: async (ids) => (await before(), r.pages.byIdsPage(ids)),
-      childrenPage: async (ids, after, limit) => (await before(), r.pages.childrenPage(ids, after, limit)),
+      membersPage: (o, after, limit) => at(() => r.pages.membersPage(o, after, limit)),
+      byIdsPage: (ids) => at(() => r.pages.byIdsPage(ids)),
+      childrenPage: (ids, after, limit) => at(() => r.pages.childrenPage(ids, after, limit)),
     },
   };
 }
 
 /**
- * Plan-phase reads of one bounded owner group: each owner starts on its own light reader (activation counters kept
- * across transient retries: ONE watch per owner) with an allowance-bounded shared children view. An activating owner
- * restarts on the durable route: it waits for the group's single durable turn (never two durable owners at once),
- * recovers or opens its plan journal (`recoverOwnerJournal`), continues the read from the journal, and hashes its
- * audiences into the journal one bounded checkpoint at a time before its descriptors are returned. A light owner never
- * touches the journal. Results come back in group order, settled each on its own (planned strictly in order).
+ * Plan-phase reads of one bounded owner group (T15P-4d steps 3-4). Every owner first runs its light read (one
+ * activation watch per owner, kept across transient retries) with an allowance-bounded shared children view. An
+ * activating owner waits for the group's single durable turn (never two durable owners at once), recovers or opens its
+ * plan journal, continues the read from it (every leg admitted first) and hashes its audiences one bounded unit at a
+ * time. CPU is OWNED: each owner has a light meter and a durable meter that count only while that owner's own code
+ * runs (every awaited read/RPC/guard is a wait), so concurrent light owners never charge each other. A light owner
+ * never touches the journal. Results come back in group order, settled each on its own.
  */
 async function routedGroup(
   env: WorkerEnv, b: Budget, a: ActiveBatch, routing: OwnerRouting,
   items: ReadonlyArray<{ owner: Owner; oldStaff: Iterable<string> }>, stats: MaterializeStats, counts: Record<string, number>,
 ): Promise<Array<PromiseSettledResult<WorkDescriptor[]>>> {
   const shared = sharedChildren(routing.base);
+  const cpuNow = env.cpuNow ?? processCpuMs;
+  const ledger = new CpuLedger();
   let turn: Promise<void> = Promise.resolve();
   /** Wait for the group's durable turn; resolves to its release. */
   const durableTurn = (): Promise<() => void> => {
@@ -391,107 +430,172 @@ async function routedGroup(
     turn = new Promise<void>((r) => (release = r));
     return prev.then(() => release);
   };
-  const cpuNow = env.cpuNow ?? processCpuMs;
-  // journal and hash RPCs run inside an admitted unit: the heartbeat/deadline guard runs before EACH of them, so a
-  // renewal that falls due between a unit's calls is taken at that call boundary
-  const jc: RpcClient = { rpc: async (fn, args) => (await routing.guard(), env.client.rpc(fn, args)) };
   return Promise.allSettled(items.map(async (item) => {
     const watch = activationWatch(item.owner, ACTIVATION_LIMITS);
+    // this owner's own CPU on its light attempt: counted only while it runs, never while it waits
+    const meter = new CpuMeter(cpuNow, ledger);
+    meter.resume();
+    // this owner's own CPU on its durable route (recovery, reads, page processing, serialization, hashing)
+    const dm = new CpuMeter(cpuNow, ledger);
+    const endLight = () => meter.wait();
+    /** Await `p` as a WAIT of the durable meter. */
+    const waiting = async <T>(f: () => Promise<T>): Promise<T> => {
+      dm.wait();
+      try {
+        return await f();
+      } finally {
+        dm.resume();
+      }
+    };
+    // journal and hash RPCs run inside an admitted unit: the heartbeat/deadline guard runs before EACH of them, so a
+    // renewal that falls due between a unit's calls is taken at that call boundary; both are waits of the meter
+    const jc: RpcClient = { rpc: (fn, args) => waiting(async () => (await routing.guard(), env.client.rpc(fn, args))) };
+    const mc: RpcClient = { rpc: (fn, args) => waiting(async () => env.client.rpc(fn, args)) };
     /**
-     * What a FRESH invocation would redo before this owner's next durable unit, kept current as the journal grows:
-     * the fixed calls, the light attempts, lookup, the committed journal's live reload calls, its reconstruction CPU and,
-     * once reading is done, the descriptor CPU. An open or discard already done is not repeated by a fresh invocation.
+     * Each owner's fresh-restart costs, kept current as its journal grows (components and their owners):
+     * - `fixed`: the calls a fresh invocation makes before this owner (version, status, resume, progress, owner page),
+     *   its light attempts, and the lookup; `reloadCalls`: the committed journal's live reload calls;
+     * - `lightCpu`: this owner's own light-attempt CPU (metered); `reconCpu`: reconstruction CPU, measured at recovery
+     *   (reload + snapshot rebuild) plus the measured reload work of every later commit; `descCpu`: descriptor CPU,
+     *   repeated by a fresh invocation only once reading is done;
+     * - per leg: `readCpu` (source decode + page processing), `serializeCpu` (entries + packing), `hashCpu`, and the
+     *   largest commit `calls` seen: measured maxima (a not-yet-measured kind uses FIRST_UNIT_CPU_MS, never zero).
      */
-    const cost = { fixed: 0, reloadCalls: 0, reloadCpuMs: 0, descCpuMs: 0, hashing: false, readCpuMs: null as number | null, hashCpuMs: null as number | null };
-    let readEnd: number | null = null;
-    const prerequisites = () => ({ rpcs: cost.fixed + cost.reloadCalls, cpuMs: cost.reloadCpuMs + (cost.hashing ? cost.descCpuMs : 0) });
+    const cost = { fixed: 0, reloadCalls: 0, lightCpu: 0, reconCpu: 0, descCpu: 0, hashing: false, readCpu: null as number | null, serializeCpu: null as number | null, hashCpu: null as number | null, calls: 1 };
+    const prerequisites = (): AdmissionCost => ({ rpcs: cost.fixed + cost.reloadCalls, cpuMs: cost.lightCpu + cost.reconCpu + (cost.hashing ? cost.descCpu : 0) });
     /**
-     * Admit the owner's next durable leg (T15P-4d step 4): a due renewal is taken first (so the phase since the beat is
-     * below one interval), then the path is judged against the time left now and against a fresh STANDARD run.
-     * `capacity` fails visibly (evidence kept); `pending` parks the owner with its committed journal unchanged.
+     * Admit the owner's next durable leg (T15P-4d step 4). A due renewal is taken first (the phase since the beat is then
+     * below one interval). `fresh` is the COMPLETE leg a fresh standard run would need on top of the prerequisites (work
+     * that must be repeated, such as re-reading and re-processing an uncommitted page, included); `now` is what is still
+     * UNPAID in this invocation. Capacity is judged on the fresh path only; parking on the current remainder only.
      */
-    const admit = async (unit: AdmissionRecord["unit"], rpcs: number, cpuMs: number) => {
-      await routing.beat();
-      const path: AdmissionPath = { prerequisites: prerequisites(), unit: { rpcs, cpuMs }, prerequisitesPaid: true };
+    const admit = async (unit: AdmissionRecord["unit"], fresh: AdmissionCost, now: AdmissionCost) => {
+      await waiting(() => routing.beat());
+      const prereq = prerequisites();
       const remainingMs = b.remainingMs();
       const sinceBeatMs = b.sinceBeat();
-      // "fits a fresh run" is judged against a STANDARD invocation (WORKER_BUDGET_MS), never this one's own deadline
-      const v = admitDurableUnit(path, remainingMs, WORKER_BUDGET_MS, sinceBeatMs);
-      const action = v.verdict === "capacity" ? "fail" : v.verdict === "pending" ? "park" : "run";
-      env.onAdmission?.({ owner: item.owner, unit, path, nowMs: env.now(), remainingMs, sinceBeatMs, budgetMs: WORKER_BUDGET_MS, verdict: v.verdict, action });
-      if (v.verdict === "capacity") throw new OwnerInputCapacityError(item.owner, v.freshMs, WORKER_BUDGET_MS);
-      if (v.verdict === "pending") {
+      const freshPath: AdmissionPath = { prerequisites: prereq, unit: fresh, prerequisitesPaid: false };
+      const freshV = admitDurableUnit(freshPath, WORKER_BUDGET_MS, WORKER_BUDGET_MS, 0); // "run" or "capacity"
+      const nowV = admitDurableUnit({ prerequisites: { rpcs: 0, cpuMs: 0 }, unit: now, prerequisitesPaid: true }, remainingMs, WORKER_BUDGET_MS, sinceBeatMs);
+      const verdict = freshV.verdict === "capacity" ? "capacity" : nowV.verdict === "run" ? "run" : "pending";
+      const action = verdict === "capacity" ? "fail" : verdict === "pending" ? "park" : "run";
+      env.onAdmission?.({ owner: item.owner, unit, path: freshPath, now, nowMs: env.now(), remainingMs, sinceBeatMs, budgetMs: WORKER_BUDGET_MS, verdict, action });
+      if (freshV.verdict === "capacity") throw new OwnerInputCapacityError(item.owner, freshV.freshMs, WORKER_BUDGET_MS);
+      if (verdict === "pending") {
         counts.ownersParked = (counts.ownersParked ?? 0) + 1;
         throw new Parked();
       }
     };
-    /** A durable source read: admitted at its smallest legal size (the read plus a one-call commit), then timed. */
+    let readStart: number | null = null;
+    /** A durable source read: admitted with the estimated read + commit (the exact commit is admitted again later). */
     const read = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
-      await admit("read", READ_LEG_RPCS, cost.readCpuMs ?? FIRST_UNIT_CPU_MS);
-      const out = await f(...args);
-      readEnd = cpuNow();
-      return out;
+      const est: AdmissionCost = { rpcs: 1 + cost.calls, cpuMs: (cost.readCpu ?? FIRST_UNIT_CPU_MS) + (cost.serializeCpu ?? 0) };
+      await admit("read", est, est);
+      await waiting(() => routing.guard()); // any due renewal happens before the measured span
+      readStart = dm.read();
+      const out = f(...args); // its synchronous part (and a memory source's whole read) runs on this owner's meter
+      return waiting(() => out);
     };
     // the durable turn's release and the journal handle (set inside the durable callback)
     const held: { release: (() => void) | null; handle: string | null } = { release: null, handle: null };
     try {
-      const r = await b.retry(() => routedOwnerInput((before, share) => shared.forOwner(routing.light(before), share), item.owner, async () => {
+      const r = await b.retry(() => routedOwnerInput((before, share) => meteredReader(meter, shared.forOwner(routing.light(async () => {
+        meter.wait();
+        try {
+          await before();
+        } finally {
+          meter.resume();
+        }
+      }, meter), share)), item.owner, async () => {
         if (!held.release) {
           // counted at activation (a parked or failed owner is counted too)
           counts.ownersActivated = (counts.ownersActivated ?? 0) + 1;
           counts.activationCalls = Math.max(counts.activationCalls ?? 0, watch.calls);
-          held.release = await durableTurn();
+          cost.lightCpu = meter.read();
+          endLight();
+          dm.resume();
+          held.release = await waiting(() => durableTurn());
         }
-        const c0 = cpuNow();
-        const rec = await recoverOwnerJournal(env.client, a.batchId, a.fence, item.owner, routing.site, "plan");
+        await waiting(() => routing.guard());
+        const c0 = dm.read();
+        const rec = await recoverOwnerJournal(mc, a.batchId, a.fence, item.owner, routing.site, "plan");
         cost.fixed = FIXED_PREREQUISITE_RPCS + watch.calls + 1; // + lookup
         cost.reloadCalls = rec.reloadCalls;
-        cost.reloadCpuMs = Math.max(0, cpuNow() - c0);
         held.handle = rec.handle;
-        if (rec.input) return { input: rec.input }; // already read (hashing or complete): no source read, no second reload
+        let reconOpen = true; // the reconstruction span ends at the first admission (snapshot rebuild included)
+        const closeRecon = () => {
+          if (reconOpen) {
+            env.cpuProbe?.("reconstructed");
+            cost.reconCpu = Math.max(0, dm.read() - c0);
+          }
+          reconOpen = false;
+        };
+        if (rec.input) {
+          closeRecon();
+          return { input: rec.input }; // already read (hashing or complete): no source read, no second reload
+        }
         const journal = ownerJournal(jc, a.batchId, a.fence, rec.handle, rec.seq, routing.cutoffUs, rec.reloadCalls);
-        const base = routing.base;
+        const base = routing.durable(dm);
+        const first = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => read(async (...args: A) => f(...args));
+        const reading = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => {
+          const g = first(f);
+          return async (...args: A): Promise<R> => {
+            closeRecon();
+            return g(...args);
+          };
+        };
         const reader: FrozenReader & { pages: FrozenReaderPages } = {
           ...base,
-          pages: { membersPage: read(base.pages.membersPage.bind(base.pages)), byIdsPage: read(base.pages.byIdsPage.bind(base.pages)), childrenPage: read(base.pages.childrenPage.bind(base.pages)) },
-          childPage: read(base.childPage.bind(base)),
-          stream: read(base.stream.bind(base)),
-          ...(base.predecessorPage ? { predecessorPage: read(base.predecessorPage.bind(base)) } : {}),
+          pages: { membersPage: reading(base.pages.membersPage.bind(base.pages)), byIdsPage: reading(base.pages.byIdsPage.bind(base.pages)), childrenPage: reading(base.pages.childrenPage.bind(base.pages)) },
+          childPage: reading(base.childPage.bind(base)),
+          stream: reading(base.stream.bind(base)),
+          ...(base.predecessorPage ? { predecessorPage: reading(base.predecessorPage.bind(base)) } : {}),
         };
         return {
           reader,
           journal: {
             async commit(pg) {
-              // the exact commit, known now that the page is: admitted before its first call (the read is not redone)
-              const c1 = cpuNow();
-              if (readEnd !== null) cost.readCpuMs = Math.max(cost.readCpuMs ?? 0, c1 - readEnd);
-              readEnd = null;
+              closeRecon();
+              // this page's measured read (decode + processing) and serialization, then its EXACT commit
+              const c1 = dm.read();
+              const readCpu = readStart === null ? 0 : Math.max(0, c1 - readStart);
+              readStart = null;
               const calls = journal.pageCalls(pg);
-              const serializeMs = Math.max(0, cpuNow() - c1);
-              await admit("commit", calls, serializeMs);
+              env.cpuProbe?.("serialized");
+              const serializeCpu = Math.max(0, dm.read() - c1);
+              cost.readCpu = Math.max(cost.readCpu ?? 0, readCpu);
+              cost.serializeCpu = Math.max(cost.serializeCpu ?? 0, serializeCpu);
+              cost.calls = Math.max(cost.calls, calls);
+              // fresh: re-read, re-process, re-serialize and all its calls; now: only the calls (the rest is paid)
+              await admit("commit", { rpcs: 1 + calls, cpuMs: readCpu + serializeCpu }, { rpcs: calls, cpuMs: 0 });
               await journal.commit(pg);
               cost.reloadCalls = journal.reloadCalls;
-              cost.reloadCpuMs += serializeMs; // reconstructing these bytes costs about what serializing them did
+              const w0 = dm.read();
+              reloadWork(journal.lastEntries(), routing.site); // the reload work these entries add, measured
+              cost.reconCpu += Math.max(0, dm.read() - w0);
               counts.durableUnits = (counts.durableUnits ?? 0) + 1;
             },
           },
           resume: rec.snapshot,
         };
       }, ACTIVATION_LIMITS, watch));
+      endLight();
       // one audience projected at a time; only descriptors (identity + input hash) are kept for ordered planning
-      const d0 = cpuNow();
+      const d0 = dm.read();
       const descs = ownerDescriptors(routing.base, item.owner, r.input, item.oldStaff, stats);
+      if (r.route === "durable") env.cpuProbe?.("described");
       if (r.route === "durable") {
         counts.ownersDurable = (counts.ownersDurable ?? 0) + 1;
         // a fresh invocation past reading recomputes every descriptor before its next hash unit: charged once, there
-        cost.descCpuMs = Math.max(0, cpuNow() - d0);
+        cost.descCpu = Math.max(0, dm.read() - d0);
         cost.hashing = true;
         const hashes = descs.map((d) => ({ audienceKind: d.audienceKind, audienceStaff: d.audienceStaff, inputHash: d.inputHash }));
         for (;;) {
-          await admit("hash", HASH_UNIT_RPCS, cost.hashCpuMs ?? FIRST_UNIT_CPU_MS);
-          const h0 = cpuNow();
+          const est: AdmissionCost = { rpcs: HASH_UNIT_RPCS, cpuMs: cost.hashCpu ?? FIRST_UNIT_CPU_MS };
+          await admit("hash", est, est);
+          const h0 = dm.read();
           const step = await b.retry(() => hashOwnerInputStep(jc, a.batchId, a.fence, held.handle!, hashes));
-          cost.hashCpuMs = Math.max(cost.hashCpuMs ?? 0, cpuNow() - h0);
+          cost.hashCpu = Math.max(cost.hashCpu ?? 0, dm.read() - h0);
           if (step.result) cost.reloadCalls = step.result.reloadCalls;
           counts.durableUnits = (counts.durableUnits ?? 0) + 1;
           if (step.complete) break;
@@ -499,9 +603,92 @@ async function routedGroup(
       }
       return descs;
     } finally {
+      endLight();
+      dm.wait();
       held.release?.();
     }
   }));
+}
+
+/**
+ * One group's CPU ledger: at most ONE meter runs at a time. A meter that resumes stops whichever meter was running, so
+ * code that runs after one owner's continuation and before another's is never charged to both, and an owner's meter
+ * stops the moment another owner's code resumes.
+ */
+class CpuLedger {
+  private current: CpuMeter | null = null;
+  switchTo(m: CpuMeter): void {
+    if (this.current === m) return;
+    this.current?.stop();
+    this.current = m;
+    m.start();
+  }
+  release(m: CpuMeter): void {
+    if (this.current !== m) return;
+    m.stop();
+    this.current = null;
+  }
+}
+/** An owner's own CPU: counted only while it is the ledger's running meter (its waits, and other owners' work, excluded). */
+class CpuMeter {
+  private total = 0;
+  private since: number | null = null;
+  constructor(private readonly now: () => number, private readonly ledger: CpuLedger) {}
+  start(): void {
+    if (this.since === null) this.since = this.now();
+  }
+  stop(): void {
+    if (this.since === null) return;
+    this.total += Math.max(0, this.now() - this.since);
+    this.since = null;
+  }
+  /** This owner's code is running again (after an await, or a reader's response). */
+  resume(): void {
+    this.ledger.switchTo(this);
+  }
+  /** This owner is about to wait. */
+  wait(): void {
+    this.ledger.release(this);
+  }
+  read(): number {
+    return this.total + (this.since === null ? 0 : Math.max(0, this.now() - this.since));
+  }
+}
+/** A light reader whose every awaited read is a WAIT for the owner's meter (the synchronous part of each call counts). */
+function meteredReader(m: CpuMeter, r: FrozenReader & { pages: FrozenReaderPages }): FrozenReader & { pages: FrozenReaderPages } {
+  const waitOn = <A extends unknown[], R>(f: (...args: A) => Promise<R>) => async (...args: A): Promise<R> => {
+    const p = f(...args);
+    m.wait();
+    try {
+      return await p;
+    } finally {
+      m.resume();
+    }
+  };
+  const iter = <T>(src: AsyncIterable<T>): AsyncIterable<T> => (async function* () {
+    const it = src[Symbol.asyncIterator]();
+    for (;;) {
+      m.wait();
+      let x: IteratorResult<T>;
+      try {
+        x = await it.next();
+      } finally {
+        m.resume();
+      }
+      if (x.done) return;
+      yield x.value;
+    }
+  })();
+  return {
+    ...r,
+    pages: { membersPage: waitOn(r.pages.membersPage.bind(r.pages)), byIdsPage: waitOn(r.pages.byIdsPage.bind(r.pages)), childrenPage: waitOn(r.pages.childrenPage.bind(r.pages)) },
+    members: waitOn(r.members.bind(r)),
+    byIds: waitOn(r.byIds.bind(r)),
+    childPage: waitOn(r.childPage.bind(r)),
+    stream: waitOn(r.stream.bind(r)),
+    children: (ids) => iter(r.children(ids)),
+    ...(r.predecessorPage ? { predecessorPage: waitOn(r.predecessorPage.bind(r)) } : {}),
+  };
 }
 
 /** Seal only with the exact completeness proof and the saved-descriptor manifest. */
@@ -605,11 +792,12 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         const materializing = env.source ? src.reader : rpcFrozenReader(env.client, ref, { beforeRead: pageGuard });
         const coalesced = guardedReader(coalescingChildren(materializing), pageGuard);
         const cutoffUs = exactInstant(ref.cutoff)!;
+        // memory light reader: the guard first and `before` (activation check + meter resume) LAST, right at the read
         const routing: OwnerRouting | null = env.source
           ? hasPages(src.reader)
-            ? { light: (before) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, async () => { await before(); await pageGuard(); }), base: hookedReader(src.reader, pageGuard), cutoffUs, site: req.site, guard: pageGuard, beat: () => b.beat(a.batchId, a.fence) }
+            ? { light: (before, io) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, async () => { await pageGuard(); await before(); }, io), base: hookedReader(src.reader, pageGuard), durable: (io) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, pageGuard, io), cutoffUs, site: req.site, guard: pageGuard, beat: () => b.beat(a.batchId, a.fence) }
             : null
-          : { light: (before) => rpcFrozenReader(env.client, ref, { beforeRead: async () => { await before(); await pageGuard(); } }), base: materializing as FrozenReader & { pages: FrozenReaderPages }, cutoffUs, site: req.site, guard: pageGuard, beat: () => b.beat(a.batchId, a.fence) };
+          : { light: (before, io) => rpcFrozenReader(env.client, ref, { beforeRead: async () => { await before(); await pageGuard(); }, io }), base: materializing as FrozenReader & { pages: FrozenReaderPages }, durable: (io) => rpcFrozenReader(env.client, ref, { beforeRead: pageGuard, io }), cutoffUs, site: req.site, guard: pageGuard, beat: () => b.beat(a.batchId, a.fence) };
         const prog = await b.retry(() => readWorkerProgress(env.client, a.batchId, a.fence));
         if (!prog.sealed) {
           if (!prog.complete) await enumerate(env, b, a, src.reader, src.pages, prog.cursor, counts);
@@ -704,8 +892,9 @@ export type AdmissionVerdict = { verdict: "run" } | { verdict: "pending"; freshM
 /** Calls a fresh invocation makes before planning an owner: version, status, resume, progress and the owner page. */
 export const FIXED_PREREQUISITE_RPCS = 5;
 /**
- * The smallest legal durable read: the source RPC plus a one-call commit. Its EXACT commit is admitted separately once
- * the page is known (`ownerJournal.pageCalls`), so no unproved pre-read bound is needed.
+ * Reads are admitted with an ESTIMATE (the source RPC plus the largest commit seen so far, at least one call); each
+ * page's EXACT commit is then admitted before its first call (`ownerJournal.pageCalls`), with the complete fresh path
+ * (re-read + re-process + re-serialize + every call) for capacity and only the unpaid calls for parking.
  */
 export const READ_LEG_RPCS = 1 + 1;
 /** An explicit CPU estimate for a unit kind not yet measured in this invocation (one RPC's worth), never zero. */

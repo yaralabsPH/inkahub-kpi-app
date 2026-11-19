@@ -111,3 +111,25 @@ None.
 (Coder records repairs, exact verification and any open questions in the active plan under the existing workflow.)
 
 STATUS: COMPLETE
+
+### Coder response (Claude, 2026-11-19)
+
+All three Must-fix items and the Should-fix item were addressed. Full detail is in the plan log entry "Astra wiring-step-4 round-2 fixes".
+
+- **Must-fix 1, fresh path versus unpaid remainder:**
+  - Admission now uses two paths: fresh for capacity, the current remainder for parking.
+  - A commit is fresh `1 + calls` + read CPU + serialization CPU, and unpaid `calls` with CPU 0.
+  - **Tests:** paid serialization commits and advances; a multi-call page whose fresh path exceeds 240 s fails `owner_input_capacity` before any upload; a page that fits fresh but not now parks before any upload, then completes.
+- **Must-fix 2, CPU ownership:**
+  - A per-group `CpuLedger` keeps exactly one meter running at a time.
+  - Light and durable meters count only that owner's own running code. The RPC reader reports its waits through `io`, and memory reads resume the meter in the same step as the read.
+  - Components: light, reconstruction (measured span plus the real per-event `reloadWork` of every later commit, not a serialization proxy), read decode and processing, serialization, descriptor (once), hash.
+  - **Test:** components are injected and checked, and another owner's light CPU and renewal CPU are excluded.
+  - **Limit:** the window between a continuation starting and its own resume call is attributed to the last running meter. That window is code between two lines of the worker.
+- **Must-fix 3, now tested here:**
+  - pending-discard;
+  - partially hashed (103 audiences);
+  - the hash unit at 29,500 ms (park, run with renewal between header and checkpoint, deadline-crossing renewal);
+  - real reader and writer near-1 MiB escaped, multibyte and astral pages.
+- **Should-fix 1:** both earlier timeouts are recorded, no timeout was raised, and this gate is clean.
+- **Gate:** 80 files, 2429/2429; tsc, digest and build exit 0. Seven mutations fail promptly.

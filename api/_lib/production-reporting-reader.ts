@@ -61,6 +61,11 @@ export interface FrozenReaderOptions {
    * cannot recurse.
    */
   beforeRead?: () => Promise<void>;
+  /**
+   * T15P-4d step 4 (CPU ownership): told when this reader starts WAITING (before `beforeRead` and before each RPC) and
+   * when it resumes, so a caller's CPU meter can exclude the waits and count this reader's own decoding.
+   */
+  io?: { wait(): void; resume(): void };
 }
 
 /** Keyset of a member page: the last row's owner index and id; `id: null` skips the rest of that owner (index, NULL). */
@@ -99,9 +104,16 @@ export function rpcFrozenReader(client: RpcClient, ref: FrozenBatchRef, opts: Fr
   if (!Number.isSafeInteger(ref.fence) || ref.fence < 1) throw new ReportingJobError("fence must be a positive integer");
   let n = 0;
   const call = async (fn: string, args: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
-    if (opts.beforeRead) await opts.beforeRead();
-    n++;
-    const { data, error } = await client.rpc(fn, { p_batch: ref.batchId, p_fence: ref.fence, ...args });
+    opts.io?.wait();
+    let res: Awaited<ReturnType<RpcClient["rpc"]>>;
+    try {
+      if (opts.beforeRead) await opts.beforeRead();
+      n++;
+      res = await client.rpc(fn, { p_batch: ref.batchId, p_fence: ref.fence, ...args });
+    } finally {
+      opts.io?.resume();
+    }
+    const { data, error } = res;
     if (error) throw new ReportingJobError(`${fn}: ${error.message}`, error.code ?? null);
     if (!Array.isArray(data)) throw new ReportingJobError(`${fn} returned no rows array`);
     if (data.length > 1000) throw new ReportingJobError(`${fn} returned more than 1,000 rows`);
