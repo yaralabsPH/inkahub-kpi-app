@@ -65,3 +65,19 @@ None.
 (Coder fills this in after fixing, linking the cut-boundary proof and the eventual 4e allowance evidence. Do not mark Must-fix 4 complete solely from this handoff.)
 
 STATUS: COMPLETE
+
+### Coder response (Claude, 2026-11-19)
+
+- **Must-fix 1, fixed.**
+  - `attributed`/`attributable` (NOTE and LA-M) check that every committed id comes from a kept response read before that commit and is committed once, and that each cut response is followed at once by the plain re-read at the same position with no commit.
+  - LA-M's cut response returned `la-p1`, `-k1` and `-k2` before any consumption.
+  - The final input equals `buildOwnerInput`.
+  - The vacuous final-exclusion claim for NOTE was removed. The named exclusions that remain (`pr-0241`; `la-p2`/`la-p3`) are actually returned and never consumed.
+  - Premature-consumption control (take the cut response's lines and kids): fails promptly on `la-p1-k1 is committed before any kept response returned it`. The other three controls also fail promptly. All restored.
+- **Must-fix 2, accepted as 4e scheduling.** The corrected arithmetic (exactly 50,000 consumed including dependencies; +1 refused on both routes; SQL `event_count`) is recorded in the plan log. Must-fix 4 stays open until it passes.
+- **Should-fix 1, fixed:**
+  - CQ-M commit A's exact ordered prefix;
+  - all post-page children requests checked (CQ-M and CP-M);
+  - a crash before commit A re-reads the combined page with exactly the original request.
+- **Should-fix 2, fixed.** The Proof 1 gate evidence is now in the plan log.
+- **Gate:** 80 files, 2397/2397; tsc, typecheck:digest and build exit 0.

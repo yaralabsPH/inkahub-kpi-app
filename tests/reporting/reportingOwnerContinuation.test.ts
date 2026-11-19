@@ -1011,8 +1011,8 @@ describe("a complete multi-line 0045 page is ONE atomic durable page (scope revi
     const phases = next.steps.map((st) => (st.step === "walk" ? (st.w!.line ? st.w!.line.phase : "cursor") : st.step));
     expect(phases.join(",")).toMatch(/^(kids,kids,done,cursor,)+/);
     // no children request for any line whose complete kids were included in the page
-    const kidReads = trace.filter((x) => "rpc" in x && x.rpc === "read_reporting_children" && (x.args.p_parent_ids as string[]).some((pid) => ["cp-t3", "cp-t2", "cp-t1", "cp-t0"].includes(pid)) && (x.args.p_parent_ids as string[]).length === 1);
-    expect(kidReads).toEqual([]);
+    const kidReads = trace.slice(i + 1).filter((x) => "rpc" in x && x.rpc === "read_reporting_children");
+    expect(kidReads).toEqual([]); // EVERY children request after the page (any parent set): none
     const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, (await openOwnerInput(c(), ref.batchId, ref.fence, o, "plan")).handle, SITE);
     expect(back.events.map((e) => e.ev).sort((x, y) => compareUtf8(x.id, y.id))).toEqual(want.events);
   });
@@ -1105,6 +1105,13 @@ describe("a line without included kids inside a combined 0045 page (scope review
     expect("commit" in A).toBe(true);
     expect(A.ids).toEqual(expect.arrayContaining(["cq-t2", "cq-t2-k", "cq-t0", "cq-t0-k", "cq-tm1"]));
     for (const k of KIDS) expect(A.ids).not.toContain(k);
+    // A's ordered prefix: for each of cq-t3, cq-t2, cq-t1, cq-t0 in stream order pending kids -> kids -> done -> cursor, then cq-tm1 pending
+    const idAt: string[] = [];
+    for (const x of trace) if ("commit" in x) idAt.push(...x.ids);
+    const phases = A.steps.map((st) => (st.step === "walk" ? (st.w.line ? st.w.line.phase : "cursor") : st.step));
+    expect(phases.join(",")).toBe("kids,kids,done,cursor,".repeat(4) + "kids");
+    expect(A.steps.filter((st) => st.w?.line?.phase === "done").map((st) => idAt[st.w.line.ord - 1])).toEqual(["cq-t3", "cq-t2", "cq-t1", "cq-t0"]);
+    expect(A.steps.filter((st) => st.step === "walk" && !st.w.line).map((st) => idAt[st.w.cursorOrd - 1])).toEqual(["cq-t3", "cq-t2", "cq-t1", "cq-t0"]);
     const tm1 = ordOf("cq-tm1");
     expect(A.steps.at(-1)).toMatchObject({ step: "walk", w: { line: { ord: tm1, phase: "kids", afterKidOrd: null } } });
     // then cq-tm1's own kid pages: each non-empty page is committed before the next request, which continues after its last kid
@@ -1134,8 +1141,10 @@ describe("a line without included kids inside a combined 0045 page (scope review
     expect(kidPages.flat()).toEqual(KIDS);
     expect(kidPages.length, "the 400 KB kids span more than one non-empty kid page").toBeGreaterThan(1);
     // no kid request for the lines whose complete kids the combined page included
-    const included = trace.filter((x) => "rpc" in x && x.rpc === "read_reporting_children" && (x.args.p_parent_ids as string[]).some((p) => ["cq-t3", "cq-t2", "cq-t1", "cq-t0"].includes(p)) && (x.args.p_parent_ids as string[]).length === 1);
-    expect(included).toEqual([]);
+    // EVERY children request after the combined page is cq-tm1's own (no request of any shape for the included lines)
+    const later = trace.slice(i + 1).filter((x): x is Rpc => "rpc" in x && x.rpc === "read_reporting_children");
+    expect(later.length).toBe(kidPages.length + 1);
+    for (const r of later) expect(r.args.p_parent_ids).toEqual(["cq-tm1"]);
   }, 300_000);
 
   it("a crash before or after each of those commits resumes to buildOwnerInput with the exact next request", async () => {
@@ -1151,6 +1160,19 @@ describe("a line without included kids inside a combined 0045 page (scope review
       }
     }
   }, 600_000);
+
+  it("a crash just before commit A re-reads the combined page with exactly the original request", async () => {
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const { trace, i } = await shape();
+    const handle = await crashAt(o, (trace[i + 1] as Commit).commit, "before");
+    const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, handle, SITE);
+    const snap = ownerJournalSnapshot(back);
+    expect(snap.state).toMatchObject({ step: "walk", w: { cursorOrd: null, line: null, stopAt: null } });
+    const reads = recording(c());
+    const got = await durableOwnerInput(rpcFrozenReader(reads.client, ref), o, ownerJournal(c(), ref.batchId, ref.fence, handle, back.header.seq, cutoffUs()), snap);
+    expect(got).toEqual(want);
+    expect(reads.calls.find((x) => SOURCE.has(x.fn))).toEqual({ fn: "read_reporting_predecessor_page", args: (trace[i] as Rpc).args });
+  }, 300_000);
 });
 
 describe("cut pages and look-ahead past the stop are never evidence (scope review Must-fix 4, Proof 1)", () => {
@@ -1187,15 +1209,72 @@ describe("cut pages and look-ahead past the stop are never evidence (scope revie
     return unconsumed;
   }
 
-  it("NOTE: a cut 0045 page is discarded and re-read as a plain page at the same position; the journal is exactly the consumed input", async () => {
-    const o: Owner = { partitionKind: "order", partitionKey: "NOTE" };
-    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
-    const { pages, journal } = await observed(o);
-    // a discarded combined page: the next source page is a plain page at the SAME position
-    const cut = pages.filter((p, i) => p.fn === "read_reporting_predecessor_page" && pages[i + 1]?.fn === "read_reporting_staff_stream" && pages[i + 1].args.p_at === p.args.p_at && pages[i + 1].args.p_at_event_id === p.args.p_at_event_id);
-    expect(cut.length, "NOTE reads at least one cut combined page").toBeGreaterThan(0);
-    exactlyConsumed(want, pages, journal);
-  }, 300_000);
+  /** Every source response (its ids; for a 0045 page whether an included kid set is cut) interleaved with every commit's ids. */
+  async function attributed(owner: Owner) {
+    await reset(owner.partitionKey);
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
+    type E = { src: string; args: Record<string, unknown>; ids: string[]; cut: boolean } | { commit: string[] };
+    const trace: E[] = [];
+    const client: RpcClient = {
+      rpc: async (fn, a) => {
+        const r = await c().rpc(fn, a);
+        if (SOURCE.has(fn)) {
+          const rows = (r.data ?? []) as Array<Record<string, unknown>>;
+          trace.push({ src: fn, args: a ?? {}, ids: rows.map((x) => x.event_id ?? x.id).filter((x): x is string => typeof x === "string"), cut: false });
+        }
+        return r;
+      },
+    };
+    const base = rpcFrozenReader(client, ref);
+    const reader: typeof base = {
+      ...base,
+      predecessorPage: async (...args: Parameters<NonNullable<typeof base.predecessorPage>>) => {
+        const p = await base.predecessorPage!(...args);
+        (trace.at(-1) as { cut: boolean }).cut = !p.lines.every((x) => x.kids === null || x.kidsComplete);
+        return p;
+      },
+    };
+    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+    const got = await durableOwnerInput(reader, owner, { commit: async (p) => { await j.commit(p); trace.push({ commit: p.events.map((e) => e.id) }); } });
+    return { trace, got };
+  }
+  /**
+   * Every committed id was returned by a KEPT (non-discarded) source response read before that commit, and is committed
+   * once: a discarded cut response consumes nothing (no id, ordinal or step). Each cut response is followed directly by
+   * the plain re-read at the same position. Returns the ids each cut response returned that were not consumed before it.
+   */
+  function attributable(trace: Awaited<ReturnType<typeof attributed>>["trace"]) {
+    const kept = new Set<string>();
+    const committed = new Set<string>();
+    const fresh: string[][] = [];
+    trace.forEach((e, i) => {
+      if ("commit" in e) {
+        for (const id of e.commit) {
+          expect(kept.has(id), `${id} is committed before any kept response returned it`).toBe(true);
+          expect(committed.has(id), `${id} committed twice`).toBe(false);
+          committed.add(id);
+        }
+      } else if (e.cut) {
+        expect(trace[i + 1], "the cut page is re-read plain at once, with no commit between").toMatchObject({ src: "read_reporting_staff_stream", args: { p_at: e.args.p_at, p_at_event_id: e.args.p_at_event_id } });
+        fresh.push(e.ids.filter((id) => !committed.has(id)));
+      } else for (const id of e.ids) kept.add(id);
+    });
+    expect(fresh.length, "at least one cut 0045 response").toBeGreaterThan(0);
+    return fresh;
+  }
+
+  for (const key of ["NOTE", "LA-M"]) {
+    it(`${key}: a cut 0045 response is discarded uncharged; every committed id comes from a kept response; the input equals buildOwnerInput`, async () => {
+      const o: Owner = { partitionKind: "order", partitionKey: key };
+      const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+      const { trace, got } = await attributed(o);
+      const fresh = attributable(trace);
+      // LA-M's cut response returned la-p1 and two of its kids before anything consumed them (NOTE's cut pages repeat
+      // members and member children only, so they prove the discard boundary but bring no new id)
+      if (key === "LA-M") expect(fresh[0]).toEqual(expect.arrayContaining(["la-p1", "la-p1-k1", "la-p1-k2"]));
+      expect(got).toEqual(want);
+    }, 300_000);
+  }
 
   it("LA-M: after a cut 0045 page, the stop falls inside the PLAIN re-read; the lines it returned below the stop are never journaled", async () => {
     const o: Owner = { partitionKind: "order", partitionKey: "LA-M" };
