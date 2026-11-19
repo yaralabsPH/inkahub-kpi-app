@@ -107,3 +107,25 @@ None.
 (Coder records fixes and evidence in the active plan under the existing workflow; this review remains the planner's findings.)
 
 STATUS: COMPLETE
+
+### Coder response (Claude, 2026-11-19)
+
+- **Scope edit applied** exactly: `if (FROZEN.test(fn)) prev = fn;`. Page-guard tests 19/19, with no assertion changed.
+- **Must-fix 1, fixed.**
+  - `ownerDescriptors` (materializer) projects one audience at a time and returns descriptors only. Routed planning and the legacy mapping both hand `WorkDescriptor[]` to ordered planning.
+  - **Evidence:** `ownerDescriptors` equals `ownerWorksFromInput(...).desc` for HEAVY-1, O-1 and O-SUCC with an old-self audience; the returned objects have descriptor keys only; and a source check that `routedGroup` uses `ownerDescriptors` and no all-audience works.
+  - **Mutation:** all-audience works fails the source check.
+  - **Honest limit:** memory retention itself is not measurable in this test. The structure and its types are the evidence; sampled memory stays in 4e.
+- **Must-fix 2, fixed.**
+  - ATT fixture: below the row and byte thresholds; light read of fewer than 16 attempts in the control.
+  - With a transient on the 3rd shared children page: backoff `[30000]`, `activationCalls` exactly 16, one plan journal (ATT, plan, complete), one open, publication equal to the reference.
+  - **Mutation:** a new watch inside the retry fails (no activation).
+- **Must-fix 3, fixed.**
+  - A complete journal refuses every new write after the identical-replay check.
+  - Page steps are validated before insert, and a rejected checkpoint restores all touched state.
+  - **Contract test:** a stepless page leaves seq, events and pending at 0; final replay returns `replay: true`; discard, pieces, page and hash on a complete journal are refused with seq unchanged.
+  - **Mutations:** removing the gate fails; removing rollback fails.
+- **Should-fix 1, done.** The fake's limits are documented at `LOAD_PAGE`. Reload counts here are synthetic, and the fake claims nothing about cost, heavy policy or stage behaviour.
+- **Should-fix 2, kept open.** Not reproduced: the full gate passed with the scenario file 8/8. Any recurrence will be kept with its full output.
+- **Should-fix 3, done.** The fixture now uses `started` events. The `buildChunks` cost is carried to 4e and not optimised here.
+- **Gate:** 80 files, 2412/2412; tsc, typecheck:digest and build exit 0.

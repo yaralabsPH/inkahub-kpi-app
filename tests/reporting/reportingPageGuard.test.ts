@@ -274,7 +274,7 @@ describe("T15P-1a: the deadline is checked again after a lease renewal (real wor
         if (done) after.push({ fn, at: t });
         if (MATERIALIZE.test(fn)) materializing = true;
         const midOwner = prev === "read_reporting_children";
-        if (fn !== "renew_reporting_lease") prev = fn;
+        if (FROZEN.test(fn)) prev = fn;
         if (fn === "renew_reporting_lease" && materializing && midOwner && !done) {
           target = true;
           attempt++;

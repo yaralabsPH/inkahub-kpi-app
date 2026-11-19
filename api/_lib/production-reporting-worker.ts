@@ -34,12 +34,12 @@
  * counts and redacted problems only — never source payloads or keys.
  */
 import { exactInstant } from "../../src/lib/domain/productionCounts.js";
-import { coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerKey, PartitionTooLargeError, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerInput, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
-import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef } from "./production-reporting-reader.js";
+import { ACTIVATION_LIMITS, activationWatch, coalescingChildren, isoOfMicros, KEY_WALK_PAGES, materializeOwnerGroup, ownerDescriptors, ownerKey, PartitionTooLargeError, routedOwnerInput, sharedChildren, walkChangedKey, type CertainBound, type FrozenReader, type KeyWalkPages, type MaterializeStats, type Owner, type OwnerInput, type OwnerJournalSnapshot, type StreamPosition } from "./production-reporting-materialize.js";
+import { imageToEvent, rpcEnumerationPages, rpcFrozenReader, type EnumerationPages, type FrozenBatchRef, type FrozenReaderPages } from "./production-reporting-reader.js";
 import { beginReportingBatch, beginReportingRebuild, copyReportingSourcePage, freezeReportingRebuild, getReportingJobStatus, renewReportingLease, ReportingJobError, resumeReportingBatch, type ReportingSite, type RpcClient } from "./reporting-jobs.js";
 import { publishReportingBatch } from "./reporting-publish.js";
-import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type StageEntry } from "./reporting-stage.js";
-import { checkpointOwnerInput, cleanupHistory, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
+import { buildChunks, claimReportingWork, compareUtf8, packStageRequests, stageReportingResults, type StageEntry, type WorkDescriptor } from "./reporting-stage.js";
+import { checkpointOwnerInput, cleanupHistory, hashOwnerInputStep, listWorkerOwners, lookupOwnerInputs, manifestFromSaved, openOwnerInput, OWNER_INPUT_VERSION, ownerInputVersion, ownerJournal, ownerJournalSnapshot, planOwner, readWalkLine, readWorkerProgress, recordRun, reloadOwnerInput, saveEnumeration, saveWalk, sealWithManifest, verifyPlan, type EnumCursor, type OwnerDiscovery, type OwnerInputHeader } from "./reporting-worker-state.js";
 
 export const WORKER_BUDGET_MS = 240_000;
 export const HEARTBEAT_MS = 30_000;
@@ -302,7 +302,7 @@ async function enumerate(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: Froz
  * reader) and planned strictly in list order; the first failure in that order
  * is raised after the owners before it are planned, exactly as one at a time.
  */
-async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>): Promise<void> {
+async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenReader, stats: MaterializeStats, counts: Record<string, number>, routing: OwnerRouting | null): Promise<void> {
   const size = ownerGroupSize(env);
   for (;;) {
     b.need();
@@ -312,18 +312,100 @@ async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenRea
       b.need();
       await b.beat(a.batchId, a.fence);
       const group = owners.slice(i, i + size);
-      const settled = await materializeOwnerGroup(reader, group, stats, (f) => b.retry(f));
+      const settled: Array<PromiseSettledResult<WorkDescriptor[]>> = routing
+        ? await routedGroup(env, b, a, routing, group, stats, counts)
+        : (await materializeOwnerGroup(reader, group, stats, (f) => b.retry(f))).map((s) => (s.status === "fulfilled" ? { status: "fulfilled", value: s.value.map((w) => w.desc) } : s));
       for (let k = 0; k < group.length; k++) {
         const s = settled[k];
         if (s.status === "rejected") throw s.reason;
         await b.beat(a.batchId, a.fence);
-        await b.retry(() => planOwner(env.client, a.batchId, a.fence, group[k].owner, s.value.map((w) => w.desc)));
+        await b.retry(() => planOwner(env.client, a.batchId, a.fence, group[k].owner, s.value));
         counts.ownersPlanned = (counts.ownersPlanned ?? 0) + 1;
       }
     }
   }
 }
 const ownerGroupSize = (env: WorkerEnv) => Math.max(1, Math.min(env.ownerGroup ?? OWNER_GROUP, 32));
+
+/**
+ * T15P-4d step 3: how planning reads an owner. `light(before)` is a fresh per-owner reader whose EVERY read first runs
+ * `before` (the owner's activation check) and then the page guard; `base` (page guard only) serves the shared children
+ * flushes and the durable route. Null when the source has no one-call pages (the legacy group path is used instead).
+ */
+interface OwnerRouting {
+  light(before: () => Promise<void>): FrozenReader & { pages: FrozenReaderPages };
+  base: FrozenReader & { pages: FrozenReaderPages };
+  cutoffUs: bigint;
+  site: ReportingSite;
+  guard: () => Promise<void>;
+}
+const hasPages = (r: FrozenReader): r is FrozenReader & { pages: FrozenReaderPages } => !!(r as { pages?: unknown }).pages;
+/** An injected reader with `before` awaited ahead of every read, page methods included. */
+function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: () => Promise<void>): FrozenReader & { pages: FrozenReaderPages } {
+  return {
+    ...guardedReader(r, before),
+    pages: {
+      membersPage: async (o, after, limit) => (await before(), r.pages.membersPage(o, after, limit)),
+      byIdsPage: async (ids) => (await before(), r.pages.byIdsPage(ids)),
+      childrenPage: async (ids, after, limit) => (await before(), r.pages.childrenPage(ids, after, limit)),
+    },
+  };
+}
+
+/**
+ * Plan-phase reads of one bounded owner group: each owner starts on its own light reader (activation counters kept
+ * across transient retries: ONE watch per owner) with an allowance-bounded shared children view. An activating owner
+ * restarts on the durable route: it waits for the group's single durable turn (never two durable owners at once),
+ * recovers or opens its plan journal (`recoverOwnerJournal`), continues the read from the journal, and hashes its
+ * audiences into the journal one bounded checkpoint at a time before its descriptors are returned. A light owner never
+ * touches the journal. Results come back in group order, settled each on its own (planned strictly in order).
+ */
+async function routedGroup(
+  env: WorkerEnv, b: Budget, a: ActiveBatch, routing: OwnerRouting,
+  items: ReadonlyArray<{ owner: Owner; oldStaff: Iterable<string> }>, stats: MaterializeStats, counts: Record<string, number>,
+): Promise<Array<PromiseSettledResult<WorkDescriptor[]>>> {
+  const shared = sharedChildren(routing.base);
+  let turn: Promise<void> = Promise.resolve();
+  /** Wait for the group's durable turn; resolves to its release. */
+  const durableTurn = (): Promise<() => void> => {
+    let release!: () => void;
+    const prev = turn;
+    turn = new Promise<void>((r) => (release = r));
+    return prev.then(() => release);
+  };
+  return Promise.allSettled(items.map(async (item) => {
+    const watch = activationWatch(item.owner, ACTIVATION_LIMITS);
+    // the durable turn's release and the journal handle (set inside the durable callback)
+    const held: { release: (() => void) | null; handle: string | null } = { release: null, handle: null };
+    try {
+      const r = await b.retry(() => routedOwnerInput((before, share) => shared.forOwner(routing.light(before), share), item.owner, async () => {
+        if (!held.release) held.release = await durableTurn();
+        const rec = await recoverOwnerJournal(env.client, a.batchId, a.fence, item.owner, routing.site, "plan");
+        held.handle = rec.handle;
+        if (rec.input) return { input: rec.input }; // already read (hashing or complete): no source read, no second reload
+        return { reader: routing.base, journal: ownerJournal(env.client, a.batchId, a.fence, rec.handle, rec.seq, routing.cutoffUs), resume: rec.snapshot };
+      }, ACTIVATION_LIMITS, watch));
+      if (r.activation) {
+        counts.ownersActivated = (counts.ownersActivated ?? 0) + 1;
+        counts.activationCalls = Math.max(counts.activationCalls ?? 0, r.activation.counts.calls);
+      }
+      // one audience projected at a time; only descriptors (identity + input hash) are kept for ordered planning
+      const descs = ownerDescriptors(routing.base, item.owner, r.input, item.oldStaff, stats);
+      if (r.route === "durable") {
+        counts.ownersDurable = (counts.ownersDurable ?? 0) + 1;
+        const hashes = descs.map((d) => ({ audienceKind: d.audienceKind, audienceStaff: d.audienceStaff, inputHash: d.inputHash }));
+        for (;;) {
+          await routing.guard();
+          const step = await b.retry(() => hashOwnerInputStep(env.client, a.batchId, a.fence, held.handle!, hashes));
+          if (step.complete) break;
+        }
+      }
+      return descs;
+    } finally {
+      held.release?.();
+    }
+  }));
+}
 
 /** Seal only with the exact completeness proof and the saved-descriptor manifest. */
 async function seal(env: WorkerEnv, b: Budget, a: ActiveBatch, counts: Record<string, number>): Promise<void> {
@@ -425,10 +507,16 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
         // stays for injected readers and non-RPC work.
         const materializing = env.source ? src.reader : rpcFrozenReader(env.client, ref, { beforeRead: pageGuard });
         const coalesced = guardedReader(coalescingChildren(materializing), pageGuard);
+        const cutoffUs = exactInstant(ref.cutoff)!;
+        const routing: OwnerRouting | null = env.source
+          ? hasPages(src.reader)
+            ? { light: (before) => hookedReader(src.reader as FrozenReader & { pages: FrozenReaderPages }, async () => { await before(); await pageGuard(); }), base: hookedReader(src.reader, pageGuard), cutoffUs, site: req.site, guard: pageGuard }
+            : null
+          : { light: (before) => rpcFrozenReader(env.client, ref, { beforeRead: async () => { await before(); await pageGuard(); } }), base: materializing as FrozenReader & { pages: FrozenReaderPages }, cutoffUs, site: req.site, guard: pageGuard };
         const prog = await b.retry(() => readWorkerProgress(env.client, a.batchId, a.fence));
         if (!prog.sealed) {
           if (!prog.complete) await enumerate(env, b, a, src.reader, src.pages, prog.cursor, counts);
-          await plan(env, b, a, coalesced, stats, counts);
+          await plan(env, b, a, coalesced, stats, counts, routing);
           await seal(env, b, a, counts);
         }
         if (await stage(env, b, a, coalesced, stats, counts)) {

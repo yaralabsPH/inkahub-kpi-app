@@ -9,8 +9,8 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { diffFrozenViews, materializeBatch, memoryFrozenReader, ownerKey, ownerOfEvent, type ChangedKey, type Owner } from "../../api/_lib/production-reporting-materialize";
-import type { EnumerationPages, FrozenBatchRef } from "../../api/_lib/production-reporting-reader";
+import { buildOwnerInput, diffFrozenViews, materializeBatch, materializeOwnerWorks, memoryFrozenReader, ownerDescriptors, ownerKey, ownerOfEvent, ownerWorksFromInput, type ChangedKey, type Owner } from "../../api/_lib/production-reporting-materialize";
+import type { EnumerationPages, FrozenBatchRef, FrozenReaderPages } from "../../api/_lib/production-reporting-reader";
 import { failureKind, isTransient, runReportingCycle, type CycleResult, type WorkerEnv } from "../../api/_lib/production-reporting-worker";
 import { bearerMatches } from "../../api/_lib/reporting-auth";
 import { REPORTING_SITES, type RpcClient } from "../../api/_lib/reporting-jobs";
@@ -55,6 +55,24 @@ function refreshChange(base: Ev[]): { after: Ev[]; changed: ChangedKey[] } {
 // ---------------------------------------------------------------------------
 
 interface Work { workId: string; desc: WorkDescriptor; state: "pending" | "leased" | "done"; chunks: Map<number, string>; chunkCount: number | null }
+/** One owner-input journal (0046): committed pieces by (ord, piece_no), pending pieces, step state, hash progress. */
+interface Journal {
+  handle: string; batch: string; kind: string; key: string; purpose: "plan" | "stage"; phase: "reading" | "hashing" | "complete"; seq: bigint;
+  state: unknown; membersCount: number | null; events: Map<number, unknown[][]>; pending: Map<number, unknown[][]>;
+  audiences: unknown[] | null; hashes: unknown[]; last: { expected: string; payload: string; result: Record<string, unknown> } | null;
+  /** Running piece counts (committed, pending): the reload accounting without re-scanning the journal. */
+  pieces: { committed: number; pending: number };
+}
+/**
+ * FAKE LIMITS (Astra wiring-step-3 review Should-fix 1). This journal models what the routed PLANNING path exercises:
+ * fence/lease, pinned-seq loads with a lone eof, pending vs committed pieces, last-checkpoint replay, reading ->
+ * hashing -> complete, immutability of a complete journal, and all-or-nothing checkpoints. It does NOT model:
+ * 0046's 1,000-row AND 1,048,576-byte load pages (a fixed 500 pieces is synthetic pagination, so reload counts here
+ * are not production reload accounting and prove nothing about 119/121), heavy proofs (always false), the
+ * frozen/sealed/purpose gates, the audience-set and ordered-hash validation of a hash checkpoint, or jsonb-normalised
+ * replay identity (string equality here). Cost, heavy-policy and stage acceptance must use real-SQL evidence.
+ */
+const LOAD_PAGE = 500;
 interface Batch { id: string; site: string; kind: "refresh" | "rebuild"; state: string; fence: number; leaseUntil: number; cutoff: string | null; copyPages: number; copied: number; sealed: { count: number; hash: string } | null }
 type Fail = Partial<{ verifyCountOff: boolean; tamperClaim: boolean; lostSaveResponse: number; transientAt: string; transientTimes: number; extraWork: boolean; publishFails: boolean; recordFails: boolean; processorDisabled: boolean; ownerInputVersion: number | "missing"; versionTransient: number }>;
 
@@ -73,6 +91,8 @@ class FakeDb implements RpcClient {
   /** 0043 worker_seen (distinct ids per key|seed) and worker_walk_line (one paged line per batch). */
   seen = new Map<string, Set<string>>();
   walkLine: { key: string; seed: number; line: string; image: unknown } | null = null;
+  /** T15P-4d: owner-input journals by handle (fenced, seq-checked, replay-safe; see `journal*`). */
+  journals = new Map<string, Journal>();
   transientLeft: number;
   /** T15P-4d step 3: code-only transient failures of the version probe still to inject (message is not transient-looking). */
   versionTransientLeft: number;
@@ -155,6 +175,42 @@ class FakeDb implements RpcClient {
         if (this.fail.ownerInputVersion === "missing") return this.err("Could not find the function public.reporting_owner_input_version without parameters in the schema cache", "PGRST202");
         return this.ok([{ version: this.fail.ownerInputVersion ?? 1 }]);
       }
+      case "open_reporting_owner_input": {
+        const b = this.live(a);
+        const found = [...this.journals.values()].find((j) => j.batch === b.id && j.kind === a.p_kind && j.key === a.p_key);
+        const j = found ?? this.newJournal(b.id, String(a.p_kind), String(a.p_key), a.p_purpose as "plan" | "stage");
+        return this.ok([{ handle: j.handle, created: !found, phase: j.phase, seq: String(j.seq), reload_calls: this.reloadCalls(j, false), provisional_reload_calls: this.reloadCalls(j, true), heavy_proven: false, pending_events: j.pending.size }]);
+      }
+      case "lookup_reporting_owner_inputs": {
+        const b = this.live(a);
+        return this.ok((a.p_owners as Array<[string, string]>).map(([k, key], idx) => {
+          const j = [...this.journals.values()].find((x) => x.batch === b.id && x.kind === k && x.key === key);
+          const o = this.owners.get(`${k}\u0000${key}`);
+          return j
+            ? { idx, handle: j.handle, phase: j.phase, seq: String(j.seq), purpose: j.purpose, reload_calls: this.reloadCalls(j, false), provisional_reload_calls: this.reloadCalls(j, true), heavy_proven: false, pending_events: j.pending.size, old_staff_count: o?.staff.length ?? 0 }
+            : { idx, handle: null, phase: null, seq: null, purpose: null, reload_calls: null, provisional_reload_calls: null, heavy_proven: null, pending_events: null, old_staff_count: o?.staff.length ?? 0 };
+        }));
+      }
+      case "load_reporting_owner_input_header": {
+        const j = this.journal(a);
+        return this.ok([{ phase: j.phase, purpose: j.purpose, seq: String(j.seq), state: j.state, members_count: j.membersCount, event_count: j.events.size, pending_events: j.pending.size,
+          pending_pieces: j.pieces.pending, audiences: j.audiences, hashes_done: j.hashes.length, input_hashes: j.hashes,
+          reload_calls: this.reloadCalls(j, false), provisional_reload_calls: this.reloadCalls(j, true), heavy_proven: false }]);
+      }
+      case "load_reporting_owner_input_events": {
+        const j = this.journal(a);
+        if (String(a.p_seq) !== String(j.seq)) throw new Error("owner input seq moved: the reload is not pinned");
+        const all = this.pieceRows(j.events);
+        const after = [Number(a.p_after_ord), Number(a.p_after_piece)];
+        const rest = all.filter((r) => r[0] > after[0] || (r[0] === after[0] && r[1] > after[1]));
+        if (!rest.length) return this.ok([{ ord: null, piece_no: null, pieces: null, event_id: null, text_bytes: null, text_sha256: null, piece: null, eof: true }]);
+        return this.ok(rest.slice(0, LOAD_PAGE).map(([ord, no, piece, meta]) => {
+          const m = meta as { event_id: string; pieces: number; text_bytes: number; text_sha256: string } | undefined;
+          return { ord, piece_no: no, pieces: m ? m.pieces : null, event_id: m ? m.event_id : null, text_bytes: m ? m.text_bytes : null, text_sha256: m ? m.text_sha256 : null, piece, eof: false };
+        }));
+      }
+      case "checkpoint_reporting_owner_input":
+        return this.ok([this.checkpoint(this.journal(a), String(a.p_expected_seq), a.p_payload as Record<string, unknown>)]);
       case "get_reporting_job_status": {
         const b = this.batch && ["active", "frozen", "publishing"].includes(this.batch.state) ? this.batch : null;
         return this.ok([{ site: a.p_site, processor_enabled: !this.fail.processorDisabled, read_mode: "legacy", capture_enabled: true, capture_epoch: 2, source_epoch: 2, active_generation_id: null,
@@ -346,6 +402,102 @@ class FakeDb implements RpcClient {
         throw new Error(`unexpected rpc ${fn}`);
     }
   }
+  private newJournal(batch: string, kind: string, key: string, purpose: "plan" | "stage"): Journal {
+    const j: Journal = { handle: String(this.journals.size + 1), batch, kind, key, purpose, phase: "reading", seq: 0n, state: { v: 1, step: "members", m: { afterOrd: null } }, membersCount: null, events: new Map(), pending: new Map(), audiences: null, hashes: [], last: null, pieces: { committed: 0, pending: 0 } };
+    this.journals.set(j.handle, j);
+    return j;
+  }
+  private journal(a: Record<string, unknown>): Journal {
+    const b = this.live(a);
+    const j = this.journals.get(String(a.p_handle));
+    if (!j || j.batch !== b.id) throw new Error("owner input not found");
+    return j;
+  }
+  /** Committed (or committed + pending) pieces as [ord, piece_no, piece, meta?], in (ord, piece_no) order. */
+  private pieceRows(...maps: Array<Map<number, unknown[][]>>): Array<[number, number, string, unknown]> {
+    const out: Array<[number, number, string, unknown]> = [];
+    for (const m of maps) for (const [ord, ps] of m) for (const e of ps) out.push([ord, e[1] as number, e[2] as string, e[3]]);
+    return out.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  }
+  /** header + every load page + the lone eof call, as the loader will spend them. */
+  private reloadCalls(j: Journal, provisional: boolean): number {
+    const n = j.pieces.committed + (provisional ? j.pieces.pending : 0);
+    return 1 + Math.ceil(n / LOAD_PAGE) + 1;
+  }
+  private checkpoint(j: Journal, expected: string, payload: Record<string, unknown>): Record<string, unknown> {
+    const body = JSON.stringify(payload);
+    // a lost response retried identically is a replay of the stored result
+    if (j.last && j.last.expected === expected && j.last.payload === body && BigInt(expected) + 1n === j.seq) return { ...j.last.result, replay: true };
+    if (BigInt(expected) !== j.seq) throw new Error(`owner_input_conflict: expected seq ${expected}, current ${j.seq}`);
+    // 0046: after the identical-replay check, every NEW write to a complete journal is refused
+    if (j.phase === "complete") throw new Error("owner_input_conflict: the owner input is complete");
+    // all or nothing, like the SQL statement: a rejected checkpoint restores every field it touched
+    const saved = { events: new Map(j.events), pending: new Map([...j.pending].map(([k, v]) => [k, [...v]])), state: j.state, membersCount: j.membersCount, audiences: j.audiences, hashes: [...j.hashes], phase: j.phase, pieces: { ...j.pieces } };
+    try {
+      return this.applyCheckpoint(j, expected, payload, body);
+    } catch (e) {
+      Object.assign(j, saved);
+      throw e;
+    }
+  }
+  private applyCheckpoint(j: Journal, expected: string, payload: Record<string, unknown>, body: string): Record<string, unknown> {
+    const take = (pieces: unknown[][]) => {
+      for (const e of pieces) {
+        const ord = e[0] as number;
+        if (j.events.has(ord)) throw new Error(`owner_input_conflict: ordinal ${ord} is committed`);
+        (j.pending.get(ord) ?? j.pending.set(ord, []).get(ord)!).push(e);
+        j.pieces.pending++;
+      }
+    };
+    switch (payload.kind) {
+      case "pieces":
+        if (j.phase !== "reading") throw new Error("pieces outside reading");
+        take(payload.pieces as unknown[][]);
+        break;
+      case "page": {
+        if (j.phase !== "reading") throw new Error("a page outside reading");
+        const steps = payload.steps as unknown[];
+        if (!Array.isArray(steps) || !steps.length) throw new Error("a page needs a step"); // validated before any insert
+        take(payload.pieces as unknown[][]);
+        const ords = [...j.pending.keys()].sort((x, y) => x - y);
+        ords.forEach((o, i) => {
+          if (o !== j.events.size + 1 + i) throw new Error("owner_input_conflict: ordinals are not contiguous");
+        });
+        for (const o of ords) j.events.set(o, j.pending.get(o)!);
+        j.pending.clear();
+        j.pieces.committed += j.pieces.pending;
+        j.pieces.pending = 0;
+        j.state = steps[steps.length - 1];
+        if (payload.members_count !== undefined) j.membersCount = payload.members_count as number;
+        break;
+      }
+      case "discard_pending":
+        j.pending.clear();
+        j.pieces.pending = 0;
+        break;
+      case "hash": {
+        if (j.phase === "reading") {
+          if ((j.state as { step?: string }).step !== "done" || j.pending.size) throw new Error("hashing needs a finished read");
+          j.audiences = payload.audiences as unknown[];
+          j.phase = "hashing";
+        } else if (j.phase !== "hashing") throw new Error("the journal is complete");
+        j.hashes.push(...(payload.hashes as unknown[]));
+        if (j.hashes.length === j.audiences!.length) j.phase = "complete";
+        break;
+      }
+      default:
+        throw new Error("unknown checkpoint kind");
+    }
+    j.seq++;
+    const result = { seq: String(j.seq), event_count: j.events.size, pending_events: j.pending.size, pending_pieces: j.pieces.pending, reload_calls: this.reloadCalls(j, false), provisional_reload_calls: this.reloadCalls(j, true), heavy: false, replay: false };
+    j.last = { expected, payload: body, result };
+    return result;
+  }
+  /** Journal RPCs (everything but the version probe), with each handle they named. */
+  journalCalls(): Array<{ fn: string; handle: string | null }> {
+    const J = ["open_reporting_owner_input", "lookup_reporting_owner_inputs", "load_reporting_owner_input_header", "load_reporting_owner_input_events", "checkpoint_reporting_owner_input", "read_reporting_owner_old_staff"];
+    return this.calls.filter((c) => J.includes(c.fn)).map((c) => ({ fn: c.fn, handle: c.args.p_handle === undefined ? null : String(c.args.p_handle) }));
+  }
   private resetWork() {
     this.progress = null;
     this.owners.clear();
@@ -362,11 +514,51 @@ class FakeDb implements RpcClient {
 }
 
 /** Frozen reads from memory with real paging (the enumeration pages honour the cursor). */
-function memorySource(view: Ev[], changed: ChangedKey[], counters: { keyPages: Array<string | null>; ownerPages: Array<string | null> }, pageSize = 37, clock?: { db: FakeDb; perRead: number }) {
-  return (ref: FrozenBatchRef): { reader: ReturnType<typeof memoryFrozenReader>; pages: EnumerationPages } => {
+function memorySource(view: Ev[], changed: ChangedKey[], counters: { keyPages: Array<string | null>; ownerPages: Array<string | null> }, pageSize = 37, clock?: { db: FakeDb; perRead: number }, fail?: { method: string; nth: number; seen?: number }) {
+  return (ref: FrozenBatchRef): { reader: ReturnType<typeof memoryFrozenReader> & { pages: FrozenReaderPages }; pages: EnumerationPages } => {
     const inner = memoryFrozenReader({ site: ref.site, cutoff: ref.cutoff, kind: ref.kind, view, changed });
     const tick = () => void (clock && (clock.db.clock += clock.perRead));
-    const reader: typeof inner = { ...inner, members: (o, c) => (tick(), inner.members(o, c)), byIds: (ids) => (tick(), inner.byIds(ids)), children: (p) => (tick(), inner.children(p)), stream: (s, d, f, l) => (tick(), inner.stream(s, d, f, l)) };
+    /** A transient on the nth call of `fail.method` (counted across invocations), thrown before the read. */
+    const maybeFail = (method: string) => {
+      if (!fail || fail.method !== method) return;
+      fail.seen = (fail.seen ?? 0) + 1;
+      if (fail.seen === fail.nth) throw new Error("fetch failed (injected)");
+    };
+    // T15P-4d: one-call pages over the same view (keyset order exactly as the 0044 adapter validates it)
+    const byOwner = new Map<string, Ev[]>();
+    const byParent = new Map<string, Ev[]>();
+    for (const e of view) {
+      const k = ownerKey(ownerOfEvent(e));
+      (byOwner.get(k) ?? byOwner.set(k, []).get(k)!).push(e);
+      if (e.parent_event_id !== null) (byParent.get(e.parent_event_id) ?? byParent.set(e.parent_event_id, []).get(e.parent_event_id)!).push(e);
+    }
+    for (const l of [...byOwner.values(), ...byParent.values()]) l.sort((x, y) => compareUtf8(x.id, y.id));
+    const byId = new Map(view.map((e) => [e.id, e]));
+    const pages: FrozenReaderPages = {
+      async membersPage(owners, after, limit = 1000) {
+        tick();
+        maybeFail("membersPage");
+        const rows = owners.flatMap((o, i) => (byOwner.get(ownerKey(o)) ?? []).map((ev) => ({ ownerIndex: i, ev })))
+          .filter((r) => after === null || r.ownerIndex > after.index || (r.ownerIndex === after.index && after.id !== null && compareUtf8(r.ev.id, after.id) > 0)).slice(0, limit);
+        const last = rows.at(-1);
+        return { rows, next: last ? { index: last.ownerIndex, id: last.ev.id } : null, empty: !rows.length };
+      },
+      async byIdsPage(ids) {
+        tick();
+        maybeFail("byIdsPage");
+        const rows = ids.filter((id) => byId.has(id)).map((id) => byId.get(id)!);
+        return { rows, pending: [], empty: !rows.length };
+      },
+      async childrenPage(parentIds, after, limit = 1000) {
+        tick();
+        maybeFail("childrenPage");
+        const rows = parentIds.flatMap((p) => byParent.get(p) ?? [])
+          .filter((e) => after === null || compareUtf8(e.parent_event_id!, after.parent) > 0 || (e.parent_event_id === after.parent && compareUtf8(e.id, after.id) > 0)).slice(0, limit);
+        const last = rows.at(-1);
+        return { rows, next: last ? { parent: last.parent_event_id!, id: last.id } : null, empty: !rows.length };
+      },
+    };
+    const reader: typeof inner & { pages: FrozenReaderPages } = { ...inner, pages, members: (o, c) => (tick(), inner.members(o, c)), byIds: (ids) => (tick(), inner.byIds(ids)), children: (p) => (tick(), inner.children(p)), stream: (s, d, f, l) => (tick(), inner.stream(s, d, f, l)), childPage: async (p, a, l) => (tick(), maybeFail("childPage"), inner.childPage(p, a, l)) };
     const owners = [...new Map(view.map((e) => [ownerKey(ownerOfEvent(e)), ownerOfEvent(e)])).values()].sort((x, y) => compareUtf8(ownerKey(x), ownerKey(y)));
     return {
       reader,
@@ -645,6 +837,191 @@ describe("T15P-4d step 3: the owner-input protocol is checked FIRST (scope revie
     expect(db.calls.filter((c) => c.fn !== "reporting_owner_input_version").map((c) => c.fn)).toEqual(["record_reporting_run"]);
     expect(db.batch).toBeNull();
   });
+});
+
+describe("T15P-4d step 3: routed planning (light owners never touch a journal; activating owners plan from it)", () => {
+  const base = baseView(80);
+  /**
+   * HEAVY-n: 1,200 members of one order (crosses the 1,000-row trigger on its first member page): three timed lines and
+   * 1,197 member "started" events (valid order members that produce no detail rows, so they are cheap to stage:
+   * reporting-stage buildChunks re-serialises a chunk per added row, so ~1,200 detail rows cost ~20 s on ANY path,
+   * the old whole-batch reference included; recorded for 4e CPU sampling with detail-rich events).
+   */
+  const heavy = (n: number, staff = W1): Ev[] => Array.from({ length: 1200 }, (_, i) => ev(`h${n}-${String(i).padStart(4, "0")}`, {
+    order_number: `HEAVY-${n}`, staff_id: staff, created_at: `2026-02-2${n}T08:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}+00:00`,
+    ...(i < 3 ? {} : { event_type: "started", line_sku: null, line_quantity: null }),
+  }));
+  const rebuild = async (view: Ev[], ownerGroup?: number) => {
+    const db = new FakeDb("rebuild");
+    const e = env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37));
+    const r = await runReportingCycle({ ...e, ownerGroup }, { site: "uk", mode: "rebuild" });
+    return { db, r };
+  };
+
+  it("a batch of light owners plans with ZERO journal RPCs and publishes exactly the whole-batch reference", async () => {
+    const { db, r } = await rebuild(base);
+    expect(r.state).toBe("published");
+    expect(db.journalCalls()).toEqual([]);
+    expect(db.journals.size).toBe(0);
+    expect(r.counts.ownersDurable ?? 0).toBe(0);
+    expect(db.lastPublished()).toEqual(await reference("rebuild", base, []));
+  });
+
+  it("an owner over the 1,000-row trigger activates: ONE plan journal, journal pages, a hash checkpoint, and the same descriptors as materializeOwnerWorks", async () => {
+    const view = [...base, ...heavy(1)];
+    const { db, r } = await rebuild(view);
+    expect(r.state).toBe("published");
+    expect(r.counts.ownersDurable).toBe(1);
+    expect(db.journals.size).toBe(1);
+    const j = [...db.journals.values()][0];
+    expect([j.kind, j.key, j.purpose, j.phase]).toEqual(["order", "HEAVY-1", "plan", "complete"]);
+    const calls = db.journalCalls();
+    expect(calls.filter((c) => c.fn === "open_reporting_owner_input")).toHaveLength(1);
+    expect(calls.filter((c) => c.fn === "lookup_reporting_owner_inputs")).toHaveLength(1);
+    const pays = db.calls.filter((c) => c.fn === "checkpoint_reporting_owner_input").map((c) => (c.args.p_payload as { kind: string }).kind);
+    expect(pays.filter((k) => k === "page").length).toBeGreaterThan(1);
+    expect(pays.filter((k) => k === "hash").length).toBeGreaterThanOrEqual(1);
+    expect(pays.at(-1)).toBe("hash");
+    // the reload of a fresh journal happens once (at recovery), never again before hashing
+    expect(calls.filter((c) => c.fn === "load_reporting_owner_input_events").length).toBe(1);
+    // the planned descriptors equal the light path's, and so does the whole published batch
+    const o: Owner = { partitionKind: "order", partitionKey: "HEAVY-1" };
+    const want = (await materializeOwnerWorks(memoryFrozenReader({ site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild", view, changed: [] }), o, [])).map((w) => w.desc);
+    expect(sortDescriptors(db.works.filter((w) => w.desc.partitionKey === "HEAVY-1").map((w) => w.desc))).toEqual(sortDescriptors(want));
+    expect((j.hashes as Array<{ inputHash: string }>).map((h) => h.inputHash)).toEqual(want.map((d) => d.inputHash));
+    expect(db.lastPublished()).toEqual(await reference("rebuild", view, []));
+  }, 120_000);
+
+  it("two activating owners in one group never run their durable reads at the same time (ordered turns)", async () => {
+    const view = [...base, ...heavy(1), ...heavy(2, W2)];
+    const { db, r } = await rebuild(view, 8);
+    expect(r.state).toBe("published");
+    expect(r.counts.ownersDurable).toBe(2);
+    // every journal call of one handle comes before every journal call of the other: no interleaving
+    const seq = db.journalCalls().map((c) => c.handle).filter((h): h is string => h !== null);
+    const firstOf2 = seq.indexOf("2");
+    expect(firstOf2).toBeGreaterThan(0);
+    expect(seq.slice(firstOf2)).not.toContain("1");
+    expect(db.lastPublished()).toEqual(await reference("rebuild", view, []));
+  }, 120_000);
+
+  it("a journal already hashed when planning was deferred is reused as is: no new page, the validated input is not re-read", async () => {
+    const view = [...base, ...heavy(1)];
+    const db = new FakeDb("rebuild", { transientAt: "plan_reporting_owner", transientTimes: 9 });
+    const e = () => env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37));
+    const first = await runReportingCycle(e(), { site: "uk", mode: "rebuild" });
+    expect(first.state).toBe("pending"); // planning HEAVY-1 was deferred after its journal was complete
+    const j = [...db.journals.values()][0];
+    expect(j.phase).toBe("complete");
+    const before = db.calls.length;
+    db.transientLeft = 0;
+    db.clock += 400_000;
+    const second = await runReportingCycle(e(), { site: "uk", mode: "rebuild" });
+    expect(second.state).toBe("published");
+    const later = db.calls.slice(before).filter((c) => c.fn === "checkpoint_reporting_owner_input");
+    expect(later).toEqual([]); // no page and no hash: the complete journal IS the input
+    // exactly ONE recovery reload: its event pages (one piece per event here) plus the lone eof call
+    expect(db.calls.slice(before).filter((c) => c.fn === "load_reporting_owner_input_events").length).toBe(Math.ceil(j.events.size / 500) + 1);
+    expect(db.journals.size).toBe(1);
+    expect(db.lastPublished()).toEqual(await reference("rebuild", view, []));
+  }, 120_000);
+
+  it("planning keeps descriptors only: one audience projected at a time, never every audience's rows (review Must-fix 1)", async () => {
+    const view = [...base, ...heavy(1)];
+    const rd = memoryFrozenReader({ site: "uk", cutoff: "2026-03-01T00:00:00.000000Z", kind: "rebuild", view, changed: [] });
+    for (const key of ["HEAVY-1", "O-1", "O-SUCC"]) {
+      const o: Owner = { partitionKind: "order", partitionKey: key };
+      const input = await buildOwnerInput(rd, o);
+      const descs = ownerDescriptors(rd, o, input, [W2]);
+      expect(descs).toEqual(ownerWorksFromInput(rd, o, input, [W2]).map((w) => w.desc)); // same identities and hashes, same order
+      for (const d of descs) expect(Object.keys(d).sort()).toEqual(["audienceKind", "audienceStaff", "inputHash", "partitionKey", "partitionKind"]); // no rows
+    }
+    // the worker's routed planning uses the per-audience helper, never the all-audience works
+    const src = read("api/_lib/production-reporting-worker.ts");
+    const routed = src.slice(src.indexOf("async function routedGroup"), src.indexOf("async function seal("));
+    expect(routed).toMatch(/ownerDescriptors\(/);
+    expect(routed).not.toMatch(/ownerWorksFromInput|materializeOwnerWorks|\.rows\b/);
+  });
+
+  describe("retry keeps the count: one activation watch per owner across transient retries (review Must-fix 2)", () => {
+    // ATT (W3): one member line; below it five lines of ATT-P, each cancelled, then one effective line. Its light read
+    // (member pages, a 0045-style page, ten shared children pages) needs fewer than 16 attempts; a transient on the 3rd
+    // shared children page makes the retried read continue on the SAME counter, so it activates before light attempt 17.
+    const W3 = "33333333-3333-4333-8333-333333333333";
+    const att: Ev[] = [ev("att-m", { order_number: "ATT", staff_id: W3, created_at: "2026-02-20T10:00:00+00:00" })];
+    for (let i = 1; i <= 5; i++) {
+      att.push(ev(`att-p${i}`, { order_number: "ATT-P", staff_id: W3, created_at: `2026-02-20T09:0${i}:00+00:00` }));
+      att.push(ev(`att-p${i}-x`, { order_number: "ATT-P", staff_id: W2, event_type: "cancelled", parent_event_id: `att-p${i}`, line_sku: null, line_quantity: null, created_at: `2026-02-20T09:3${i}:00+00:00` }));
+    }
+    att.push(ev("att-z", { order_number: "ATT-Z", staff_id: W3, created_at: "2026-02-20T08:00:00+00:00" }));
+    const run = async (fail?: { method: string; nth: number }) => {
+      const db = new FakeDb("rebuild");
+      const e = env(db, memorySource(att, [], { keyPages: [], ownerPages: [] }, 37, undefined, fail));
+      const r = await runReportingCycle({ ...e, ownerGroup: 1 }, { site: "uk", mode: "rebuild" });
+      return { db, r, slept: e.slept };
+    };
+    it("control: without a transient, ATT completes on the light route (no journal)", async () => {
+      const { db, r } = await run();
+      expect(r.state).toBe("published");
+      expect(r.counts.ownersActivated ?? 0).toBe(0);
+      expect(db.journals.size).toBe(0);
+      expect(db.lastPublished()).toEqual(await reference("rebuild", att, []));
+    });
+    it("a transient during ATT's light read: the same backoff, then the retry continues the SAME count and activates at exactly 16", async () => {
+      const { db, r, slept } = await run({ method: "childrenPage", nth: 3 });
+      expect(r.state).toBe("published");
+      expect(slept).toEqual([30_000]); // the unchanged bounded backoff
+      expect(r.counts.ownersActivated).toBe(1);
+      expect(r.counts.activationCalls).toBe(16); // failed attempts counted; activated before light attempt 17
+      expect([...db.journals.values()].map((j) => [j.key, j.purpose, j.phase])).toEqual([["ATT", "plan", "complete"]]);
+      expect(db.journalCalls().filter((c) => c.fn === "open_reporting_owner_input")).toHaveLength(1);
+      expect(db.lastPublished()).toEqual(await reference("rebuild", att, []));
+    });
+  });
+
+  it("the fake journal: a complete journal refuses new writes (identical final replay still allowed); a rejected checkpoint changes nothing (review Must-fix 3)", async () => {
+    const db = new FakeDb("rebuild");
+    const b = (await db.rpc("begin_reporting_rebuild", { p_site: "uk" })).data as Array<{ batch_id: string; lease_fence: number }>;
+    const ba = { p_batch: b[0].batch_id, p_fence: b[0].lease_fence };
+    const h = ((await db.rpc("open_reporting_owner_input", { ...ba, p_kind: "order", p_key: "X", p_purpose: "plan" })).data as Array<{ handle: string }>)[0].handle;
+    const cp = (seq: string, payload: unknown) => db.rpc("checkpoint_reporting_owner_input", { ...ba, p_handle: h, p_expected_seq: seq, p_payload: payload });
+    const piece = [1, 0, "x", { event_id: "e1", pieces: 1, text_bytes: 1, text_sha256: "0".repeat(64), src_at: CUT, stream_candidate: false }];
+    // a page with no step is rejected before anything is stored
+    expect((await cp("0", { kind: "page", pieces: [piece], steps: [] })).error).not.toBeNull();
+    const j = db.journals.get(h)!;
+    expect([j.seq, j.events.size, j.pending.size, j.pieces]).toEqual([0n, 0, 0, { committed: 0, pending: 0 }]);
+    // finish: a done page, then the one-audience hash
+    expect((await cp("0", { kind: "page", pieces: [], steps: [{ v: 1, step: "done" }] })).error).toBeNull();
+    const hash = { kind: "hash", audiences: [{ audienceKind: "site", audienceStaff: null }], hashes: [{ audienceKind: "site", audienceStaff: null, inputHash: "a".repeat(64) }] };
+    expect((await cp("1", hash)).error).toBeNull();
+    expect(j.phase).toBe("complete");
+    // the identical final checkpoint is a replay; any new write is refused and moves nothing
+    expect(((await cp("1", hash)).data as Array<{ replay: boolean }>)[0].replay).toBe(true);
+    for (const payload of [{ kind: "discard_pending" }, { kind: "pieces", pieces: [piece] }, { kind: "page", pieces: [], steps: [{ v: 1, step: "done" }] }, hash]) {
+      const res = await cp("2", payload);
+      expect(res.error?.message, JSON.stringify(payload).slice(0, 40)).toMatch(/complete/);
+      expect(j.seq).toBe(2n);
+    }
+  });
+
+  it("a durable owner interrupted by its budget resumes from its journal in the next invocation and still publishes the reference", async () => {
+    const view = [...base, ...heavy(1)];
+    const db = new FakeDb("rebuild", {}, 400);
+    const e = () => env(db, memorySource(view, [], { keyPages: [], ownerPages: [] }, 37, { db, perRead: 3_000 }));
+    let r = await runReportingCycle(e(), { site: "uk", mode: "rebuild", deadlineMs: 60_000 });
+    const seen: string[] = []; // the journal after each pending invocation
+    for (let i = 0; i < 40 && r.state !== "published"; i++) {
+      db.clock += 400_000;
+      seen.push(...[...db.journals.values()].map((j) => `${j.phase}:${(j.state as { step: string }).step}`));
+      r = await runReportingCycle(e(), { site: "uk", mode: "rebuild", deadlineMs: 60_000 });
+    }
+    expect(r.state).toBe("published");
+    expect(db.journals.size).toBe(1); // one journal, reused across invocations
+    // the budget really stopped the durable read part-way (twice), and later invocations continued that same journal
+    expect(seen.slice(0, 3)).toEqual(["reading:members", "reading:walk", "complete:done"]);
+    expect(db.journalCalls().filter((c) => c.fn === "open_reporting_owner_input")).toHaveLength(1);
+    expect(db.lastPublished()).toEqual(await reference("rebuild", view, []));
+  }, 300_000);
 });
 
 describe("Task 15 worker state helpers", () => {

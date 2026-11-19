@@ -990,13 +990,25 @@ export async function materializeOwnerWorks(reader: FrozenReader, owner: Owner, 
 
 /** T15P-4d: the per-audience works of an already built owner input (light or durable); materializeOwnerWorks is this over buildOwnerInput. */
 export function ownerWorksFromInput(reader: FrozenReader, owner: Owner, input: OwnerInput, oldStaff: Iterable<string>, stats?: MaterializeStats): MaterializedWork[] {
-  if (stats) {
-    stats.owners++;
-    stats.maxInput = Math.max(stats.maxInput, input.events.length);
-    stats.peakInput = Math.max(stats.peakInput, input.events.length);
-    stats.totalInput += input.events.length;
-  }
+  countInput(stats, input);
   return ownerAudiences(input, oldStaff).map((audience) => audienceWork(reader, owner, input, audience));
+}
+function countInput(stats: MaterializeStats | undefined, input: OwnerInput): void {
+  if (!stats) return;
+  stats.owners++;
+  stats.maxInput = Math.max(stats.maxInput, input.events.length);
+  stats.peakInput = Math.max(stats.peakInput, input.events.length);
+  stats.totalInput += input.events.length;
+}
+/**
+ * T15P-4d step 3 (planning): an owner's descriptors with ONE audience projected at a time. Each audience's result rows
+ * are dropped before the next audience is projected; only the descriptor (identity + input hash) is kept.
+ */
+export function ownerDescriptors(reader: Pick<FrozenReader, "site" | "cutoff">, owner: Owner, input: OwnerInput, oldStaff: Iterable<string>, stats?: MaterializeStats): WorkDescriptor[] {
+  countInput(stats, input);
+  const out: WorkDescriptor[] = [];
+  for (const audience of ownerAudiences(input, oldStaff)) out.push(audienceWork(reader, owner, input, audience).desc);
+  return out;
 }
 
 /** T15P-4d step 2: an owner's required audiences (site, then member and old-staff self audiences bytewise), without projecting any. */
@@ -1480,7 +1492,8 @@ export async function routedOwnerInput(
   /** The owner's own light reader (its activation check on every RPC); `share` is its allowance for a shared flush. */
   lightReader: (beforeRead: () => Promise<void>, share: FlushShare) => FrozenReader & { pages: FrozenReaderPages },
   owner: Owner,
-  durable: () => Promise<{ reader: FrozenReader & { pages: FrozenReaderPages }; journal: OwnerJournal; resume: OwnerJournalSnapshot | null }>,
+  /** Opens or recovers the journal; a journal already past reading returns its validated `input` instead (no re-read). */
+  durable: () => Promise<{ reader: FrozenReader & { pages: FrozenReaderPages }; journal: OwnerJournal; resume: OwnerJournalSnapshot | null } | { input: OwnerInput }>,
   limits: ActivationLimits = ACTIVATION_LIMITS,
   /** Pass the SAME watch when retrying the owner after a transient failure: attempts accumulate across retries. */
   watch: ReturnType<typeof activationWatch> = activationWatch(owner, limits),
@@ -1507,7 +1520,7 @@ export async function routedOwnerInput(
   } catch (e) {
     if (!(e instanceof OwnerActivation)) throw e;
     const d = await durable();
-    const input = await durableOwnerInput(d.reader, owner, d.journal, d.resume);
+    const input = "input" in d ? d.input : await durableOwnerInput(d.reader, owner, d.journal, d.resume);
     return { input, route: "durable", activation: e, light: e.counts };
   }
 }

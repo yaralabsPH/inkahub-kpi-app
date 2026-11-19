@@ -6650,3 +6650,22 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - A new test checks that a crash before commit A re-reads the combined page with exactly the original request.
   - **Gate:** 80 files, **2397/2397**; tsc, digest and build exit 0.
 - **T15P-4d step 3, wiring step 2 (version first), 2026-11-19:** `runReportingCycle` probes `requireOwnerInputProtocol` through `b.retry` before `acquire` (refresh/rebuild; cleanup unchanged) and returns without `recordRun` on `OwnerInputUnsupportedError`. The fake gains only `reporting_owner_input_version` (1 by default; `"missing"` returns PGRST202; another version; code-only `40001` transients). New API tests: missing and version 2 in both refresh and rebuild (one version RPC only, zero injected-source creations, no batch, no run record); a transient then version 1 (30 s retry, then published equal to the reference); an exhausted transient (30/60/120 s, pending/deferred, no unsupported diagnosis, no acquire). Two trace updates for the demonstrated new call: the processor-disabled trace, and the version probe excluded from the lease-span measurement like the status read. Astra-approved dependency edits: `tests/reporting/pg/runtimeCtx.ts:49` and `tests/staging/reportingWorkerHarness.ts:53` `paceCalls` 3 to 4; no assertion changed; R3a still copies one page. Mutations: no early return fails the no-record tests; no probe fails all four. Gate: 80 files, **2403/2403**; tsc, digest and build exit 0.
+- **T15P-4d step 3, wiring step 3 (routed planning), 2026-11-19 (Astra: `docs/reviews/item-counting-t15p4-wiring-step3.md`):**
+  - **Implementation:** as in the resolved open question above. Additions from the review:
+    - **Must-fix 1:** planning projects one audience at a time through the new `ownerDescriptors` (materializer) and keeps only `WorkDescriptor`s; the legacy group path is mapped to descriptors too.
+    - **Must-fix 2:** `counts.ownersActivated`/`activationCalls` are recorded per cycle. ATT fixture: a transient on its 3rd shared children page gives the 30 s backoff, then activation at exactly 16 attempts, one plan journal, and publication equal to the reference. The no-transient control stays light.
+    - **Must-fix 3:** the fake refuses every new write to a complete journal after the identical-replay check, validates page steps before inserting, and restores all touched state on a rejected checkpoint. Contract test included.
+    - **SF1:** the fake's limits are documented at `LOAD_PAGE`.
+    - **SF3:** the heavy fixtures use member `started` events (valid; clock events may not carry an order).
+  - **Approved dependency edit:** `tests/reporting/reportingPageGuard.test.ts`, `prev` now tracks frozen reads only. No assertion changed; 19/19.
+  - **Mutations (all prompt assertion failures, restored):**
+    - no routing;
+    - no durable turn;
+    - no hashing;
+    - ignoring the recovered input;
+    - a new watch inside the retry;
+    - all-audience works;
+    - the fake without its complete gate;
+    - the fake without rollback.
+  - **SF2 (left open):** the scenario-test failure seen once earlier did not recur. The common gate at this commit passed with the scenario file 8/8 (and alone 8/8 twice). No exact assertion was captured, because that earlier run's output was not saved. It stays open: any recurrence will be kept with its full output.
+  - **Gate:** 80 files, **2412/2412**; tsc, typecheck:digest and build exit 0.
