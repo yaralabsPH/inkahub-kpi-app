@@ -6917,3 +6917,7 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
   - **Covered or deferred:** as recorded in the trim decision and the task 1–2 entries. No hosted environment was contacted, and no SQL was applied.
   - **Final gate (on the combined tree of tasks 1–3):** `npx tsc -b` exit 0; `npm run typecheck:digest` exit 0; the strict staging-runner check (`npx tsc --noEmit --strict --skipLibCheck --target ES2020 --module ESNext --moduleResolution bundler --types node tests/staging/reporting-jobs.ts tests/staging/reporting-capture.ts`) exit 0; `npm run test -- --run`: 80 files, **2459/2459**; `npm run build` exit 0. No hosted CI.
   - **Ready for the single final review.** STATUS: COMPLETE
+- **Correction to the task 2 entry (from Astra's final review, Should-fix 1), 2026-11-19, Claude:**
+  - The SET-1 proof is **Items/line parity** (`parityProblems`: mirror images plus daily Items/line totals against `reducerDaily`). It does not compare Orders, timing, source-issue rows or input hashes, so "the completion is checked" overstated it.
+  - Moving `set-b` to W3 leaves W2's `set-c` in SET-1, so W2 is not a non-member old-self audience, and this is not an empty old-self replacement proof.
+  - The fuller five-family/hash fixture remains follow-on work, as do Should-fix 2 (inspection `runtimeReady` must also require no drift and complete evidence) and Should-fix 3 (runtime R0 reusing the inspector's full identity checks). None of them blocks the staging rehearsal.
