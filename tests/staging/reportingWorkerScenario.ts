@@ -15,7 +15,7 @@ import { OWNERSHIP_SQL, ownershipParams, parityProblems, runtimeAllowance, runti
 import { runReportingCycle, WORKER_BUDGET_MS } from "../../api/_lib/production-reporting-worker";
 import { abandonReportingBatch } from "../../api/_lib/reporting-jobs";
 import type { ServiceRpcClient, ServiceRpcOptions } from "./serviceRpc";
-import { MIGRATION_0046, receiptFindings, REVIEWED_LF } from "./reportingInstalledState";
+import { expectedIndexes, INDEX_SQL, indexProblems, MIGRATION_0044, MIGRATION_0046, receiptFindings, REVIEWED_LF } from "./reportingInstalledState";
 import { SESSION_ROLES, type SessionRole } from "./stagingSessions";
 
 /** Task 15 scale contingency: the worker's predecessor walk reads 0045; the runtime refuses unless it is installed exactly. */
@@ -133,6 +133,14 @@ export async function preflightRuntime(main: Db, ctx: RuntimeCtx, own: RuntimeOw
     const t45 = read(MIGRATION_0045);
     const cat45 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t45)))).rows[0].j as WorkerCatalog;
     p.push(...workerCatalogProblems(cat45, t45, "installed").map((x) => `0045: ${x}`));
+    // final review Should-fix 3: 0044 inspected too (its absent receipt is accepted only on its effective identity), the
+    // local 0044/0045 files are the pinned reviewed ones, and every expected index is valid and ready
+    const t44 = read(MIGRATION_0044);
+    for (const [m, t] of [["0044", t44], ["0045", t45]] as const) if (sha256Lf(t) !== REVIEWED_LF[m].sha256) p.push(`the local ${m} file is not the reviewed one`);
+    const cat44 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t44)))).rows[0].j as WorkerCatalog;
+    p.push(...workerCatalogProblems(cat44, t44, "installed").map((x) => `0044: ${x}`));
+    const wantIndexes = expectedIndexes({ "0043": t43, "0046": t46 });
+    p.push(...indexProblems((await main.query(INDEX_SQL, [wantIndexes])).rows, wantIndexes));
     // T15P-4 trim task 3: the reviewed 0046 draft, installed exactly (functions, tables, indexes, RLS and grants)
     if (sha256Lf(t46) !== REVIEWED_LF["0046"].sha256) p.push("the local 0046 file is not the reviewed draft");
     const cat46 = (await main.query(WORKER_CATALOG_SQL, workerCatalogParams(workerObjects(t46)))).rows[0].j as WorkerCatalog;

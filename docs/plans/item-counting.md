@@ -6921,3 +6921,12 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
   - The SET-1 proof is **Items/line parity** (`parityProblems`: mirror images plus daily Items/line totals against `reducerDaily`). It does not compare Orders, timing, source-issue rows or input hashes, so "the completion is checked" overstated it.
   - Moving `set-b` to W3 leaves W2's `set-c` in SET-1, so W2 is not a non-member old-self audience, and this is not an empty old-self replacement proof.
   - The fuller five-family/hash fixture remains follow-on work, as do Should-fix 2 (inspection `runtimeReady` must also require no drift and complete evidence) and Should-fix 3 (runtime R0 reusing the inspector's full identity checks). None of them blocks the staging rehearsal.
+- **Final-review Should-fix 2 and 3, 2026-11-19, Claude (CJ: "fix them first"):**
+  - **Should-fix 2:** inspection `runtimeReady` now also requires complete evidence, no drift and no error. The drift test asserts readiness is false while a site was eligible.
+  - **Should-fix 3:** runtime R0 also checks the local 0044/0045 files against their pins, inspects the installed 0044 objects (bodies and security), and checks that every expected index (dependency, 0043, 0046) is valid and ready.
+    - New R0 cases: a dropped 0046 index, and an authenticated grant on a 0044 function. Both fail R0 before any write.
+    - Not added: the inspector's full signature/volatility comparison. It needs the offline expected catalog, which the hosted runtime does not have, so the mandatory preceding inspection remains the authority for it.
+  - **Gate:** tsc -b, typecheck:digest, the strict staging-runner check and build all exit 0.
+    - **First full test run:** 2456/2459, with three 5,000 ms timeouts in `tests/api/reporting-worker.test.ts`: "a refresh enumerates changed keys durably…", "a transient failure is retried…", and "a disabled processor…". That file was not changed by this fix, and alone it passes 89/89 in 51.7 s.
+    - **Full rerun:** 2458/2459, with one timeout in "a refresh enumerates changed keys durably…" (1.8 s alone).
+    - These are the same timeouts as in the retained history, now seen more often under full-suite load. No timeout was raised (none is authorized). This is recorded as an open flakiness risk for hosted CI.

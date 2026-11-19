@@ -269,6 +269,8 @@ describe("inspection against PGlite with 0037-0045 installed", () => {
       const r = await inspectInstalled(d);
       expect(r.drift.join(";")).toMatch(/state/);
       expect(inspectionStatus(r)).toMatch(/^STATUS: FAILED/);
+      expect(r.sites.some((x) => x.eligible)).toBe(true); // a site was eligible on the first snapshot ...
+      expect(r.runtimeReady).toBe(false); // ... but drift makes the inspection, and so readiness, fail
       expect(writes(log)).toEqual([]);
     } finally {
       await t.close();

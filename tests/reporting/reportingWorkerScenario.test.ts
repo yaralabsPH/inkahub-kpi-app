@@ -74,6 +74,18 @@ describe("runtime gate: preflight, R1-R4 and cleanup (PGlite, real SQL)", () => 
     await expect(preflightRuntime(pgDb(db), granted.ctx, own, newRuntimeEvidence())).rejects.toThrow(/R0 failed/);
     expect(granted.observations[0].result).toMatch(/0046: public\.reporting_owner_input_version security differs/);
     await db.query("revoke execute on function public.reporting_owner_input_version() from authenticated");
+    // a missing 0046 index (final review Should-fix 3: index validity is checked by R0 too)
+    await db.query("drop index reporting_private.owner_input_pieces_pending");
+    const noIndex = pgCtx(db, own);
+    await expect(preflightRuntime(pgDb(db), noIndex.ctx, own, newRuntimeEvidence())).rejects.toThrow(/R0 failed/);
+    expect(noIndex.observations[0].result).toMatch(/index reporting_private\.owner_input_pieces_pending found 0 times/);
+    await db.query("create index owner_input_pieces_pending on reporting_private.owner_input_pieces (handle) where not committed");
+    // an altered 0044 object: its absent receipt can then never be accepted
+    await db.query("grant execute on function public.read_reporting_generation(text, uuid) to authenticated");
+    const bad44 = pgCtx(db, own);
+    await expect(preflightRuntime(pgDb(db), bad44.ctx, own, newRuntimeEvidence())).rejects.toThrow(/R0 failed/);
+    expect(bad44.observations[0].result).toMatch(/0044: public\.read_reporting_generation security differs/);
+    await db.query("revoke execute on function public.read_reporting_generation(text, uuid) from authenticated");
     expect(own.committedAnything).toBe(false);
     expect(await write()).toBe(0);
   }, 120_000);

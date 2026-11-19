@@ -446,8 +446,9 @@ export async function inspectInstalled(deps: InspectDeps): Promise<InspectionRep
     const failedR0 = [...(identityOk ? [] : ["installed identities, receipts or collation do not hold"]), ...preflightProblems(first.preflight, [site])];
     return { site, eligible: failedR0.length === 0, failedR0, state: states.find((s) => s.site === site) ?? null };
   });
-  r.runtimeReady = r.sites.some((s) => s.eligible);
   r.complete = r.readOnly.first === "on" && r.readOnly.fresh === "on" && r.readOnly.rolledBack && r.readOnly.nonSelect.length === 0;
+  // ready only when the inspection itself would end COMPLETE (no drift, complete evidence, no error) and a site is eligible
+  r.runtimeReady = r.sites.some((s) => s.eligible) && r.complete && r.drift.length === 0 && r.errors.length === 0;
   return finish();
 }
 
