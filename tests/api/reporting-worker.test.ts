@@ -1508,6 +1508,90 @@ describe("T15P-4d step 4 (simplified): capacity from counted calls, parking from
     expect((await runReportingCycle(env(db, src(view)), { site: "uk", mode: "rebuild" })).state).toBe("published");
   });
 
+  // ---- Astra simplified-step-4 review, Must-fix 1 and 3 ----
+  /** The first `kind` checkpoint COMMITS, but its response is lost (a transient 08006 instead). */
+  const losing = (db: FakeDb, kind: string, then?: () => void): RpcClient => {
+    let lost = false;
+    return { rpc: async (fn, args) => {
+      const out = await db.rpc(fn, args);
+      if (!lost && fn === "checkpoint_reporting_owner_input" && (args.p_payload as { kind: string }).kind === kind) {
+        lost = true;
+        then?.();
+        return { data: null, error: { message: "connection failure", code: "08006" } };
+      }
+      return out;
+    } };
+  };
+
+  it("a page commit whose response is lost is never 'no progress': a stop during recovery (outcome unknown) or after it (progress adopted) stays pending, and the batch then publishes", async () => {
+    const view = heavyOnly();
+    // (a) the stop falls inside the recovery that would establish the outcome
+    const a = await enumerated(view);
+    let armed = false;
+    const base = losing(a, "page", () => (armed = true));
+    const slowRecovery: RpcClient = { rpc: async (fn, args) => {
+      const out = await base.rpc(fn, args);
+      if (armed && fn === "load_reporting_owner_input_events") (armed = false, a.clock += 250_000);
+      return out;
+    } };
+    const ra = await runReportingCycle({ ...env(a, src(view)), client: slowRecovery }, { site: "uk", mode: "rebuild" });
+    expect(ra).toMatchObject({ state: "pending", failureKind: null });
+    expect(journal(a).seq).toBe(1n); // the lost write had committed
+    a.clock += 400_000;
+    expect((await runReportingCycle(env(a, src(view)), { site: "uk", mode: "rebuild" })).state).toBe("published");
+    // (b) recovery completes and finds the page committed: that IS progress; a later stop is an ordinary park
+    const b = await enumerated(view);
+    let lostB = false;
+    let reads = 0;
+    const rb = await runReportingCycle({ ...env(b, src(view)), client: losing(b, "page", () => (lostB = true)), onAdmission: (x) => {
+      if (lostB && x.unit === "read" && ++reads === 1) b.clock += 250_000;
+    } }, { site: "uk", mode: "rebuild" });
+    expect(reads).toBe(1);
+    expect(rb).toMatchObject({ state: "pending", failureKind: null });
+    expect(journal(b).seq).toBe(1n);
+    b.clock += 400_000;
+    expect((await runReportingCycle(env(b, src(view)), { site: "uk", mode: "rebuild" })).state).toBe("published");
+  });
+
+  it("a hash checkpoint whose response is lost is never 'no progress' either", async () => {
+    const { db, view, j } = await halfHashed();
+    let armed = false;
+    const base = losing(db, "hash", () => (armed = true));
+    const slow: RpcClient = { rpc: async (fn, args) => {
+      const out = await base.rpc(fn, args);
+      if (armed && fn === "load_reporting_owner_input_header") (armed = false, db.clock += 250_000);
+      return out;
+    } };
+    const r = await runReportingCycle({ ...env(db, src(view)), client: slow }, { site: "uk", mode: "rebuild" });
+    expect(r).toMatchObject({ state: "pending", failureKind: null });
+    expect(j.hashes.length).toBe(103); // the lost write had committed
+    db.clock += 400_000;
+    expect((await runReportingCycle(env(db, src(view)), { site: "uk", mode: "rebuild" })).state).toBe("published");
+  });
+
+  it("when the run log itself cannot be recorded, the no-progress result stays and no database error text (keys, payload) is returned", async () => {
+    const view = heavyOnly();
+    const db = await enumerated(view);
+    const client: RpcClient = { rpc: async (fn, args) => (fn === "record_reporting_run"
+      ? (db.calls.push({ fn, args, at: db.clock }), { data: null, error: { message: "rejected partition ORDER_SENTINEL event EVENT_SENTINEL payload PAYLOAD_SENTINEL token=SECRET_SENTINEL", code: "P0001" } })
+      : db.rpc(fn, args)) };
+    const from = db.calls.length;
+    const r = await runReportingCycle({ ...env(db, src(view)), client, onAdmission: after(db, "commit", 1, 250_000) }, { site: "uk", mode: "rebuild" });
+    expect(r).toMatchObject({ state: "failed", failureKind: "owner_input_no_progress" });
+    expect(r.problems).toEqual([
+      "owner_input_no_progress: an order owner's fresh attempt did not reach its first durable progress boundary within the guarded budget (0 durable units)",
+      "run log not recorded (error)",
+    ]);
+    const attempted = db.calls.slice(from).filter((c) => c.fn === "record_reporting_run");
+    expect(attempted).toHaveLength(1);
+    expect(attempted[0].args).toMatchObject({ p_outcome: "failed", p_failure_kind: "owner_input_no_progress" });
+    expect(JSON.stringify([r, attempted[0].args])).not.toMatch(/SENTINEL|HEAVY|h1-/);
+    expect(db.journals.size).toBe(1);
+    expect(db.published).toHaveLength(0);
+    db.clock += 400_000;
+    expect((await runReportingCycle(env(db, src(view)), { site: "uk", mode: "rebuild" })).state).toBe("published"); // the kept journal resumes
+  });
+
   // ---- recovery and boundary regressions (kept) ----
   it("an unfinished multi-call page (pending pieces) is discarded exactly once on recovery, the prediction drops the discard, and the cursor advances", async () => {
     const view = big2();

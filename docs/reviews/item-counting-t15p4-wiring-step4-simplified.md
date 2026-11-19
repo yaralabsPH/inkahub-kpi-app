@@ -219,5 +219,10 @@ None.
 ## Coder response
 
 Reserved for the response under **CJ's next decision**. This failed review ends the authorized review opportunity; do not start another automatic round. Completion of this review artifact does not approve wiring step 4 or T15P-4d/4e.
+- **CJ decision (2026-11-19):** fix Must-fix 1 and 3; Must-fix 2, 4 and 5 waived as too unlikely to matter for this reporting feature. The decision is recorded in the plan's Implementation log.
+- **Must-fix 1, done:** an `unresolved` state after a possibly committed journal write keeps a budget stop pending. A recovery that finds the committed position advanced adopts the progress, and a successful hash step counts as progress. Regression tests cover a lost page reply (a stop during recovery and a stop after it) and a lost hash reply.
+- **Must-fix 3, done:** the run-log failure problem is now `run log not recorded (<kind>)`, with no database text. A sentinel test asserts the complete problems array and the attempted run arguments.
+- **Must-fix 2, 4, 5: waived by CJ.** Not implemented.
+- **Should-fix 1:** the log states that the production-reader test accepts either published or pending.
 
 STATUS: COMPLETE

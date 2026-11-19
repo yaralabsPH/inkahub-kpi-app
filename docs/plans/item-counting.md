@@ -6815,3 +6815,17 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - One mutation survived: dropping only `!copied`. It is redundant, because an invocation that copies always enumerates too, and the enumeration check is what the M3 mutation above removes. Kept as a defensive check.
   - **Timeout history (round-3 Should-fix 1):** both earlier observations stand. The first API test timed out under full-suite load (5,000 ms limit; 1.8–1.9 s alone). Round 2's transient-retry test showed 64/65 passed, with one 5,000 ms timeout and 1,953 ms alone (`docs/reviews/item-counting-t15p4-wiring-step4-r2.md`). Suite contention as the cause is unconfirmed. This gate had no timeout, and no timeout was changed.
   - **Gate:** `npx tsc -b` exit 0; `npm run typecheck:digest` exit 0; `npm run test -- --run`: 80 files, **2435/2435**; `npm run build` exit 0. No hosted CI.
+- **CJ decision on Astra's simplified-step-4 review (`docs/reviews/item-counting-t15p4-wiring-step4-simplified.md`), 2026-11-19, recorded by Claude:** CJ: "i need to be fast ... some things that you test or astra tests are too farfetch to happen. can we just take this to finish line now?" CJ then approved fixing Must-fix 1 and 3 only, waiving the rest, and trimming the remaining steps ("yes go ahead, do all 3").
+  - **Fixed, Must-fix 1 (false no-progress after a lost reply):**
+    - A journal write (`open`/`checkpoint`) that fails transiently or by network error marks the fresh attempt `unresolved`. A budget stop while it is unresolved stays `pending`.
+    - Each recovery compares the committed position (phase, state, event count, hashes done) with the attempt's first recovery. An advance is adopted as progress, and the outcome is then resolved.
+    - A successful hash step always counts as progress.
+    - Tests: a lost page response with the stop inside recovery (a) and after it (b); a lost hash response. All stay pending and then publish.
+    - Mutations: ignoring `unresolved` and never adopting a recovered advance each fail a test.
+  - **Fixed, Must-fix 3 (run-log failure text):** the run-log failure problem is now the allowlisted `run log not recorded (<failure kind>)`, never database error text, on every path. Test: a no-progress run whose run log fails with key, payload and secret sentinels returns exactly the two expected problems, with no sentinel in the result or the attempted run arguments, and the kept journal later publishes. Only the order-owner case is tested (waived: an event-owner duplicate).
+  - **Waived by CJ, not done:**
+    - Must-fix 2: retry-driven call-trigger accounting. With the production caps it cannot cause a refusal.
+    - Must-fix 4: validation of absurd arithmetic inputs (`Number.MAX_VALUE`, NaN beside a capacity verdict). Production data cannot produce them.
+    - Must-fix 5: the further boundary-evidence tests (the real packing seam, the synchronous preparation seams, the empty-page and fence-loss controls, more contamination comparisons, the event-owner visibility case). Recorded here as accepted gaps, not as done.
+  - **Gate:** tsc -b exit 0; typecheck:digest exit 0; 80 files, 2438/2438; build exit 0.
+  - **Step 4 status:** complete under CJ's waiver.

@@ -395,13 +395,14 @@ async function plan(env: WorkerEnv, b: Budget, a: ActiveBatch, reader: FrozenRea
       first = false;
       // the startup (only the fixed restart prerequisites ran) must have left essentially the whole standard budget
       if (routing && b.elapsedMs() <= FRESH_STARTUP_MS) {
-        const attempt: FreshAttempt = { started: false, progressed: false };
+        const attempt: FreshAttempt = { started: false, progressed: false, unresolved: false };
         counts.freshAttempts = (counts.freshAttempts ?? 0) + 1;
         try {
           await planGroup(owners.slice(0, 1), attempt);
         } catch (e) {
           // only a budget stop of an attempt that did owner work and made no durable progress; every other error keeps its kind
-          if (e instanceof OutOfTime && attempt.started && !attempt.progressed) {
+          // a write whose outcome is still unknown (lost response, not yet recovered) is never declared "no progress"
+          if (e instanceof OutOfTime && attempt.started && !attempt.progressed && !attempt.unresolved) {
             counts.ownersNoProgress = (counts.ownersNoProgress ?? 0) + 1;
             throw new OwnerInputNoProgressError(owners[0].owner, counts.durableUnits ?? 0);
           }
@@ -463,7 +464,14 @@ function hookedReader(r: FrozenReader & { pages: FrozenReaderPages }, before: ()
 }
 
 /** The qualified fresh attempt of one owner (simplification §4): did it start owner work, and did it make progress? */
-interface FreshAttempt { started: boolean; progressed: boolean }
+interface FreshAttempt {
+  started: boolean;
+  progressed: boolean;
+  /** A journal write failed in a way that may still have committed; cleared once recovery or a retry establishes the outcome. */
+  unresolved: boolean;
+}
+/** Journal writes whose lost response may hide a committed change. */
+const JOURNAL_WRITES = new Set(["open_reporting_owner_input", "checkpoint_reporting_owner_input"]);
 
 /**
  * Plan-phase reads of one bounded owner group (T15P-4d steps 3-4). Every owner first runs its light read (one
@@ -490,7 +498,17 @@ async function routedGroup(
   };
   // journal, recovery and hash RPCs: the unit guard runs before EACH of them (a renewal due between a unit's calls is
   // taken at that call boundary, and no call starts without its own time plus the reserve)
-  const jc: RpcClient = { rpc: async (fn, args) => (await routing.unitGuard(), env.client.rpc(fn, args)) };
+  const jc: RpcClient = { rpc: async (fn, args) => {
+    await routing.unitGuard();
+    try {
+      const out = await env.client.rpc(fn, args);
+      if (out.error && attempt && JOURNAL_WRITES.has(fn) && isTransient(out.error)) attempt.unresolved = true;
+      return out;
+    } catch (e) {
+      if (attempt && JOURNAL_WRITES.has(fn)) attempt.unresolved = true; // a network failure: the write may have landed
+      throw e;
+    }
+  } };
   return Promise.allSettled(items.map(async (item) => {
     if (attempt) attempt.started = true;
     const progressed = () => {
@@ -534,6 +552,8 @@ async function routedGroup(
     // the durable turn's release, the journal handle and whether the recovered journal was already complete
     const held: { release: (() => void) | null; handle: string | null; complete: boolean } = { release: null, handle: null, complete: false };
     let freshLight = 0;
+    /** This attempt's committed position at its first recovery. */
+    let startPos: string | null = null;
     try {
       const r = await b.retry(() => {
         attemptStart = watch.calls;
@@ -548,6 +568,12 @@ async function routedGroup(
             held.release = await durableTurn();
           }
           const rec = await recoverOwnerJournal(jc, a.batchId, a.fence, item.owner, routing.site, "plan");
+          // the committed semantic position (pending pieces were discarded before this reload): a later recovery that
+          // finds it advanced adopts progress a lost response hid; either way the outcome is now known
+          const pos = JSON.stringify([rec.header.phase, rec.header.state, rec.header.eventCount, rec.header.hashesDone]);
+          if (startPos === null) startPos = pos;
+          else if (pos !== startPos) progressed();
+          if (attempt) attempt.unresolved = false;
           cost.fixed = FIXED_PREREQUISITE_RPCS + freshLight + 1; // + lookup
           cost.reload = rec.reloadCalls;
           held.handle = rec.handle;
@@ -592,7 +618,9 @@ async function routedGroup(
             await admit("hash", "hash", HASH_UNIT_RPCS, HASH_UNIT_RPCS);
             const h0 = b.now();
             const step = await b.retry(() => hashOwnerInputStep(jc, a.batchId, a.fence, held.handle!, hashes));
-            if (step.payload) progressed(); // committed hashes (or completion)
+            // committed hashes, or a completion a lost response hid (a journal recovered complete never enters this loop)
+            progressed();
+            if (attempt) attempt.unresolved = false;
             samples.hash = Math.max(samples.hash ?? 0, b.now() - h0);
             if (step.result) cost.reload = step.result.reloadCalls;
             counts.durableUnits = (counts.durableUnits ?? 0) + 1;
@@ -764,7 +792,8 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
   try {
     await recordRun(env.client, { site: req.site, mode: req.mode, action: req.mode, outcome: out.state, batchId: out.batchId, generationId: out.generationId, startedAtUtc, durationMs: out.durationMs, counts, failureKind: out.state === "failed" ? out.failureKind ?? "error" : null });
   } catch (e) {
-    problems.push(`run log not recorded: ${redact(e instanceof Error ? e.message : String(e))}`);
+    // allowlisted: the failure KIND only (a database error text may carry keys or payload); the returned diagnosis stays
+    problems.push(`run log not recorded (${failureKind(e)})`);
   }
   return out;
 }
