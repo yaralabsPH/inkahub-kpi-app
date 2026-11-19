@@ -813,7 +813,8 @@ describe("Task 15 worker: durable resume, fences and recovery", () => {
     expect(r2.state).toBe("pending");
     expect(r2.problems.join()).toMatch(/^deferred: /);
     expect(e2.slept).toEqual([30_000]); // the 60 s retry would cross the deadline: deferred instead of sleeping past it
-  });
+    // CJ approved (2026-11-19): 20 s instead of vitest's default 5 s (~2 s alone; repeatedly over 5 s under full-suite load)
+  }, 20_000);
   it("partition_too_large is a permanent, visible failure kind (no truncation, nothing published)", async () => {
     const big: Ev[] = Array.from({ length: 50_001 }, (_, i) => ev(`b${String(i).padStart(5, "0")}`, { order_number: "BIG", created_at: "2026-02-10T08:00:00+00:00", line_sku: null, line_quantity: null, event_type: "completed" }));
     const db = new FakeDb("rebuild");
