@@ -26,6 +26,7 @@ const W7 = "0000000c-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W8 = "0000000d-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W9 = "0000000e-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const W10 = "0000000f-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const W11 = "00000010-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 /** scope review Must-fix 4, Proof 3: each owner's earliest member id ends in this code point (built, never escaped). */
 const UNI = [["U7FF", W7, 0xd7ff, true], ["UE000", W8, 0xe000, false], ["UASTRAL", W9, 0x1f600, false]] as const;
 const uniId = (cp: number) => "cu" + String.fromCodePoint(cp);
@@ -154,6 +155,14 @@ beforeAll(async () => {
     if (id !== "cq-tm1") await ins({ id: `${id}-k`, staff: W2, order: order === "CQ-M" ? "CQ-K" : order, type: "cancelled", parent: id, at: cq(t + 1) });
   }
   for (let i = 1; i <= 3; i++) await noteRow(`cq-tm1-k${i}`, "cancelled", "CQ-W", cq(-9 + i / 10), "cq-tm1", null, W2);
+  // scope review Must-fix 4, Proof 1 (plain-page look-ahead): LA-M's only member line la-m; below it la-p1 (effective,
+  // framed: it satisfies the walk) whose three 400 KB non-cancelling kids CUT the first 0045 page, so the position is
+  // re-read as a PLAIN page that also returns la-p2/la-p3 below the stop instant.
+  await db.query("insert into auth.users (id, email) values ($1, 'w11@x')", [W11]);
+  const la = (s: number) => new Date(Date.parse("2026-10-05T06:00:00Z") + s * 1000).toISOString();
+  await ins({ id: "la-m", staff: W11, order: "LA-M", at: la(100) });
+  for (const [id, t] of [["la-p1", 50], ["la-p2", 40], ["la-p3", 30]] as const) await ins({ id, staff: W11, order: "LA-P", at: la(t) });
+  for (let i = 1; i <= 3; i++) await noteRow(`la-p1-k${i}`, "cancelled", "LA-K", la(60 + i), "la-p1", null, W2);
   expect((await c().rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
   expect((await c().rpc("set_reporting_site_mode", { p_site: SITE, p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
   const r = await beginReportingRebuild(c(), SITE);
@@ -1142,4 +1151,79 @@ describe("a line without included kids inside a combined 0045 page (scope review
       }
     }
   }, 600_000);
+});
+
+describe("cut pages and look-ahead past the stop are never evidence (scope review Must-fix 4, Proof 1)", () => {
+  type Page = { fn: string; args: Record<string, unknown>; ids: string[] };
+  /** A durable read of `owner` that records every stream / 0045 page response's ids and every commit's steps. */
+  async function observed(owner: Owner) {
+    await reset(owner.partitionKey);
+    const h = await openOwnerInput(c(), ref.batchId, ref.fence, owner, "plan");
+    const pages: Page[] = [];
+    const client: RpcClient = {
+      rpc: async (fn, a) => {
+        const r = await c().rpc(fn, a);
+        if (fn === "read_reporting_predecessor_page" || fn === "read_reporting_staff_stream") {
+          const rows = (r.data ?? []) as Array<{ event_id?: string | null }>;
+          pages.push({ fn, args: a ?? {}, ids: rows.map((x) => x.event_id).filter((x): x is string => typeof x === "string") });
+        }
+        return r;
+      },
+    };
+    const j = ownerJournal(c(), ref.batchId, ref.fence, h.handle, h.seq, cutoffUs());
+    const steps: St[] = [];
+    await durableOwnerInput(rpcFrozenReader(client, ref), owner, { commit: async (p) => { await j.commit(p); steps.push(...(p.steps as unknown as St[])); } });
+    const back = await reloadOwnerInput(c(), ref.batchId, ref.fence, h.handle, SITE);
+    return { pages, steps, journal: back.events.map((e) => e.ev.id) };
+  }
+  /** The journal holds exactly buildOwnerInput's events, once each; returned-but-unconsumed ids are absent. */
+  function exactlyConsumed(want: { events: Ev[] }, pages: Page[], journal: string[]) {
+    const wanted = new Set(want.events.map((e) => e.id));
+    expect(journal.length).toBe(want.events.length);
+    expect(new Set(journal)).toEqual(wanted);
+    const unconsumed = [...new Set(pages.flatMap((p) => p.ids))].filter((id) => !wanted.has(id));
+    const inJournal = new Set(journal);
+    expect(unconsumed.filter((id) => inJournal.has(id))).toEqual([]);
+    return unconsumed;
+  }
+
+  it("NOTE: a cut 0045 page is discarded and re-read as a plain page at the same position; the journal is exactly the consumed input", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "NOTE" };
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const { pages, journal } = await observed(o);
+    // a discarded combined page: the next source page is a plain page at the SAME position
+    const cut = pages.filter((p, i) => p.fn === "read_reporting_predecessor_page" && pages[i + 1]?.fn === "read_reporting_staff_stream" && pages[i + 1].args.p_at === p.args.p_at && pages[i + 1].args.p_at_event_id === p.args.p_at_event_id);
+    expect(cut.length, "NOTE reads at least one cut combined page").toBeGreaterThan(0);
+    exactlyConsumed(want, pages, journal);
+  }, 300_000);
+
+  it("LA-M: after a cut 0045 page, the stop falls inside the PLAIN re-read; the lines it returned below the stop are never journaled", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "LA-M" };
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const { pages, steps, journal } = await observed(o);
+    const first = pages.findIndex((p) => p.fn === "read_reporting_predecessor_page");
+    const plain = pages[first + 1];
+    expect(plain, "the cut combined page is followed by a plain page at the same position").toMatchObject({ fn: "read_reporting_staff_stream", args: { p_at: pages[first].args.p_at, p_at_event_id: pages[first].args.p_at_event_id } });
+    expect(plain.ids).toEqual(expect.arrayContaining(["la-p1", "la-p2", "la-p3"]));
+    expect(steps.some((x) => x.step === "walk" && x.w.stopAt === String(exactInstant(want.events.find((e) => e.id === "la-p1")!.created_at)))).toBe(true);
+    expect(journal).toEqual(expect.arrayContaining(["la-p1", "la-p1-k1", "la-p1-k2", "la-p1-k3"]));
+    const unconsumed = exactlyConsumed(want, pages, journal);
+    expect(unconsumed).toEqual(expect.arrayContaining(["la-p2", "la-p3"]));
+  }, 300_000);
+
+  it("O-1: lines below the stop instant returned by the look-ahead page are never journaled; the tie at the stop is", async () => {
+    const o: Owner = { partitionKind: "order", partitionKey: "O-1" };
+    const want = await buildOwnerInput(rpcFrozenReader(c(), ref), o);
+    const { pages, steps, journal } = await observed(o);
+    const stopUs = exactInstant(at(-2400))!;
+    // W1 (worker 0) stops at the effective unframed pr-0240; its stored stopAt is that exact microsecond
+    const stored = steps.filter((x) => x.step === "walk" && x.w.worker === 0 && x.w.stopAt !== null).map((x) => x.w.stopAt);
+    expect(stored.length).toBeGreaterThan(0);
+    expect(new Set(stored)).toEqual(new Set([String(stopUs)]));
+    expect(journal).toContain("pr-0240");
+    expect(journal).toContain("pr-0240-tie"); // the tie at the stop instant is consumed
+    const unconsumed = exactlyConsumed(want, pages, journal);
+    expect(unconsumed, "the look-ahead page returned lines below the stop").toContain("pr-0241");
+    expect(journal).not.toContain("pr-0241");
+  }, 300_000);
 });
