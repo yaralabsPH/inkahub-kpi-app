@@ -46,7 +46,7 @@ export function pgCtx(db: PGlite, own: RuntimeOwnership, over: Partial<RuntimeCt
     redact: (s) => s.replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, "[jwt]").replace(/postgres(ql)?:\/\/\S+/g, "[url]"),
     now: () => Date.now(),
     sleep: async () => undefined,
-    limits: { paceCalls: 3, maxInvocations: 30 },
+    limits: { paceCalls: 4, maxInvocations: 30 },
     ...over,
   };
   return { ctx, observations, saves };

@@ -50,7 +50,7 @@ export function parseWorkerArgs(argv: readonly string[]): WorkerArgs {
     }
     return n;
   };
-  const paceCalls = int("pace-calls", 3, 2, 50);
+  const paceCalls = int("pace-calls", 4, 2, 50);
   const maxInvocations = int("max-invocations", 12, 3, 60);
   const maxLeaseWaitMs = int("max-lease-wait-ms", 420_000, 1_000, 900_000);
   const known = new Set([...WORKER_FLAGS, "--site", "--pace-calls", "--max-invocations", "--max-lease-wait-ms", "--report"]);

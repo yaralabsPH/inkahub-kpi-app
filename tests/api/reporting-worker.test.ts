@@ -56,7 +56,7 @@ function refreshChange(base: Ev[]): { after: Ev[]; changed: ChangedKey[] } {
 
 interface Work { workId: string; desc: WorkDescriptor; state: "pending" | "leased" | "done"; chunks: Map<number, string>; chunkCount: number | null }
 interface Batch { id: string; site: string; kind: "refresh" | "rebuild"; state: string; fence: number; leaseUntil: number; cutoff: string | null; copyPages: number; copied: number; sealed: { count: number; hash: string } | null }
-type Fail = Partial<{ verifyCountOff: boolean; tamperClaim: boolean; lostSaveResponse: number; transientAt: string; transientTimes: number; extraWork: boolean; publishFails: boolean; recordFails: boolean; processorDisabled: boolean }>;
+type Fail = Partial<{ verifyCountOff: boolean; tamperClaim: boolean; lostSaveResponse: number; transientAt: string; transientTimes: number; extraWork: boolean; publishFails: boolean; recordFails: boolean; processorDisabled: boolean; ownerInputVersion: number | "missing"; versionTransient: number }>;
 
 class FakeDb implements RpcClient {
   clock = 1_700_000_000_000;
@@ -74,8 +74,11 @@ class FakeDb implements RpcClient {
   seen = new Map<string, Set<string>>();
   walkLine: { key: string; seed: number; line: string; image: unknown } | null = null;
   transientLeft: number;
+  /** T15P-4d step 3: code-only transient failures of the version probe still to inject (message is not transient-looking). */
+  versionTransientLeft: number;
   constructor(public kind: "refresh" | "rebuild", public fail: Fail = {}, public tick = 50) {
     this.transientLeft = fail.transientTimes ?? 0;
+    this.versionTransientLeft = fail.versionTransient ?? 0;
   }
   private err(message: string, code = "P0001") {
     return { data: null, error: { message, code } };
@@ -143,6 +146,15 @@ class FakeDb implements RpcClient {
   }
   private handle(fn: string, a: Record<string, unknown>): { data: unknown; error: { message: string; code: string } | null } {
     switch (fn) {
+      case "reporting_owner_input_version": {
+        // 0046's protocol probe: installed (version 1 by default), another version, missing, or a code-only transient
+        if (this.versionTransientLeft > 0) {
+          this.versionTransientLeft--;
+          return this.err("retry this transaction", "40001");
+        }
+        if (this.fail.ownerInputVersion === "missing") return this.err("Could not find the function public.reporting_owner_input_version without parameters in the schema cache", "PGRST202");
+        return this.ok([{ version: this.fail.ownerInputVersion ?? 1 }]);
+      }
       case "get_reporting_job_status": {
         const b = this.batch && ["active", "frozen", "publishing"].includes(this.batch.state) ? this.batch : null;
         return this.ok([{ site: a.p_site, processor_enabled: !this.fail.processorDisabled, read_mode: "legacy", capture_enabled: true, capture_epoch: 2, source_epoch: 2, active_generation_id: null,
@@ -517,7 +529,7 @@ describe("Task 15 worker: durable resume, fences and recovery", () => {
     expect(takeovers).toBeGreaterThan(1);
     // heartbeat: within every invocation the lease is renewed at least every 30 s of work (plus one bounded unit)
     const marks = db.calls.filter((c) => ["resume_reporting_batch", "begin_reporting_batch", "renew_reporting_lease"].includes(c.fn)).map((c) => c.at);
-    const spans = db.calls.filter((c) => c.at >= marks[0] && c.fn !== "get_reporting_job_status").map((c) => c.at - Math.max(...marks.filter((m) => m <= c.at)));
+    const spans = db.calls.filter((c) => c.at >= marks[0] && c.fn !== "get_reporting_job_status" && c.fn !== "reporting_owner_input_version").map((c) => c.at - Math.max(...marks.filter((m) => m <= c.at)));
     expect(Math.max(...spans)).toBeLessThanOrEqual(30_000 + 10 * 2_000);
     expect(db.calls.filter((c) => c.fn === "renew_reporting_lease").length).toBeGreaterThan(0);
     expect(db.calls.some((c) => c.fn === "resume_reporting_batch")).toBe(true);
@@ -571,7 +583,7 @@ describe("Task 15 worker: durable resume, fences and recovery", () => {
     const db = new FakeDb("refresh", { processorDisabled: true });
     const r = await runReportingCycle(env(db, memorySource(after, changed, { keyPages: [], ownerPages: [] })), { site: "uk", mode: "refresh" });
     expect(r).toMatchObject({ state: "failed", failureKind: "processor_disabled" });
-    expect(db.calls.map((c) => c.fn)).toEqual(["get_reporting_job_status", "record_reporting_run"]);
+    expect(db.calls.map((c) => c.fn)).toEqual(["reporting_owner_input_version", "get_reporting_job_status", "record_reporting_run"]); // T15P-4d: version first
     const db2 = new FakeDb("refresh", { recordFails: true });
     const r2 = await runReportingCycle(env(db2, memorySource(after, changed, { keyPages: [], ownerPages: [] })), { site: "uk", mode: "refresh" });
     expect(r2.state).toBe("published");
@@ -589,6 +601,49 @@ describe("Task 15 worker: durable resume, fences and recovery", () => {
     expect(isTransient(new Error("plan_reporting_work: conflicting descriptor"))).toBe(false);
     expect(failureKind(new Error("site uk has no continuous published base at rule r and capture epoch 2; a rebuild is required"))).toBe("rebuild_required");
     expect(failureKind(new Error("reporting batch x is no longer valid: capture epoch changed"))).toBe("invalidated");
+  });
+});
+
+describe("T15P-4d step 3: the owner-input protocol is checked FIRST (scope review Must-fix 1 and 3)", () => {
+  const base = baseView(80);
+  const { after, changed } = refreshChange(base);
+  const src = () => memorySource(after, changed, { keyPages: [], ownerPages: [] });
+  for (const [label, v] of [["missing", "missing"], ["version 2", 2]] as const) {
+    for (const mode of ["refresh", "rebuild"] as const) {
+      it(`${label} (${mode}): failed owner_input_unsupported before ANY batch work, and no run record`, async () => {
+        const db = new FakeDb(mode, { ownerInputVersion: v });
+        let sourced = 0; // the injected source factory: a frozen view is never even created
+        const inner = memorySource(mode === "refresh" ? after : base, mode === "refresh" ? changed : [], { keyPages: [], ownerPages: [] });
+        const r = await runReportingCycle(env(db, (ref) => (sourced++, inner(ref))), { site: "uk", mode });
+        expect(r).toMatchObject({ state: "failed", failureKind: "owner_input_unsupported", batchId: null, generationId: null });
+        expect(db.calls.map((c) => c.fn)).toEqual(["reporting_owner_input_version"]); // no status/acquire/source/journal/publish/run record
+        expect(sourced).toBe(0);
+        expect(db.runs).toEqual([]);
+        expect(db.batch).toBeNull();
+        expect(r.problems.join()).toMatch(/owner_input_unsupported/);
+      });
+    }
+  }
+  it("a code-only transient on the version probe is retried (30 s), then the cycle works normally", async () => {
+    const db = new FakeDb("refresh", { versionTransient: 1 });
+    const e = env(db, src());
+    const r = await runReportingCycle(e, { site: "uk", mode: "refresh" });
+    expect(r.state).toBe("published");
+    expect(r.failureKind).toBeNull();
+    expect(e.slept).toEqual([30_000]);
+    expect(db.calls.slice(0, 3).map((c) => c.fn)).toEqual(["reporting_owner_input_version", "reporting_owner_input_version", "get_reporting_job_status"]);
+    expect(db.lastPublished()).toEqual(await reference("refresh", after, changed));
+  });
+  it("an exhausted transient is deferred (pending), never diagnosed as unsupported, and acquires nothing", async () => {
+    const db = new FakeDb("refresh", { versionTransient: 9 });
+    const e = env(db, src());
+    const r = await runReportingCycle(e, { site: "uk", mode: "refresh" });
+    expect(r).toMatchObject({ state: "pending", failureKind: null });
+    expect(r.problems.join()).toMatch(/^deferred: /);
+    expect(r.problems.join()).not.toMatch(/unsupported/);
+    expect(e.slept).toEqual([30_000, 60_000, 120_000]);
+    expect(db.calls.filter((c) => c.fn !== "reporting_owner_input_version").map((c) => c.fn)).toEqual(["record_reporting_run"]);
+    expect(db.batch).toBeNull();
   });
 });
 

@@ -400,6 +400,9 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
       }
       out.state = "done";
     } else {
+      // T15P-4d step 3: the 0046 owner-input protocol FIRST, before any batch work (a transient probe failure keeps its code
+      // and goes through the bounded retry / Deferred path; only a missing or other version is unsupported)
+      await b.retry(() => requireOwnerInputProtocol(env.client));
       const a = await acquire(env, b, req.site, req.mode, counts);
       if (!a) out.state = "busy";
       else {
@@ -447,6 +450,11 @@ export async function runReportingCycle(env: WorkerEnv, req: { site: ReportingSi
       out.state = "failed";
       out.failureKind = failureKind(e);
       problems.push(redact(e instanceof Error ? e.message : String(e)));
+      // an unsupported protocol did no batch work: it is reported, but records no run (the run log is part of the protocol)
+      if (e instanceof OwnerInputUnsupportedError) {
+        out.durationMs = Math.max(0, env.now() - t0);
+        return out;
+      }
     }
   }
   counts.ownersMaterialized = stats.owners;
