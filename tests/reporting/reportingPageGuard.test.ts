@@ -176,11 +176,10 @@ describe("the real worker over real SQL with 1 simulated second per RPC: budget,
   }, 600_000);
 });
 
-describe("the real worker wires the per-RPC guard: one line with 300 cancellations read one row per page", () => {
+describe("PG-LONG (T15P-4 trim, 4e): the 300-cancellation owner read one row per page now FINISHES through its durable journal", () => {
   const STAFF = "00000009-cccc-4ccc-8ccc-cccccccccccc";
-  let db: PGlite;
-  beforeAll(async () => {
-    db = await reportingDb();
+  const seed = async () => {
+    const db = await reportingDb();
     await db.query("insert into auth.users (id, email) values ($1, 'c@x')", [STAFF]);
     const ins = `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
       values ('au', $1, $2, 'framed', 'PG-LONG', $3, $4, $5, 's', '', $6, $7)`;
@@ -189,41 +188,97 @@ describe("the real worker wires the per-RPC guard: one line with 300 cancellatio
     const c = pgRpc(db);
     expect((await c.rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
     expect((await c.rpc("set_reporting_site_mode", { p_site: "au", p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
-  }, 300_000);
-  afterAll(async () => db?.close());
-
-  // FINDING for the planner (Open question): an owner whose reads alone exceed one invocation's budget never finishes,
-  // because owner materialization restarts from the beginning on resume. This is not new: without the T15P-1 wiring the
-  // same owner also stayed pending here, only with each invocation overrunning by ~70 s (measured 74,000/68,000/68,000 ms).
-  it("no invocation runs past the budget by more than the in-flight group; the over-budget owner stays pending and nothing partial is published", async () => {
+    return db;
+  };
+  /**
+   * Fresh worker instances (no in-memory carry-over), the unchanged 240 s budget, 1,000 simulated ms on EVERY RPC
+   * (checkpoints, reloads, claims, stage and publish included) and byte-capped one-row children pages. Lease expiry
+   * between invocations is simulated in the database. `lose` may drop the reply of a committed call once.
+   */
+  const run = async (db: PGlite, lose?: (fn: string, a: Record<string, unknown>) => boolean) => {
     let t = Date.parse("2026-11-18T00:00:00Z");
     const inner = pgRpc(db);
     const overruns: number[] = [];
-    let last = "";
-    for (let inv = 0; inv < 3; inv++) {
+    const progress: string[] = [];
+    const states: string[] = [];
+    let calls = 0;
+    let lost = 0;
+    for (let inv = 0; inv < 20; inv++) {
       const started = t;
       const client = {
         rpc: async (fn: string, a: Record<string, unknown>) => {
           t += 1000;
-          // Byte-capped pages: every children read returns at most one row (the hosted 1 MiB cap with large images).
-          return inner.rpc(fn, fn === "read_reporting_children" ? { ...a, p_limit: 1 } : a);
+          calls++;
+          const out = await inner.rpc(fn, fn === "read_reporting_children" ? { ...a, p_limit: 1 } : a);
+          if (!out.error && lose && lost === 0 && lose(fn, a)) {
+            lost++;
+            return { data: null, error: { message: "connection failure", code: "08006" } };
+          }
+          return out;
         },
       };
-      const r = await runReportingCycle({ client, now: () => t, sleep: async () => undefined }, { site: "au", mode: "rebuild" });
-      expect(r.problems).toEqual([]);
+      const r = await runReportingCycle({ client, now: () => t, sleep: async (ms) => void (t += ms) }, { site: "au", mode: "rebuild" });
+      expect(r.failureKind, JSON.stringify(r.problems)).toBeNull();
       overruns.push(t - started - WORKER_BUDGET_MS);
-      last = r.state;
+      states.push(r.state);
+      // the owner's durable position after this invocation (seq, phase, events)
+      const j = (await db.query<{ p: string }>("select coalesce(string_agg(seq::text || ':' || phase || ':' || event_count::text, ','), '') as p from reporting_private.owner_inputs")).rows[0].p;
+      progress.push(j);
       if (r.state === "published") break;
       await db.query("update reporting_private.batches set lease_expires_at = now() - interval '1 second' where site = 'au' and state in ('active', 'frozen', 'publishing')");
       await db.query("update reporting_private.site_state set lease_expires_at = now() - interval '1 second' where site = 'au' and active_batch_id is not null");
       t += 400_000;
     }
-    expect(Math.max(...overruns), `overruns (ms): ${overruns.join(",")}`).toBeLessThanOrEqual((OWNER_GROUP + 2) * 1000 + 10_000);
-    expect(last).toBe("pending");
-    // no partial publication: no generation exists and the site still reads legacy
-    expect((await db.query<{ n: number }>("select count(*)::int as n from reporting_private.generations where site = 'au'")).rows[0].n).toBe(0);
-    expect((await db.query<{ m: string }>("select read_mode as m from reporting_private.site_state where site = 'au'")).rows[0].m).toBe("legacy");
-  }, 600_000);
+    return { overruns, progress, states, calls, lost };
+  };
+  const expectFinished = async (db: PGlite, x: Awaited<ReturnType<typeof run>>) => {
+    expect(x.states.at(-1), `states: ${x.states.join(",")}`).toBe("published");
+    expect(x.states.length).toBeLessThanOrEqual(20); // the declared finite ceiling
+    expect(x.states.filter((s) => s === "pending").length).toBeGreaterThan(0); // the owner really needed several invocations
+    // every unfinished invocation ADVANCED the durable position (no restart from the owner's beginning)
+    const unfinished = x.progress.slice(0, -1);
+    for (let i = 1; i < unfinished.length; i++) expect(unfinished[i], `invocation ${i}`).not.toBe(unfinished[i - 1]);
+    expect(Math.max(...x.overruns), `overruns (ms): ${x.overruns.join(",")}`).toBeLessThanOrEqual((OWNER_GROUP + 2) * 1000 + 10_000);
+    // exact parity with the source for the site and the worker's own audience
+    for (const who of [null, STAFF]) expect(await parityProblems(pgDb(db), "au", who)).toEqual([]);
+  };
+
+  it("uninterrupted (apart from its budget): publishes within the ceiling, each pending invocation advances, parity holds", async () => {
+    const db = await seed();
+    try {
+      const x = await run(db);
+      await expectFinished(db, x);
+      // recorded for the plan log (not an exact trace target)
+      console.info(`PG-LONG uninterrupted: ${x.states.length} invocations, ${x.calls} calls, states ${x.states.join(",")}`);
+    } finally {
+      await db.close();
+    }
+  }, 900_000);
+
+  it("with one lost reply of a committed durable checkpoint and one lost reply of a stage upload: no duplicate, still publishes with parity", async () => {
+    const db = await seed();
+    try {
+      let pages = 0;
+
+      // first: the 5th page checkpoint's reply is lost; then (a second run of the rule) the first stage upload's reply
+      const x1 = await run(db, (fn, a) => fn === "checkpoint_reporting_owner_input" && (a.p_payload as { kind: string }).kind === "page" && ++pages === 5);
+      expect(x1.lost).toBe(1);
+      await expectFinished(db, x1);
+      console.info(`PG-LONG with a lost checkpoint reply: ${x1.states.length} invocations, ${x1.calls} calls`);
+
+    } finally {
+      await db.close();
+    }
+    const db2 = await seed();
+    try {
+      const x2 = await run(db2, (fn) => fn === "stage_reporting_results");
+      expect(x2.lost).toBe(1);
+      await expectFinished(db2, x2);
+      console.info(`PG-LONG with a lost stage-upload reply: ${x2.states.length} invocations, ${x2.calls} calls`);
+    } finally {
+      await db2.close();
+    }
+  }, 1_800_000);
 });
 
 describe("T15P-1a: the deadline is checked again after a lease renewal (real worker, real SQL, simulated clock)", () => {
@@ -625,4 +680,163 @@ describe("source-position order (review r2 Must-fix 3): pages are rejected befor
     await expect(after([str("b", T1), str("a", T1)], { createdAt: T, id: "" })).rejects.toThrow(/after keyset order/);
     expect((await after([str("a", T), str("b", T), str("a", T1)], { createdAt: T, id: "" })).map((e) => e.id)).toEqual(["a", "b", "a"]);
   });
+});
+
+describe("T15P-4 trim step 5 and the small count fixture: the REAL worker over real SQL, durable owners forced by 1,000 padding members", () => {
+  const W2 = "00000009-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const W3 = "0000000a-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const W4 = "0000000b-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const W1 = "00000008-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const insSql = `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+    values ('au', $1, $2, $3, $4, $5, $6, $7, 's', '', $8, $9)`;
+  const ins = (db: PGlite, r: { id: string; staff: string | null; order: string | null; type?: string; parent?: string | null; at: string; dept?: string; sku?: string; qty?: number }) => {
+    const type = r.type ?? "line_verified";
+    return db.query(insSql, [r.id, r.staff, r.dept ?? "framed", r.order, type === "line_verified" ? (r.sku ?? "INKA-KAN0566-A4-FB") : null, type === "line_verified" ? (r.qty ?? 1) : null, type, r.at, r.parent ?? null]);
+  };
+  const PAD = "00000011-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  /** 1,000 `started` members of a padding worker: they cross the 1,000-row activation trigger and are never lines. */
+  const padding = (db: PGlite, order: string, prefix: string) => db.query(
+    `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id)
+     select 'au', $1 || lpad(g::text, 4, '0'), $3, 'framed', $2, null, null, 'started', 's', '', timestamptz '2026-09-20' + g * interval '1 second', null from generate_series(0, 999) g`, [prefix, order, PAD]);
+  const seed = async () => {
+    const db = await reportingDb();
+    for (const w of [W1, W2, W3, W4, PAD]) await db.query("insert into auth.users (id, email) values ($1, $2)", [w, `${w}@x`]);
+    // CP-M (as reportingOwnerContinuation's 0045 fixture): W4 lines at T1/T3 of CP-M, another order's W4 line at T2 between
+    // them and a predecessor at T0 below, each with one small cancellation: the walk's first 0045 page includes them all
+    const cp = (s: number) => new Date(Date.parse("2026-10-02T06:00:00Z") + s * 1000).toISOString();
+    for (const [id, order, t] of [["cp-t3", "CP-M", 30], ["cp-t2", "CP-X", 20], ["cp-t1", "CP-M", 10], ["cp-t0", "CP-Y", 0]] as const) {
+      await ins(db, { id, staff: W4, order, at: cp(t) });
+      await ins(db, { id: `${id}-k`, staff: W2, order: order === "CP-M" ? "CP-K" : order, type: "cancelled", parent: id, at: cp(t + 1) });
+    }
+    await padding(db, "CP-M", "cpp-");
+    // SET-1 (small independent count fixture): two current workers, a 2-piece set at quantity 2 (2 x 2 = 4 Items), a
+    // single print, a completion (1 Order), and a cancelled line; durable too
+    const st = (s: number) => new Date(Date.parse("2026-10-03T06:00:00Z") + s * 1000).toISOString();
+    await ins(db, { id: "set-a", staff: W1, order: "SET-1", sku: "INKA-S2BON0064-A1-UN", qty: 2, at: st(0) });
+    await ins(db, { id: "set-b", staff: W2, order: "SET-1", at: st(10) });
+    await ins(db, { id: "set-c", staff: W2, order: "SET-1", at: st(20) });
+    await ins(db, { id: "set-c-x", staff: W1, order: "SET-1", type: "cancelled", parent: "set-c", at: st(30) });
+    await ins(db, { id: "set-done", staff: W1, order: "SET-1", type: "completed", at: st(40) });
+    await padding(db, "SET-1", "stp-");
+    const c = pgRpc(db);
+    expect((await c.rpc("set_reporting_capture", { p_enabled: true })).error).toBeNull();
+    expect((await c.rpc("set_reporting_site_mode", { p_site: "au", p_read_mode: null, p_processor_enabled: true })).error).toBeNull();
+    return db;
+  };
+  const expire = async (db: PGlite) => {
+    await db.query("update reporting_private.batches set lease_expires_at = now() - interval '1 second' where site = 'au' and state in ('active', 'frozen', 'publishing')");
+    await db.query("update reporting_private.site_state set lease_expires_at = now() - interval '1 second' where site = 'au' and active_batch_id is not null");
+  };
+  type Call = { fn: string; args: Record<string, unknown>; inv: number };
+  /** Fresh workers until published (at most 10), every RPC recorded; `hook` may alter a response or the clock. */
+  const cycle = async (db: PGlite, mode: "rebuild" | "refresh", hook?: (fn: string, a: Record<string, unknown>, out: { data: unknown; error: unknown }, ctx: { advance(ms: number): void }) => { data: unknown; error: unknown } | void) => {
+    let t = Date.parse("2026-11-18T00:00:00Z");
+    const inner = pgRpc(db);
+    const calls: Call[] = [];
+    const states: string[] = [];
+    for (let inv = 0; inv < 10; inv++) {
+      const client = { rpc: async (fn: string, a: Record<string, unknown>) => {
+        t += 50;
+        calls.push({ fn, args: a ?? {}, inv });
+        const out = await inner.rpc(fn, a);
+        const alt = hook?.(fn, a ?? {}, out as { data: unknown; error: unknown }, { advance: (ms) => void (t += ms) });
+        return (alt ?? out) as typeof out;
+      } };
+      const r = await runReportingCycle({ client, now: () => t, sleep: async (ms) => void (t += ms) }, { site: "au", mode });
+      expect(r.failureKind, JSON.stringify(r.problems)).toBeNull();
+      states.push(r.state);
+      if (r.state === "published") break;
+      // nothing is published while work is incomplete
+      expect((await db.query<{ n: number }>("select count(*)::int as n from reporting_private.generations where site = 'au'")).rows[0].n).toBe(mode === "rebuild" ? 0 : 1);
+      await expire(db);
+      t += 400_000;
+    }
+    return { calls, states };
+  };
+  const isW4Page = (c: Call) => c.fn === "read_reporting_predecessor_page" && c.args.p_staff === W4;
+  /** A request's identity apart from its batch and fence (which differ per database and per takeover). */
+  const req = (args: Record<string, unknown> | null) => JSON.stringify(Object.fromEntries(Object.entries(args ?? {}).filter(([k]) => k !== "p_batch" && k !== "p_fence")));
+  const parity = async (db: PGlite, staff: Array<string | null>) => {
+    for (const who of staff) expect(await parityProblems(pgDb(db), "au", who), String(who)).toEqual([]);
+  };
+
+  it("the combined 0045 page commits as ONE durable page before any dependent read; a crash just before it re-reads it, a lost reply after it does not", async () => {
+    // uninterrupted, through the worker
+    const a = await seed();
+    let original: Record<string, unknown> | null = null;
+    try {
+      const x = await cycle(a, "rebuild");
+      expect(x.states.at(-1)).toBe("published");
+      const i = x.calls.findIndex(isW4Page);
+      expect(i).toBeGreaterThan(-1); // the durable walk really read the combined page
+      original = x.calls[i].args;
+      const next = x.calls.slice(i + 1).find((c) => c.fn !== "renew_reporting_lease")!;
+      expect([next.fn, (next.args.p_payload as { kind?: string } | undefined)?.kind]).toEqual(["checkpoint_reporting_owner_input", "page"]); // committed first
+      // the durable owner's own remaining work, up to its hash checkpoint (later light owners of the batch, CP-X/CP-Y/CP-K,
+      // read their own members' children; that is not this owner's walk)
+      const end = x.calls.findIndex((c, k) => k > i && c.fn === "checkpoint_reporting_owner_input" && (c.args.p_payload as { kind?: string }).kind === "hash");
+      expect(end).toBeGreaterThan(i);
+      const kids = x.calls.slice(i + 1, end).filter((c) => c.fn === "read_reporting_children" || c.fn === "read_reporting_staff_stream" || c.fn === "read_reporting_predecessor_page");
+      expect(kids).toEqual([]); // the included complete children are never requested again
+      await parity(a, [null, W4, W2, W1]);
+    } finally {
+      await a.close();
+    }
+    // a crash just BEFORE that commit: the page returns, then the invocation runs out of time; a fresh worker re-reads it
+    const b = await seed();
+    try {
+      let armed = true;
+      const x = await cycle(b, "rebuild", (fn, args, _out, ctx) => {
+        if (armed && fn === "read_reporting_predecessor_page" && args.p_staff === W4) {
+          armed = false;
+          ctx.advance(250_000);
+        }
+      });
+      expect(x.states.at(-1)).toBe("published");
+      expect(x.states.length).toBeGreaterThan(1);
+      const reads = x.calls.filter(isW4Page);
+      expect(reads.filter((c) => req(c.args) === req(original)).length).toBe(2); // the uncommitted page is read again, with the same request
+      await parity(b, [null, W4, W2, W1]);
+    } finally {
+      await b.close();
+    }
+    // its commit succeeds but the REPLY is lost (and time runs out): the fresh worker starts at the saved cursor
+    const c = await seed();
+    try {
+      let seenPage = false;
+      let armed = true;
+      const x = await cycle(c, "rebuild", (fn, args, _out, ctx) => {
+        if (fn === "read_reporting_predecessor_page" && args.p_staff === W4) seenPage = true;
+        if (armed && seenPage && fn === "checkpoint_reporting_owner_input") {
+          armed = false;
+          ctx.advance(250_000);
+          return { data: null, error: { message: "connection failure", code: "08006" } };
+        }
+      });
+      expect(x.states.at(-1)).toBe("published");
+      expect(x.states.length).toBeGreaterThan(1);
+      const reads = x.calls.filter(isW4Page);
+      expect(reads.filter((c2) => req(c2.args) === req(original)).length).toBe(1); // never re-read
+      await parity(c, [null, W4, W2, W1]);
+    } finally {
+      await c.close();
+    }
+  }, 900_000);
+
+  it("counts: a set (2 x 2 = 4 Items), a completion, a cancellation and an old-self audience after a worker change all equal the independent reducer", async () => {
+    const db = await seed();
+    try {
+      expect((await cycle(db, "rebuild")).states.at(-1)).toBe("published");
+      await parity(db, [null, W1, W2, W4]);
+      // (the set's 4 Items, the completion and the cancellation are checked by the independent reducer's daily totals)
+      // W2's single print moves to W3: W2 becomes an OLD-self audience of SET-1 (its count must drop), W3 a new one
+      await db.query("update public.production_events set staff_id = $1 where id = 'set-b'", [W3]);
+      await expire(db);
+      const r = await cycle(db, "refresh");
+      expect(r.states.at(-1)).toBe("published");
+      await parity(db, [null, W1, W2, W3, W4]);
+    } finally {
+      await db.close();
+    }
+  }, 900_000);
 });

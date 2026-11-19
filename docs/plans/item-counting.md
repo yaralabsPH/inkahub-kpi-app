@@ -6861,3 +6861,27 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - durable owners treated as light at stage (4 tests fail).
   - **Not done (per the trim):** stage takeover of an INCOMPLETE plan journal (purpose upgrade on first write). The worker routes it through `recoverOwnerJournal(..., "stage")` plus `durableOwnerInput`, but it cannot be reached in this fake's flow: planning completes every journal before sealing. It is covered by the existing SQL continuation and purpose tests, not by a new worker test.
   - **Gate:** tsc -b exit 0; typecheck:digest exit 0; 80 files, **2445/2445**; build exit 0.
+- **Trim task 2 (`docs/reviews/item-counting-t15p4-trim.md`): continuation and count proofs (step 5 and the trimmed 4e), 2026-11-19, Claude.**
+  - [x] Done. Tests only: no production code changed. All tests use the real worker over real SQL (PGlite, migrations including draft 0046), in `tests/reporting/reportingPageGuard.test.ts`.
+  - **PG-LONG:**
+    - The old test asserted that the 300-cancellation, one-row-children-page owner stays pending forever (the original finding). It now asserts that the owner FINISHES.
+    - Setup: fresh `runReportingCycle` instances, the unchanged 240 s budget, 1,000 simulated ms on EVERY RPC (checkpoints, reloads, claims, stage, publish, renewals), and lease expiry simulated in the database between invocations.
+    - **Uninterrupted:** published in **4 invocations, 759 calls** (`pending, pending, pending, published`). The ceiling is 20.
+    - Every unfinished invocation advanced the journal position (seq, phase, events). Each invocation's overrun stays within the existing in-flight bound, and site and self parity with the independent reducer holds.
+    - **A lost reply of a committed 5th page checkpoint:** 4 invocations, 764 calls.
+    - **A lost reply of the first stage upload:** 4 invocations, 761 calls.
+    - Both publish with parity and no duplicate.
+  - **Step 5, atomic 0045 page through the worker:** the CP-M fixture of `reportingOwnerContinuation` (W4 lines at T3/T1, another order's line at T2, a predecessor at T0, one cancellation each), made durable by 1,000 `started` members of a padding worker.
+    - **Uninterrupted:** the next call after the combined `read_reporting_predecessor_page` is that owner's `page` checkpoint, and the owner makes no children, stream or predecessor read before its hash checkpoint. Parity holds for the site, W4, W2 and W1.
+    - **Crash just BEFORE the commit** (the page returns, then the time runs out): a fresh worker re-reads the page with the identical request (2 reads), then publishes with parity.
+    - **Reply lost AFTER the commit:** the identical request is never sent again (1 read), and it publishes with parity.
+    - No generation exists while work is incomplete.
+  - **Small independent count fixture (SET-1, durable):**
+    - Contents: two current workers; a 2-piece set at quantity 2 (4 Items); a single print; a cancelled line; a completion.
+    - Rebuild parity holds for the site, W1, W2 and W4.
+    - Then W2's line moves to W3, which makes W2 an OLD-self audience. The refresh publishes with parity for the site, W1, W2, W3 and W4.
+    - Every count, including the set's 4 Items, is checked against the existing independent `reducerDaily` oracle (`parityProblems`) on the published daily totals; there is no separate direct per-row check.
+  - **Evidence limits:** PGlite with a simulated clock and latency, not hosted evidence. No mutation campaign (dropped by the trim).
+  - **Gate:** tsc -b exit 0; typecheck:digest exit 0; build exit 0.
+    - First full test run: 80 files, 2447/2448. The failure was the first API test ("a refresh enumerates changed keys durably..."), the test with the earlier full-suite timeout history. The captured output did not show its reason, and it passed alone in 1.8 s.
+    - Immediate full rerun: 80 files, **2448/2448**. No timeout was changed, and the first run's failure is recorded here, not erased.
