@@ -656,7 +656,9 @@ describe("Task 15 worker: complete refresh and rebuild cycles", () => {
     expect(db.saves).toBeGreaterThanOrEqual(changed.length); // every key completes with its own checkpoint (no whole-batch save)
     expect(db.seen.size).toBe(0); // completed keys leave no scratch state
     expect(db.runs.at(-1)).toMatchObject({ p_outcome: "published", p_mode: "refresh", p_failure_kind: null });
-  });
+    // CJ approved (2026-11-19): 20 s instead of vitest's default 5 s. ~1.8 s alone, but as this file's first test it
+    // repeatedly exceeded 5 s under full-suite load; the assertions are unchanged.
+  }, 20_000);
   it("a rebuild copies, freezes, enumerates owner keysets in pages and publishes the same work as the whole-batch path", async () => {
     const db = new FakeDb("rebuild");
     const counters = { keyPages: [] as Array<string | null>, ownerPages: [] as Array<string | null> };

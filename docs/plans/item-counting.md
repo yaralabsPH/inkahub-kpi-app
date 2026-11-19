@@ -6930,3 +6930,5 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - **First full test run:** 2456/2459, with three 5,000 ms timeouts in `tests/api/reporting-worker.test.ts`: "a refresh enumerates changed keys durably…", "a transient failure is retried…", and "a disabled processor…". That file was not changed by this fix, and alone it passes 89/89 in 51.7 s.
     - **Full rerun:** 2458/2459, with one timeout in "a refresh enumerates changed keys durably…" (1.8 s alone).
     - These are the same timeouts as in the retained history, now seen more often under full-suite load. No timeout was raised (none is authorized). This is recorded as an open flakiness risk for hosted CI.
+- **Test time limit (CJ: "Yes, raise its limit"), 2026-11-19, Claude:** "a refresh enumerates changed keys durably…" now has a 20,000 ms limit (vitest's default is 5,000). Its assertions are unchanged.
+  - Full run afterwards: 2458/2459. That test passed. The one failure was a 5,000 ms timeout in "a transient failure is retried after 30/60/120 s…", the same test as the round-2 observation and the earlier full run today. Its limit was NOT raised (not approved).
