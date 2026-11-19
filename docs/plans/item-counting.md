@@ -6765,3 +6765,11 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - hash RPCs unguarded.
   - **Should-fix 1:** both earlier timeouts are recorded above; no timeout was changed. This gate had no timeout.
   - **Gate:** 80 files, **2429/2429**; tsc, typecheck:digest and build exit 0.
+- **T15P-4d wiring step 4: review ROUND LIMIT reached (2026-11-19, Claude). STOPPED for CJ.** Round 3 (`docs/reviews/item-counting-t15p4-wiring-step4-r3.md`) is "changes required". Under CLAUDE.md step 8, no further fix round is started without CJ.
+  - **Resolved in round 3:** the round-2 Must-fix 3 tests (pending-discard, partially hashed, the hash boundary at 29,500 ms, real-reader/writer sizing); the scope-review Must-fix 2 phase and renewal behaviour.
+  - **Open (step-4 blockers):**
+    - **Round-3 Must-fix 1:** the packing and transport CPU of `writeOwnerPage`, which runs after the exact commit is admitted, is priced at zero (its `packEntries` runs again). Astra reproduced unchanged-position pending by injecting it.
+    - **Round-3 Must-fix 2a:** retry backoff (`b.retry` sleep) and the production `rpcFrozenReader` light route's `pageGuard` renewal run with the owner's meter active. Astra reproduced a false `owner_input_capacity` both ways.
+    - **Round-3 Must-fix 2b:** the reconstruction estimate is a measured subset (`reloadWork`). It omits the loader's per-piece validation, the map/budget rebuild and the hashing-recovery sort; predicted CPU components must be compared with an actual fresh recovery across a growing prefix and the reading-to-hashing transition.
+    - **Round-3 Should-fix 1:** keep both timeout observations precisely: the first API test under suite load, and the round-2 transient-retry test (64/65, one 5,000 ms timeout, 1,953 ms alone). Suite contention is unconfirmed.
+  - **State:** all work is committed through `80e9c51`; the gate there was 80 files, 2429/2429. Steps 5–7 and 4e are not started.
