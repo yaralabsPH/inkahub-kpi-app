@@ -6669,3 +6669,29 @@ All three proofs go in `tests/reporting/reportingOwnerContinuation.test.ts` (aut
     - the fake without rollback.
   - **SF2 (left open):** the scenario-test failure seen once earlier did not recur. The common gate at this commit passed with the scenario file 8/8 (and alone 8/8 twice). No exact assertion was captured, because that earlier run's output was not saved. It stays open: any recurrence will be kept with its full output.
   - **Gate:** 80 files, **2412/2412**; tsc, typecheck:digest and build exit 0.
+- **T15P-4d step 3, wiring step 4 (admission of every durable unit), 2026-11-19:**
+  - **`Budget`:** gains `sinceBeat()` and `remainingMs()`.
+  - **Admission point:** each durable source read and each hash unit is admitted right after the previous unit's commit. A due renewal is taken first (`routing.guard()`), then `admitDurableUnit(path, b.remainingMs(), WORKER_BUDGET_MS, b.sinceBeat())`.
+    - **"Fits fresh"** is judged against a STANDARD 240,000 ms run, never against a shorter test or invocation deadline.
+  - **The path is derived from actual counts:**
+    - **Prerequisites:** `FIXED_PREREQUISITE_RPCS` (5: version, status, resume, progress, owner page), plus the light attempts made before activation, plus lookup, plus open when the journal is new, plus discard when anything was pending, plus the reload's actual `reload_calls`. The CPU is the measured recovery time, plus the measured descriptor CPU before hash units (`env.cpuNow`, default `performance.now`).
+    - **Unit:** `READ_UNIT_RPCS` = 1 + 3, or `HASH_UNIT_RPCS` = 2. The unit CPU is the largest measured span of this owner's earlier units.
+    - **Design choice for the planner:** the read unit's 3 commit calls are a bound, not a measure (a source response of at most 1 MiB fits two `pieces` bodies plus the `page` call), because the real count is only known after the read.
+  - **Outcomes:**
+    - `capacity` throws `OwnerInputCapacityError` (`owner_input_capacity`; the message carries only the kind and times).
+    - `pending` parks the owner (`Parked`, which becomes pending; the committed journal is unchanged). If the owner committed nothing in an invocation that did no other work (no copy, enumeration, planning or durable unit), it is a capacity failure instead ("no durable progress is possible"), so repeated pending with an unchanged position cannot happen.
+    - `env.onAdmission` observes each decision; the exported `admissionAt` is the pure form of the decision.
+  - **Tests (API):**
+    - **Derived path:** for HEAVY-1 on a new journal the path is exactly `5 + activationCalls + 1 + 1 + 2` prerequisite RPCs, CPU 0 with the injected clock, and read or hash unit RPCs. For every admission, `sinceBeatMs` equals the time since the last *actual* `renew_reporting_lease` (or the invocation start), stays below 30 s, and `remainingMs` equals the real time left.
+    - **29,500 ms after the last beat** (two-RPC hash unit): 4,000 ms left gives `pending` with `nowMs` 5,000 (one renewal plus the reserve); 5,000 ms left gives `run`.
+    - **Capacity:** measured recovery CPU above 240 s gives a failed `owner_input_capacity`, the journal retained, nothing published, and no key in the problems or the run record.
+    - **Idle invocation that cannot progress:** a capacity failure.
+    - **The step 3 budget test now asserts progress per run:** every stop leaves no pending pieces, the seq rises strictly across reading invocations, and the journal ends complete.
+  - **Mutations (all prompt assertion failures, restored):**
+    - the phase ignored;
+    - capacity ignored;
+    - no idle-invocation rule;
+    - fresh fit judged on this invocation's deadline;
+    - hash units not admitted;
+    - reads not admitted.
+  - **Gate:** 80 files, **2416/2416**; tsc, typecheck:digest and build exit 0.
