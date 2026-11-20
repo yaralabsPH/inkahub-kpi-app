@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
+import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
 import { computeShifts, formatShiftDuration, effectiveHourlyRate, type ShiftEvent } from "@/lib/domain/shifts";
 
 /**
@@ -105,7 +106,9 @@ function DailyTimesheetCardInner() {
     const rangeStart = new Date(fy, fm - 1, fd, 0, 0, 0, 0);
     const rangeEnd = new Date(ty, tm - 1, td + 1, 0, 0, 0, 0);
 
-    const [evRes, barcodesRes, ratesRes] = await Promise.all([
+    // Every page of the range in a total order (created_at, id): the file is computed from complete
+    // events or not at all (a page error or the safety cap becomes the error below, never a partial file).
+    const eventsRead = fetchAllRows<ShiftEvent>((from, to) =>
       supabase
         .from("production_events")
         .select("staff_id, event_type, order_number, created_at")
@@ -113,7 +116,15 @@ function DailyTimesheetCardInner() {
         .in("event_type", ["clock_in", "clock_out", "started", "completed", "dispatched"])
         .gte("created_at", rangeStart.toISOString())
         .lt("created_at", rangeEnd.toISOString())
-        .order("created_at", { ascending: true }),
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, to),
+    ).then(
+      (data) => ({ data, error: null as { message: string } | null }),
+      (e: unknown) => ({ data: null, error: { message: e instanceof Error ? e.message : String(e) } }),
+    );
+    const [evRes, barcodesRes, ratesRes] = await Promise.all([
+      eventsRead,
       supabase
         .from("staff_barcodes")
         .select("user_id, display_name")

@@ -6,9 +6,16 @@
       "destination": "/index.html"
     }
   ],
+  "functions": {
+    "api/reports/refresh-summaries.ts": { "maxDuration": 300 },
+    "api/reports/reporting-admin.ts": { "maxDuration": 300 }
+  },
   "crons": [
     { "path": "/api/reports/daily-digest?location=au", "schedule": "55 13 * * *" },
     { "path": "/api/reports/daily-digest?location=uk", "schedule": "55 22 * * *" },
-    { "path": "/api/reports/daily-digest?location=us", "schedule": "55 4 * * *" }
+    { "path": "/api/reports/daily-digest?location=us", "schedule": "55 4 * * *" },
+    { "path": "/api/reports/refresh-summaries?site=au", "schedule": "0,15,30,45 * * * *" },
+    { "path": "/api/reports/refresh-summaries?site=uk", "schedule": "1,16,31,46 * * * *" },
+    { "path": "/api/reports/refresh-summaries?site=us", "schedule": "2,17,32,47 * * * *" }
   ]
 }

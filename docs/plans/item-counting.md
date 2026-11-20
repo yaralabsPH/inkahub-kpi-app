@@ -1,0 +1,4231 @@
+# Plan: Item counting and stored management reports
+
+- Slug: `item-counting` · Spec: [item-counting.md](../specs/item-counting.md), reporting-scale amendment approved by CJ on 2026-11-14.
+- Branch: `feature/item-counting` · Amendment baseline: `83a3fd4`.
+- Status: approved by CJ on 2026-11-14 ("approved. make claude resume it"). Claude may resume in task order, starting with Task 10. Prior Tasks 1–8 remain implementation history; Task 9's browser/release evidence and Task 4 M6's reopened evidence remain pending. Approval does not waive prerequisites or authorize production access, SQL application, merge or deployment.
+- Execution: Claude is the coder; Codex is the planner/reviewer. Use `superpowers:executing-plans` for the existing sequential handoff. One writer and one commit per task. No new worktree, dependency, production connection, deployment or migration application is authorized by writing this plan.
+
+## Operative amendment and precedence
+
+This section through **Amendment implementation log** is the current approved contract. The complete earlier plan follows as a historical appendix, preserving its checked tasks, implementation log, M6 requirements, rollback SQL and evidence. Where the appendix forbids derived storage, new schedules, indexes or server aggregation, this amendment supersedes those restrictions **only for the reporting objects/tasks defined here**. It does not authorize changing original counting rules, source write policies, existing 0034–0036 migrations, inventory, source data, report permissions or database timeouts. Old checkboxes and old passing reports do not certify the new architecture.
+
+The latest log says the four-case M6 checker was implemented but its collector and fresh v2.3 phase evidence were not completed. An older local `STATUS: COMPLETE` artifact is therefore insufficient. Close that prerequisite in Task 10. Task 9's still-pending Preview/browser checks are carried into Task 20; do not mark either completed without new evidence.
+
+## Goal and architecture
+
+Management screens and digest read small, versioned report results from durable derived facts. A scheduled TypeScript worker reuses the existing counting/classification code to process source changes. Workers retain the current bounded current-day authoritative refresh and immediate saved-action confirmation. Reporting downtime must not cause a valid saved action to be replayed or stock to be deducted again.
+
+Use existing Supabase/PostgreSQL, Vercel Node functions, supabase-js, React and Vitest. No new package is planned. Database RPCs move bounded chunks and perform transactional capture/publication; the existing `pg` dev dependency remains staging-only. Do not add a second SQL implementation of SKU eligibility, valid cancellation or completion qualification. SQL may group classified contributions, select their range/context membership and count exact identities.
+
+**Alternatives:** retaining whole-period browser reads keeps repeated transfer/reduction cost; moving all business counting into SQL duplicates the shared rules. The selected stored-fact design adds durable jobs and derived storage but fits the approved reporting delay and permits independent rebuild/reconciliation. No warehouse, streaming vendor or source-table partitioning is included.
+
+## Global constraints and acceptance values
+
+- Preserve spec A/B exactly: set pieces, UN/PF eligibility, exclusions, quantity errors, original worker credit, cancellation/terminal qualification, distinct normal/rework order keys and coverage warnings. Preserve exact timestamp microseconds and existing framing/attendance/cost definitions.
+- Three sites, existing 04:00 production dates and IANA zones; Monday weeks. No digest cron/recipient/S1 changes. No source deletion, source repair, deduplication of distinct legacy event IDs or new scanner idempotency system.
+- Refresh each site every 15 minutes; healthy committed changes visible within 30 minutes. Show `Update delayed` above 30 minutes and `Report out of date` at 120 minutes. Missing/failed generation is unavailable; digest refuses missing/incomplete/over-30-minute-stale coverage before workbook/email work.
+- One-day report ≤2 s and three-month report ≤10 s, including server/transfer/client preparation, with three paired runs per permitted role/site/scope and 20 concurrent readers. Keep the authenticated catalog timeout at 8 s; no role/global timeout increase.
+- Test retained two-year fixtures plus five years at 200 orders/site/day × three pieces/order × 365 days/year: 1,095,000 orders and 3,285,000 physical pieces. Record actual event/fact counts separately. Test a 10-times-volume busy day with that history. Capture p95 regression ≤10% against the identical load with reporting worker disabled, and zero new capture failures attributable to reporting.
+- Preserve `Repository.ts` and both adapters: production already uses direct Supabase paths. Dexie keeps its existing unavailable-state behavior without constructing a missing Supabase client. Shared pure modules must import from browser and Node without env access.
+- Each task follows failing tests → implementation → focused tests → `npx tsc -b`, `npm run typecheck:digest`, `npm run test -- --run`, `npm run build` → one commit. Extend the API typecheck command before adding new handlers. Database/Preview evidence cannot be replaced by unit tests. CI must be green for the committed handoff.
+
+**Global-constraints clarification v2 — approved by CJ on 2026-11-14; operative.** The Task 10 proposal below changes the acceptance path and timing of the raw AU three-month API gate, not its 10 s target or the 8 s authenticated catalog timeout. Task 10 retains the appendix's three-run **median paired total** criterion for operational one-day reads; cold/first and slowest observations remain visible, including values above 2 s. Task 19 must prove one-day ≤2 s and three-month ≤10 s on the published management path, including server, transfer and client preparation, with the unchanged workload, repetitions, roles/sites, 20 concurrent readers and failure rules. No timeout, workload, cutoff or target waiver; Task 10 acceptance is not certification of raw long-range reliability or permission to release.
+
+## Data model and immutable publication contract
+
+All reporting storage lives in a new **`reporting_private`** schema, not an exposed Data API schema. Revoke PUBLIC/anon/authenticated schema/table/function access; enable RLS with no client policies as defense in depth. Grant only the existing trusted server `service_role` the required schema/object privileges. Clients never query these tables directly. New public RPC wrappers are `SECURITY INVOKER SET search_path = ''`, fully qualified, and execute-granted only to service_role; revoke PUBLIC/anon/authenticated explicitly in the same migration. Authenticated browser reads go through the checked server API described below. Do not change any existing grant/default privilege or helper.
+
+**Internal capture-role clarification (planner, 2026-11-14):** the non-login trigger owner below is the sole narrow exception to the server-only object grants: schema USAGE, control SELECT, journal INSERT and only the sequence privilege required for that insert. It must not own the tables, have BYPASSRLS, inherit a privileged role, or be granted to client roles. Because RLS is enabled, add command-specific policies addressed only to this internal role for control SELECT and journal INSERT; no client policy is added. Do not solve capture failure with broader ownership or disabled RLS. Task 12 must prove successful capture under the actual trigger owner as well as client denial. [PostgreSQL RLS](https://www.postgresql.org/docs/current/ddl-rowsecurity.html) distinguishes object grants from row policies and defaults to denial when no applicable policy exists.
+
+| Relation | Key and responsibility |
+| --- | --- |
+| `reporting_private.control` | Singleton: `capture_epoch`, capture enabled, active rule version. Only operator code changes it. A capture-epoch change invalidates every site's continuity. |
+| `reporting_private.changes` | Unique change ID, transactionally captured old/new `(site,event id)`, old/new event images, operation and capture time; batch assignment/ack. Change IDs identify rows, **never a committed high-water mark**. Includes supported-site old/new sides of location/id moves. |
+| `reporting_private.site_state` | One row/site: processor enabled, read mode `legacy|shadow|summary`, current source epoch, active published generation, active batch, monotonic lease fence, heartbeat and last verified cutoff. Operator mode changes are per site; clients receive only effective mode through the authorized API. Worker locks this row only for brief metadata transitions, never from the source trigger. |
+| `reporting_private.batches` / `batch_changes` / `batch_events` | Batch ID, site, base generation, rule/epoch, cutoff, state and lease; exact set of claimed change IDs; frozen final images/tombstones at one source snapshot. These survive process death. |
+| `reporting_private.source_current` | Private rebuildable mirror keyed `(site,event id)` at the published source boundary, including future events and raw export fields. It avoids re-reading mutable source across separate worker invocations. Never returned directly to clients. |
+| `reporting_private.partition_work` / `partition_results` | Unique `(batch, audience, partition key)` work, input hash, result digest and completion marker. Results are staged, replacement-based and fenced; replay of an identical result is a no-op, conflicting replay fails. |
+| `reporting_private.event_facts` / `cancel_edges` / `order_occurrences` | Versioned derived rows, keyed by site, audience, source identity and generation validity interval. Store shared-rule classifications, credit/qualification facts, valid/invalid parent relation, exact terminal/order/case identity, raw detail fields and scoped coverage inputs. Preserve old versions for detail tokens. |
+| `reporting_private.daily_totals` / `timing_facts` | Additive item/work totals and timing observations for affected site/production-day/audience/staff/work-type/case. Daily distinct Orders are display values, **not additive range totals**. |
+| `reporting_private.generations` | Published generation ID, base/source cutoff, rule/epoch, completeness, verification time, publication time, expiry and reconciliation fingerprint. No private backlog/error internals in user metadata. |
+
+Audience is `{kind:'site'}` or `{kind:'self', staffId}`. Build site facts using all member-site source rows; build each self audience using only rows with that saved `staff_id` **before** correction/qualification preparation. Never derive self facts by filtering site facts. Build self facts for every recorded worker, not only currently signed-in users; role changes then choose an existing audience without a permissions refresh. Null/invalid staff rows contribute only where current source RLS would expose them. The existing CS/kiosk/manager/owner site visibility is preserved, with the route-specific output restrictions below.
+
+Indexes follow actual access: unacknowledged changes by site; source/facts `(site,id)`, `(site,trimmed order)`, `(site,parent id)` and `(site,audience,event time,id)`; exact order occurrence `(site,audience,order key,time)` plus staff/work-type filtering; generation validity; pending partition work; timing stream `(site,audience,staff,time,id)`. Use explicit relational tuple keys, including nullable case identity, not ambiguous concatenated delimiters. New indexes are on reporting objects first; any source index addition needs measured justification and a separately numbered migration/task amendment. No edit to 0034–0036.
+
+### Commit-safe input capture and rebuild
+
+1. Add one private trigger function on `production_events` for INSERT/UPDATE/DELETE. It writes old/new images to `changes` in the **same transaction** as the original action, with no remote calls, KPI calculations, per-site counter lock or row scan. All columns needed by existing counts, clocks/timing and raw export (`note`, `station_id`) travel in the images. Only a supported old/new site creates journal work. A key move invalidates both sides. A no-op update with identical report-relevant fields need not create work. Use a private non-login function owner with only journal/control privileges, fixed search path, no dynamic SQL and no publicly callable definer RPC. The source caller still passes existing source RLS.
+2. Required journal failure aborts the original transaction visibly; never catch it and acknowledge an untracked save. Processor downtime is independent of capture. Operator emergency capture-disable increments `capture_epoch`, invalidates publication freshness and requires a full backfill before summary reads resume; it never silently resumes at a timestamp cursor. Measure trigger overhead and ordinary stock transaction behavior.
+3. One active batch/site. `begin_reporting_batch(site)` takes a short metadata lock, then freezes **all visible unacknowledged change IDs and the current source image or tombstone of every affected old/new key in one data-modifying SQL statement snapshot**. Set a conservative snapshot-start cutoff and capture epoch in the same result. Do not implement the membership and source reads as successive READ COMMITTED statements. Already-active batch returns its existing ID. Changes committing after the snapshot remain unclaimed for the next batch, even when their allocated IDs are smaller. A source transaction's journal visibility matches its source visibility. No LIMIT may silently exclude visible changes from a declared complete batch; statement timeout leaves no partial claim.
+4. Build input is immutable `source_current` at the base generation plus frozen replacements/tombstones. Do not reread current source when resuming. Only one batch may publish against a given site's base; a changed base/epoch or obsolete fence rejects publication. Future source event times remain stored but excluded from facts until their time is due; include due keys in the next batch even without another source write. A no-change cycle advances verified freshness only after the same complete pending/due check.
+5. First backfill or epoch/rule rebuild: enable capture before scanning; keyset-copy all source rows per site into a private candidate mirror in ≤1,000-row pages, with persisted cursor and checksums. Reserve the site's sole active batch for the entire rebuild, including between invocations: another refresh must not acknowledge changes needed to repair the scan. A single long open database transaction is not required. After the base scan, freeze all unacknowledged journal membership and final images as above, then overlay them: every row changed/deleted/moved during the scan is repaired from the frozen boundary, and unchanged rows were stable. Prove this with adversarial interleavings. Capture cannot be disabled during the scan. Finish candidate projection, reconcile, publish and acknowledge only the frozen IDs. Later changes remain pending. Restart from a new epoch if continuity cannot be proved.
+6. Normal refresh processes changed dependency partitions, not the full mirror. A partition is normalized `(site,order)` plus isolated invalid-identity event keys. Include both old/new partitions, referenced parent partitions and inverse child dependencies from base and delta indexes, including previously missing parents. Recompute affected timing streams at adjacent accepted observations, not all history on every job. No identity must vanish because its order is blank or its type is malformed.
+
+### Activation fence and cross-site acknowledgement (planner decision, 2026-11-14)
+
+The Task 12 staging tests verify the journal but do not prove the first backfill boundary. Under CJ's overnight delegation, Task 13 adds the following to **new migration 0038**; installed 0037 remains unchanged:
+
+- The capture function reads the singleton control row **FOR SHARE**, including while capture is disabled, and keeps that shared row lock until the source transaction ends. Ordinary writers can share it; they still never lock/update `site_state` or a counter. A control toggle waits for pre-toggle source transactions to finish. A waiting READ COMMITTED writer then sees the new control row; an older REPEATABLE READ/SERIALIZABLE snapshot must fail serialization rather than acknowledge an untracked write. Do not replace this with FOR KEY SHARE, which does not conflict with an ordinary control UPDATE.
+- Grant the internal capture owner only `UPDATE(updated_at)` on control, in addition to its current SELECT/INSERT privileges, because PostgreSQL requires an UPDATE privilege for row locking. Add a role-specific control UPDATE policy with `USING (singleton) WITH CHECK (false)`: this permits the locking read while refusing actual control updates. No capture-enabled/epoch UPDATE privilege, table ownership, BYPASSRLS, membership or client access is added. Test actual locking plus actual UPDATE denial under this role; catalog tests must include column privileges, not table grants alone.
+- Add service-only `set_reporting_capture(p_enabled boolean)` (SECURITY INVOKER, empty search path). It performs only the brief control transition and returns epoch/enabled state; it never writes source rows. Its transaction-local lock timeout is at most three seconds, retaining a stricter existing limit; a timeout rolls the transition back visibly. Do not hold control UPDATE locks while doing network calls, backfill or projection. Batch/publish mutations take the control shared lock before site metadata locks and recheck epoch/rule/base/fence; a complete generation cannot race a toggle. Task 15 routes global capture actions here and identifies their all-site effect explicitly.
+- A journal row moving AU to UK must remain pending independently for both sites. Use published `batches` + exact `batch_changes` membership as durable per-site receipts. A site's pending selection excludes only its own published receipts. `changes.batch_id` must never be an exclusive claim that hides the other side. Set global `acknowledged_at` only after every distinct supported old/new site has a published receipt; a concurrent publication may safely leave acknowledgement pending for a later idempotent pass. Retain receipt/batch references until the journal row is fully acknowledged and eligible for cleanup. Never use an allocated maximum change ID as a cursor.
+
+Tests must exercise two compatible source writers; enable waiting on an uncommitted disabled-period write; an old-snapshot writer after enable; disable/re-enable; transition timeout/rollback; and AU→UK with both publication orders, one side failing/restarting, and delayed global acknowledgement. Use isolated synthetic staging fixtures, exact cleanup/restoration evidence and unchanged timeouts. These checks precede any complete backfill publication. The extra shared-lock cost remains subject to Task 19's unchanged capture p95 limit.
+
+Basis: [PostgreSQL lock conflicts and older snapshots](https://www.postgresql.org/docs/17/explicit-locking.html), [locking-read privileges](https://www.postgresql.org/docs/17/sql-select.html), and [RLS UPDATE USING rules for locking reads](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/rewrite/rowsecurity.c). This is a narrow continuity fix within the approved architecture, not source-rule or client-permission redesign.
+
+### Rule reuse and range-sensitive results
+
+Task 11 must characterize and extract pure classification/projection primitives from the existing reducer, leaving its public behavior unchanged. Some existing results depend on the requested evidence window: `ambiguous_repeat` is based on selected effective verification context, and frame timing discards the first predecessor outside the selected range/work-type stream. **Do not persist one all-history ambiguity flag or sum independently computed daily frame averages.**
+
+Persist per-event classifications and per-parent validity from the shared TypeScript code, original verification qualification prefixes, terminal identities, timing stream eligibility/weight and coverage anchors. The read query selects the same four evidence families as v2 from indexed classified facts, applies context presence to valid edges, and groups exact identities. Range-dependent repeat warnings count the selected effective verification keys; qualification remains original evidence at/before the terminal. Scope-sensitive issue inclusion/detail must match `prepareProductionEvidence` + `summarizeProduction` on the same four-family source snapshot; absent/hidden parent context cannot be resolved from a site-wide flag. SQL only combines saved rule outputs and their identity/range membership. Task 11's counterexamples and Task 16's SQL parity tests must prove this decomposition; failure blocks integration rather than redefining coverage.
+
+**Task 11 decomposition decision (planner, 2026-11-14):** retain the existing raw-order equality when selecting pre-window qualification context, including whitespace behavior. This is an exact-parity feature, not a counting-rule correction. Store original qualification inputs/prefixes and terminal identities, not a universally qualified terminal flag. `daily_totals` stores additive effective Items by the documented dimensions; any daily Orders are valid only for that day's own selection and are never used to derive range Orders. Full production-day Items may use those summaries; partial-day boundaries use classified facts for the exact interval, without rounding or transferring source history. Selected-context Orders, coverage and timing boundary adjustments use indexed classified facts and saved edge validity inside the database, following `selectFactFamilies` / `evaluateSelection` and the separate existing-reducer oracle. This is the already-approved range-sensitive combination, not a second SQL classifier. No source scan or raw history transfer is permitted on management reads. Task 16 proves SQL parity, and Task 19 proves the unchanged scale and latency gates; unit parity alone does not certify performance.
+
+Precompute timing observations/edges for the currently supported work-type selections (each of four types and all-types). Store predecessor identity/time, shared-helper eligibility and weight. For an arbitrary selected range, the first included observation has zero gap if its predecessor is outside that range; subsequent valid positive gaps ≤30 minutes retain current timing semantics. Late inserts/deletes/cancellations repair the changed observation and next observation in each affected stream. Sum duration and timed weight, then divide; never average daily averages. A requested new combination not supported by the UI is rejected, not silently approximated. Validate exact ordering and ties against current `productionFrameTiming.ts`.
+
+Task 11 review refinement: saved full-history predecessors are index hints, not authoritative range results. The read must select the previous observation from the selected effective timing stream for that worker and work-type choice; selected correction/context membership can change that stream. Preserve exact-microsecond evidence selection followed by the existing millisecond timing/range arithmetic. A predecessor excluded by selection cannot contribute even if it shares the boundary millisecond; one included through a context family follows the existing timing oracle. Task 16 must reproduce both T11-1 regressions in SQL, and Task 19 must measure this indexed stream combination at scale. Do not sum saved daily durations if doing so changes the selected stream.
+
+Publish only after every required partition/audience has a durable result and all integrity/parity checks pass. In one transaction close superseded fact validity intervals, install staged replacements and additive totals, apply mirror deltas, insert generation metadata, move the site pointer and acknowledge the exact `batch_changes` set. Larger staged results are uploaded in ≤1 MiB chunks with per-partition hash/completion marker; partial chunks never count as complete. No count increment on replay. An old generation remains readable for **seven days after supersession**; then return `410 GENERATION_EXPIRED` and require a whole-view refresh. Never mix generations across totals/charts/detail. Cleanup cannot delete active, leased, unresolved or referenced rows; original source rows are never cleaned by this subsystem. Keep job failure metadata 30 days without secret/customer payloads.
+
+## Interfaces and access boundary
+
+New shared types live in `src/lib/domain/productionReporting.ts` (no browser/server env imports):
+
+- `ReportingAudience = {kind:'site'} | {kind:'self'; staffId:string}`; chosen only by the trusted server from current role/membership, never a client-supplied authority.
+- `PublishedMeta = {site:ReportSite; generationId:string; ruleVersion:string; sourceCutoffUtc:string; verifiedAtUtc:string; publishedAtUtc:string; freshUntilUtc:string; expiresAtUtc:string; visibility:ProductionVisibility; state:'current'|'delayed'|'outdated'}`. Rule v1 identifier: `item-counting-summary-v1`.
+- `SummaryRequest = {site:ReportSite; firstDate:string; lastDate:string; staffId?:string; workType?:WorkType; view:'reports'|'welcome'; generationId?:string}`. Validate calendar/zone, a finite nonempty range and supported site. Preserve existing date-filter semantics; the five-year acceptance fixture is not a new maximum selectable range. Totals cover the full requested range; daily chart points and detail are paged to bound transfer. A query exceeding the existing runtime budget fails explicitly, never clips the period.
+- `SummaryResult = {meta:PublishedMeta; totals:CountTotals; byWorkType:WorkTypeTotals[]; dailyPage:Page<DailyCountTotals>; coverage:CoverageCounts; timing:FrameTimingTotals; peoplePage:Page<ReportPersonRow>; welcome?:PublishedWelcomeView}`. `CountTotals = {normal:{items:number|null; orders:number}; rework:{items:number|null; orders:number}}`; nullable Items represent the existing overflow state, never an unknown value coerced to zero. `WorkTypeTotals = {workType:WorkType; totals:CountTotals}` and `DailyCountTotals = {productionDate:string; totals:CountTotals}`. Orders are exact safe integers; overflow fails explicitly. No `Set`, bigint, raw events or complete order-key arrays cross this boundary. Daily points describe their own dates; range Orders are independent exact unions. Task 11 defines the remaining DTO fields by explicitly mapping the current selectors, retaining every current coverage/timing/person/Welcome field meaning, without casting to `ProductionSummary`/`ProductionSnapshot`.
+- `DetailRequest = {site:ReportSite; generationId:string; kind:'days'|'people'|'orders'|'events'|'coverage'|'timing'|'raw-export'; firstDate:string; lastDate:string; staffId?:string; workType?:WorkType; orderNumber?:string; cursor?:string; limit?:number}`; page default 200, max 1,000, response ≤1 MiB. `Page<T> = {rows:T[]; nextCursor:string|null; pageComplete:boolean; totalRows:number}`; full totals never depend on page length. `pageComplete` certifies this page was read completely; only a null cursor certifies the end of the requested sequence. Opaque cursor binds version, site, audience, filter hash and stable last tuple; altered/mismatched cursor is 400. Treat cursors as untrusted selectors, never authorization.
+- `projectReportingPartition(input:FrozenPartitionInput):PartitionResult`, `compareReportingProjection(expected:ProductionSummary, actual:ComparableSummary):ParityDifference[]` in `productionReportingProjection.ts`. Input includes complete authorized partition/context, frozen source cutoff, rule version and audience. Result contains classified facts, identities, anchors and hash, no database operations.
+- Server module `api/_lib/production-reporting.ts`: `authorizeReportingRequest(req, view):Promise<ReportingPrincipal>`, `readPublishedSummary(principal, request):Promise<SummaryResult>`, `readPublishedDetail(principal, request):Promise<Page<PublishedDetailRow>>`. `PublishedDetailRow` is a discriminated union of the seven `kind` row DTOs defined in Task 11. `ReportingPrincipal` is created internally after Supabase `auth.getUser(token)` and fresh profile/membership reads; no trusted role/site taken from request/JWT user metadata.
+- Worker module `api/_lib/production-reporting-worker.ts`: `runReportingCycle({site,mode:'refresh'|'rebuild'|'cleanup',deadlineMs}):Promise<CycleResult>` using service-only database RPCs; `CycleResult` contains batch/generation IDs, state, counts and redacted problems, not source payloads.
+
+`GET /api/reports/summary` and `GET /api/reports/detail` require a valid app JWT, current membership and route permission. `view=reports` requires the current effective `reports` nav permission; `view=welcome` returns only existing Welcome fields, without financial or additional staff detail. Role visibility follows the current source policies: owner/manager/kiosk/CS member-site audience, staff self audience labelled limited; unknown role/membership denies. A staff user explicitly granted Reports still gets only self-visible evidence. Preserve staff-rate/name table access by making those small reads through the caller's JWT, not a service-key metadata join. Check role/membership on every page, old generation and export request; clear client caches on identity/site change. Return no-store. Public RPC wrappers are service-only, so direct caller attempts bypassing these checks must fail.
+
+`GET /api/reports/refresh-summaries?site=au|uk|us` is scheduled/manual refresh, authenticated with constant-time `Authorization: Bearer <CRON_SECRET>` **before parsing or DB work**, GET-only like the existing scheduler pattern. Use separate `POST /api/reports/reporting-admin` with `REPORTING_OPERATOR_SECRET` for explicit `rebuild|cleanup|set-mode|disable-capture|enable-capture` commands, strict site/action validation and auditable redacted result; no app role or ordinary refresh may trigger rebuild. Operator mode changes are CJ actions, not new UI features. Keep S1 digest responses/precedence independent.
+
+Default request results: 401 bad/missing auth, 403 missing permission/membership, 400 invalid selector/cursor, 410 expired generation, 503 missing/incomplete/failed publication. Management can receive a coherent old generation with delayed/outdated metadata; the digest additionally refuses age >30 minutes. Freshness is measured from verified source coverage, including no-change verification, not render time or event time. Cross-generation comparison requests fail/reload together. Over-budget result work fails explicitly; no partial success or raw-scan fallback.
+
+### Runtime, schedule and recovery budgets
+
+Keep the existing three digest cron entries unchanged. Add site-staggered refresh calls at `0,15,30,45 * * * *` (AU), `1,16,31,46 * * * *` (UK) and `2,17,32,47 * * * *` (US). Use `maxDuration: 300`, stop taking new partition work at 240 seconds, persist progress and return pending; lease 360 seconds with heartbeat/fence renewal every 30 seconds. One active worker/site, maximum three sites; duplicate invocations return busy without work. Timed-out/failed batches resume on the next tick or an authorized manual refresh, with bounded exponential retry (30 s, 60 s, 120 s, then deferred to the next cycle), not in-process sleeps beyond remaining budget. Permanent malformed/conflicting input stays failed and visible; never auto-delete it.
+
+Database RPC statements remain within the existing effective service/authenticated limits; no `SET statement_timeout` increase. Chunk reads at 1,000 rows and ≤1 MiB; stage output ≤1 MiB per call. A frozen dependency partition over 50,000 source events is a visible `partition_too_large` blocker for a reviewed bounded algorithm amendment, not truncation. This limit does not cap total report/history size. Publication/freeze are atomic database statements: if their workload cannot meet the existing timeout at acceptance scale, stop for an evidenced plan amendment rather than batch-publish a mixed source boundary.
+
+Vercel's documented cron frequency requires a suitable plan, and functions have runtime/payload limits. Task 10 must record the actual project's existing entitlement without production data access; **do not assume Pro or purchase an upgrade**. Deployment of the new schedules is blocked until 15-minute execution, 300-second Node runtime and budget are confirmed. Sources checked 2026-11-14: [cron limits](https://vercel.com/docs/schedules/cron-jobs/usage-and-pricing), [function limits](https://vercel.com/docs/functions/limitations), [PostgreSQL snapshot semantics](https://www.postgresql.org/docs/current/transaction-iso.html). Staging cron may need CJ's explicit test invocations rather than assuming Preview cron runs. No new hosting vendor or automation is provisioned here.
+
+## Review focus
+
+- Out-of-order source commits and a lower change ID arriving later: no missed delta; capture membership plus final images must share one snapshot (Tasks 12–13).
+- Restricted users and hidden correction/context: compare self projections against real staff JWT evidence before filters; current membership wins over a saved generation (Tasks 11, 16).
+- Window-dependent ambiguity, first timing predecessor and late opposite-worker cancellation: global/day caches cannot change existing answers (Tasks 11, 14, 16).
+- Publish succeeded but worker lost the response or its lease: exactly one generation, no duplicate credit, no acknowledgement of later changes (Tasks 13–15).
+- Batch/rebuild failure while workers scan and digest fires: capture still works, old report is labelled, stale digest sends nothing (Tasks 15, 17–20).
+
+## Amendment tasks — one commit each, in this order
+
+For each code task below, copy these steps into its execution log and check them only with recorded evidence:
+
+- [ ] Write the named failing cases with the stated expected values.
+- [ ] Run the task's focused test command; confirm it fails for the missing behavior.
+- [ ] Implement the task's files and interfaces within the stated scope.
+- [ ] Run focused tests, the common gate and required CJ staging checks; record the results.
+- [ ] Commit only that task's changes using its commit message, then update its completion checkbox/log. A prerequisite awaiting CJ evidence remains unchecked.
+
+### [x] Task 10: Close the existing M6 prerequisite and record runtime feasibility
+
+- Files: existing `tests/staging/policyParityRun.ts`, `itemCountingParityCases.ts`, runner/gate tests and `supabase/staging/item-counting/README.md`; this plan's implementation log only for evidence. Preserve the exact approved four-case M6 contract in the appendix.
+- Do: finish the collector/mode and tests already named by M6; retain its rolled-back transaction, fresh restoration check, real session claims and unchanged policies. CJ runs the four-case collection and three fresh v2.3 manager phases. Obtain approved follow-up M6 review and green CI. Record actual scheduler/runtime entitlement, estimated 288 scheduled calls/day plus bounded manual/retry work, and configured safe staging target. Missing hosting entitlement is an explicit deployment blocker, not authorization to spend.
+- Done when: old two-case artifacts fail; all four comparisons/restoration and fresh phases pass; no persistent membership change; evidence records exact revision/hash. Existing policy/source permissions are the proven baseline for new projection parity. No old passing report is relabelled. Focused staging-runner tests and common gate pass.
+- Commit: `task 10: close reporting permission prerequisite`.
+
+**Task 10 amendment v2 — approved by CJ on 2026-11-14; operative and closed by the focused verification recorded below**
+
+- **Do:** close M6 using the retained evidence identified below and an explicit criteria-level assessment in the follow-up review. Preserve the complete historical four-case contract: `baseline`, `manager-all-sites`, `owner-denied-uk`, `kiosk-denied-uk`; one always-rolled-back REPEATABLE READ transaction; exact before/after row identities and all 11 direct-reader results; positive self/other-worker coverage at every member site including `staging`; no-subject and populated-site denials; unchanged catalog/helpers/grants/write policies; full real-session claims, authenticated non-bypass identity, RLS on and exactly 8,000 ms catalog/effective timeout; fresh restoration outside the snapshot; no persistent membership or fixture change. Underlying evidence and canonical hash must validate, not just the Markdown success summary. Old two-case, incomplete, cancelled or mixed-collection artifacts remain ineligible.
+- **Do:** retain three distinct manager phases in order (denied-before, all-sites, denied-after), with the temporary membership transitions and reauthentication, owner AND manager, all six original scopes and three API attempts per scope. Retain each phase's full 48 EXPLAINs and 36 full-body text runs, completing without error under 8 s, plus independent family/field/ID checks, staff/kiosk/CS parity and dictionary non-disclosure. Operational one-day acceptance remains median paired load + reducer ≤2,000 ms, with no failed one-day attempt; retain first/slowest and every individual observation. Successful raw three-month responses still require complete/correct evidence; record every long-range attempt, including timeouts and totals above 10,000 ms. Only raw AU three-month API availability/latency acceptance moves to Task 19's published management path; a failure in the retained direct SQL gate, authorization, parity, restoration or other correctness check cannot be moved there. Preserve the separately recorded write-compatibility rehearsal, unchanged INSERT/UPDATE/DELETE behavior and old-app/v1 compatibility requirements; outstanding browser/capture/stock/ledger checks remain with Task 20.
+- **Do:** keep the two-year/three-site fixture, all UK/US scopes, AU busy production date `2026-09-15` (1,287 window / 1,313 evidence rows), AU `2026-08-01` through `2026-10-31` (118,226 window + 18 qualification = 118,244 evidence rows), exact timestamps/encoding and cutoff `2026-11-12T00:00:00.000Z`. Keep the actual Vercel entitlement record: team/project, support for 15-minute scheduling and 300 s Node runtime, estimated 288 scheduled calls/day plus bounded manual/retry work, budget and safe staging target `ybrzhrgfrnvtcwymjdrq`. Currently entitlement is **unobserved**, explicitly recorded as a deployment blocker for CJ; neither this proposal nor a Task 10 sign-off supplies it or authorizes spending.
+
+**Retained evidence eligible for this amended gate (no new staging collection requested):**
+
+| Evidence | Revision | What it can satisfy; limits retained |
+| --- | --- | --- |
+| `staging-results-item-counting-v23r3-parity-cases.md` | `29e255f` | Four cases, positive `staging` probes and fresh restoration at `2026-11-14T12:07:48.880Z`; collection `90d3da63-cf68-4041-921d-aa1f4b43af47`, parity hash `26330a488dc15dd2c89c3e26b15c0256d41dc6945a067e1f63df5b38d26eaa8b`. Round 3 must verify the retained underlying collection against that hash. |
+| `staging-results-item-counting-v23r3-denied-before.md` | `29e255f` | Denied-before correctness/SQL/operational evidence. AU one-day owner/manager medians 1,289/1,225 ms; report FAILED only for then-pending phases. |
+| `staging-results-item-counting-v23r3-all-sites.md` | `29e255f` | All-sites correctness/SQL/operational evidence, including positive manager UK/US access. AU one-day medians 1,408/1,419 ms. Preserve manager AU three-month run 1 at 13,327 ms and run 2 statement timeout; neither becomes a pass. |
+| `staging-results-item-counting-v23r3b-all-sites.md` | `e4291e5` | Additional, already CJ-authorized all-sites evidence, not a replacement that erases the failed attempt. AU one-day medians 1,371/1,320 ms; three-month owner/manager medians 6,536/4,772 ms. Its overall FAILED status means denied-after was still pending. |
+| `staging-results-item-counting-v23r3b-denied-after.md` | `e4291e5` | Actual final denied-after correctness/SQL/operational evidence, with manager back on `au,staging`, zero UK/US reads and owner access unchanged. AU one-day medians 1,505/1,359 ms. Preserve owner AU three-month run 1 timeout, then 9,567/4,548 ms; its reported 7,058 ms average of the two successes is not a passing three-run median. |
+
+All four phase-run reports reference that same `90d3da63…` collection / `26330a48…` parity hash, fixture `1de5d6235ca4471709e60945b3913257bbfaeecfae551c240fac7a7c204d5681`, restored pre-0036 policy `2ce3f0db8fbfdc04c62993def22c0a5fcd8f10a558807df82993f5ab2aafa212`, installed policy `b7884efe22600764525362bc13a976ecdf2f895489da6377ecd7f8257d7bb99b`, v2 definition `9b3098a4926cdb26bbda6c5869a79892`, encoding 2 and harness `item-counting-gate-v2.3`. Each contains 150/150 SQL statements, 48 EXPLAINs and 36 full-body text runs; all one-day medians and the unaffected UK/US scope checks pass. The difference from `29e255f` to `e4291e5` is one plan-log insertion, with no code/harness change. Preserve both revision labels; do not invent one common revision.
+
+The old `76f74d2` denied-after row still displayed in the later reports' phase-history table is **not** eligible final-phase evidence. Use the actual `e4291e5` denied-after measurements above. Its phase was not recorded as passed by the existing all-or-nothing gate. CJ approval of this proposal would explicitly permit a separate round-3 assessment of the named retained measurements under the amended criteria; it would not rewrite any report STATUS, phase JSON, timestamp or historical result, or change the harness to ignore timeouts generally. No failed attempt is discarded or silently converted to success.
+
+- **Done when:** CJ approves this proposal and explicitly accepts the interim operational risk described in the Planner decision; the eligible underlying evidence satisfies every retained M6/correctness/restoration/operational criterion; and follow-up M6 **review round 3 (the last allowed round)** approves the fixes and this evidence assessment, with focused staging-runner tests, the common gate and green PR CI for the committed handoff. The review must explicitly distinguish the superseded raw long-range acceptance condition from any still-blocking failure. The Vercel entitlement/budget record remains mandatory and an unresolved entitlement still blocks deployment. No checkbox is changed by this proposal. Until these conditions hold, Task 10 and Tasks 11–20 remain blocked. If round 3 cannot approve, stop and report the exact gap to CJ; do not start round 4 or rerun benchmarks to obtain a pass.
+- **Remaining runs:** none for Task 10's parity collection, three raw manager phases or cold-connection diagnostic on this unchanged code/evidence. Local focused/common checks and PR CI at the reviewed handoff still need recorded verification; Task 19's new published-path scale/fault/concurrency runs and Task 20's Preview/rollback evidence remain required later. Missing/tampered underlying evidence or a relevant code/schema/fixture change is a new blocker for CJ, not authority to reuse invalid evidence or launch an automatic rerun.
+
+### [x] Task 11: Extract reusable classified facts and prove range semantics
+
+- Files: create `src/lib/domain/productionReporting.ts`, `productionReportingProjection.ts`, `__tests__/productionReportingProjection.test.ts`, `tests/fixtures/reporting-history.ts`; modify `productionCounts.ts` / `productionFrameTiming.ts` only to extract reusable pure primitives without behavior change.
+- Consumes current raw snapshot/reducer interfaces; produces the DTOs and partition projector above plus a pure reference query over derived facts for tests. Freeze explicit rule version and canonical hashing fields. Keep quantities/instants/case and identity rules unchanged.
+- Write failing fixtures with four Items/one Order, same order on two days and two workers, two work types, distinct sites/cases, cancellation after the selected period, an orphan parent arriving later, hidden other-worker context, null/invalid identities and microsecond ties. Include a repeat outside the four-family selected context that must **not** create a new ambiguity warning, and a first timing observation whose predecessor is outside the selected range. Add full-day vs arbitrary custom-window and source-update/delete variants.
+- Implement extraction/projector and exact DTO validation; compare the reference derived query with existing reducer/selectors over the same frozen four-family evidence, including issue/note scope and overflow. SQL implementation comes later; this task locks down expected constants and reusable predicates rather than writing a second oracle that calls the implementation under test.
+- Done when: `npm run test -- --run src/lib/domain/__tests__/productionReportingProjection.test.ts` and existing counting/timing tests plus common gate pass. Mutation dropping case/site, changing hidden-parent visibility or summing daily Orders must fail. A decomposition that cannot preserve existing answers is an Open question before storage work.
+- Commit: `task 11: define reusable reporting facts and contracts`.
+
+### [x] Task 12: Add private reporting storage and durable source journal
+
+- Files: create `supabase/migrations/0037_reporting_storage.sql` (verify next unused number before creation), `tests/reporting/reportingSchema.test.ts`, `tests/staging/reporting-capture.ts`, `supabase/staging/item-counting/reporting-README.md`; no existing migration edits.
+- Define relations/keys/checks/indexes/privileges above, capture trigger and control epoch, with constraints on audience, active batch uniqueness, generation states, nonnegative counts and immutable published rule identity. Create transactional private trigger with only local insert work. Default processor off/read mode legacy; activation is a CJ staging step.
+- Write failing schema/ACL and transaction tests: source and journal commit/rollback together, failure cannot acknowledge an untracked save, old/new site/id/order/person/time changes are retained, existing delete works, capture-disabled epoch invalidates completeness, retries do not invent source-event deduplication. Two simultaneous source transactions must not contend on a reporting site-state row.
+- Done when: focused test `npm run test -- --run tests/reporting/reportingSchema.test.ts` and common gate pass, plus CJ-run staging checks prove exact grants, no client job/table access, existing source write/RLS/stock behavior and measured trigger overhead. No production SQL by agents.
+- Commit: `task 12: add private report storage and source journal`.
+
+### [x] Task 13: Freeze resumable source snapshots and publish atomically
+
+- Files: create `supabase/migrations/0038_reporting_jobs.sql`, `api/_lib/reporting-jobs.ts`, `tests/reporting/reportingJobs.test.ts`, `tests/staging/reporting-jobs.ts`; expand package `typecheck:digest` to include new API modules/tests. New service-only RPCs: `begin_reporting_batch(p_site text)`, `claim_reporting_work(p_batch uuid,p_fence bigint)`, `stage_reporting_result(p_batch uuid,p_fence bigint,p_partition text,p_chunk jsonb)`, `publish_reporting_batch(p_batch uuid,p_fence bigint)`, `get_reporting_job_status(p_site text)`. Return typed metadata/chunks, never raw auth tokens.
+- Include the activation fence, `set_reporting_capture(p_enabled boolean)` and per-site acknowledgement contract above. Extend schema/runner catalog expectations explicitly for 0038 without rewriting 0037's historical passing evidence. Record secondary-connection disconnect failures in the concurrency runner rather than swallowing them; every cleanup failure must remain visible in the final status.
+- Implement brief lease/fence transitions, single-statement freeze, exact batch membership, immutable final images, source-current overlay, staged chunk/hash checks and atomic publication. Implement candidate backfill cursor/frozen-journal repair and no-change/future-due cycles. All job mutations require matching capture epoch, base generation and fence; renewal increments no source credit.
+- Tests start failing for transaction A allocating a smaller ID then committing after B's snapshot; source move/delete during backfill; invisible uncommitted journal; crash between every stage; expired worker attempting stage/publish; committed publish with lost response; contradictory chunk retry; rule/epoch/base drift. Verify no source scan beyond necessary keyset backfill or changed-key queries during normal refresh.
+- Done when: `npm run test -- --run tests/reporting/reportingJobs.test.ts`, common gate and CJ-run interleaving/rollback tests pass; exact fresh source-vs-mirror identity/hash equality holds after backfill/catch-up. Completion metadata cannot be written when one partition/chunk is missing. No statement timeout waiver.
+- Commit: `task 13: add resumable snapshot and publication jobs`.
+
+### [x] Task 14: Materialize affected audiences, order identities and timing
+
+- Files: create `api/_lib/production-reporting-materialize.ts`, `tests/reporting/reportingMaterialize.test.ts`; extend Task 11 projector and Task 13 partition work adapter; create `supabase/migrations/0040_reporting_dependency_reads.sql` for bounded service-only input/dependency RPCs/indexes where required (0039 is allocated to the Task 13 rebuild-insert repair below).
+- Implement `materializePartition(input, audience) -> PartitionResult` using shared primitives. Enumerate changed old/new order partitions, parent and inverse-child dependencies, invalid-identity events, future-due keys, and adjacent timing streams. Build site/self results separately from immutable input; source staff filtering happens before preparation. Store original facts and exact terminal identities, scope-sensitive coverage inputs, additive Items and timing edge/weight facts. Do not write global ambiguity flags as final per-range answers.
+- Tests: late correction of a years-old verification repairs its original day/person, not arrival day; an event moving sites clears old credit; hidden worker cancellation stays hidden for self audience; parent arriving later resolves only authorized context; deleting a middle timing line updates its successor; rework/case null distinction; repeated staged results do not increment totals; 50,001-row partition fails visibly without dropping work.
+- Done when: `npm run test -- --run tests/reporting/reportingMaterialize.test.ts`, source/derived parity tests and common gate pass. Published old generation is unchanged until atomic promotion. Record actual dependency fan-out and memory; no all-history site scan per cycle.
+- Commit: `task 14: materialize reporting contributions and timing`.
+
+### [ ] Task 15: Add the protected scheduled worker and operator recovery
+
+- Files: create `supabase/migrations/0043_reporting_worker_state.sql`, `api/_lib/production-reporting-worker.ts`, `api/reports/refresh-summaries.ts`, `api/reports/reporting-admin.ts`, `tests/api/reporting-worker.test.ts`; modify `vercel.json`, `package.json` API typecheck and `docs/releases/item-counting.md` prerequisite/recovery text. Durable enumeration/recovery follows the continuous-delivery contract below; focused helper/test modules may be split by responsibility.
+- Use service role only inside server modules. Add strict auth-first handlers and explicit operator actions as above, 240 s budget / 300 s maxDuration, 360 s lease with 30 s heartbeat/fence, bounded retries and resume. Add the three staggered schedules without editing digest entries; deployment remains blocked on Task 10 entitlement and CJ environment setup. No hidden fire-and-forget promises after returning a function response.
+- Record successful cutoff, job/backlog/oldest-change ages, failure kind and duration without payload/keys. Implement seven-day superseded-generation retention and 30-day redacted job log cleanup, protecting active/referenced work. A failed generation stays inspectable; cleanup must not acknowledge pending changes. Operator capture disable invalidates epoch immediately; enabling requires rebuild, not a resume cursor.
+- Tests: missing/wrong secret returns 401 with zero DB calls; app token cannot rebuild; wrong method/selector follows documented precedence; duplicate cron is busy; dead worker lease can recover; time budget persists work; stale fence is rejected; cleanup cannot remove active/pending/retained versions; new schedules are exactly as stated and digest unchanged.
+- Done when: `npm run test -- --run tests/api/reporting-worker.test.ts` and common gate pass; CJ can exercise staging protected refresh/rebuild/disable/recovery with captured output, without email. A missed run visibly ages metadata.
+- Commit: `task 15: schedule protected reporting work and recovery`.
+
+### [ ] Task 16: Serve exact authorized summaries and versioned detail pages
+
+- Files: create `supabase/migrations/0044_reporting_reads.sql`, `api/_lib/production-reporting.ts`, `api/reports/summary.ts`, `api/reports/detail.ts`, `tests/api/reporting-reads.test.ts`, `tests/staging/reporting-read-parity.ts`. Service-only read RPCs accept explicit trusted audience/scope/generation and return compact DTOs, never client-selected privileges (0041 is allocated to the response-bound repair, 0042 reserved for an evidence-backed access-path repair, and 0043 for Task 15 durable worker state).
+- Implement SQL aggregation over classified facts and the exact window/context contract. Numeric Items sums check safe-integer bounds; normal/rework Orders use exact distinct relational keys over the selected period. Keep full totals independent of person/order/detail pagination. Return existing Welcome comparisons/leader/streak semantics at the published cutoff; compute required lookbacks server-side. Timing derives sum(duration)/sum(timed weight) with range-boundary predecessor rules, never UN pieces in denominators.
+- API verifies app user through `getUser`, then current profile, effective nav and memberships under the user's client. Only then call the service-only reader with internally derived audience. Profiles/rates/names retain caller permissions. Reports route requires `reports`; Welcome returns only its current shape. Validate finite date range, ≤1,000 page rows, cursor scope, output cap and generation retention. Page daily points without limiting full-range totals. Every page reauthorizes. No-store and typed failures; stale valid results are labelled, not zeroed.
+- Tests: all five roles/anonymous and explicit-nav overrides; revoked membership with cached/old generation; staff self projection against actual JWT source oracle; forged audience/worker cursor; two days/workers sharing one order; coverage/timing counterexamples from Task 11; expired/mixed generations; invalid date/oversized result; partial page still has full exact totals. Real SQL row identity/value parity across randomized windows is required, not counts alone.
+- Done when: `npm run test -- --run tests/api/reporting-reads.test.ts`, common gate and CJ-run real-role/SQL parity pass. API trace contains no `loadProductionEvidence` or raw source history for summary loads; required source snapshot for the oracle is a separate staging operation.
+- Commit: `task 16: serve authorized published report summaries`.
+
+### [ ] Task 17: Use published management views and preserve live worker feedback
+
+- Files: create `src/lib/hooks/usePublishedProduction.ts`, `src/lib/repository/supabase/productionPublished.ts`, `src/lib/domain/productionReportingFreshness.ts`, `src/lib/domain/__tests__/productionReportingFreshness.test.ts`, `tests/production/published-reporting.test.ts`; modify `Reports.tsx`, `Welcome.tsx`, `ProductionCountStatus.tsx`, and `Production.tsx` only where read-mode/status distinction requires it.
+- Keep the existing `useProductionEvidence` current-day path for Production: saved action confirmation occurs before KPI refresh; failed KPI reads do not repeat writes. Management hooks request summary DTOs, not fake raw snapshots. Page staff/order/coverage/timing tables on demand with one generation; stale cursor triggers a whole-view reload. Cache keys include user/site/view/filter/generation; abort/discard old responses on identity/site/date change.
+- Report filters/charts/rankings retain current meaning. Read current staff labels/rates with caller permission; use published timing denominators for cost and preserve labels that distinguish current rates from historical evidence. Welcome lookbacks use one published generation. Current worker counts carry their own cutoff so they need not equal an older management generation until reconciliation.
+- Audit every existing Reports/Welcome side card: `DailyTimesheetCard`, `PackageUsageCard`, `PackageHistoryCard`, `LiveOrderCompletionsCard`, `CurrentlyClockedInCard`. Keep operational single-day cards on explicitly bounded existing reads; historical range tables become lazy paged reads/exports and must not download raw months on mount. Do not change attendance/packaging definitions or add these counts to F1. If a card cannot meet the bounded-read contract without a new calculation design, record a blocker before replacing it.
+- Tests: 15/30/120-minute boundaries, quiet no-change verification, current-day rollover with old generation, immediate saved/failed action, worker switch, pending/stale reports, old-generation expiry, table-next-page vs totals and Dexie fallback. Inventory/capture spies must remain identical. Mock network traces reject raw history fetches from management mount/refresh and require bounded side-card requests.
+- Done when: focused freshness/published-report tests, prior view/capture tests and common gate pass; staging browser sees expected warnings and immediate worker confirmation with worker job stopped, without new data exposure or false zeroes.
+- Commit: `task 17: show published reports and preserve live capture`.
+
+### [ ] Task 18: Pin the digest and calculated exports to published generations
+
+- Files: modify `api/reports/daily-digest.ts`, `tests/api/daily-digest-counts.test.ts`, `tests/api/daily-digest.test.ts`, `tests/production/item-counting-parity.test.ts`; extend protected detail raw-export mode and Reports export UI/tests as necessary.
+- Keep S1 auth first and recipients/method/diagnostics/no-store unchanged. Read today/yesterday counts and existing comparisons from one complete generation, print source cutoff/publication/rule version, and reject unavailable/incomplete/over-30-minute-stale coverage before XLSX or email. Reuse the internal published reader rather than making a public HTTP request back to self. Preserve distinct-clock-staff and packaging ledger definitions: fixed one/two-day authorized server reads remain bounded and labelled with their own source cutoff if not part of the published source generation; do not present them as frozen summary evidence.
+- Raw export pages preserve raw quantity/timestamp/note/station fields at the selected generation and range. Build/download CSV incrementally from bounded pages; do not load all rows just to display the report or label a partial file complete. Any page/permission/expiry failure aborts export with an explicit incomplete error. Existing small XLSX digest stays within platform response limits; oversized output fails explicitly, never truncates.
+- Tests: live counter and management/digest agree at identical cutoff; intentional newer worker save differs until next publication; same generation across sheets; stale digest no workbook/no email; invalid generation, RLS/context warning, failed detail page and mid-export revocation; all existing S1 precedence and allowlist tests unchanged.
+- Done when: digest/API/parity focused tests and common gate pass; CJ downloads staging dry digests for three sites and verifies counts/cutoffs plus negative auth/stale cases. No test email sent for count verification.
+- Commit: `task 18: use published reporting in digest and exports`.
+
+### [ ] Task 19: Prove growth, recovery, isolation and capture safety
+
+- Files: create `tests/staging/run-reporting-scale.ts`, `tests/staging/reportingScaleEvidence.ts`, `tests/staging/reportingScaleEvidence.test.ts`, deterministic `tests/fixtures/reporting-scale.ts`; update reporting README and `package.json` with `staging:reporting-scale`. Store only ignored `staging-results-*` outputs; no keys/tokens in fixtures/reports.
+- Preserve original fixtures and permission baseline. CJ explicitly enables separate staging scale fixtures; every SQL/script asserts project ref `ybrzhrgfrnvtcwymjdrq` before each run. Generate five-year baseline volumes above with measured event counts and realistic multiple stages/corrections/clocks/sets; use valid synthetic identities and no production data. Do not assume 3,285,000 physical pieces equals event rows. Record code/rule/schema/fixture hashes and exact workload, payload, plan/index, storage and runtime/cost measurements.
+- Run 3 repeats per owner/manager permitted site/scope with one-day and three-month windows and 20 concurrent readers; include staff/kiosk/CS permission/shape and concurrent denial/revocation tests. Separately replay the 10-times daily peak while processing, and prove every committed change reaches publication ≤30 minutes. Record cold, median and slowest rather than reporting only a successful median after discarding failures. Compare exact results to trusted source/reducer and use full-data equality/fingerprints for large fixtures.
+- Inject each job failure boundary, out-of-order commits, backdated edits/deletes, hidden-parent correction, rule/epoch rebuild and generation expiry. Prove replay/idempotency, complete restoration and reconciliation. Measure scan-save p95 and errors under identical source load with worker disabled/enabled; regression >10% or any reporting-induced capture failure fails. Record initial backfill duration/memory/disk and 24-hour simulated backlog recovery; no running work exceeds the documented invocation budget.
+- Done when: evidence verifier rejects missing/partial/old-rule/failed runs and emits exactly `STATUS: COMPLETE` only when all new gates pass, otherwise `STATUS: FAILED – <reason>` with nonzero exit. Atomic incremental output retains evidence on stop. Focused verifier tests/common gate pass and CJ's staged execution is fully recorded. A failing gate stops release for an explicit bounded decision; no timeout, target, security or workload waiver.
+- Commit: `task 19: prove reporting scale and recovery gates`.
+
+**Task 19 matching amendment v2 — approved by CJ on 2026-11-14; operative.**
+
+- **Do (addition):** own the deferred raw AU three-month availability/10 s acceptance as an acceptance gate on the approved published management read path. Include the original two-year fixtures, six scopes and fixed `2026-11-12T00:00:00.000Z` cutoff as a source/parity baseline, as well as the approved five-year workload: 200 orders/site/day × three sites × 365 days/year × five years = 1,095,000 orders, at three pieces/order = 3,285,000 pieces, with actual event/fact counts separate, and a 10-times-volume busy day. Retain three paired runs per permitted owner/manager site/scope and 20 concurrent readers, one-day ≤2 s / three-month ≤10 s end to end, cold/first, median and slowest, all errors and no discarded failed attempts. Keep the authenticated catalog timeout at 8 s; no prewarming to hide first-call cost, timeout extension, smaller fixture, changed cutoff or successful-subset median. The named Task 10 raw failures remain the baseline, never proof that published reads already pass.
+- **Done when (addition):** the published path passes the unchanged latency, correctness, security, freshness, recovery and capture gates, including ≤30-minute visibility, scan-save p95 regression ≤10% and zero new reporting-attributable capture failures. A timeout/error is still a failed run even if other samples meet the median target. Failed acceptance blocks release for a bounded CJ decision, not repeated reruns. Task 17 integration alone does not discharge this gate; summary activation, runtime entitlement, Task 20 browser/rollback checks and green CI remain release prerequisites.
+
+### [ ] Task 20: Complete Preview review and rehearse controlled rollout
+
+- Files: modify `docs/releases/item-counting.md`, `supabase/staging/item-counting/reporting-README.md`, this implementation log/checklist; reviewer writes the next `docs/reviews/item-counting-rN.md` through the normal handoff.
+- Complete Task 9's pending browser/Preview smoke checks against the amended code, real five-role login/read/capture/dry-digest flows, full stock/ledger smoke, old-app compatibility with new schema, and all read-mode/epoch rollback steps below. Pin evidence to exact head/schema/rule/generation. Require M6, Task 19, independent review and green CI; resolve findings before marking this task complete.
+- Done when: CJ has verified the Preview/browser checklist and reporting worker-stop/restart/capture-disable/rebuild rehearsal, reviewer verdict approved, CI green, and release record contains prerequisites, tested rollback target and manual steps. This task does **not** merge, deploy, apply production SQL or claim those actions were authorized.
+- Commit: `task 20: document verified reporting rollout and rollback`.
+
+## Hardening in the amendment
+
+| HARDENING section | Owning tasks / proof |
+| --- | --- |
+| Failure modes | 12–15, 17–19: transactional capture with visible failure, durable replay/fences, independent scan confirmation, stale labels, no partial publication; dependency outage/crash/unknown commit tests. |
+| Data correctness | 11, 13–14, 16, 18–19: shared classifier/reducer, exact source boundary, order unions, context/coverage/timing parity, old/new scope invalidation, exact instants and rebuild equality. No source rewrite. |
+| Security | 10, 12–13, 15–16, 18–19: closed M6 baseline, private schema/RLS/ACL, service-only RPCs, auth-first HTTP handlers, current membership/nav, self-evidence semantics, no client credentials, bounded operator jobs and replay. |
+| Release/rollback | 12, 15, 20: additive migrations, capture epoch and read modes, shadow backfill before promotion, preserved S1/digest schedules, old-app smoke and explicit source-continuity recovery. |
+| Performance | 11–19: changed-partition normal jobs, compact summary DTOs, bounded detail/raw exports, frame/side-card audit, five-year/10-times/20-reader gates, unchanged timeouts and ≤10% capture p95 regression. |
+| Operations | 13, 15, 19–20: job status/cutoffs/freshness, quiet-site verification, backlog/missed-run visibility, protected recovery, retention and storage/runtime/cost record. No unrelated station alerts. |
+| Tests | Every task's failing/focused/common gates, existing counting/credit/inventory/S1 regressions, Task 10 actual policies, Task 19 scale/fault/security, Task 20 real Preview/browser/rollback. |
+
+## Release and rollback for the amendment
+
+1. CJ confirms plan approval, staging project isolation, M6/new test gates, review and CI. Record actual Vercel plan/runtime capability and approved operating budget. No production inspection during development. New server-only `REPORTING_OPERATOR_SECRET`, existing `CRON_SECRET` and `SUPABASE_SERVICE_ROLE_KEY` must be correctly separated in Preview/Production; never expose as `VITE_*`. The operator secret is new because ordinary digest/cron callers must not gain rebuild/disable authority.
+2. Verify unused migration numbers, definitions, grants and old-source compatibility. Apply the existing reviewed migrations in the 0037–0044 sequence to staging under CJ's recorded staging delegation (0042 is a reservation, not a required placeholder), preserving 0034–0036 and existing policies; already-installed migrations remain immutable. Production application remains CJ's release step. Rehearse capture enabled / processor off / legacy reads; journal loss is impossible without a visible transaction error or explicit epoch-invalidating disable. Fixture/runtime tools never auto-apply migrations.
+3. In staging, run backfill into shadow, catch up changes, validate every audience and metric, then switch to summary reads. Complete worker-stop, stale digest, role-revoke, lease, failed publication and rebuild checks. Preserve raw/canonical input fingerprints needed to audit reconciliation. Verify raw-export completion and seven-day expiry behavior with a test clock.
+4. Only after all gates and CJ's separate release authorization: CJ backs up production, records an S1-protected rollback deployment, applies additive migrations and credentials, deploys with reads legacy/processor disabled, confirms old capture, enables capture and shadow processing, backfills and reconciles production **as a human release step**. Agents do not query/copy production for this. Existing digest schedules/recipients stay intact; shadow summaries send no extra email. Enable summary reads per site only after its verified generation, then watch at least two refresh cycles and the next scheduled digest per site.
+5. Reporting read/worker regression: CJ changes read mode to legacy (explicit operational rollback, never automatic query-error fallback), disables processing if needed and restores the protected app deployment. Retain source capture/journal to permit catch-up where healthy. Legacy reporting has its previously measured capacity, not the new scale guarantee; allow reports to show unavailable rather than claim large requests are safe.
+6. Capture-trigger/storage incident: CJ follows the rehearsed operator disable (or reviewed direct SQL equivalent if API unavailable), increments capture epoch, marks summaries unavailable/stale and preserves original production actions. Existing saved events remain untouched. Before enabling summary reads again, re-enable capture with a new epoch, rebuild from source, reconcile and publish; never jump a cursor over the disabled interval.
+7. Leave additive schema/private data on app rollback. No source/stock restore, queue deletion to hide backlog, changes to 0036, or drop/rename operation is part of this rollout. Future contraction requires a separate release. The appendix's policy-specific rollback remains a separate CJ procedure for a genuine 0036 regression, not a reporting performance workaround.
+
+## Out of scope for this amendment
+
+New scanner/offline sessions, source scan deduplication, canvas eligibility, historical credit repair, inventory/packaging changes, managed departments/F8 redesign, source policy widening, new vendors, purchased upgrades, new digest recipients/schedules, source archival/deletion and deployments/merges by agents. Database work in this plan is authoring and staging verification under explicit CJ authorization; production application remains CJ-only.
+
+## Open questions and execution gates
+
+- **Task 14 coder design notes and open questions (2026-11-15, for planner review; not decided by Claude):**
+  - **Decided within the contract:**
+    - **Audiences per owner:** site, plus every staff id of the owner's frozen members, plus every staff id of BASE images of changed keys whose base owner is this owner. A self audience can only own rows for its own member events (self input is filtered to that worker before projection), so previously published self rows of an owner come only from its old members. This yields the required empty replacements (moves, staff reassignment, deletion) without reading published fact tables.
+    - **Owner input:**
+      - members;
+      - their parents;
+      - their inverse children;
+      - for each worker of a member stream line: an exact predecessor walk from the worker's LATEST member line down past a site-effective line of all types and of each member work type found below the EARLIEST member line;
+      - every consumed candidate's own cancellations.
+      Ties at the stop instant are read whole. Self audiences need no separate walk: site-effective implies self-effective, so the site walk is a superset.
+    - **Refresh closure:**
+      - old and new owners (also invalid-identity and due future keys);
+      - owners of parents (old and new parent ids);
+      - owners of frozen inverse children of every changed id;
+      - owners of every stream line from each changed/affected stream position (changed lines old and new, and parents of changed cancellations) up to and including the first site-effective line of all types and of that line's type.
+    - **Reads are exact and page-size independent.** What a walk consumes depends only on the frozen view; a short (byte-capped) page is never treated as the end. Input hashes are therefore deterministic for a frozen view.
+  - **Open question 1 (fan-out):** an order whose member lines span a long time (e.g. rework months later) brings that worker's whole intervening stream into its input. Likewise, a predecessor/successor walk for a rarely used work type may scan far. Both are bounded only by the 50,000-event `partition_too_large` failure, never truncated.
+    - Options: (a) accept, and measure in Task 19 on the five-year fixture; (b) for refresh only, seed predecessors from the published base's `timing_facts` stream index instead of walking source; (c) a reviewed amendment that bounds per-type look-back.
+    - Claude has implemented (a) only.
+  - **Open question 2 (request count):** members are read for up to 100 owners per call, but parents, children and stream pages are per owner (several RPC round trips per owner). A million-order rebuild therefore needs several million bounded calls.
+    - Options: (a) accept and measure in Task 19; (b) a later reviewed amendment adding multi-owner parent/child/stream reads.
+    - The 0040 functions already accept up to 1,000 ids per call, so (b) is a TypeScript change.
+  - **Open question 3 (read locking):** every 0040 read takes the existing `lock_batch` (control share + site row FOR UPDATE, fence/lease/drift checks) for the duration of one call. This serializes reads with other site metadata transitions, matching every other batch RPC.
+    - Planner to confirm that per-call validation is preferred over a cheaper unlocked fence check.
+- **Hosting entitlement and budget not observed:** Task 10 records whether existing Vercel supports the defined schedule/runtime and the measured worker/backfill costs. If it does not, CJ chooses an explicitly costed amendment; do not provision/upgrade by assumption. This does not prevent preparing/reviewing the plan.
+- **Existing M6 collection still pending:** complete Task 10 exactly as the preserved contract; the old COMPLETE report cannot clear it. Maintain original manager memberships on completion.
+- **Implementation discoveries:** if exact range/coverage parity, frozen-source capture/publication under current timeout, pathological dependency fan-out, side-card bounds or five-year resource budgets cannot meet this plan, stop the affected task and record measured evidence plus one bounded proposed change. Do not move counting rules, widen permissions, reduce fixtures or silently relax limits.
+- **Task 10 performance gate — intermittent v2 statement timeout (open; blocks Task 10; diagnostic only, nothing changed).** Read-only staging logs and statistics, 2026-11-14 12:10–13:05 UTC.
+  - **Confirmed:**
+    - Both failures were PostgreSQL statement timeouts inside the RPC, not network or API delays. `postgres_logs` show "canceling statement due to statement timeout" at 12:21:31.223 and 13:00:33.664. PostgREST logged code 57014 and `POST /rpc/load_production_evidence_v2` 500 as `authenticated` at 12:21:31 and 13:00:35. The edge logs show those requests arriving at 12:21:22.8 and 13:00:24.5, about 8.5 s and 9.2 s before the cancel.
+    - There was no outside load. All 254 edge requests in the window came from the harness (`node`), one at a time; the 200 retry followed each 500.
+    - No checkpoint overlapped either failure. The nearest were 12:20:50–53 (finished before) and 13:00:50 (after). Checkpoints in the window wrote 5–54 buffers each.
+    - No pooler event lined up with either failure. There was one pgbouncer server-lifetime recycle at 12:24:41 and a Supavisor `postgres` session shutdown at 13:00:50, after the cancel.
+    - The same call's database time varies a lot. Retained EXPLAINs (denied-after report, statements 24–26) took 2,697 / 1,641 / 1,580 ms with identical buffers (shared hit 188,322; temp read 9,319, written 5,626, about 73 MB read and 44 MB written to temp files per call). `pg_stat_statements` (since 2026-11-12 23:16, all window sizes mixed) records completed PostgREST-shape v2 calls up to 7,667 ms and wrapped full-body runs up to 7,470 ms. Cancelled statements are not counted there, so the true maximum is at least 8 s.
+    - Staging configuration: `work_mem` 2,184 kB, `shared_buffers` 224 MB, `effective_cache_size` 384 MB, `max_connections` 60. `track_io_timing`, `log_temp_files` and `log_min_duration_statement` are all off, so I/O wait, temp-file and per-statement durations were not recorded. Database totals since startup: 1,325 temp files, 14 GB.
+  - **Not established (hypotheses):**
+    - Small staging compute with burstable CPU or disk throttled by repeated about-117 MB temp-file round trips during back-to-back gate runs.
+    - Plan or JIT variance between PostgREST's parameterised call and the literal EXPLAIN.
+    - The settings above are present-day; they do not prove the historical state at 12:21 or 13:00. Whether 0036 makes the call borderline cannot be separated from instance variance with existing logs. The same load passed all three phases at `76f74d2` (medians 4.4–5.9 s), and the 2026-11-13 entry already recorded 2–4× SQL slowdowns after back-to-back runs. Production compute size was not inspected (agents never do).
+  - **Smallest justified next action (needs CJ approval; one bounded staging diagnostic, not a benchmark rerun):** Astra runs, at staging only and in one rolled-back transaction as owner with real claims and the 8 s catalog timeout, the exact PostgREST-shape v2 AU three-month call 6 times back to back. It then runs it 3 more times with `set local work_mem = '64MB'`, which is transaction-local and discarded at ROLLBACK, with `EXPLAIN (ANALYZE, BUFFERS, SETTINGS)` on the first and last of each group. Record each elapsed time and the temp blocks. This distinguishes:
+    - variance that stays with zero temp spill, pointing to CPU or instance throttling rather than spill;
+    - stable times once spill is gone, pointing to temp I/O.
+    - It does not change any setting, policy, timeout or target. A persistent `work_mem` change would be a separate CJ decision, not part of this diagnostic.
+  - **Diagnostic result (2026-11-14 13:27Z, `staging-results-item-counting-timeout-diag-1.md`):**
+    - **Ruled out as the main cause:**
+      - Temp spill: removing it saved only about 0.1 s (1.69 s → 1.54–1.62 s).
+      - Generic-plan switching and JIT: neither occurred.
+      - Plan changes: the plan shape was identical in all nine runs.
+      - Concurrent clients: there were none.
+    - **Observed:** the first execution on a fresh database connection took 5.1 s, three times the steady 1.7 s, with the same plan and work. It used 680 more shared-buffer hits; disk reads were not captured.
+    - **Likely mechanism (hypothesis, not proven):** the API timeouts hit runs 1 or 2 of a phase, when PostgREST likely serves from newly opened or long-idle connections after the minutes-long SQL gate. A first-call cost of about 5 s plus normal variance can reach the 8 s limit. This diagnostic cannot say whether that cost is per-connection warm-up (catalog/RLS/function caches) or uncached data pages.
+    - **Implication:** the same first-call cost can occur in production for real users after idle periods, independent of the benchmark.
+    - **Not justified by this evidence:** a `work_mem` change. It is out of scope anyway.
+    - **Decision needed:** this result strengthens the proposal below. Long three-month raw reads are inherently near the limit on a cold connection; steady-state reads have about 6 s of margin. A further diagnostic (separating connection warm-up from data-page cache) would need another CJ approval and is optional.
+  - **Proposed Task 10 amendment (PROPOSAL for Astra/CJ; not approved, not applied; Tasks 11–20 stay blocked until a decision is recorded):**
+    - Keep in Task 10 unchanged: four-case parity and restoration, real-session claims, positive coverage, no persistent membership change, the SQL gate's correctness checks (48 EXPLAINs and 36 full-body runs must complete under 8 s), follow-up M6 review and green CI, and the entitlement record.
+    - Move long-range acceptance: the AU three-month 10 s target through the raw v2 browser path would no longer gate Task 10. It would become a Task 19 gate on the approved pre-aggregated read path, which already requires one-day ≤2 s and three-month ≤10 s with 20 concurrent readers, cold/median/slowest recorded, and no discarding of failures.
+    - Keep short operational reads in Task 10: one-day (busy-day) owner and manager runs ≤2 s in all three manager phases, which passed in every phase so far (about 1.2–1.5 s).
+    - Record the three-month runs as measured baseline only, including every timeout, against the same parity hash.
+    - Risk: until Task 17 ships, the live app still uses the raw three-month path, so production three-month Reports may time out intermittently under 0036 exactly as on staging. CJ must accept that interim risk, or require the diagnostic above to pass first.
+    - Unchanged: the timeout, targets, workload and the scale and release gates.
+  - **Planner decision (Astra, 2026-11-14) — pending CJ approval:** **MODIFY / accept with the v2 conditions beside Tasks 10 and 19 and the global constraints.** Separate M6's proven permission/correctness baseline and operational-read gate from long-range acceptance on the already approved stored-report architecture. Do not accept the proposal as a claim that every short run met 2 s, that 0036 is cleared of performance risk, or that one more diagnostic/pass can establish reliability. The existing Task 10 text remains operative until CJ approves; this document-only decision neither closes Task 10 nor constitutes review round 3.
+    - **Confirmed evidence:** `staging-results-item-counting-v23r3-parity-cases.md` at `29e255f` reports exact restored-pre-0036/installed-0036 equality in all four arrangements, positive probes and fresh restoration for collection `90d3da63…` / hash `26330a48…`. The four phase-run reports listed under the v2 proposal preserve full SQL gates and the denied-before → all-sites → denied-after observations, with the same fixture/policy/parity identity. Two raw AU three-month API attempts timed out under installed 0036: manager run 2 in `staging-results-item-counting-v23r3-all-sites.md`, and owner run 1 in `staging-results-item-counting-v23r3b-denied-after.md`. The owner's membership did not change. One-day **medians** passed; manager AU first runs reached 3,060 / 2,393 / 3,424 / 2,984 ms across those four reports, and owner US day reached 2,330 ms in denied-after. These outliers stay visible; “all short runs ≤2 s” is unsupported.
+    - **What this proves about 0036:** the retained comparisons support equivalent tested visibility/direct-reader results, not universal performance safety. `staging-results-item-counting-v23-parity-cases.md`, `staging-results-item-counting-v23-denied-before.md`, `staging-results-item-counting-v23-all-sites.md` and `staging-results-item-counting-v23-denied-after.md` at `76f74d2` show the same post-0036 raw workload previously completed with AU three-month medians 4.4–5.9 s. That contradicts an unavoidable failure on every invocation, but neither clears 0036 nor fills current M6 gaps: collection `b31856a9…`, parity hash `608b3e12…` and its weaker pre-r2 evidence are history only. There is no controlled before/after policy performance comparison isolating 0036 from connection/cache/instance effects. Do not infer that reverting 0036 fixes latency or that 0036 alone caused these timeouts.
+    - **Cold-connection evidence versus hypotheses:** `staging-results-item-counting-timeout-diag-1.md` at `4467dd3` records one fresh owner connection, real claims, authenticated/RLS, 8 s timeout and rollback: first EXPLAIN execution 5,096 ms; later default-memory execution 1,686 ms with plain elapsed samples 1,701–1,838 ms. Removing spill with transaction-local 64 MB gave 1,540–1,618 ms execution, with unchanged observed plan shape, no JIT/generic-plan switch, and no other active client at the start. This supports a first-call cost in that sample and does not justify a persistent memory change. It does **not** identify connection-local caches versus data-page warming/CPU/I/O variance, establish that the timed-out API requests used cold connections, reproduce an 8 s timeout, or estimate production frequency/capacity. The high-memory group also ran later on the already-used connection; it is not a cold matched comparison. The earlier diagnostic's broad “ruled out” language applies only to what that sample observed. Cold/idle cost as the explanation for API timeouts, or as a cause independent of 0036, remains a hypothesis. No further diagnostic is necessary for this proposed gate or a substitute for risk acceptance.
+    - **Interim production risk and HARDENING:** until Task 17 is shipped **and the published path is enabled after its release gates**, management still depends on the raw path. CJ must explicitly accept possible intermittent unavailable/slow three-month Reports under installed 0036, unknown production frequency, and the retained first-call outliers on operational reads. No production environment was inspected; unchanged worker raw reads remain subject to their own reliability checks even after Task 17. Keep visible loading/stale/error and coverage states, never false zeroes/partial totals; operators may use a smaller supported view temporarily but must not sum daily distinct Orders to fabricate a long-range total. Successful saved actions must not be replayed because a KPI refresh failed. CJ monitors existing RPC 57014/HTTP errors, report complaints and scheduled-digest failures; worsening errors, capture impact or unavailable operational reads require incident handling and the documented S1-protected app rollback. Legacy reporting rollback restores prior behavior, not guaranteed three-month speed. Keep the appendix's CJ-only 0036 policy rollback for a demonstrated policy regression, not an automatic performance workaround; preserve additive schema, source/stock, memberships and reporting epoch/rebuild procedures. Vercel entitlement remains a deployment blocker. If CJ declines this interim risk, Task 10 stays blocked for an explicit revised design; do not search for a lucky pass.
+    - **Evidence disposition and remaining work:** the v2 Task 10 evidence table identifies the complete retained set that can satisfy the amended staging portion, conditional on round-3 underlying-evidence/hash verification and approval. No new Task 10 staging, SQL, benchmark or diagnostic run is requested. Preserve original FAILED statuses and the stale historical phase row as history; the reviewer must write a separate criteria-level assessment rather than certify that the original gate passed. Obtain round 3 (last allowed), focused/common checks and green PR CI; later run Task 19 on the actual published implementation and Task 20's release/rollback checks. No deployment, merge, SQL application, app change, new dependency or task completion is authorized by this decision.
+- **Review round limit reached — resolved by focused planner verification (2026-11-14; see amendment log and review closure addendum).** Round 3 (the last allowed) asked for R3-1 and R3-2; both are fixed in `7a4a323` (see the r3 Coder response). Decide:
+  - (a) whether these fixes close the round-3 Must-fix items without a round 4, for example by planner verification of `7a4a323`;
+  - (b) whether the retained Task 10 v2 evidence (collection `90d3da63…`, parity hash `26330a48…`) still qualifies after these changes. The coder's view is yes: R3-1 touches only a cancelled run's publication, and R3-2 is UI code outside the harness.
+  Resolution: both fixes are verified and the retained evidence remains eligible. CI is green at `2cb9089`; Task 10 is checked under v2 and Task 11 may start after this decision is committed. Vercel entitlement remains a deployment blocker. The original questions above are retained to explain the decision.
+- **Task 11 finding for Tasks 14/16 (not a blocker for Task 11; for the planner's focused review).** The decomposition preserves every existing answer: the reference query is exact on all tested windows and scopes. But four answers depend on the selected window's v2 four-family context, not only on per-event facts:
+  1. **Qualification.** Context verifications before the window are selected only by exact raw order-number match with a window terminal, or as a cancelled parent. A whitespace-variant order such as `" 5010"` before the window does not qualify a `5010` completion inside it, but does when both are inside (fixture order 5010).
+  2. **Unresolved-parent detail.** A cancellation in the window whose parent is after the window end reads "parent not found"; with the parent inside the window it reads "parent is later than cancellation" (order 5007).
+  3. **`ambiguous_repeat` counts.** These cover the selected effective verifications, including context ones, whose effectiveness depends on which cancellations are selected (order 5009).
+  4. **The first timing gap.** It is zero when the stored predecessor is outside the range.
+
+  Items credit for window verifications is selection-independent: every valid cancellation of a window line is itself selected. So additive daily Items are safe. Orders, qualification and coverage need read-time evaluation over event-level facts (`event_facts`/`cancel_edges` plus the selection), as `referenceSummary` does. They cannot come from additive daily totals or a stored per-terminal qualification. Task 16's SQL must reproduce `selectFactFamilies` + `evaluateSelection`; Task 11's reference is its test oracle. The planner should confirm this is the intended Task 14/16 shape before Task 12 storage work, especially the `daily_totals` scope and whether the qualification raw-order quirk is kept for exact parity (current answer) or fixed as a separately approved rule change.
+  **Resolved by planner under CJ's overnight delegation, 2026-11-14:** this is the intended classified-fact combination. Follow the explicit decomposition decision in Rule reuse above. Preserve the whitespace behavior and all original counting rules. The focused reviewer agrees this is anticipated by the approved contract. Task 12 is nevertheless blocked on the three Task 11 code findings below, not on this design question.
+- **Task 12 staging steps — planner review needed before any staging SQL (2026-11-14).** 0037 and its runner are ready for the planner's migration/runner security review. Nothing has run on staging. Proposed order, each step only on the planner's go:
+  1. `npm run staging:reporting-capture -- --rehearse-migration`: applies 0037 inside a rolled-back transaction and runs every check. This is the first real test of the non-superuser ownership transfer, the sequence grant and RLS-under-definer capture.
+  2. Apply 0037 to staging as one transaction.
+  3. `--check`.
+  4. Commit `capture_enabled = true` on staging (an operator step that advances the epoch), then `--concurrency`.
+  5. Decide whether capture stays enabled on staging.
+
+  Notes:
+  - 0037 needs PostgreSQL 16+ (`WITH INHERIT FALSE, SET TRUE`, `NULLS NOT DISTINCT`, `pg_auth_members.inherit_option`). Staging is 17.x; CJ must confirm production's version before any production step.
+  - Trigger overhead is recorded, not gated, in Task 12. Task 19 owns the ≤10% capture p95 regression gate.
+  - Task 12 stays unchecked until the staging capture/ACL/overhead/concurrency evidence passes.
+  **Planner disposition (2026-11-14):** the proposed order is accepted, but none of its SQL steps is released until T12-1 through T12-5 below are fixed and verified. Task 12's bulk insert medians are diagnostic only; they do not satisfy or replace Task 19's full capture p95 gate. Production version/hosting evidence stays a release blocker, not a reason to inspect production overnight.
+- **Capture activation boundary — planner design checkpoint before Task 13/15 activation or backfill publication.** A source transaction can observe capture disabled, remain uncommitted while capture is enabled and the backfill snapshot runs, then commit without a journal entry. An epoch increment alone cannot prove continuity. The operator/rebuild design must fence or drain pre-toggle writers (including a transaction with an older snapshot) or otherwise prove repair before declaring a generation complete. Add an adversarial two-connection test for that sequence and disable/re-enable. No source-table scan or lock on every ordinary write is authorized by this note; resolve the smallest safe transition protocol in the plan before implementing it. Task 12's rollback rehearsal and capture-only concurrency check do not certify a rebuild boundary.
+  **Resolved for implementation:** follow Activation fence and cross-site acknowledgement above in 0038. The sole new ordinary-write lock is a compatible shared lock on the private control row, not a source-table or per-site-state lock. Real interleaving, privilege and performance tests remain mandatory; no publication is approved by this design decision alone.
+- **Task 13 Part B — interface/algorithm questions for the planner (2026-11-14; Part A is committed; Part B SQL is not written).** Installed 0037 fixes the table shapes, and Task 14 owns materialization and dependency enumeration. These points decide Part B's SQL; each has a proposal:
+  1. **Who creates `partition_work`.** The five listed RPCs have no way to add work, and dependency partitions (parents, inverse children, previously missing parents) are Task 14's enumeration. *Proposal:* one more service-only RPC, `plan_reporting_work(p_batch, p_fence, p_items jsonb)`. The worker inserts `(audience, partition kind, partition key, input hash)` rows computed in TypeScript from `batch_events` plus `source_current`. `claim_reporting_work` then leases pending rows and returns each one's frozen input. Alternative: begin creates order/event partitions for frozen keys only, and Task 14 adds dependency partitions later.
+  2. **`stage_reporting_result(p_batch, p_fence, p_partition text, p_chunk jsonb)` identity and envelope.** *Proposal:*
+     - `p_partition` = the decimal `partition_work.work_id`, which is unambiguous and avoids delimiter-joined keys.
+     - `p_chunk` = `{chunkNo, chunkCount, chunkHash, resultDigest, rows: {event_facts, cancel_edges, order_occurrences, timing_facts}}`, with rows in table column names, at most 1 MiB, `chunkHash` = SHA-256 of the canonical JSON of `rows`, and `resultDigest` = SHA-256 of the ordered chunk hashes.
+     - An identical replay is a no-op; a different hash for the same chunk number fails; `done` is set only when `chunkCount` chunks match `resultDigest`.
+  3. **Superseding old fact versions at publish.** Installed fact tables have no partition column, so publish cannot tell which current rows a re-materialized partition replaces. *Proposal:* 0038 adds nullable `partition_kind`/`partition_key` (expand-only) plus an index to `event_facts`, `cancel_edges`, `order_occurrences` and `timing_facts`. Publish closes (`valid_to_seq`) current rows of each re-materialized `(site, audience, partition)` and installs the staged rows with `valid_from_seq` = the new generation. Alternative: close by the set of event ids in the staged rows plus the frozen tombstones.
+  4. **`daily_totals` maintenance.** Additive Items per production day cross partition boundaries, and the production-date rule (site zone, 04:00) lives in TypeScript. *Options:*
+     - (a) Publish recomputes affected `(site, audience, date, staff, work type, rework)` groups in SQL from current `event_facts`, adding a `production_date` column to `event_facts` (computed by TypeScript at materialization) so SQL only sums.
+     - (b) Staged delta rows per partition, applied additively, which needs per-partition old contributions.
+     - *Recommendation:* (a), which keeps the date rule in TypeScript and makes publish a pure aggregation of saved facts.
+  5. **Backfill/rebuild flow.** Begin (Part A) refuses until a continuous published base exists, so the first generation needs a rebuild path. 0037 has `batches.rebuild_cursor` but no candidate mirror. *Proposal:* 0038 adds `reporting_private.source_candidate(batch_id, site, event_id, image, event_created_at, order_key, parent_event_id, staff_id)` and service-only RPCs:
+     - `begin_reporting_rebuild(p_site)`: requires capture enabled; reserves the site's sole batch; records the epoch.
+     - `copy_reporting_source_page(p_batch, p_fence, p_after_event_id)`: at most 1,000 rows keyset by `(location, id)`, with a persisted cursor and page checksum.
+     - `freeze_reporting_rebuild(p_batch, p_fence)`: single-statement journal freeze and overlay onto the candidate.
+
+     Publish then swaps the candidate into `source_current`. These go beyond the five listed RPCs.
+  6. **Lease renewal.** The 30 s heartbeat is Task 15's, but needs an RPC. *Proposal:* `renew_reporting_lease(p_batch, p_fence)`, which extends the lease and returns the fence, and refuses an obsolete fence; or `claim_reporting_work` doubles as renewal.
+  7. **Self audiences per batch.** *Proposal:* a refresh re-materializes the site audience plus every staff id in the frozen old/new images of the batch's changed and dependency partitions. A rebuild covers every staff id with rows at the site.
+
+  These questions are resolved by the implementation contract below. Task 13 stays unchecked until both parts and their staging evidence pass.
+
+### Task 13 Part B implementation contract — planner decision, 2026-11-14
+
+Approved within the existing spec under CJ's overnight delegation. This defines internal interfaces, not new counting rules or weaker gates. Part A at `edb5ab1` has green CI; independent review requires the three runner fixes recorded below. **Keep 0038 unapplied until Part B and review fixes are complete.** It remains one draft migration; 0037 stays byte-identical. Task 14 keeps 0039 and Task 16 keeps 0040. No production action is authorized.
+
+1. **Explicit work planning and sealing.** Add service-only `plan_reporting_work(p_batch uuid,p_fence bigint,p_items jsonb)` and `seal_reporting_work(p_batch uuid,p_fence bigint,p_expected_count integer,p_manifest_hash text)`. Task 14 enumerates the complete dependency closure from the frozen batch view, then computes work descriptors in TypeScript. Plan calls contain at most 1,000 descriptors and 1 MiB. Each descriptor has audience, partition kind/key and input hash; unique identical replay is a no-op, a conflicting descriptor fails. The input hash covers canonical `FrozenPartitionInput` (including site/audience/rule/cutoff and all input rows sorted by exact event identity), not just a partition name. Input includes context, but output ownership is separate below. Seal checks the exact saved work count and a deterministic SHA-256 manifest over descriptors sorted by audience kind, nullable staff, partition kind and key. Store the sealing metadata on the batch with nullable additive columns; no work may be added/changed after seal. Claim/stage/publish require a sealed frozen batch. A genuinely empty/no-change cycle still seals an explicit zero-work manifest. Task 14 must prove enumeration completeness against the source oracle; a matching count/hash alone is not that proof.
+
+2. **Claims, chunks and replay.** `claim_reporting_work(p_batch,p_fence)` claims one pending partition and returns its work ID and descriptor; Task 14's bounded input reader supplies frozen input pages, not a full partition inside the claim response. `p_partition` in `stage_reporting_result` is the positive decimal work ID, parsed without lossy JavaScript number conversion. It must belong to this batch and fence. Use an envelope `{chunkNo,chunkCount,chunkHash,resultDigest,canonicalRows}` where `canonicalRows` is the UTF-8 text produced by shared `canonicalJson` for `{event_facts:[],cancel_edges:[],order_occurrences:[],timing_facts:[]}`. SQL verifies SHA-256 of these exact bytes before parsing/storing the object; do not hash PostgreSQL's differently formatted `jsonb::text` as though it were JavaScript canonical JSON. Reject unknown keys, malformed row shapes, more than 1,000 total rows or an envelope over 1 MiB. Chunk numbers are zero-based contiguous integers; `chunkCount` is positive and consistent for the work. An empty replacement is one chunk with four empty arrays. `resultDigest` is SHA-256 of the ASCII chunk hashes joined with `\n` in chunk-number order (no trailing newline). Only all chunks present with the recomputed digest can mark work done. Identical retries are no-ops; different content, count or digest for a saved chunk fails, including after completion. SQL derives site, audience, partition, rule and validity sequence from trusted batch/work metadata and rejects payload attempts to set them. Test omitted/duplicate/contradictory chunks and mismatched hashes, not just wrapper mocks.
+
+3. **Exclusive replacement ownership and retained source images.** Accept nullable `partition_kind`/`partition_key` additions and supporting indexes on the four fact tables. A primary source event belongs to its trimmed nonblank order partition, otherwise its event-ID partition. An edge belongs to its cancellation's partition; an occurrence to its terminal's; a timing row to its event's. Dependency/context rows may be read by multiple partitions but emitted only by their owner. Recompute both old and new owners for moves, plus affected dependency owners. Thus an empty replacement closes all old owned rows; closing only IDs present in new output is rejected because it loses deletions. Publish closes current versions of every completed partition/audience, then inserts replacements at the new generation sequence. Require nonnull ownership on all newly published facts and validate row ownership against the frozen view. Rebuild closes all prior site facts, including departed audiences/empty partitions. To fulfill seven-day raw-export snapshots (including note, station, non-count and future rows), add private `source_versions` with `(site,event_id,valid_from_seq,valid_to_seq,image)` and indexes; publish versions the same mirror delta and rebuild closes absent old rows. Do not reconstruct old exports from mutable `source_current`. Apply the same RLS/no-client/service-only model and retention protection as other private facts.
+
+4. **Daily totals: recompute affected groups, not deltas.** Choose option (a). Add nullable `production_date` to event facts; TypeScript calculates it with the existing site-zone/04:00 rule and publication requires it for dated new facts. Derive affected day/person/work-type/normal-or-rework groups from both retired and replacement contributions (including parents affected by changed cancellation edges). SQL recomputes their totals from the resulting current classified facts and valid cancellation relations, versions the old group and writes the new value, including zero/removal. Keep effective Items rules, safe-integer overflow and line-count meaning equal to Task 11; do not sum raw verification quantities or count cancelled contributions. No SQL SKU/classification/date-rule rewrite and no additive range Orders. Task 14 supplies mapping/parity tests; Task 13 tests the transactional replacement with known classified fixtures.
+
+5. **Resumable candidate rebuild.** Accept private `source_candidate` and the three proposed RPCs. Candidate rows are keyed by batch/site/event ID and have the same image/index fields as `source_current`, plus no client access. `begin_reporting_rebuild(p_site)` requires capture on, reserves the sole site batch, records current epoch/rule/base and starts a 360-second lease. No journal cleanup can discard changes still needed by an active rebuild. `copy_reporting_source_page(p_batch,p_fence,p_after_event_id)` owns the source read and atomic candidate write; it never accepts source images from a caller. The requested cursor must match persisted progress, or match the last saved request for an identical response replay. Return metadata/checksum/cursor, not the raw page. Read keyset by site and exact event ID, at most 1,000 rows and 1 MiB of images; a smaller byte-bounded page advances to its actual last row. An oversized single row fails visibly. Persist completion only after a true end-of-source read, not a short byte-capped page. No OFFSET and no full-history response.
+
+   After copy completion, `freeze_reporting_rebuild(p_batch,p_fence)` uses one statement snapshot to freeze all pending per-site change IDs and their final source images/tombstones, and overlays them on the candidate. This repairs inserts below the copy cursor, moves, updates and deletes during copying. Candidate becomes immutable after freeze; subsequent commits remain pending for the next batch. Publication promotes the repaired candidate and versions mirror/facts in the same transaction as generation/receipts. A timeout rolls everything back. Test exact source/mirror equality at the frozen snapshot, not against a later changing source. Do not enable summary mode before the complete generation exists.
+
+6. **Lease identity and recovery.** Add `renew_reporting_lease(p_batch,p_fence)` for the 30-second heartbeat; it extends the current unexpired lease to 360 seconds without changing the fence. Every mutation checks control epoch/rule, active site/base, expected batch fence and unexpired lease under the established control-before-site lock order. Add `resume_reporting_batch(p_batch,p_expected_fence)` for expired-lease takeover: atomically increments the site's monotonic fence, updates the same batch, returns unfinished leased work to pending and keeps verified staged chunks for identical replay. It does not resnapshot frozen input or revive epoch/rule/base-invalid work. Duplicate live workers get busy. Provide a service-only `abandon_reporting_batch(p_batch,p_fence,p_reason)` metadata transition for explicit recovery of failed/obsolete work, preserving evidence and unacknowledged journal; Task 15 exposes it only through the existing protected rebuild/recovery action, never ordinary refresh. Old worker stage/renew/publish fails after takeover. Lost-response replay of an already successful publication returns its existing generation only when the batch/fence identity matches; it cannot mint another generation or reapply credit.
+
+7. **Audience completeness.** Accept the proposed refresh audience union, including every saved staff ID in both previous and next primary/dependency inputs, not only changed rows or current users. Staff reassignment/deletion must emit an empty replacement for the old self audience when appropriate. Rebuild covers every recorded source staff ID and closes all obsolete old audiences. Self filtering occurs before correction/qualification; context belonging to another worker must not leak into the self projector. The site audience remains separate. Tests cover a hidden cancellation, staff change, departure and an empty old partition.
+
+8. **Publication and neighboring tasks.** Publication requires sealed enumeration, all exact work/chunks done, current lease/epoch/rule/base and integrity checks. Allocate one new generation, close/install facts and daily groups, promote mirror/source versions, supersede the previous generation, update site metadata and publish per-site receipts atomically. Run the delayed global acknowledgement pass without treating `changes.batch_id` as an exclusive claim. A no-change verification publishes a new metadata generation with the new verified cutoff while existing fact intervals continue; do not mutate immutable published metadata or pretend an old cutoff was checked. Task 14 owns bounded frozen-input/dependency reads and projection mapping, Task 15 orchestration, Task 16 selected-family combination and authorized reads. Add focused modules if needed rather than a single unreviewable server file; include each in API type-check.
+
+**Task 13 execution split:** Part B1 implements rebuild/copy/freeze plus renewal/takeover/abandon and wrappers/tests; common gate, commit/push and pause for focused review. Part B2 implements planning/sealing, chunks and atomic publication with replacement fixtures; common gate, commit/push and pause. 0038 remains an unapplied draft across these commits. After the final reviewed draft, planner rehearses/applies staging only and runs the real interleavings, including Part A F1–F6 and cross-site receipt/rebuild/publish fault tests. Do not claim Task 13 complete from pure models or SQL text assertions. If measured publication/freeze cannot fit existing timeouts, preserve the failure and request a bounded planner amendment; no timeout or workload waiver.
+
+For base validation, refresh creation/reuse checks the actual active generation's site, published/complete state, rule and epoch, not only a nonnull pointer plus `source_epoch`. Rebuild may intentionally replace an older rule/epoch generation, but its base pointer must remain the unchanged published base and its own captured rule/epoch must match current control. A toggle/rule/base drift invalidates an active batch rather than returning it as usable. Test both refresh rejection and a legitimate rule-change rebuild.
+
+**Bounded transport clarification (before Part B implementation):** the one-partition claim wording in item 2 is superseded here. Do not impose one database round trip per order on a million-order backfill. `claim_reporting_work(p_batch,p_fence,p_limit integer DEFAULT 100)` returns a bounded list of descriptors (maximum 1,000 and 1 MiB), all under the same batch fence. Each work still has independent identity, input hash and completion. Add `stage_reporting_results(p_batch,p_fence,p_results jsonb)` as a service-only bulk transport around the same validated single-work staging operation: at most 100 `{partition,chunk}` entries and 1 MiB for the whole request; all entries succeed atomically or none do. Preserve the single-work RPC for retries/tests. Task 14's input reader can page inputs for several claimed works in one bounded request; no partial partition is declared complete just because a page ended. Tests must prove bulk and single-work semantics match and that one invalid entry rolls back the whole bulk request. Task 19 records actual request counts/backfill duration; batching does not waive any limit or establish performance before measurement.
+
+### Task 13 Part A focused review — changes required, 2026-11-14
+
+At `edb5ab124c47130e7aea28338d8e251d7041fab7`, independent read-only review passed 112 focused tests and reproduced the first two failures with local injection probes. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43609836013/job/132492220121). No SQL was run; migration execution remains unverified. Three P2 runner fixes are required before staging:
+
+- **T13A-1:** `tests/staging/reporting-jobs.ts:149,157` starts toggle/write promises and then polls another connection before attaching a rejection handler. An early rejection emits `unhandledRejection` before cleanup; default Node behavior can terminate before restoration/audit. Attach a nonthrowing outcome handler immediately and inspect/rethrow at the intended await point. Test both early query failures and a polling failure while a query is pending; every launched query must be settled/observed and cleanup/audit retained.
+- **T13A-2:** `tests/staging/reportingCapture.ts:696` swallows `auditor.end()` failure. Record it as a cleanup error and emit FAILED even when the fresh audit itself succeeded. Add an injected auditor-disconnect failure test. This fixes the shared helper; do not rewrite historical reports as though the injected failure occurred in them.
+- **T13A-3:** `tests/staging/reporting-jobs.ts:128,205` replaces a stricter existing lock timeout with 3 s/1 s; `reportingFence.ts:84` then assumes the default must take at least 2.5 s. Cap every scenario-local limit to the effective existing limit, record that limit and evaluate timeout evidence against it. A 500 ms existing limit must remain 500 ms and be assessed correctly. Do not change statement/session timeouts.
+
+**Next handoff:** fix only T13A-1–3, add regression tests, run focused/common checks, commit/push and pause for focused verification. The Part B contract is approved for subsequent work after those fixes are verified. Root remains the planner and Claude the sole coder; no application or SQL edit by root.
+
+**Coder response (Claude, 2026-11-14; runner code and tests only; no SQL run; 0037/0038 untouched):**
+- **T13A-1:**
+  - New `launch(promise)` in `tests/staging/reportingFence.ts` attaches a non-throwing outcome handler immediately. `result()` returns the value or rethrows the original error where it is awaited; `settled()` reports the state.
+  - F2's toggle and queued write are both launched this way, and awaited via `enable.result()` / `write.result()`. A polling failure while they are pending therefore leaves no unhandled rejection, and `withClients` still rolls back and ends every scenario connection, so the fresh audit runs.
+  - Tests: an early rejection raises no `unhandledRejection` and is rethrown unchanged. With a polling failure while a query is pending, the polling error surfaces, cleanup runs, and the later query rejection is observed. A runner check asserts no other query promise is held un-awaited.
+- **T13A-2:** `runCaptureLifecycle` records `cleanup failed: audit disconnect: …` when the fresh audit connection cannot be closed, so the status is FAILED even when the audit passed. Test: an injected audit-disconnect failure gives `restorationVerified: true` but `STATUS: FAILED – cleanup failed: audit disconnect`. Historical reports are not rewritten.
+- **T13A-3:**
+  - The runner reads each scenario connection's effective `lock_timeout` from `pg_settings` and sets a transaction-local limit only through `setLocalLockLimit(client, want)`. The limit used is `capLimit(want, existing)`: the stricter of the two, with 0 meaning none. The runner no longer contains a literal `set local lock_timeout`, and statement/session timeouts are untouched.
+  - F1 records `existingLockMs`/`writerLimitMs`. F5 records `existingLockMs`, `defaultLimitMs` (= `capLimit(3000, existing)`, what `set_reporting_capture` applies) and `stricterLimitMs` (= `capLimit(1000, existing)`).
+  - `checkFence` checks that each limit used equals the cap, and that each timeout fired `near` its own limit (≥ 0.8× and < 1.5× + 500 ms) rather than near a fixed 3 s.
+  - Tests: `capLimit`/`near` values; a 500 ms existing limit stays 500 ms and passes; using 3 s with a 500 ms existing limit, judging against 3 s, or firing early each fail. Runner checks cover the read-and-cap path.
+- **Regressions proven:** each fix reverted in turn fails its tests. That covers 6 reverts: `launch` not observing; the runner floating the toggle query; the audit disconnect swallowed; the runner forcing 1 s; the cap ignoring a stricter limit; assessment fixed at 3 s.
+- Gate: `npx tsc -b`, `npm run typecheck:digest`, 897/897 tests, build OK; strict `tsc --noEmit` clean on both runners.
+
+**Focused planner closure (2026-11-14):** T13A-1–3 are verified closed at `001218df9128186bec26256c490fdf6dc2b1a24a`. The independent reviewer reran 119 focused tests successfully and found no remaining scoped issue. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43610633888/job/132494707990), completed 15:32:37 UTC. This clears code review for Part A, not database execution or Task 13 completion. Claude may now implement **Part B1 only**, following the approved contract and bounded transport clarification; run the common gate, commit/push and pause. No SQL application before the full reviewed 0038 draft.
+
+**Part B1 coder record (Claude, 2026-11-14; 0038 still an unapplied draft; 0037 byte-identical; no SQL run):**
+- **Identity:**
+  - `reporting_private.batch_drift(batch)` returns why a batch is no longer usable (NULL = valid): capture off, epoch or rule changed, not the site's active batch, base pointer changed, or base not a complete published generation of this site. A refresh base must also be at the current rule and epoch; a rebuild may replace an older rule/epoch base, but its own captured rule/epoch must match control.
+  - `reporting_private.lock_batch(batch, fence, live)` takes the control `FOR SHARE` lock, then the site row, then the batch row. It requires drift NULL, the exact fence on both batch and site, and, when `live`, an unexpired lease. Every B1 mutation uses it.
+- **Refresh `begin_reporting_batch` (Part A, revised):**
+  - Validates the REAL base generation: site, published, complete, rule and epoch, plus `source_epoch`.
+  - An active batch with drift is marked `failed` (`invalidated: …`) and never returned as usable. A valid live batch raises `busy`. A valid expired batch is returned `reused` so its owner can resume it.
+  - Known limit: if the same call then raises for a missing/invalid base, PostgreSQL rolls back the invalidation too. The drifted batch stays unusable (every mutation refuses it), and `begin_reporting_rebuild` or `abandon_reporting_batch` clears it.
+- **Rebuild:**
+  - New private `source_candidate` (keyed batch/site/event; RLS on; service-only DML), with the same image/index fields as `source_current`. The guard trigger allows writes only while its batch is an ACTIVE rebuild, and deletes only after the batch is published/failed/abandoned, so the candidate is immutable after freeze.
+  - `begin_reporting_rebuild(site)` requires capture and processor enabled. A drifted active batch is invalidated; a valid live one is busy; a valid expired one must be resumed or abandoned, never replaced. The base must be the unchanged complete published base (or none). It records rule/epoch from control, fence +1, a 360 s lease, and the cursor.
+  - `copy_reporting_source_page(batch, fence, after)` owns the read and the write; there is no image parameter. Keyset `id > after ORDER BY id LIMIT 1000`, no OFFSET, a 1 MiB running-byte cap, and an oversized single row raises. It is complete only on a true end-of-source read, i.e. fewer than 1,000 rows fetched and none byte-capped. The page checksum is SHA-256. The request must be at the persisted cursor, or it is an identical replay of the last saved request.
+  - **Planner note fixed:** a final EMPTY page (empty site, or an exact multiple of 1,000 rows) leaves the cursor unchanged, so the replay condition also accepts a completed copy. Its lost-response retry now replays instead of raising "already complete".
+  - `freeze_reporting_rebuild(batch, fence)` requires a complete copy. ONE `WITH` statement inserts membership (`site_pending_changes`) and final images/tombstones into `batch_events`, upserts images into the candidate and deletes tombstones. Then the batch is `frozen` with its cutoff.
+- **Lease:**
+  - `renew_reporting_lease` extends a live lease to 360 s with the fence unchanged.
+  - `resume_reporting_batch(batch, expected_fence)` works only for a valid batch at that fence with an EXPIRED lease (otherwise busy; a drifted batch must be abandoned). It sets fence +1 on site and batch and returns leased work to pending. Staged chunks, frozen inputs and the candidate are untouched.
+  - `abandon_reporting_batch(batch, fence, reason)` requires a non-empty reason and the current fence, and refuses a live valid batch. It sets `abandoned` plus the reason and clears the site pointer, keeping evidence and the pending journal. An unfrozen batch records the abandonment time as its cutoff only to satisfy 0037's state check.
+- **`reporting_private.order_key(text)` (planner note):** it now trims EXACTLY the characters JavaScript's `String.prototype.trim` removes (tab, LF, VT, FF, CR, space, NBSP, U+1680, U+2000–U+200A, U+2028/9, U+202F, U+205F, U+3000, BOM). A test decodes the SQL set and proves it equal to JavaScript over every BMP code point, and that it matches `evidenceOrderKey` on sample keys. An indexed order-key lookup therefore finds every row the shared key groups together. Counting semantics are unchanged.
+- **Other changes:**
+  - ACLs: the six public calls and three helpers are service-only; the guard trigger is executable by nobody.
+  - Runner catalog expectations now include the B1 table, helpers, trigger function and RPCs, with all of 0038 required when any of it is present.
+  - `api/_lib/reporting-jobs.ts` adds typed wrappers (argument validation before calling; checks that renew keeps the fence and resume advances it) and pure references `selectSourcePage`, `copyCursorDecision`, `batchDrift`.
+  - The new `tests/reporting/reportingRebuild.test.ts` (30 tests) is added to `typecheck:digest`.
+- **Tests:**
+  - SQL text for every rule above.
+  - Pure models: a full page that is not complete; a byte-capped page that is not complete; true end of source; oversize; cursor decisions including both empty-final-page replays; refresh rejected on an older-rule base vs a legitimate rule-change rebuild; toggle/epoch/base/active/site drift.
+  - Wrapper validation.
+- **Mutations:** 16 B1 breaks plus 4 for the planner-note fixes are each caught.
+- Gate: `npx tsc -b`, `npm run typecheck:digest`, 924/924 tests, build OK; strict `tsc --noEmit` clean on both runners.
+- **Not in B1:** planning/sealing, chunks/staging, publication, `source_versions`, `production_date` and ownership columns (all B2). Staging rehearsal of the complete draft is the planner's step after B2.
+
+**Part B1 planner review — changes required (2026-11-14):** independent review at `07345b67d822c9b515b5f4f2e5aaeb0ff092c62c` passed 146 focused tests and the digest/API type-check. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43611818098/job/132498302911), completed 15:45:55 UTC. Empty-final-page replay and Unicode-trim regressions are verified; no SQL was executed. One P2 must be fixed before B2:
+
+- **T13B1-1 — persisted cursor is unavailable to the replacement worker.** `resume_reporting_batch` returns fence/state but no saved rebuild cursor; status also omits it. Copy two pages, lose all process memory, expire the lease and take over: the new worker cannot discover the next cursor, and `copy(..., null)` fails because null is neither current progress nor the last request. Extend the takeover result with bounded typed metadata: batch kind, base generation, rule, epoch, source cutoff and `rebuild_progress` (`afterEventId`, `complete`, `pages`, `rows`, `bytes`; null for refresh). Derive it from saved state, expose and validate it in the wrapper, and never return source payloads or auth tokens. Include active batch kind in status so orchestration can route recovery explicitly. A resumed rebuild continues from returned progress or proceeds to freeze if copying was already complete; it must not restart copying or require private-table access. Add a regression simulating at least two pages, lost process state and lease takeover, plus completed-copy recovery and malformed progress rejection. Keep fence checks and immutability unchanged.
+- A lost freeze response can recover through persisted `frozen` status without resnapshotting; add that orchestration case in Task 15. It is not a B1 blocker.
+
+**Next:** Claude fixes T13B1-1 only, records failing/passing regression evidence, runs focused/common gates, commits/pushes and pauses for verification. B2 remains gated on that verification; 0038 stays unapplied.
+
+**Coder response to T13B1-1 (Claude, 2026-11-14; 0038 still an unapplied draft; 0037 byte-identical; no SQL run):**
+- **SQL:**
+  - `resume_reporting_batch` now also returns `kind`, `base_generation_id`, `rule_version`, `capture_epoch`, `source_cutoff` and `rebuild_progress`. The progress (rebuilds only; NULL for a refresh) is a jsonb `{afterEventId, complete, pages, rows, bytes}` derived from the saved `rebuild_cursor`. It excludes the saved `last` response, images and any source payload.
+  - `get_reporting_job_status` adds `active_batch_kind`.
+  - Fence checks, lease rules and candidate immutability are unchanged.
+- **Wrappers** (`api/_lib/reporting-jobs.ts`):
+  - `ResumedBatch` carries the typed identity and progress. `parseRebuildProgress` is strict: exact keys (so no extra payload), a null or non-empty cursor, non-negative safe-integer counts, and consistency (no pages ⇒ null cursor, zero counts, not complete; rows ⇒ a cursor).
+  - `resumeReportingBatch` also rejects another batch id, an unknown kind or state, a refresh carrying progress, and an active rebuild with a cutoff.
+  - `getReportingJobStatus` validates `activeBatchKind` and refuses a kind/id mismatch.
+  - New `recoverRebuildCopy(client, batchId, expectedFence, maxPages)` needs only the batch id and fence from status. It takes over, then continues copying from the RETURNED cursor, or returns `next: "freeze"` without any copy call when the saved copy is complete. It never restarts from null and never reads private tables.
+- **Tests** (new `tests/reporting/reportingRebuildRecovery.test.ts`, 21 tests, also in `typecheck:digest`). A stateful fake applies the B1 rules: keyset pages, the cursor/replay decision, fence and lease.
+  - Two pages copied, all process state lost, lease expired; then status → takeover → continuation. Copy cursors are exactly `[null, e00999, e01999]`, and all 2,500 candidate rows are written exactly once.
+  - After takeover the old fence is refused. After one page, a `null` request is an identical replay that copies nothing; after two pages it is a cursor mismatch.
+  - Completed-copy recovery with an exact multiple of 1,000 rows (empty final page) goes straight to freeze with no copy call. A takeover before any page starts from null.
+  - Ten malformed-progress cases, plus wrapper identity/kind/state/cutoff and status kind/id checks.
+  - SQL text for the new resume columns (no `last`, image or source access) and the status kind.
+- **Regressions proven:** reverting each part in turn fails its test. That covers 7 reverts: resume returns no progress; status without kind; recovery restarting from null; copying again after a complete copy; lenient keys; ignored consistency; unvalidated status kind.
+- Gate: `npx tsc -b`, `npm run typecheck:digest`, 942/942 tests, build OK. A lost freeze response remains Task 15's orchestration case, as noted.
+
+**Part B1 focused closure (2026-11-14):** T13B1-1 is verified closed at `830007235dc2f172f521614c1832d168e3063682`; independent reviewer passed 164 focused tests plus `typecheck:digest`, with no scoped residual blocker. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43612544978/job/132500503222), completed 15:53:48 UTC. No SQL execution has occurred. Part B1 is accepted as an implementation checkpoint; Task 13 remains open.
+
+**Remaining B2 execution checkpoints (clarifies the earlier split):**
+
+- **B2a — plan, seal, claim and stage.** Implement the approved planning/sealing and bounded claim/single/bulk staging RPCs with typed wrappers, exact hash/envelope/row-ownership validation and durable idempotent completion. Add only schema metadata needed for these operations. Test incomplete/mismatched manifests, chunk replay/conflict/missing chunks, bad ownership/metadata, lease/epoch/base drift, bulk rollback and 1,000-row/1 MiB bounds. Common gate, one commit/push, then pause for focused review. No publication or live SQL in this checkpoint.
+- **B2b — atomic publication and runtime evidence runner.** After B2a verification, implement generation/fact/daily/mirror/source-version replacement, no-change publication, per-site receipts and lost-response publication replay. Extend `tests/staging/reporting-jobs.ts` with a guarded `--rehearse-migration` mode for the full 0038 draft (one outer transaction, migration transaction delimiters stripped safely, actual SQL catalog/transaction fixtures, always rollback plus fresh baseline audit) and installed-job checks for the real interleavings/fault cases. Preserve separate immutable outputs and every cleanup failure. Multi-connection fence tests need installed 0038 and must not pretend to run inside the rehearsal transaction. Common gate, one commit/push, then pause for full migration/runner review.
+
+The planner then runs the reviewed rollback rehearsal on staging, applies the exact reviewed 0038 only if that passes, and runs installed fence/job checks. Every SQL target is checked against `ybrzhrgfrnvtcwymjdrq`; no other account/project, timeout relaxation or source cleanup. The final fresh audit must show original source/stock/membership state, capture restored, processor off and read mode legacy. Evidence of actual snapshots/cross-site receipts/rebuild/source equality is still required before checking Task 13. The 0038 file remains an unapplied draft through B2a and B2b; 0037 never changes.
+- No new product decision is required for the approved 15/30/120-minute, five-year, 10-times, 20-reader or capture-regression limits. CJ approved this document on 2026-11-14; Tasks 11–20 remain subject to Task 10 and their stated evidence gates.
+
+### Selected-source warning correction — planner decision, 2026-11-15
+
+**T11-4 (P2), newly reproduced at `cf6c18b`:** Task 11 is reopened for this bounded parity correction; its earlier T11-1–3 fixes remain accepted. `projectReportingPartition` puts malformed identities into partition-wide `globalIssues`, and `referenceSummary` adds all of them to every range. A local, database-free probe with a whitespace-only ID on a January 5 verification and a valid January 12 verification shows January 12 incorrectly marked incomplete (`invalid_event=1` versus the source oracle's zero). A future malformed row also contaminates the current result. The existing transport accepts whitespace-only IDs and migration 0012 permits them; empty IDs are rejected by that transport and are not the end-to-end regression. Preserve that distinction.
+
+Independent companion probes confirm that these malformed source rows still participate in the four-family source selection **before** the reducer rejects their identities. A malformed window terminal can select prior verification context; a malformed cancellation can seed its parent; a malformed `started` row selected as a cancellation's parent must retain the global warning. Conversely, a valid-ID `started` parent is ignored by preparation and its cancellation still reports "parent not found". Once a source issue is selected, it survives narrower display range/staff/work-type filters; self visibility filters source rows before selection. Dropping the rows early, treating them as ordinary invalid count facts, or filtering warnings only by the displayed range changes existing answers.
+
+**Approved internal contract correction:** retain separate `source_issue_facts` with exact raw source identity, source instant, event type, raw order/parent/staff selectors and the existing shared-TypeScript issue kind/detail. They contribute no Items, Orders, timing, or reducer parent presence. Select the four families over the union of ordinary selectors and source-issue selectors; then evaluate ordinary facts and add only the selected source issues globally, with the existing deduplication. Apply source cutoff and source audience filtering first. Do not trim/invent IDs, alter count/qualification rules, or turn unsupported timestamps into all-history warnings: unreadable source timestamps follow the existing loader's explicit failure behavior.
+
+Add a fifth versioned private relation/array in **unapplied 0038**, leaving installed 0037 byte-identical. The five-array envelope supersedes earlier four-array wording for new staged results. Include these facts in canonical hashes, aggregate row/byte limits, frozen-source/owner binding, replay validation, atomic replacement, source deletions and retained-generation reads. SQL validates structural/source identity; TypeScript remains the sole warning classifier. Keep source-issue selectors distinct from effective-event parent existence, including ignored non-count event types. Task 14 maps the corrected projector result, B2b persists/replaces it, and Task 16 proves SQL selection/read parity.
+
+**Resume order after Claude's quota reset:** first correct T11-4 with the independent source oracle and the companion cases above; add projection tests plus canonical/hash sensitivity and the fifth-family storage/transport changes needed before publication. Then fix T13B2a-1–3 below, applying required-field/source-binding/byte checks to all five arrays. These may be two reviewable commits, but run the common gate, demonstrate deliberate-break sensitivity, push and pause before B2b. Record failures and successful verification separately. The later B2b harness must prove staging/publish round-trip, replacement/delete, selected-context warning scope and audience isolation. This authorizes a representation correction within the approved exact-parity spec, not a rule change or a new database run. No additional diagnostic SQL is needed before the final reviewed migration rehearsal.
+
+**T11-4 domain closure:** independently verified at `36ec35d83c6d20a1bcff546c85bbcb02cfac0237`: 129 focused tests passed, exact domain/test file hashes remained unchanged, and no scoped blocker remains. The parent-presence mutant is equivalent under this supported-site/whitespace-ID contract because both reducers skip blank parent IDs before lookup. Shared classification, selected-global warning scope, cutoff, audience, hash and loader failure distinctions are preserved. The combined pushed head `5bcf3538b2eb723e22a24884b2e43113f32be4ed` passed [CI](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43631962220/job/132560338465) at 19:26:11 UTC on Nov 14. Task 11 is closed again; durable SQL round-trip/publication/read parity remains in Tasks 13–16.
+
+### B2b full migration/runner review — changes required, 2026-11-15
+
+Reviewed clean pushed `58cc9800b6ade92a88fda6bf597df05c89c3e0ff`. Root verified [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43635410212/job/132571008501), completed 20:04:27 UTC Nov 14. Independent publisher review passed 161 focused tests; runner review passed 88. Coder's full gate passed 1,045 tests/type-checks/build and 20 sensitivity mutations. These are local/model/static checks; **no B2b SQL has run, 0038 remains unapplied, and rehearsal is blocked by the following findings**:
+
+1. **T13B2b-1 (P1), migration syntax:** `publication_fingerprint` uses `pg_catalog.extract(epoch FROM b.source_cutoff)`, an invalid combination of a qualified ordinary function name and EXTRACT's special grammar. Use valid unqualified `EXTRACT(epoch FROM ...)` (or ordinary qualified comma-separated arguments), and correct the test that currently endorses the invalid spelling. Evidence is the [PostgreSQL 17 parser grammar](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/backend/parser/gram.y), not an executed migration failure.
+2. **T13B2b-2 (P2), nonempty five-family fixtures:** `rowsByOwner` never populates `order_occurrences` or `timing_facts`; both model and runtime runner therefore exercise empty arrays for those tables. Add real classified nonempty fixtures and explicit insertion, replacement/deletion and retained-version assertions for both. Keep all five families covered through publication.
+3. **T13B2b-3 (P2), report persistence:** a throwing `save()` reaches the first `runCaptureLifecycle` finally block before the auditor opens. An actual-helper local injection produced one rollback/disconnect and zero fresh audits. Persistence errors must be sticky/nonthrowing through cleanup and audit; stop further scenario work, preserve FAILED status and report to stderr if disk persistence remains unavailable. Initial output failure must refuse DB connection. Fix the shared lifecycle boundary or supply a safe writer consistently, with actual failure-injection tests.
+4. **T13B2b-4 (P2), restoration audit:** the baseline compares source counts/IDs and selected private counts, omitting full source payloads, stock/ledger/membership state, catalog/function/ACL restoration and several private families. Capture comparable full-state fingerprints for the promised surfaces, including absence of 0038 objects after rehearsal. Known generated sequence gaps/expected transaction timestamps must be distinguished explicitly; do not normalize away unexplained data, permission or function changes.
+5. **T13B2b-5 (P2), transaction parser:** leading block comments bypass the regex that refuses inner transaction control. The actual `migrationBody` accepts `BEGIN; /* leading block comment */ COMMIT; SELECT 1; COMMIT;`. Use executable statement classification that handles comments and quoted function bodies correctly, with regressions. The current reviewed draft contains no such bypass, but the advertised rollback guarantee needs the guard fixed before use.
+6. **T13B2b-6 (P2), killed-connection cleanup:** I5 records unexpected `victim.end()` failure only as descriptive text. Actual-function injection returned `ok=true` and no cleanup failures. Keep expected backend-termination notifications separate from unexpected disconnect failures; the latter must fail the report. Only a connection opened/identified by this invocation may be terminated.
+7. **T13B2b-7 (P2), real runtime evidence:** P2d compares candidate/mirror/version counts rather than identities/images; replace that with exact equality. I4 has no controlled shared move and cannot certify shared-change acknowledgement. I2 rolls its writer back, so it does not prove a smaller allocated change ID committed after freeze remains pending. F5's same-transaction takeover and P3's same-transaction replay do not prove durable recovery after commit. Keep their narrower evidence labels and add the committed cases below. Do not claim a passing empty-state scenario proves a missing interleaving.
+
+**Approved bounded installed-commit harness (under CJ's overnight staging delegation):** add a separate, explicit mode such as `--committed-interleavings`, available only after reviewed 0038 installation, targeting `ybrzhrgfrnvtcwymjdrq` before every SQL. The existing rehearsal/check modes remain rollback-only. This mode is prepared now but not run until independently reviewed. It must prove (a) lower change ID uncommitted while a higher ID commits and freezes, then lower ID commits and remains pending until a later publication; (b) a committed active batch survives disconnect and is taken over from another connection, rejecting the old fence; (c) committed publication followed by a simulated lost response replays the same generation without duplicate credit; (d) a controlled committed shared-site move exercises both site receipts/concurrent publication and eventual global acknowledgement, including any allowed deferred acknowledgement pass.
+
+Preflight must refuse unrelated active jobs or existing derived/journal state that prevents an isolated restore. Use collision-checked, run-unique source IDs and exact recorded identities for all private fixtures; never update/delete a pre-existing source row, membership, stock item or unrelated journal/batch/generation. Record baseline and cleanup ownership before the first commit. Source fixtures should avoid stock deductions; verify stock/ledger/membership fingerprints anyway. Capture/processor setup and cleanup may commit only their documented staging settings: restore original enabled/mode/processor state, preserve monotonic capture epochs, and report the exact expected epoch increments instead of resetting them. Refuse an incompatible existing published state rather than discarding it. Never use unscoped table deletion or suppress triggers/constraints. Detect unexpected external changes, retain their rows and report the mismatch; do not clean someone else's work. Always clean only this run's fixtures in dependency order, preserve every failure, disconnect all sessions and open a fresh complete audit, even after output/SQL/connection failure. Inject cleanup/persistence failures locally before execution. Existing timeout limits remain unchanged; waits and cancellation must be bounded and confined to this run's sessions.
+
+**Next handoff:** Claude fixes T13B2b-1–7 and prepares the explicit installed-commit harness (one or two reviewable commits), runs the common gate and focused sensitivity checks, commits/pushes and pauses. Root remains read-only while the coder edits. No SQL execution, migration application, production access, merge/deploy, dependency or acceptance-target change is part of this coding handoff. After review, rollback rehearsal may establish its scoped evidence; installation and actual fence/committed interleaving runs still require the reviewed exact draft and complete fresh restoration audit before Task 13 can close.
+
+### B2a review and overnight diagnostic checkpoint — 2026-11-15
+
+Claude reached its usage limit and paused with a clean, pushed checkpoint `4d91622200f43066d31a76bc0d652f0adae4e1a3`; reset is 02:50 Asia/Shanghai. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43613748301/job/132504196989), completed 16:07:33 UTC on Nov 14. Independent review passed 204 focused tests and the API type-check. This is **changes required**, not approval for B2b or installation:
+
+- **T13B2a-1 (P2):** `check_staged_rows` uses `jsonb_populate_record` as validation, but a composite value does not enforce its table's NOT NULL/CHECK constraints. A NULL/check-invalid row can reach a completed work item. Explicitly reject malformed required/null/enum/range/relational fields before saving chunks or marking done; keep shared business classification in TypeScript. Include malformed-row regression cases and runtime SQL proof in the final harness.
+- **T13B2a-2 (P2):** source ownership is checked, but payload staff attribution and occurrence/timing source fields are not fully bound to the frozen image. Structurally valid wrong-staff rows can survive the existing fact constraints. Require raw staff, time, order/case and parent identity fields to match their primary frozen source as applicable; preserve intentional derived fields and avoid a second SQL counting implementation. Test wrong-worker/time/order payloads for both site and self audiences.
+- **T13B2a-3 (P2):** claim size uses `octet_length(partition_key)+200`, which misses JSON escaping. A local calculation for 1,000 unique keys (three digits plus 800 quotes each), planned in ten valid 176,901-byte requests, gives SQL's 1,003,000-byte estimate but a 1,835,894-byte compact response. Bound the actual serialized returned descriptor list, including JSON framing/escaping, and prove the same bound in wrapper tests and runtime SQL. Do not silently truncate a claimed descriptor or strand work not returned to the caller.
+
+The first two findings are static SQL conclusions; the third includes a local byte-count reproduction. No runtime SQL evidence is claimed. The coder's deliberate-break check is still outstanding. Claude must fix these, demonstrate regression sensitivity, run the common gate, commit/push and pause for focused verification before B2b.
+
+**Focused fix review at `5bcf353` (19:26 UTC):** T13B2a-2 and T13B2a-3 are verified closed in code. The fifth result family is threaded through shape, hash, row/byte bounds, source binding, grants and catalog checks. Independent verification passed 216 focused tests plus the API type-check; 0037 is unchanged and the tracked tree is clean. Coder's common gate passed 1,004 tests/build/both type-checks; all 15 deliberate staging mutations were caught after tightening two table-specific SQL assertions. Root verified the exact-head CI above. Runtime SQL remains explicitly unproven.
+
+**T13B2a-1 remains partly open (P2):** `staged_row_problem` checks `production_date` only with a `YYYY-MM-DD` regular expression. With composite parsing removed, an otherwise valid event fact dated `2026-02-30` or `2026-99-99` can reach staged/done but cannot be inserted into the date column at publication; its immutable digest then prevents correcting the saved result by retry. The actual TypeScript `resultRowProblem` accepted both in a local probe; SQL acceptance is static inference, not a database run. Require native calendar/date validation before chunk storage, and make the TypeScript date validator reject impossible dates too. Test invalid day/month, leap years and supported boundary years, with deliberate-break sensitivity. Keep nullability and site/04:00 business rules unchanged; this is structural validation, not an SQL date-rule implementation. Claude fixes only this residual, runs the common gate, commits/pushes and pauses for focused review before B2b. No new SQL run is authorized by this correction.
+
+**B2a focused closure:** the calendar residual is independently verified closed at `8b4d229d3a7352d67107d0c3fd67d787f89f89f2`; 53/53 fresh stage tests passed with no scoped blocker. SQL checks real calendar components and native `make_date` before storage; TypeScript matches, including null and years 0001–9999. Coder's common gate passed 1,005 tests, both type-checks and build, with sensitivity evidence in the log. Root verified exact-head [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43633001588/job/132563526373), completed 19:37:34 UTC on Nov 14. All T13B2a-1–3 code findings are now closed; B2a is accepted as an implementation checkpoint, not runtime SQL certification. Claude may implement **B2b only** under the existing atomic-publication and guarded-runner contract, including all five result families, source versions, owner replacement and actual SQL regressions for the reviewed findings. Run the common gate, commit/push and pause for the full migration/runner review. Task 13 remains open. Do not run SQL or apply 0038 while preparing B2b; installed 0037 remains immutable. Existing final-draft rollback rehearsal, installed interleavings, unchanged timeout/scale gates and fresh restoration audits remain mandatory.
+
+**Narrow planner diagnostic exception while Claude is unavailable:** permit one rollback-only compile/catalog/helper rehearsal of this exact current 0038 draft on staging `ybrzhrgfrnvtcwymjdrq`. This advances only a diagnostic, not the final B2b runner or installation gate. Use the existing guarded pg client (check target before every SQL), marker check, existing timeouts, one outer transaction, safely stripped outer migration BEGIN/COMMIT, and unconditional rollback/disconnect plus a fresh baseline audit. Check catalog and read-only empty-manifest/Unicode-key helpers only. No source DML, capture toggle, batch/fixture creation, committed DDL or migration-history write. Record the draft hash, every statement result, first failure and restoration in a new ignored result artifact; stop on failure and preserve it. Installed staging remains 0037 with capture off and all sites legacy/processor off. Claude receives any additional compile finding after reset. Full final-draft rehearsal, application and real interleavings remain required after B2b review.
+
+**Diagnostic result:** `STATUS: COMPLETE`, 2026-11-14 16:16:08–16:16:20 UTC (Nov 15 local). Ignored artifact `staging-results-0038-compile-2026-11-14T161608533Z-4deaba65.md`; exact draft SHA-256 `17dc4dfdeeec5bb6a79fb40c660123f3684b6523811b8fea62601606f988228e`. All 94 statements compiled inside the rolled-back transaction; 0038 catalog checks returned no problems, empty-work manifest matched SHA-256 of empty text, and the Unicode-key helper matched JavaScript. Independent safety review of the temporary script (`f74b4437…cddc521`) preceded execution; its persistence-error path was fixed and locally failure-injected before connecting. The existing timeout settings were only read. Fresh post-rollback catalog/tracked-state snapshots exactly matched baseline: 0038 job RPC absent, capture off at epoch 3, all sites legacy/processor off, zero journal/batch/generation rows; source row count, stock/membership fingerprints and ledger count unchanged. No source write or committed migration occurred. This does **not** prove runtime job/claim/stage behavior, resolve T13B2a-1–3, or replace final Task 13 evidence. Wait for Claude's quota reset, then fix the recorded findings and complete regression sensitivity before B2b.
+
+### B2b round-1 fix review checkpoint — 2026-11-15
+
+Root reviewed clean pushed `20134591c1417604f6846910a83098921301831c`; [CI succeeded](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43637798926/job/132578379872) at 20:31:09 UTC Nov 14. Publisher review passed 57 focused tests and the digest type-check, closing T13B2b-1/-2. Runner review passed 103 focused tests, closing T13B2b-3/-4/-5/-6 and the rebuild portion of -7. The current 0038 SHA-256 is `14a808ea0787009650437444baaa886da218349353e3ee4a854a97ef68714b1d`; 0037 is unchanged.
+
+One refresh-evidence gap remains: F9j's inner join does not detect a missing current `source_versions` row (for example inserted `rp-v6`). Require bidirectional `(event_id, image)` equality for source/mirror/current-version fixture sets, with an absent-version regression. This is an assurance gap, not a rollback execution-safety defect. The separate installed-commit harness also has unresolved cleanup/ownership findings; it is **not authorized to run** and installation remains blocked.
+
+**Bounded diagnostic authorization:** while Claude is paused and root owns the workspace, run the independently cleared rollback-only `--rehearse-migration --sites=uk,us` once against staging `ybrzhrgfrnvtcwymjdrq`, with the exact reviewed draft and existing limits. Its guarded client checks the target before every SQL. Preserve the complete report, stop on the first execution failure, and confirm unconditional rollback/disconnect plus the fresh full-state audit. This is a diagnostic to expose real SQL errors before the next coder handoff; it is not acceptance of F9j or the committed harness, does not install 0038, and does not close Task 13. Any subsequent changed draft still requires its final rehearsal. No production access or committed staging mutation is authorized by this diagnostic.
+
+### B2b round-2 repair handoff — 2026-11-15
+
+The bounded diagnostic at `d8935b0` **FAILED** at 20:34:07 UTC Nov 14, before `fullState` returned and before the migration transaction began. Artifact: `staging-results-reporting-publication-rehearse-migration-20261114T203354246Z-25d65b84.md`. First error: `operator is not unique: text || "char"`; starting baseline incomplete, so restoration is explicitly **NOT verified**. No migration statements or source fixtures ran. Existing settings were read only (`statement_timeout=2min`, `lock_timeout=0`, `idle_in_transaction_session_timeout=0`); no retry or timeout change occurred. Fix the cause before another run, preserving this failed evidence.
+
+Claude owns the next code/test repair. Findings against `20134591c1417604f6846910a83098921301831c`:
+
+1. **T13B2b-8 (P1), baseline SQL runtime failure:** `STATE_QUERIES` concatenates PostgreSQL internal `"char"` catalog fields without a text cast (`c.relkind`, `t.tgenabled`). Cast these explicitly and inspect the other baseline queries for the same issue. Report the failed surface name when a baseline query throws, without losing the original error. Add a regression and prepare a bounded read-only baseline smoke check for the next reviewed run; do not weaken/remove the full-state audit.
+2. **T13B2b-9 (P2), refresh equality:** replace F9j's inner-join/count checks with exact bidirectional scoped `(event_id, image)` set equality between source, mirror and current versions. Missing current version for surviving `rp-v6` must fail, along with missing/extra/mismatched mirror/version rows. Reviewer freshly passed 103 tests but the missing-row counterexample is not currently covered.
+3. **T13B2b-10 (P1), conservative committed cleanup:** `cleanupPlan` protects external-active metadata but still deletes its base generation's facts/mirror; an externally published generation can also have its pointer reset. Failed journal/dependency discovery defaults to empty arrays and still permits deletion. Discover ownership/dependencies conservatively, preserve rows/pointers when ownership is external or uncertain, and protect discovery plus deletion against intervening changes. Match journal ownership by exact recorded fixture identities, not a prefix. Preserve external batches, generations and all dependencies; on uncertainty, retain and report rather than guess. Local reviewer probes demonstrated destructive plans after both external dependency and discovery failure.
+4. **T13B2b-11 (P1), settle secondary writers before restoration:** the open case-A writer can retain the control SHARE lock when cleanup calls capture-off; its existing three-second bound then times out and cleanup proceeds while capture is enabled. Settle/rollback/close outstanding secondary transactions before restoring capture or deleting fixtures, preserve rollback/disconnect errors, and ensure all sessions close even if cleanup fails. Do not delete fixture source rows if capture-off/restoration prerequisites failed. Do not increase timeout limits.
+5. **T13B2b-12 (P2), ownership before commit:** `serviceCall` commits before returned batch/generation IDs enter the ownership record. Persist returned IDs/sequences as tentative ownership inside that transaction before COMMIT; on uncertain commit response, resolve only those exact IDs using a fresh guarded connection. Keep speculative identities distinct from confirmed outcomes and preserve failures. Record successful capture transition accounting before the separately fallible processor setup, so an intermediate failure does not misstate the epoch. The current lost-response scenario is after receipt/save and does not cover this earlier gap.
+6. **T13B2b-13 (P2), entire connection lifecycle:** the committed-mode preflight queries, observation save and ownership save occur before `try/finally`; a local actual-helper save-failure injection produced zero rollbacks and zero disconnects. Enclose all work after opening a connection in unconditional cleanup; preflight failure must not invoke destructive cleanup for state it never owned. Test query/save failures before the first commit and prove every session closes and the fresh audit still runs.
+
+The committed harness reviewer passed 26 focused runner tests but reproduced the above safety defects with additional probes. Positive changes remain accepted: explicit service-role/JWT transactions, sticky rollback errors, and actual committed A–D scenarios. 0038 remains unapplied; 0037 is immutable. Root remains read-only while Claude fixes. Run focused failure-injection/sensitivity checks and the common gate, log the exact results, commit/push and pause. No SQL, committed harness execution, installation or Task 14 work during this repair handoff. Root will review the exact checkpoint, then run the corrected read-only baseline check followed by the authorized rollback rehearsal if clear. Task 13 remains unchecked.
+
+### B2b round-2 review and staged execution — 2026-11-15
+
+Root reviewed clean pushed `111f14009ef11c27a92c7463607312afe4aa5309`. [CI succeeded](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43657064474/job/132637828128) at 00:14:11 UTC Nov 15. The independent baseline/rollback reviewer freshly passed 64 focused tests and strict ES2020 type-checking, closing T13B2b-8/-9 and the smoke-authentication/error-constructor/import/matcher residuals. Exact 0038 remains `14a808ea0787009650437444baaa886da218349353e3ee4a854a97ef68714b1d`; no migration changed in this repair.
+
+**Next action belongs to root:** run `--baseline-smoke --sites=uk,us` once on staging `ybrzhrgfrnvtcwymjdrq`; if it completes with a fresh identical-state audit, run `--rehearse-migration --sites=uk,us` once with that same draft. The guarded client verifies the target before every query. Preserve each complete artifact, stop on failure, keep existing limits and do not reinterpret a failed run as success. The first mode is read-only and signs nobody in; the second must roll back all migration/test changes and verify restoration. The earlier failed baseline artifact remains unchanged history.
+
+Claude is paused in **Item-counting planner (session 2)** while root runs these checks and records evidence. No app edits, installation, committed harness run or Task 14 work is released by this section. Independent review of the committed harness remains separate and pending. Root will append the execution result and the next concrete coder instruction before handing the workspace back. Task 13 remains unchecked.
+
+### B2b runtime evidence and next coder handoff — 2026-11-15
+
+Root executed the approved sequence at `7ef67b4`, only on guarded staging `ybrzhrgfrnvtcwymjdrq` (target checked before every SQL), with unchanged 0038 hash `14a808ea0787009650437444baaa886da218349353e3ee4a854a97ef68714b1d`:
+
+- **Baseline smoke COMPLETE**, 00:19:55–00:20:13 UTC: `staging-results-reporting-publication-baseline-smoke-20261115T001955391Z-8aaab85f.md`. All 26 surfaces succeeded, 0038 was absent, and the fresh audit verified identical state. No sign-in or mutation.
+- **Rollback rehearsal FAILED**, 00:20:53–00:21:30 UTC: `staging-results-reporting-publication-rehearse-migration-20261115T002053587Z-1a70d837.md`. All 139 draft statements compiled; rollback-local capture/processor setup passed. S1 stopped at fixture insertion: SQLSTATE `23514`, `production_events_order_number_check`. No later dependent scenario ran. Unconditional rollback and the fresh full-state audit **verified restoration**. 0038 remains unapplied; no timeout was changed. Preserve the failed artifact without retrying unchanged code.
+
+**Claude now owns these two bounded repairs in Item-counting planner (session 2):**
+
+1. **T13B2b-14 (P2), database-admissible fixture:** `reportingPublication.ts` creates `rp-x1` as `line_verified` with `order_number = ''`. Migration 0030 explicitly requires a non-null, positive-length order number for non-clock events. Use a database-admissible representation that preserves the intended trimmed-blank event-owner/invalid-verification/deletion scenario (whitespace-only is permitted by this length check), and update exact fixture expectations as needed. Check all runner fixtures against the actual source constraints. Do not weaken/remove constraints or change counting rules to make a test insert pass. Add a regression tied to the source-admissibility contract and show the old empty-string fixture fails it.
+2. **T13B2b-15 (P1), protect external active batches before begin:** independent review at `111f140` passed 39 runner and 25 lifecycle tests and closed the previous draft residuals, but an unknown external batch can still be durably invalidated. After harness preflight, an external job can create a rebuild then change capture epoch. The harness's next `begin_reporting_rebuild` marks that unknown drifted batch failed, replaces the pointer and returns a NEW batch ID; rejecting only returned `reused:true` does not protect it. Before either begin RPC, inspect unknown active-batch ownership inside the SAME transaction using the RPC's control-then-site lock order, and refuse BEFORE the RPC can invalidate or replace foreign state. Keep the locks through invocation/commit; no race between check and use, no timeout increase and no migration change. Add the external epoch-drift/new-ID case and known-owned replay regressions; preserve unrelated batch state/pointers on refusal.
+
+Run focused behavioural tests/sensitivity and the common gate, append the implementation evidence, commit/push, and pause for root review. Root remains read-only while Claude edits. No SQL, staging execution, migration installation or Task 14 work during this coder handoff. On a clear review, root will run the corrected rollback rehearsal, then separately release installation/committed tests only after their remaining checks pass. Task 13 remains unchecked.
+
+### B2b corrected rehearsal and installed gates — 2026-11-15
+
+Root reviewed `214a5d2` and clean pushed `35f5ec3ec9f477065b14845dd058aa2105961fa9` (log correction only). Independent fixture review passed 75 focused tests and strict ES2020 checking; ownership review passed 50 focused tests. T13B2b-14/-15 are closed: the blank-order fixture now satisfies the source constraint without changing its classification, and both begin RPCs refuse foreign active ownership under locks BEFORE invocation. Coder's common gate passed 1,086 tests, type-checks and build; all 12 deliberate breaks were detected. [CI succeeded](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43658465092/job/132642224243) at 00:31:16 UTC.
+
+The corrected rollback rehearsal **COMPLETE**, 00:32:14–00:34:20 UTC, is preserved in `staging-results-reporting-publication-rehearse-migration-20261115T003214358Z-65ab333e.md`. All 139 statements of exact 0038 SHA-256 `14a808ea0787009650437444baaa886da218349353e3ee4a854a97ef68714b1d` applied inside the rollback transaction. UK rebuild/refresh, US rebuild, all five families, exact source/mirror/version images, response bounds, old-fence refusal, deleted/replaced retained history, shared-site acknowledgement, replay and no-change publication passed. The fresh full-state audit verified restoration. Existing limits were unchanged. This supersedes neither failed artifact, both of which remain preserved.
+
+Under the existing staged execution authorization, root now owns the workspace and may install ONLY that exact reviewed 0038 on staging `ybrzhrgfrnvtcwymjdrq` after rechecking the target, staging markers and idle baseline. Once installed, 0038 is immutable. Run installed publication checks, activation-fence tests, rollback-only interleavings with explicit temporary capture/processor setup and restoration, and the independently cleared committed harness. Keep separate complete outputs and fresh restoration audits; stop dependent execution on any failure, preserve evidence, and return a bounded repair to Claude. Never loosen limits, change production, or delete foreign/uncertain state. Task 13 remains unchecked until those gates pass. Claude remains paused; Task 14 is not authorized by this checkpoint.
+
+### B2b installed checkpoint and recovery-runner repair — 2026-11-15
+
+0038 was installed on staging `ybrzhrgfrnvtcwymjdrq` through the staging connector after the exact-hash rehearsal and idle baseline checks. Installation evidence is `staging-results-reporting-0038-install-20261115.md`. Its SHA-256 remains `14a808ea0787009650437444baaa886da218349353e3ee4a854a97ef68714b1d`; **0037 AND 0038 are now immutable**. The installed publication flow at `2c17e93` is COMPLETE in `staging-results-reporting-publication-check-installed-20261115T003852842Z-7af4cfd9.md`: every scenario passed and the fresh full-state audit verified restoration. Capture is off, processors off, legacy reads retained. No production access. This is publication correctness evidence, not the outstanding cross-connection recovery or scale evidence.
+
+Before executing the older `--fence` and rollback `--interleavings` runners, root and the independent reviewer found these remaining execution-safety gaps. Claude now owns ONLY the following runner/test repairs; no SQL, staging mode, migration changes, app changes or Task 14 work:
+
+1. **T13B2b-16 (P1), unconditional fence restoration.** In `tests/staging/reporting-jobs.ts`, `save()` after F1 can throw after capture=true has committed. Restoration currently sits on the normal body path; rolling back the lifecycle's different main connection cannot undo it. Settle scenario sessions first, then restore the original capture state unconditionally, including persistence/query/observation failures; use a fresh guarded connection when required. Preserve the original, persistence, rollback/disconnect and restoration failures independently. A failed save must not prevent cleanup or the final fresh audit. Test the actual coordinator with failure after a committed toggle.
+2. **T13B2b-17 (P2), stop at the first failed scenario.** Fence currently catches a failed scenario/cleanup and continues, checking expectations only after F6. Validate each observation immediately and stop later scenarios on false expectations, exceptions, persistence or cleanup failure. The rollback `runInterleavings` wrapper in `reportingPublication.ts` likewise swallows a failed I0 precondition and proceeds to I1; abort on the first failure while retaining unconditional connection cleanup and audit. Tests must prove no later scenario/RPC runs. Expected refusal checks that PASS their expectation remain successful scenarios.
+3. **T13B2b-18 (P2), full fence restoration proof.** Replace fence's narrow catalog and `rj-*` count snapshot with existing `fullState`/`compareFullState`. Allow only this run's explicitly confirmed capture-epoch increments and their control timestamp changes; do not derive permission to ignore drift from observed before/after totals. Record transition receipts before COMMIT and handle uncertain outcomes conservatively (reuse reviewed receipt/settlement helpers where appropriate). Preserve source/stock/ledger/membership payloads, all private rows, site state and schema/ACL invariants. Inject a same-count payload change, unexpected epoch drift and a cleanup failure and require FAILED. Do not reset epochs, loosen timeouts, or silently normalize other fields.
+
+Rollback interleavings remain operator-setup-only: their I0 must refuse unless capture and both processors are already enabled. Do not introduce automatic setup in this repair. Root will separately bracket the eventual run with recorded guarded setup/restoration and a full audit; the committed harness requires the idle/off baseline instead. None of the fence/interleavings/committed modes has run at this checkpoint. Run focused failure-injection/sensitivity checks and the common gate, log evidence, commit/push, then pause for review. Root stays read-only while Claude edits. Task 13 remains unchecked.
+
+### B2b recovery-runner residual review — 2026-11-15
+
+Root reviewed clean pushed `ae4a8e4a56cd02be392e501f554f85f5cc6744ca`; [CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43660496579/job/132648521080), completed 00:55:51 UTC. Independent coordinator review passed 146 focused tests; F1–F6 integration review passed 71. The original unconditional-restoration and full-state-audit paths are repaired. F2's SHARE receipt prelock is compatible with the first writer; the toggle UPDATE still supplies the intended wait. 0037/0038 hashes remain exact and immutable. No SQL or staging mode ran during this review.
+
+Claude owns this bounded residual repair before root runs `--fence`:
+
+1. **T13B2b-17 residual: stop on recorded toggle cleanup errors.** `ownedToggle` catches `end()` failure, adds it to `report.errors`, then returns success. `runFence` only checks observation problems. An actual coordinator/ownedToggle probe with `failEnd=true` executed F1–F6 and six commits despite the first toggle disconnect failure. Ordinary toggle cleanup failure must propagate after recording, preserving any original failure. The coordinator must also stop when a scenario adds report errors, while still restoring capture and auditing unconditionally. Extend the current disconnect test to prove no subsequent scenario or ordinary toggle runs; final FAILED alone is insufficient.
+2. **Interleaving I1 evidence residual.** Its result uses `ok: waited` even if the second begin fails after the first transaction rolls back. Require both the observed wait and a successful second begin. Regress the wait-then-unexpected-SQL-error path and prove I2 onward is not invoked. Preserve the original SQL error in the report.
+3. **T13B2b-18 F2 receipt settlement residual.** After `tentativeReceipt`, a failure getting D's pid, beginning/authorizing D, or monitoring its lock bypasses `abandonReceipt`. The existing connection cleanup rolls C back, but the receipt stays tentative, falsely preventing restoration verification. An actual F2-body in-memory probe of the second monitor failure reproduced all four clients rolling back/closing with the receipt still tentative. Own the receipt and launched query handles across the entire F2 lifecycle. Settle/rollback sessions and inspect launched outcomes on every exit; mark a noncommitted receipt absent only after its rollback is known, preserving confirmed/uncertain outcomes. A separate actual-body probe with enable-query failure plus monitor failure retained only the monitor error: preserve secondary query/cleanup failures without replacing the first error. Add actual F2 orchestration regressions (extract a testable helper if necessary; do not import a module that runs main) rather than only mocking F2 in the coordinator. Keep the SHARE prelock and current timeout limits.
+
+These are runner/test-only corrections, not counting-rule or migration changes. Run focused regression/sensitivity checks and the common gate, append exact evidence, commit/push and pause. No SQL/staging modes, app/API edits, Task 14, production action or acceptance relaxation. Root stays read-only while Claude edits. Task 13 remains unchecked; installed staging retains capture off, processors off and legacy reads from the last verified checkpoint.
+
+### B2b recovery-runner clearance — 2026-11-15
+
+Root reviewed clean pushed `08b62dba94c51f8ab3c3cb133f44ebdf0cc9cd66`; [CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43662573862/job/132654894224), completed 01:20:46 UTC. Independent stop/cleanup/I1 review passed 158 focused tests; extracted F2 integration review passed 83. All three residuals above are closed: ordinary-toggle disconnect errors propagate and stop further scenarios, I1 needs the wait AND successful second begin, and actual F2 orchestration settles sessions/queries and receipt states in dependency order while retaining first/secondary failures. Coder common gate passed 1,117 tests, type-checks and build; 12 new and 19 retained deliberate breaks were caught. 0037/0038 hashes are unchanged.
+
+Root owns the next staging execution under the existing authorization: run `--fence` against `ybrzhrgfrnvtcwymjdrq` with the per-SQL target guard, unchanged limits, immutable output, exact transition receipts and fresh full-state restoration audit. Stop dependent work on failure; no unchanged retries. On success, continue the remaining explicitly bracketed rollback interleavings and reviewed committed harness. Claude remains paused while root runs these gates. Task 13 stays unchecked until runtime evidence is complete; no Task 14 or production action is authorized here.
+
+### B2b installed fence result — 2026-11-15
+
+Root ran `npm run staging:reporting-jobs -- --fence` at `791049a`, staging target `ybrzhrgfrnvtcwymjdrq` checked before launch and every SQL. Artifact `staging-results-reporting-fence-20261115T012742155Z-3b9eee4b.md` is **COMPLETE**, with fresh full-state restoration verified. All F1–F6 passed: compatible source writers (88 ms), activation and queued-writer waits, old-snapshot serialization refusal (40001), exact epoch changes/journal attribution, default 3 s and stricter 1 s lock refusals (55P03; 3,084/1,084 ms) with unchanged control, and capture-role mutation denial (42501). Capture returned to disabled; only the explicitly receipted epoch/timestamp transitions were allowed. Existing limits and 0037/0038 stayed unchanged. No production action.
+
+Task 13 remains open for rollback interleavings with explicitly recorded temporary operator setup/restoration, followed by the reviewed committed interleavings and their fresh audits. Claude's current repair handoff is complete and accepted; Claude remains paused while root owns those runtime gates. Do not restart the completed repairs or start Task 14 from this result alone.
+
+### B2b I4 runtime failure and diagnostic handoff — 2026-11-15
+
+The rollback interleavings at `a7691f6` **FAILED**, artifact `staging-results-reporting-publication-interleavings-20261115T013301943Z-7239dbf5.md` (01:33:01–01:38:10 UTC). I0/I1/I2/I3 passed: valid operator setup, duplicate worker waits then begins, uncommitted input excluded, source write not blocked by an open publication. I3 took 94,288 ms overall. I4 ran both sites concurrently and both `publish_reporting_batch` calls hit existing **2 min statement_timeout**, SQLSTATE 57014; scenario elapsed 153,394 ms. I5 and the committed harness were NOT run. No retry, timeout change or fixture reduction.
+
+Runner cleanup and fresh full-state audit VERIFIED restoration to its temporary enabled baseline. Root then restored the explicit operator setup under guarded control-before-site locks: capture epoch11/off ->12/on ->13/off, UK/US processors on then off, all sites legacy and no active batch/generation/journal. The independent before/after full-state comparison passed with only those two confirmed capture increments and control timestamp change allowed. Evidence: `staging-results-reporting-operator-20261115-1.md`, its `-before.json`/`-after.json` full snapshots and `-setup.json`/`-restore.json` connector responses. No source/stock/ledger/membership/private-row/site-state/schema/ACL difference remained. Production untouched.
+
+**Confirmed localization:** staging PostgreSQL logs at 01:37:51.655/.766 UTC identify the same failing statement for both backends, `public.publish_reporting_batch(uuid,bigint)` line250: rebuild `INSERT INTO reporting_private.source_versions ... SELECT ... FROM source_candidate ... AND NOT EXISTS (... source_versions ... valid_to_seq IS NULL)` (0038 file lines1943–1947). Full log evidence: `staging-results-reporting-I4-timeout-logs-20261115.json`. No deadlock message was returned in the bounded log window. A live activity lookup by startup application_name found no rows (the logs show Supavisor), so it supplies NO wait-state evidence.
+
+**Hypotheses, not findings:** underestimated anti-join scanning the target repeatedly; physical storage left by rollback tests; concurrent CPU/I/O or waiting. The current unique index includes `(site,event_id)` and candidate selection includes batch/site; no obvious cross-site key collision is established. Post-run statistics (saved in `staging-results-reporting-I4-table-stats-20261115.json`) were collected AFTER autovacuum: zero live/dead source-version rows, reltuples/relpages0, total relation size14.6MB; candidate total40.6MB. These sizes include indexes/TOAST and do not prove heap bloat or reconstruct the failing plan. Health advisors returned no lints; full performance/security advisor results are preserved separately, not treated as the cause or authorization for unrelated changes.
+
+**Next coder task: prepare ONE bounded plan-only diagnostic; do not execute it.** Add an explicit diagnostic mode/helper to the staging runner, with local tests, that uses staging target checks before every SQL, installed immutable0038, original UK source volume, existing limits and one outer transaction ending in unconditional ROLLBACK. Capture the full baseline first. Enable capture/UK processor only INSIDE that transaction; use reviewed begin/copy/freeze helpers to prepare the same-sized UK candidate. Before any publication, collect candidate count, effective role/settings, relevant relation heap/index/TOAST sizes and stats timestamps, then `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON)` WITHOUT ANALYZE for the exact source-version INSERT under the same service role with that candidate. Preserve SQL and parameter identities without source payloads/secrets and label this a current standalone plan, not proof of the previous cached PL/pgSQL plan. Do not call publish, VACUUM, ANALYZE, force a planner setting, add indexes/DDL, change timeouts or run a benchmark. Roll back, close every session and compare a fresh fullState with ZERO allowed changes (sequence gaps remain excluded). Preserve failures/output atomically and stop at the first failure while always auditing restoration.
+
+Use tests to prove the diagnostic cannot publish or commit, uses the original candidate workload, emits the full plan, and cleans up after prepare/EXPLAIN/persistence failures. Run focused checks and the common gate, append evidence, commit/push and pause for root review. Root stays read-only while Claude edits. Root will run the reviewed diagnostic once; if the plan is inconclusive, specify a separate monitored reproduction using exact backend PIDs, wait events and blocking PIDs before any further execution. **No fix is selected yet.** 0037/0038 remain byte-identical and installed; any eventual SQL repair must be append-only with its migration allocation explicitly revised in the plan. Task13 remains unchecked; Task14 and later execution remain blocked on this gate.
+
+### B2b plan-only diagnostic clearance — 2026-11-15
+
+Root reviewed clean pushed `cd6d25c3a553ed0d8ff7ad29a2ec3fdfc05c36b5` (code `c0b775d`; final commit corrects only the logged test count). [CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43665033314/job/132662399370) at 01:52:35 UTC. Independent lifecycle/allow-list review passed 108 focused tests; SQL-fidelity review passed 33. No scoped blocker: exact source-version INSERT, verified service role, full UK candidate, EXPLAIN without ANALYZE, complete JSON evidence, one rollback transaction, sticky failures and fresh zero-change audit. Coder common gate passed 1,150 tests, type-checks and build. 0037/0038 unchanged.
+
+Root now runs the previously authorized diagnostic ONCE: `npm run staging:reporting-jobs -- --explain-source-versions --site=uk`, only on staging `ybrzhrgfrnvtcwymjdrq`, checking the target before every SQL. This is current standalone plan evidence, not a publication retry or historical cached-plan proof. Stop on failure and preserve the full output/restoration audit. Claude stays paused; no SQL fix, Task13 closure or Task14 work is authorized by this clearance.
+
+### B2b diagnostic result and rebuild-insert repair handoff — 2026-11-15
+
+**Observed result:** root ran the cleared diagnostic once at `b8941da`, 05:25:45–05:26:40 UTC. `staging-results-reporting-publication-explain-source-versions-20261115T052545904Z-12718438.md` is COMPLETE with unconditional rollback and a fresh ZERO-change full-state restoration audit. Full UK source/candidate: **42,340 rows / 43 pages**; current UK source versions: zero. The current standalone service-role plan estimates **2 candidate rows**, choosing a Nested Loop Anti with an inner sequential scan of `source_versions`. The existing partial unique index `source_versions_current (site,event_id) WHERE valid_to_seq IS NULL` is present. The captured plan proves a structural risk from repeated target scanning; it does NOT establish I4's historical cached plan, observed wait state or sole timeout cause. No publication INSERT was executed by the diagnostic.
+
+**Planner decision:** prepare the smallest repair and its rollback proof, then review before running anything. Remove the rebuild INSERT's self anti-join and use the existing partial unique index as its conflict arbiter. Independent SQL review agrees this preserves behavior under the existing site lock and frozen-candidate invariants. Do not change refresh SQL, the preceding version-closing UPDATE, timeouts, planner settings, volume, counting rules or acceptance targets. Performance improvement remains unproven until measured.
+
+**Migration allocation:** installed 0037 and 0038 stay byte-identical. Allocate new `supabase/migrations/0039_reporting_rebuild_insert.sql` to this Task 13 repair; Task 14 becomes `0040_reporting_dependency_reads.sql`, Task 16 becomes `0041_reporting_reads.sql`. This supersedes older reservation statements in the historical handoffs. Verify these numbers remain free before creating files.
+
+#### T13B2b-19 — Prepare append-only rebuild repair and rollback proof (Claude; no database execution)
+
+- [x] **Regression first:** add `tests/reporting/reportingRebuildInsert.test.ts` covering the exact replacement-function diff and the real rollback-check coordinator's success/failure paths. Record a failing test before the fix. An accidental edit to the preceding closure, refresh branch, fences, receipts, replay, function security/search_path or ACLs must fail the migration-fidelity check; installed 0037/0038 hashes must remain unchanged.
+- [x] **Minimal migration:** create 0039 as one BEGIN/COMMIT transaction containing `CREATE OR REPLACE FUNCTION public.publish_reporting_batch(uuid,bigint)` with the full original definition and only its rebuild INSERT changed. Keep candidate batch/site filtering and the projected values. Replace that INSERT's `AND NOT EXISTS (...)` with explicit `ON CONFLICT (site,event_id) WHERE valid_to_seq IS NULL DO NOTHING`. Never use untargeted DO NOTHING: unrelated constraint failures must remain visible. Preserve the preceding UPDATE that closes absent/changed images; unchanged current images keep their original interval, changed/new images receive the new sequence, absent images stay closed. Do not drop/recreate the function or alter grants.
+- [x] **Prepare a dedicated rollback mode:** add `tests/staging/reportingRebuildRepair.ts`, wired through `reportingPublication.ts` / `reporting-jobs.ts` as `--rehearse-rebuild-repair --sites=uk,us`. It accepts ONLY the fixed 0039 path, records its SHA-256 and installed 0037/0038 identity, and requires the installed 0038 function baseline before starting. Apply 0039's body inside ONE outer transaction using the reviewed transaction-control parser. Capture fullState before, always roll back/disconnect, then compare a fresh fullState with ZERO allowed changes. Preserve original failure, rollback/disconnect/audit errors and failed evidence independently. No COMMIT, migration-history write, VACUUM/ANALYZE, setting relaxation or hidden install; target-check staging `ybrzhrgfrnvtcwymjdrq` before every SQL. Keep prior modes and historical evidence usable.
+- [x] **Real-SQL proof prepared in that mode:** use the existing reviewed helpers and original full UK workload, without capping it to a small fixture. Before publication, collect EXPLAIN without ANALYZE of the exact new rebuild INSERT as service_role, with candidate count and full JSON plan. Require conflict arbiter `source_versions_current` and no source-version anti-join/inner scan. Then execute real publication with existing limits and record elapsed time. Verify exact images AND version intervals for unchanged, changed, new and absent rows across a second rebuild, not just refresh; verify lost-response replay does not alter them. Reuse the established full publication flow/assertions for the five families, receipts, mirror, historical snapshots and refresh behavior; do not weaken those assertions to fit the repair. Use source changes only inside this rollback transaction. Add an isolated savepoint probe for an unrelated constraint failure to show it is not silently suppressed.
+- [x] **Prepare monitored I4 evidence:** minimally extend the existing I4 concurrency check to get each worker's backend PID inside its explicit transaction before publishing. While both calls are pending, use a guarded independent monitor with a bounded sampling loop to record elapsed time, state, wait_event_type, wait_event and blocking PIDs for those exact backends (no query text or source payloads). Stop/settle the monitor on success and every failure; monitor/persistence failures are sticky and cannot strand publication promises. Do not rely on application_name (Supavisor masked it previously), raise timeouts or skip I0–I3/I5. Test monitor success, publication failure and monitor failure cleanup. Prepare only; do not run interleavings yet.
+- [x] **Verify and hand back:** focused new/existing publication/diagnostic/lifecycle tests, full type-checks including API and staging runners, all tests and build; demonstrate deliberate-break sensitivity for the conflict target, preserved closure, rebuild interval assertions and unconditional cleanup. Append exact commands/results and immutable hashes to the Implementation log. Commit repair/proof as a reviewable Task 13 commit, push, obtain green CI and pause. Keep Task 13 unchecked and Tasks 14–20 blocked. Root owns the next staging execution after independent review.
+
+**Next execution gates (root, after review; not part of Claude's current authorization):** one rollback-only 0039 rehearsal with exact version semantics, plan and full-volume publication measurements. If that passes, review and apply only 0039 to staging under the existing delegation, then verify installed identity. Re-establish the explicitly receipted temporary control baseline and run the rollback I0–I5 harness with the new PID monitoring; restore capture off/processors off/all legacy and verify full restoration on success or failure. Only after it passes may the previously reviewed committed A–D harness proceed. Stop on the first failure, retain evidence and investigate; no unchanged retry. No result here closes Task 13 without all its remaining gates.
+
+**Release / rollback:** production is untouched and no merge/deploy is authorized. 0039 changes only the publisher implementation; consumers and all source/stock/ledger schemas stay compatible. Rehearsal rollback restores the installed function and all rows automatically. If a later installed staging check fails, disable/restore the run-owned capture/processor state and stop; do not edit installed 0039 or silently revert to the slow publisher. Any further correction is append-only and requires review. Future production release still requires the existing preview, capacity, authorization and rollback gates.
+
+Handoff status covers preparation of this bounded repair only, not a proven performance fix or Task 13 acceptance.
+
+STATUS: COMPLETE
+
+### T13B2b-19 review corrections before staging — 2026-11-15
+
+Root reviewed pushed `ae68a83` (implementation `de362d2`); exact-head CI passed at 06:02:53 UTC. The 0039 definition preserves the entire installed publisher except the intended rebuild INSERT; installed 0037/0038 are unchanged. Independent lifecycle tests passed 117/117. No staging SQL or rehearsal has been run for this repair yet. The SQL change is suitable for a rollback test, but the test runner must first close these two evidence gaps:
+
+- [x] **T13B2b-20, fail immediately on a recorded assertion failure.** `rehearseRebuildRepair` passes the original recorder into the existing flow and proof. `expectEqual` and `refused` can record `ok:false` without throwing, allowing later work (including another publication) after a failed assertion. Add a repair-local recorder that persists the original observation, then throws on `ok:false`, and pass that context through every rehearsal step, established flow and version proof. Preserve savepoint cleanup before refusal recording, original error evidence, unconditional outer rollback/disconnect and fresh audit. Do not weaken assertions or broadly rewrite shared helper behavior. Test a flow that records false and would otherwise return: proof must never begin; test V7a's real refusal path with an unexpected success/wrong error: savepoint cleanup occurs, V7b is not sent, outer rollback still occurs. Test persistence failure remains fatal. A deliberate break removing fail-fast must be caught.
+- [x] **T13B2b-21, do not pass I4 without monitoring coverage.** The 150-sample budget covers copying/freezing as well as publication, while `i4Monitored` currently permits success after sampling exhausts with jobs still pending. Capture exhaustion at loop exit BEFORE awaiting the settled jobs. Treat exhaustion while pending as a sticky monitoring failure even if both jobs later succeed; always await both jobs and preserve cleanup. An exactly-at-limit completion with no pending jobs is not exhaustion. Require observed samples for both pinned PIDs during the run; absent PID coverage must be explicit failure, not silently treated as clean monitoring. Keep existing limits and bounded sampling; do not extend or remove the bound. Test exhausted-with-pending then successful publications => I4 failure, exact-limit completed => no false exhaustion, missing PID coverage => failure, and all pending jobs settled on every path. A deliberate break ignoring coverage/exhaustion must be caught. If real I4 later exceeds the monitoring budget, stop with the evidence; a separately reviewed phase-aware monitor can follow, not an automatic longer retry.
+
+Claude owns these two runner/test corrections only; 0039 SQL stays unchanged. Run focused tests, common gate and sensitivity checks; record results, commit/push, check CI and pause. Root remains read-only while Claude edits. Then root reviews the correction before the previously authorized one-shot rollback rehearsal. No SQL execution, installation, production access or Task 14 work is authorized to Claude. This section authorizes correction work, not acceptance of the current staging runner.
+
+STATUS: COMPLETE
+
+### 0039 staging result and connection-error repair handoff — 2026-11-15
+
+**Review clearance:** independent review cleared `a0bc48c` after T13B2b-20/21, with 78/78 focused tests and unchanged 0037/0038/0039 identities. Exact-head [CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43690620010/job/132740295025) at 07:36:48 UTC; coder common gate passed 1,228 tests, both type-checks, strict runner checks and build.
+
+**Rollback rehearsal COMPLETE:** `staging-results-reporting-publication-rehearse-rebuild-repair-20261115T073812657Z-1d514974.md`. Full UK workload plus fixtures (42,351 rows): initial publication 9,574 ms, later rebuild publications 5,156 / 5,678 ms. The new INSERT used `source_versions_current` with no source-version anti-join/scan. All existing publication/refresh/move/five-family assertions, exact unchanged/changed/absent/created intervals, whole-site versions, replay and unrelated constraint probes passed. Transaction rolled back; fresh ZERO-change restoration verified. These single-run timings do not close Task 19's performance gate.
+
+**0039 installed on staging and now immutable:** exact file SHA-256 `05d7eff179993a6eeeba3fadaddd345b83bd20c68676cb6bda709937984c3bd5`; installed publisher body MD5 `3f9dc677b6a78d8ef23ee02519287dbe`, matching the file. SECURITY INVOKER, search_path and service-only execution privileges verified. Evidence: `staging-results-reporting-0039-install-20261115.md`. Production untouched.
+
+**Rollback interleavings FAILED:** `staging-results-reporting-publication-interleavings-20261115T074405980Z-03d04d15.md`. I0–I3 passed (I3 41,803 ms overall), then Node exited 1 during I4 with an unhandled pg Client `error` event: `read ECONNRESET`, errno -4077. No I4 observation was persisted; its publication outcome is UNKNOWN, not a proven timeout. I5 and committed A–D were NOT run. The original incomplete FAILED report is preserved. No retry.
+
+**Independent restoration COMPLETE after the crash:** the process bypassed its finally/audit and left two I4 transactions idle with rebuild candidate/site/control locks. Root recorded their exact PID/backend-start/transaction-start identities and aborted ONLY those run-owned transactions using guarded identity/state/query/lock predicates, then restored temporary setup. Full evidence is in `staging-results-reporting-operator-0039-20261115-1.md` and its `-before.json`, `-intent.json`, `-setup.json`, `-crash.json`, `-termination.json`, `-restore.json`, `-after.json`. Fresh full-state comparison passed with ONLY the two confirmed capture epoch increments and control timestamp allowed: off epoch13 -> on14 -> off15, all processors off/all legacy/no active batch or generation, source/stock/ledger/membership/private data and schema/ACL otherwise unchanged. 0039 remains installed as intended.
+
+**Confirmed harness defect; uncertain external cause:** installed `node_modules/pg/lib/client.js` `_handleErrorEvent` rejects outstanding queries AND emits `error`; `openGuardedClient` does not attach a client error listener. An EventEmitter error can terminate Node outside promise try/finally. The outer main connection is idle during interleavings, so the exception alone does not identify the disconnected connection. A query catch cannot fix this. See [node-postgres client error events](https://node-postgres.com/apis/client#events). Network/pooler/server cause is unknown; do not describe this as a database timeout or proven recurrence of the original query issue.
+
+#### T13B2b-22 — Prepare connection-failure handling and durable I4 evidence (Claude; offline only)
+
+- [x] Add a run-scoped connection failure mechanism in `tests/staging/reportingCapture.ts` and wire it through the reporting-jobs runner/lifecycle and interleaving connections. Attach an error listener before connect and keep it installed through disconnect; every unexpected event immediately appends a redacted, sticky error to the SAME store used by final status, including idle-main and late-cleanup/auditor events. Never throw from the event listener. Persistence must be attempted safely; its own failure is retained, not emitted as another unhandled exception. No silent listener that merely suppresses the crash.
+- [x] Stop new normal scenario/SQL work after the shared failure, while allowing explicit cleanup, settlement of already-started work and the independent fresh audit. Do not abandon pending promises with a bare Promise.race. Preserve original error plus rollback/disconnect/persistence/audit failures; do not declare COMPLETE merely because cleanup succeeded. Keep target checks before every SQL. Preserve only I5's narrowly armed, intentionally terminated victim/expected 57P01; never exempt connection failures globally.
+- [x] Persist I4's pinned PID, backend_start and xact_start for BOTH workers inside their explicit transactions BEFORE starting rebuild work. Preserve timestamp strings losslessly and associate them with run/site/session identity; do not rely on application_name. Persist incremental monitor observations so process loss cannot erase all ownership/monitor evidence. Persistence failure stops normal work and enters cleanup. No automatic backend termination, reconnect/retry, or relaxation of timeouts/sample bounds.
+- [x] Add offline EventEmitter-based regressions through the real opener/coordinator for idle main, active worker, monitor, rollback/end, auditor and persistence failures. Prove no unhandled event, no later normal SQL/scenario, all started promises settle, cleanup and fresh audit are attempted, and all errors remain in FAILED output. Test I5's expected narrow termination separately from an unexpected reset. Verify ownership evidence is persisted before work and samples before final I4 return; deliberate breaks must detect silent swallowing, listener installed too late, continuation after error and missing receipts.
+- [x] Keep app code and installed 0037/0038/0039 unchanged. Run focused tests, common gate and sensitivity checks; record results, commit/push, confirm CI and pause for root review. Do not run SQL or staging modes, reinstall 0039, merge/deploy or start Task 14.
+
+Root will review this correction before authorizing any new staging invocation. The original 0038-only repair rehearsal is no longer applicable after installation; preserve its successful evidence. The next eventual runtime gate is the corrected rollback I0–I5 harness against installed 0039, then committed A–D only after that passes. Task 13 remains unchecked. This handoff clears offline correction work only; the staging gate remains FAILED.
+
+STATUS: COMPLETE
+
+### Connection-watch review and I5 correction handoff — 2026-11-15
+
+**Reviewed head:** `de45f2eb0172bfb6a68d922ee0f500e85748138f`. Exact-head CI passed (run `43692923059`); coder reports 1,249 tests and common gate passed. Independent offline review nevertheless found two blocking failure paths. No staging SQL was run for this review. Staging remains at the previously audited capture-off epoch15, all processors off/all legacy, with immutable 0037/0038/0039 installed. Task 13 remains open; Tasks 14–20 remain blocked.
+
+**Finding 1 — evidence persistence does not stop workers.** The runner's `evidence` callback throws if saving fails, but I4's monitor catches that into `monitorError` and awaits both entire rebuilds without failing the shared watch. An offline probe through the actual I4/watch helpers reproduced `ok:false` with `watch.failed():false`, no shared errors, and both workers issuing later freeze/publication SQL. Already-issued queries must settle; this does not permit subsequent SQL after a fatal save failure.
+
+**Finding 2 — I5 connection identity and expected close sequence.** `killOwnVictim` gets PID/application_name before `work()` starts its explicit transaction. Transaction pooling can invalidate that backend identity; application_name is not ownership proof. An offline probe using the installed pg 8.23.1 error/end handlers emitted expected 57P01 followed by the no-code `Connection terminated unexpectedly` error. Both current listeners reject that normal follow-on. Do not run full I0–I5 unchanged.
+
+#### T13B2b-23 — Stop all normal work after evidence persistence failure (Claude; offline only)
+
+- [x] In `tests/staging/reportingCapture.ts` expose a shared fatal-failure entry point on the existing watch (redacted, sticky, same final-status error store), and wire the actual evidence persistence boundary in `tests/staging/reporting-jobs.ts` to latch failure BEFORE rethrowing. Avoid recursively persisting the same failing save. Retain the original save error and any later cleanup/audit errors; error listeners must still never throw.
+- [x] Keep all normal client queries gated after failure, including each next step of workers already in progress. Await already-issued queries and both job promises; do not abandon them or reconnect. Only explicit rollback, cleanup and fresh audit may proceed under the existing cleanup phase. Do not enter that permissive phase while normal workers are still advancing.
+- [x] Add a regression through the real persistence callback, watch, guarded worker clients and I4 coordinator: hold both workers at already-issued queries, fail a monitor-sample save, resolve the outstanding queries, and assert no subsequent copy/freeze/seal/publish SQL reaches either raw client. Assert both jobs settle, shared final status is FAILED, and rollback/disconnect/fresh audit are attempted. Keep the pre-work ownership-save failure case. Demonstrate the regression fails on `de45f2e` behavior.
+
+#### T13B2b-24 — Pin and prove the intentional I5 termination (Claude; offline only)
+
+- [x] In `tests/staging/reportingPublication.ts`, obtain the victim's lossless PID, backend_start and xact_start AFTER `work()` while its explicit transaction is still open. Refuse missing transaction identity. Persist a run/scenario-labelled ownership receipt before requesting termination. Remove application_name as the termination authority; use the guarded monitor to terminate only the exact PID + backend-start + transaction-start match. Persist the returned matching identity and successful termination result. Missing, mismatched or false receipts fail I5; never fall back to PID alone.
+- [x] Arm ONLY that victim immediately before the intentional kill. Consistently classify its expected 57P01 and then the exact no-code `Connection terminated unexpectedly` follow-on only AFTER its observed expected 57P01. Centralize classification or otherwise ensure both listeners see the same decision without consuming a stateful predicate twice. This allowance is provisional until the matching kill receipt succeeds. An unarmed/other-client error, follow-on before 57P01, ECONNRESET or any other unexpected error remains a sticky run failure. Retain listeners through disconnect and cleanup; no global exemptions.
+- [x] Add offline tests replaying the actual installed-pg two-event sequence, including events before the kill response resolves, with a successful matching receipt. Reject false/no-match receipts, missing/changed identity, the follow-on before 57P01, unexpected reset and errors on another client. Assert identity is read inside the transaction after work, persisted before kill, and every termination predicate binds all identity fields. Cover failures during work/identity/save/kill and retain disconnect plus fresh-audit behavior.
+
+**Completion and next gate:** use focused failing regressions, then the common gate, strict runner typechecks and targeted sensitivity checks for the two fixes. Keep app/API code, dependencies, installed migrations, SQL timeouts, sampling bounds and acceptance targets unchanged. Record evidence in the implementation log; commit/push and verify exact-head CI, then pause for root review. Claude must not run SQL/staging modes or begin Task 14. After review clearance only, root takes a fresh full baseline and runs the corrected rollback I0–I5 once against staging `ybrzhrgfrnvtcwymjdrq`, with guarded temporary setup/restoration and a fresh full-state audit. Committed A–D remains conditional on that passing. Do not rerun the obsolete 0038-only repair rehearsal or reinstall 0039.
+
+This handoff authorizes the scoped offline corrections under CJ's existing autonomous coordination instruction. The staging gate is still FAILED; COMPLETE below applies only to this actionable coder handoff.
+
+STATUS: COMPLETE
+
+### Task 13 closure and Task 14 handoff — 2026-11-15
+
+**Task 13 is complete at reviewed code `f84b9b90521067acde8ff4a6e9efef64be28fa36`.** This latest decision supersedes the earlier Task-13-open / Tasks-14–20-blocked handoff notes only as to sequential progression. Historical failures remain unchanged. It does not certify the full feature, dashboard latency, scale or release readiness.
+
+- **Code gate:** both independent reviews cleared T13B2b-23/24. Evidence-persistence review ran 114 focused tests; I5 review ran 85 (overlapping suites, not additive). All passed with environment-file loading disabled. Claude's common gate passed 1,263 tests, both typechecks, strict runner checks and build. [Exact-head CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43711133157/job/132802708559) at 11:55:33 UTC. Installed 0037/0038/0039 file hashes remain unchanged.
+- **Rollback I0–I5 COMPLETE:** `staging-results-reporting-publication-interleavings-20261115T115705973Z-8073b020.md`, exit 0. Same-site exclusion, uncommitted-source isolation, source write during publication, simultaneous UK/US publication, and exact owned-worker termination all passed. I4 took 67,124 ms for both whole rebuild jobs under monitoring, with 61 persisted sample batches, no exhaustion, uncovered PID or monitor error. I5 recorded the exact matching successful termination receipt and two expected notices; no generation/batch/mirror survived.
+- **Temporary setup restoration COMPLETE:** `staging-results-reporting-operator-0039-20261115-2.md` plus matching before/intent/setup/restore/after JSON. Baseline capture off15 -> on16 (UK/US processors) -> off17; fresh full-state comparison had zero problems and allowed only those two epoch increments/control timestamp. All processors off, all sites legacy, private data empty; sources, stock, ledger, memberships and schema/ACL unchanged.
+- **Committed A–D COMPLETE:** `staging-results-reporting-publication-committed-interleavings-20261115T120156417Z-d831d5d6.md`, exit 0, 12:01:56–12:05:13 UTC. A1–A3 proved late lower-ID receipt without loss; B1–B3 proved durable takeover and obsolete-fence rejection; C1–C2 replayed the same generation without duplicate credit; D0–D3 proved concurrent cross-site move receipt and removal of old-site facts. The explicitly permitted one deferred acknowledgement pass was used. All owned test data was cleaned; the independent fresh full-state audit verified restoration with only documented epoch/lease bookkeeping allowances. Confirmed capture off17 -> on18 -> off19; processors restored off and reads legacy. No unexpected error or cleanup failure.
+- **Evidence closure:** independent reviewer checked both reports, exact I5 receipt and operator full-state equality. Together with the retained Part A F1–F6, installed-0038/0039 identity/ACL and 0039 repaired rehearsal evidence above (whole source/candidate/mirror/version equality, five-family replacement, incomplete-work refusal and replay), the remaining Task 13 criteria are met. No timeout/target/workload waiver or unchanged retry was used. Production was never accessed.
+
+**Next coder authorization: Task 14 only, offline preparation.** Read the approved spec and current Task 14, plus the Part B ownership/audience/bounded-input contract and later five-family amendments. Implement the existing materializer/dependency-read scope with its parity tests, using new draft `0040_reporting_dependency_reads.sql` where required. All installed migrations through 0039 are immutable. Preserve shared TypeScript classification, exact site/self visibility, complete dependency enumeration, empty old-owner replacements, timing repair, bounded pages/chunks and explicit oversized-partition failure. Do not derive range Orders by adding daily counts or scan full site history on every refresh. Do not implement Task 15 or later tasks in this handoff.
+
+Follow failing tests -> implementation -> focused/common gate -> log -> commit/push -> exact-head CI, then pause for planner review. If the approved contract leaves a material design decision unresolved, document the concrete options before implementation. No SQL/staging modes, migration application, production access, merge or deployment is authorized for Claude by this handoff. Root will review the prepared code before any new staging execution. Task 19's full scale/latency/capture-safety gates, Task 20 Preview/release checks and the unresolved Vercel entitlement remain mandatory.
+
+STATUS: COMPLETE
+
+### Task 14 review and bounded repair handoff — 2026-11-15
+
+**Reviewed commit:** `c06532da8075114aad054006f956254a409c7074`. **Verdict: changes required; Task 14 remains open.** Task 13 stays complete. This is the current coder handoff, superseding the initial Task 14 handoff only for the repairs below. No Task 15+ work or SQL execution is authorized yet.
+
+**Evidence:** root verified [CI success](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43714503656/job/132812992865), completed 12:35:28 UTC: both typechecks, tests, build and append-only checks. Claude recorded 1,303 passing tests. Independent reviewers reproduced the issues below with offline, environment-file-disabled probes; the focused materializer/reader tests pass (40 tests, including the separately reviewed 12 reader tests). Passing existing tests does not cover these missing cases. No database was accessed during this review; 0040 remains unapplied.
+
+**T14R1 — Repair successor closure before claiming enumeration completeness.**
+
+- Files: `api/_lib/production-reporting-materialize.ts`, `tests/reporting/reportingMaterialize.test.ts`.
+- Proven failure: existing PREV at 08:00 and NEXT at 08:20; insert NEW at 08:10. `affectedOwners` starts at `(08:10, "")`; NEW itself satisfies the successor stop, so NEXT is omitted although both predecessor pointers must change. Removing a cancellation of the middle line has the same failure. Restaffing the middle line A -> B omits B's later successor.
+- Preserve the anchor's full identity and projector order. Include affected ties, but only an effective line strictly after the anchor in the projector's time/UTF-16-id order may satisfy the successor stop. The anchor and earlier ties cannot satisfy it. Keep bytewise SQL keyset traversal and consume the complete boundary tie group.
+- Failing-first tests: isolated middle insertion; cancellation removal; old/new worker reassignment; a timestamp move; same-instant ASCII and non-BMP ties. Assert complete changed-owner enumeration and exact five-family oracle parity for site and self audiences, across page caps 1, 2 and 200. Removing the repair must reproduce the failure.
+
+**T14R2 — Use the projector's order for member boundaries.**
+
+- Files: the same materializer and tests.
+- Proven failure: two member verifications in one order, IDs U+1F600 and U+FFFD, both at 08:10; another order has the actual predecessor at 08:00. Members are ordered bytewise to choose the earliest boundary, but `below` compares UTF-16. U+1F600 is treated as its own group's predecessor; the walk stops at 08:10 and its saved predecessor is null instead of the 08:00 line.
+- Choose member earliest/latest boundaries with the shared projector's logical order; retain SQL bytewise transport order as a separate concern and retain whole ties. Do not change the shared counting/timing semantics. Add the exact regression with both types of predecessor, site/self parity and page-size-independent input hashes.
+
+**T14R3 — Enforce budgets while reading, before accumulating unbounded dependencies.**
+
+- Files: materializer, reader, and both corresponding test suites. This clarifies the existing 50,000-event dependency limit; it does not cap total history, total owners or the whole batch.
+- Proven failures: one changed framed line followed by 50,100 other-type stream lines consumes 252 pages and returns 50,101 owners without a limit error. A single member with 60,000 inverse children fetches all 60,000 in 61 RPCs before raising the partition error. The 100-owner member prefetch can retain up to five million events before processing any owner's dependencies.
+- Read children incrementally with a caller budget and stop at the first distinct consumed event proving overflow (50,001); no further pages or work for that failed owner/seed. Bound each successor dependency walk to the same number of distinct consumed source/dependency IDs, attributing a visible `partition_too_large` failure to its seed/owner. Never truncate or declare the manifest complete on overflow.
+- Budget consumed input separately from bounded lookahead: unconsumed candidates in a fetched stream page must not affect success, hashes or the dependency limit. A straightforward acceptable approach is incremental children of each consumed candidate; batching is permitted only with equivalent bounded consumption. Process owner members one owner at a time or use a demonstrably bounded shared buffer; do not prefetch 100 maximum-size owners.
+- Tests must instrument request/row counts and prove overflow stops reading promptly; vary page sizes and add a large unused candidate beyond the stopping point. Assert unchanged output/hash below the limit, failure rather than partial success above it, and no completion/publication signal. Keep large multi-owner batches valid; durable cross-invocation owner/changed-key enumeration belongs to Task 15, not a whole-batch 50k cutoff.
+
+**T14R4 — Bound complete RPC responses, including owner lists.**
+
+- Files: new append-only `supabase/migrations/0041_reporting_dependency_read_bounds.sql`, reader defensive validation, `tests/reporting/reportingDependencyReads.test.ts`, and necessary migration-allocation assertions. Existing 0037–0040 stay byte-identical. Task 16 is now 0042; this allocation supersedes older reservations.
+- Proven failure: `list_reporting_owners` limits only rows. A valid 1,000-owner page with 1,200-byte keys serializes to 1,246,001 UTF-8 bytes. The other five RPCs count only image bytes, omitting duplicated identifiers, field names, separators and the response array.
+- Replace the six read functions in 0041 using full returned-row/array byte accounting, conservatively covering the actual JSON representation, plus the existing 1,000-row cap. Fail visibly if one complete row cannot fit. Preserve short-page continuation, all six existing signatures, frozen overlay/candidate semantics, locks, fences, lease/drift checks, invoker security, empty search paths and service-only ACLs. No classification moves into SQL. Defensive TypeScript checks must reject an oversized response, not silently slice it.
+- Failing-first coverage: owner keys, long IDs, escaped and multibyte text near the byte boundary, single oversized row, exact continuation across byte-capped short pages. Check the effective 0040+0041 definitions, not only 0040's text. Real PostgreSQL execution and wire-size evidence remain required after independent review.
+
+**Planner answers to the three Task 14 design questions:**
+
+1. Retain exact source-derived dependency selection and the visible 50k limit, with T14R3 making it real. No arbitrary look-back cutoff, approximation or switch to unproven published timing hints. Measure long-lived orders and rare work types at Task 19; failure remains a blocker requiring an evidenced amendment.
+2. The per-owner request count is not approved as scale-ready. Keep this repair scoped; record calls/rows/peak retained input. Task 15 must use resumable bounded enumeration, and Task 19 must measure full five-year rebuild duration, calls, memory and operating cost. Any batching optimization must preserve exact inputs, cancellation visibility and deterministic replay; do not defer an already observed contract violation to the scale gate.
+3. Keep per-call `lock_batch` validation and existing lock order. Do not weaken fences/leases to save round trips. Measure actual query plans and timings during the reviewed rehearsal and scale gate.
+
+**Execution and handback:** implement T14R1–R4 offline, failing tests first, then focused tests, both typechecks, full test suite and build. Record mutations of the repaired conditions, actual outcomes and any remaining limitations in the log. Commit/push the repair and verify CI for that commit, then pause for planner review. Do not prepare/run a speculative staging retry or start Task 15. The next step after code clearance is a separately reviewed rollback rehearsal of 0040+0041 against staging `ybrzhrgfrnvtcwymjdrq`, with role/fence/drift refusal, exact paging/overlay parity, complete response sizes, full-volume query plans and a fresh restoration audit. Installation waits for that evidence. Production, merges, deployment, timeout increases and reduced acceptance workloads remain excluded.
+
+STATUS: COMPLETE
+
+### Task 14 repair clearance and dependency-read rehearsal preparation — 2026-11-16
+
+**T14R1–R4 code review is cleared at `8e770500caa0d8e2fbf963de81786407b69bb02d`; Task 14 remains open pending database evidence.** Independent reviewers verified successor anchors and projector-order member boundaries, early per-owner/per-seed budgets with lazy children, and complete response accounting in append-only 0041. They ran 41 materializer tests and 20 reader tests (61 combined; overlapping reviewer runs are not additive), all passing with environment files disabled. An additional actual-reader probe of 60,000 children stopped at the first proof of 50,001 distinct consumed events with only bounded page lookahead. Root verified [exact-commit CI success](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43716275206). Claude records 1,324 full-suite tests, both typechecks and build passing. No new SQL was executed for this review. Files 0037–0040 remain unchanged; 0040/0041 remain unapplied.
+
+**Next coder authorization: prepare T14S1 only, offline.** Add the bounded rollback rehearsal below, then commit/push, verify CI and pause. This authorizes a test harness, not Task 15, migration installation or SQL execution. The 1,704-call small-fixture result remains a cost concern, not evidence of acceptable rebuild speed.
+
+**T14S1 — Prepare the actual dependency-read proof.**
+
+- Files: new `tests/staging/reportingDependencyRehearsal.ts` and `tests/reporting/reportingDependencyRehearsal.test.ts`; minimal mode/report wiring in `tests/staging/reporting-jobs.ts`, `tests/staging/reportingPublication.ts`, existing runner argument tests and `package.json` API typecheck. Keep production modules and all migration files unchanged. Reuse the established lifecycle, connection watch, durable evidence, guarded clients, transaction-control parser, role helpers, full-state baseline and fresh restoration audit.
+- Command: `npm run staging:reporting-jobs -- --rehearse-dependency-reads --sites=uk,us`. Reject incompatible/unknown flags. The only target is `ybrzhrgfrnvtcwymjdrq`, checked before every SQL call. The report is a unique git-ignored `staging-results-...md` and records commit, migration hashes, every assertion, timings, row/request/byte counts and final status without credentials, JWTs or source payloads.
+- Before mutation: verify installed 0037–0039 identities and publisher security, absence of the 0040 helper/six read RPCs/four new indexes, and the staging markers. Capture the full baseline. Refuse an unexpected schema or active batch rather than adapting automatically. Do not assume capture epoch 19; take and restore the actual baseline exactly.
+- All temporary DDL, source fixtures, capture/processor toggles, private candidate/mirror setup and publication needed for setup occur inside ONE outer transaction that always rolls back. Apply only the parsed bodies of the two exact reviewed files 0040 then 0041. Reject COMMIT, migration-history writes, unrelated DDL, VACUUM/ANALYZE, timeout/planner changes, network calls from SQL and out-of-scope SQL. Existing staging-only test-user sign-in for role claims is permitted. Expected rejection probes use savepoints. On any unexpected error, stop normal work, retain the first error, roll back/close, and audit on a fresh connection with `ROLLBACK_ONLY` (zero state-change allowance). Preserve the existing connection/error/evidence-save behavior.
+- Use a fixed allowlisted SQL `RpcClient` adapter to call all six real functions on that same transaction and pass the resulting rows into the actual `rpcFrozenReader` and materializer. Do not substitute an in-memory RPC implementation for database evidence. Record serialized JSON lengths from PostgreSQL rows and compact client JSON, plus calls/rows/max page per function. An uncommitted migration cannot be tested through a separate PostgREST connection: explicitly label this SQL-serialization proof, not an observed HTTP response. Actual PostgREST wire verification is a later post-installation gate.
+- Prove rebuild candidate reads and refresh mirror-plus-overlay reads exactly against independently collected frozen images: inserts, changed owner/worker, tombstones, absent IDs, inverse children, due/future rows, bytewise keys and timestamp ties. Include cross-site duplicate IDs to prove scope isolation. Exercise all six RPCs and complete pagination, including a byte-capped short page followed by more data; prove no missing or repeated identities. Use fixture owners with controlled dependencies for the materializer and compare all five result families, site/self visibility, old-owner empty replacements, and input hashes to the full frozen-view oracle. Include the exact T14R1 middle-insert and T14R2 tied-member regressions through the real reader.
+- Byte tests: 1,000 distinct 1,200-byte owner keys; long/escaped/multibyte IDs and images; each applicable RPC's short-page continuation and a single returned row that cannot fit. Every complete result array must stay within 1 MiB/1,000 rows, or fail visibly when one row is oversized. A refusal is a pass only for the explicitly expected error; a timeout or unrelated SQL error is not interchangeable with it.
+- Security and immutability: verify invoker/empty-search-path/service-only ACLs for all functions; call as anon and authenticated and require permission denial. Use savepoints for wrong fence, wrong batch kind, non-frozen state, expired lease and capture-epoch/drift rejection, preserving original state afterward. Confirm ordinary reads do not mutate the frozen candidate/base/overlay or source tables. Role switch/claim helpers may set the already-approved session claims and authenticated catalog timeout; they may not raise a timeout.
+- Performance evidence: retain the original full UK source volume in the candidate/mirror setup, assert exact source/candidate identity equality, and time representative first and later pages for owner members and before/after worker streams on that volume. Record their actual underlying SELECT plans with `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON)` (no ANALYZE), checking statement equality to the effective migration queries rather than explaining only an opaque PL/pgSQL Function Scan. No fixture reduction, timeout change or repeat-until-fast loop. A small controlled owner materialization records calls/input/fan-out/duration; this does not certify full rebuild or five-year scale. A setup-only zero-work rebuild is permitted inside the rollback transaction to construct the base mirror, but must be labelled setup and cannot count as complete materialization evidence.
+- Keep the rehearsal finite: fixed named cases, existing bounded copy pages, bounded keyset pages with failure on non-progress/exhaustion, and per-owner/per-seed production limits. Do not run a million-owner rebuild or enlarge the fixture merely to produce a new benchmark. Task 19 retains full-scale acceptance. Preserve full failure output and do not retry the same failed run automatically.
+- Offline tests must cover argument/dispatch wiring, the exact two migration bodies and identities, all-six SQL argument bindings, expected-refusal savepoints, wrong-project refusal before SQL, fail-fast on any unexpected query/assertion, evidence-save failure, rollback/disconnect failure, fresh-audit mismatch, and missing/incomplete evidence never yielding COMPLETE. Reuse existing tested lifecycle behavior rather than duplicating it. Add targeted sensitivity checks for skipped bound/parity/security assertions. Include the new module/test in strict API typechecking; run focused tests and the common gate.
+
+**Handback:** record the prepared command, exact fixture/case scope, measured offline outcomes and limitations; commit/push and confirm CI, then pause. Root reviews this harness before taking a fresh baseline and executing it once on staging. SQL failure stops the run and returns to review; no installation follows a failed or incomplete rehearsal. Installation and any HTTP verification need their own concrete reviewed step. Task 15+, production, merge/deploy, paid upgrades and acceptance-limit changes remain excluded.
+
+STATUS: COMPLETE
+
+### Task 14 first dependency rehearsal: deterministic owner-byte probe — 2026-11-16
+
+**T14S1 was reviewed and run once at `dcf9924ab64f8d63deaea0d0f1c23d39d94940ec`; it is NOT a passing rehearsal.** Three independent final reviews cleared the harness (103/103 focused tests with environment files disabled), and [exact-commit CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43777844205). Root ran only `npm run staging:reporting-jobs -- --rehearse-dependency-reads --sites=uk,us` against guarded staging `ybrzhrgfrnvtcwymjdrq`.
+
+**Retained evidence:** `staging-results-reporting-publication-rehearse-dependency-reads-20261116T000646115Z-f8a1f42c.md` (ignored, not committed). Started 00:06:46 UTC; finished 00:08:47 UTC. D0-D3, S0-S1 and R0-R1 passed. The full UK candidate copied in 48 pages / 73,598 ms: 43,390 rows including fixtures, 21,800,441 image bytes, with exact source/candidate count and image identity equality. R2 enumerated 17,093 owners in 19 calls; complete owner parity and all 1,000 long-key owners passed. Its sole failure was `no byte-capped non-final owner page was followed by its exact continuation`. Maximum response: 1,000 rows, 669,160 PostgreSQL bytes / 666,163 compact bytes; only the ordinary final page was short. No later case ran. Existing timeout remained 2 minutes; this failure was an assertion, not a timeout.
+
+**Restoration is verified by the runner's fresh zero-change audit.** The transaction was rolled back, 0040/0041 were not installed, and no production access occurred. The failed evidence stays failed. Task 14 remains unchecked; no installation, HTTP verification, Task 15+, merge or deployment is authorized by this result.
+
+**Diagnosis:** a block of exactly 1,000 long owner keys does not force a byte-capped page when complete enumeration starts before existing owners. The ordinary 1,000-row page boundary can split that block across two pages. The observed maximum was well below 1 MiB. An offline size calculation confirms 500 long + 500 short representative owners fit (~648,502 compact bytes), while 1,000 long owners exceed the cap (~1,246,002 bytes). This is insufficient fixture positioning in the rehearsal, not evidence that the SQL byte limiter failed. Do not change the limiter or increase the fixture to make this test pass.
+
+**T14S2 — Coder authorization, offline harness correction only:**
+
+1. Keep R2's complete `rpcFrozenReader.owners()` enumeration and independent exact owner-list equality, including all 1,000 `DRK-` owners. Add a separate deterministic real-SQL owner byte-cap probe using the same SQL adapter and frozen rebuild. Anchor immediately before the fixed long-key group (`p_after_kind='order'`, `p_after_key='DRK-'`), request the existing limit of 1,000, and continue from the exact last returned key. The first response must be nonempty and shorter than 1,000, with another nonempty exact continuation. Compare each page's identities/order against the independently sorted full-owner suffix and assert that the long-key fixture makes the uncapped requested page exceed 1 MiB. Record bounded per-page counts/bytes and continuation evidence. Do not let incidental pagination elsewhere satisfy this case. If staging has unexpected owners interleaved in that prefix, derive/check the actual expected suffix rather than silently assuming it.
+2. Require the independent suffix to begin with the 1,000 known long-key fixture owners, and require the two pages together to contain all 1,000; both complete responses must be at most 1 MiB. Add a failing-first offline regression using the actual reader and adapter interfaces: pre-existing short owners position the 1,000 long keys across ordinary page boundaries so the old assertion fails; the anchored probe forces a byte cutoff and continuation. Cover truncation/missing/repeated/wrong continuation identities and an incorrectly full first page. Keep production reader behavior and all six existing cap checks unchanged. Review the remaining R3-R6/F1 byte probes offline for the same positioning assumption; report a concrete further defect before expanding scope.
+3. Allowed edits: `tests/staging/reportingDependencyRehearsal.ts`, its focused test, and this implementation log. No `api/`, application, migrations, dependencies, timeout, fixture volume, acceptance-limit or SQL execution changes. Retain the target guard, fail-fast behavior, full rollback and fresh audit. No unchanged staging retry.
+4. Run focused tests, both typechecks, the full test suite and build. Record cause, fix, regression sensitivity and outcomes. Commit/push and confirm exact-commit CI, then pause. Root reviews the correction before one new rehearsal; a passing unit test is not PostgreSQL evidence.
+
+STATUS: COMPLETE
+
+### Task 14 dependency rehearsal passed; access-path diagnostic next — 2026-11-16
+
+**The corrected rollback rehearsal passed at `f072c24f91ab83d4910813f5f61822557428a039`.** Root reviewed the correction, an independent reviewer passed 119/119 focused tests with environment files disabled, and [exact-commit CI passed](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43779400422). Moving the owner cap assertion from R2 to required R2c is confirmed as the intended T14S2 correction; full owner parity remains in R2. The failed `dcf9924` report remains unchanged.
+
+**Retained successful evidence:** `staging-results-reporting-publication-rehearse-dependency-reads-20261116T001812749Z-5cc39ae9.md`, 00:18:12–00:25:15 UTC. All 44 required cases passed, including R2c, rebuild/refresh materialization parity against independent full-view results, raw note-only changed-key membership, the controlled due transition, full response bounds/continuations, oversized-row refusals, role/fence/lease/epoch refusals, immutable frozen reads, rollback and a fresh zero-change audit. An independent evidence review confirmed the report. 0040/0041 remain **uninstalled**; source data and reporting state were restored. Sequence advancement is intentionally outside the established restoration audit.
+
+- Full candidate/source identity parity: 43,390 rows, 21,800,441 image bytes; 48 copy pages / 73,343 ms. R2 enumerated all 17,093 owners exactly.
+- R2c: first page 839 rows / 1,045,395 compact bytes, exact continuation 1,000 / 253,926; all 1,000 long owners present. All six read functions recorded capped continuations and PostgreSQL/compact maxima below 1 MiB.
+- Controlled rebuild: 17 owners / 34 works, max input 31, 120 SQL calls / 51,629 ms. Refresh: 12 owners / 24 works, max input 23, 143 SQL calls / 62,615 ms. These durations include the SQL adapter's role changes and network round trips; they are not HTTP or production worker latency. The full-view comparison adds further test-only CPU work.
+- Sample worker stream pages (1,000 rows; worker has 12,410 rows): 447–843 ms. The largest original owner had four rows; its later 1,000-limit page was empty. No full-scale, full materialization, actual HTTP wire, or wall-clock lease claim follows from this run. Task 14 stays unchecked.
+
+**Access-path concern discovered during evidence review; installation is held pending diagnosis.** Both recorded rebuild owner-member plans constrain their index only by batch/site and evaluate owner identity and the later cursor as join filters beneath a sort. They estimate one candidate row despite 43,390 present. Stream plans have staff/time bounds but sort the matching range before the limit. The correctness evidence is valid, but neither shape demonstrates a small indexed lookup/page as data grows. Refresh member plans were not captured and its mirror branch has the same order/event OR join.
+
+Do not assume this is solely a collation bug: 0040's new C-collation candidate index does not match the default-collation owner equality, but 0038 already supplies `source_candidate_order(batch_id,site,order_key)` with matching default collation, and 0037 supplies `source_current_order(site,order_key)`. Existing primary keys support event identity. Poor estimates and query structure must be distinguished with actual scan counts. Do not append a speculative migration or defer this concern to Task 19.
+
+**T14S3 — Prepare a bounded access-path diagnostic, offline only.**
+
+1. Add `tests/staging/reportingDependencyPlans.ts` and focused `tests/reporting/reportingDependencyPlans.test.ts`, with minimal dispatch/report/typecheck wiring for `npm run staging:reporting-jobs -- --diagnose-dependency-plans --sites=uk,us`. Reuse the guarded connection, installed-identity checks, exact reviewed 0040/0041 bodies, copy/setup helpers, evidence persistence and rollback/fresh-audit lifecycle. A small shared-helper extraction in the existing dependency rehearsal is allowed if its 119 tests and behavior remain unchanged. No production module, migration or dependency changes. This prepares the command; Claude must not run it.
+2. Refuse unexpected installed objects/active batches and preserve the full original UK source volume. Inside one always-rolled-back transaction, apply the same reviewed bodies, create/freeze a candidate, and assert candidate/source identity equality. Reuse only the bounded existing fixtures needed for representative owners/streams; report counts and do not reduce the original source workload. Do not run the materializer or repeat the whole correctness suite. After rebuild diagnostics, the existing clearly labelled zero-work publication may create a mirror for refresh diagnostics; all setup remains rollback-only.
+3. Measure the **exact extracted SELECTs**, not an opaque function scan: rebuild member first/later, refresh member first/later, and before/after stream first/later. Capture `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON, TIMING OFF)` with original query bindings. This narrowly permits executing these allowlisted read-only SELECTs under EXPLAIN; it does not authorize EXPLAIN ANALYZE of DML, maintenance `ANALYZE`, arbitrary SQL, function replacement, forced planner settings or raised timeouts. Extend the rehearsal guard only through an exact diagnostic SELECT allowlist; existing mode remains unable to execute EXPLAIN ANALYZE.
+4. For member first/later probes choose a known owner with multiple rows and a valid small diagnostic `p_limit` so the second page is genuinely nonempty; also record a representative normal-limit observation. Keep the full source dataset and label the smaller limit as pagination diagnosis, not a throughput acceptance sample. For streams retain 1,000-row pages and the full-volume worker. Record index conditions, actual scanned rows/loops, rows removed by filters, sort input/method, buffers, server planning/execution time, expected/actual result counts and cursor identities. No payloads or credentials in evidence.
+5. Compare member reads with one SELECT-only alternative that splits mutually exclusive order/event branches, preserving current equality semantics, owner ordinality, candidate/mirror/overlay rules, tombstone exclusion and keyset order. Use existing indexes and the same parameters/statistics; no blanket COLLATE rewrite or added index. Compare actual ordered results (identities plus image hashes) to the original query and independent frozen images. This is a diagnostic candidate, not an approved production fix. Preserve both positive and negative results. Stream plans are measured first; do not bundle a speculative stream rewrite.
+6. Keep a fixed case matrix: at most 24 explained SELECT executions, no adaptive retries, no full-site materialization. Reuse the original finite copy limit and existing statement timeouts. Failure stops normal work; always roll back/close and audit fresh with zero-change allowance. The diagnostic may report COMPLETE only when every required measurement/comparison and restoration check is present; COMPLETE means evidence collected, not acceptable performance. Save a unique ignored report, never overwrite the two earlier reports.
+7. Offline tests cover exact SELECT extraction/binding, allowlist and forbidden DML/maintenance/other EXPLAIN, all required cases, nonempty later-page selection, alternative parity sensitivity (missing/duplicate/reordered/incorrect-overlay rows), evidence failure and unchanged rollback/fresh-audit behavior. Run focused tests, both typechecks, full suite and build. Record scope/queries/case count/limitations, commit/push and verify CI, then pause for root review. If a safe selective alternative requires a design decision outside this comparison, document it instead of changing production SQL.
+
+**Next after preparation:** root reviews, then runs the diagnostic once on staging `ybrzhrgfrnvtcwymjdrq`, checking the target before every SQL. Only the resulting measurements may justify a query/index repair or clearance for the separate installation/HTTP gate. No installation, Task 15+, production, merge/deploy, paid upgrades or acceptance-limit relaxation is authorized by T14S3.
+
+STATUS: COMPLETE
+
+### Continuous delivery authorization for remaining tasks — CJ, 2026-11-16
+
+**CJ requested faster progress and work on all remaining tasks now.** This section supersedes earlier instructions to pause after each prepared diagnostic or completed implementation commit. Counting rules, acceptance limits, one writer at a time, planner/coder roles and production restrictions remain in force. Claude is the sole application/test/migration writer. Root and read-only reviewers work concurrently on committed checkpoints, staged evidence and preparation. Do not wait for CJ to say “continue” between routine tasks or ask again for already-approved implementation choices.
+
+**Execution lanes:** Claude fixes the two diagnostic review findings below, commits/pushes that checkpoint, and then proceeds directly through Tasks 15–18 offline, one task/meaningful repair per commit, with focused verification and common gates. Root reviews those commits and runs reviewed staging diagnostics concurrently. Prepare Task 19's fixtures/evidence verifier and Task 20's release/browser checklist as interfaces settle; execute their dependent integration checks only when prerequisites actually pass. A failure blocks the affected dependent work, not unrelated preparation. A failed full gate is corrected before building on that commit; do not repeatedly rerun an unchanged failed experiment. Routine scope-consistent decisions are documented in the log without a new permission cycle.
+
+**Immediate diagnostic repair at `777f466`:** independent review passed 176 focused tests but found (1) `PLAN_SQL.owner` uses `ORDER BY count(*) DESC, 1 COLLATE "C"`, which collates an integer rather than the selected key: use the actual text expression or an outer text alias; (2) `dependencyGuard` recognizes parenthesized EXPLAIN ANALYZE only, so the non-parenthesized `EXPLAIN ANALYZE SELECT/UPDATE ...` form bypasses the exact allowlist. Reject every executing EXPLAIN form except the exact diagnostic allowlist, including non-parenthesized forms, with regression tests. Preserve permitted nonexecuting plans and the existing exact SELECTs. Commit/push the repair, record focused/common gate and CI outcomes, and continue with Task 15 while root reviews. No staging diagnostic runs until this repair is cleared.
+
+**Migration allocation, replacing earlier unused reservations:** 0037–0041 remain immutable. Reserve **0042** only for an evidence-backed Task 14 access-path correction, **0043_reporting_worker_state.sql** for Task 15 durable state/recovery, and **0044_reporting_reads.sql** for Task 16. Do not create a placeholder 0042 or invent a query fix before the diagnostic. No migration is applied by Claude. A numeric reservation is not permission to change installed schema.
+
+**Task 15 implementation is unblocked offline now.** Existing frozen-reader, materializer, work-descriptor, staging and publication interfaces are the implementation contract; pending Task 14 SQL/HTTP evidence blocks runtime clearance, not writing/testing the worker and protected handlers. Add the necessary durable worker state and service-only RPCs in 0043 as part of Task 15:
+
+- Persist per-batch/fence enumeration phase/cursor, discovered owner identities, old-self audiences and enumeration completion. A refresh retains changed-key, parent/inverse-child and timing-successor dependencies; rebuild uses owner keysets. Atomically persist discoveries with cursor advancement; a crash before checkpoint replays the bounded unit without lost work or double credit.
+- Persist enough bounded per-owner/dependency-walk state to stop at the 240-second budget and resume without rescanning the completed batch or losing consumed-ID accounting. Preserve exact microsecond/projector ordering and the existing 50,000 distinct-input failure. Do not use whole-batch `materializeBatch()` or `affectedOwners()` arrays as the production resume mechanism. Recovery cannot rebuild all enumeration from zero on every invocation.
+- Require durable enumeration completion and all discovered owner/audience descriptors before the existing exact count/hash seal. Provide bounded saved-descriptor traversal/manifest recovery; an incomplete count returned by planning is not proof of completeness. Keep frozen evidence, identical replay, drift/fence validation, service-only access, ≤1,000-row/1 MiB calls, leases/heartbeat and atomic publication semantics. No output may be published before all required work is complete.
+- Implement the already-approved handlers, schedule, retention and recovery controls. Keep source-capture work independent from reporting and unchanged digest schedules. Record any true contract contradiction with a bounded proposal; continue independent auth/handler/test work while root resolves it. Existing request-count concerns remain measurable integration gates, not permission for unbounded prefetch or weaker stopping rules.
+
+**Task 16 follows the existing shared DTO/fact contract, without waiting for deployment.** Build the authorized summary/detail API and 0044 SQL against the five fact families and exact selection oracle. Preserve server-derived site/self scope, fresh membership/nav authorization on every request/page, caller-authorized name/rate reads, generation-bound cursors, full-range totals independent of pages, no-store and explicit 400/401/403/410/503 results. No raw-history fallback or second classifier. Root may review Task 15 while Claude builds this independent reader layer. Runtime SQL/role/parity evidence still gates completion.
+
+**Tasks 17–18 can use the existing DTOs for fixtures and tests immediately, then integrate the implemented readers.** Reports consumes `SummaryResult` directly, Welcome consumes `PublishedWelcomeView`; do not fabricate raw snapshots or derive whole-period totals from loaded pages. Preserve immediate Production feedback and caller-permitted metadata. Test identity/site/filter invalidation, pinned-generation reload, expiry, freshness/rollover and Dexie behavior. Audit side cards: PackageHistory/PackageUsage currently eagerly load historical records; make historical drill-down explicit/lazy, keep actual definitions and implement complete bounded paging where required. DailyTimesheet/CurrentlyClockedIn unpaged reads and LiveOrderCompletions' cap must not silently present truncated totals. Digest uses one published generation across comparisons, refuses unavailable/incomplete/over-30-minute-stale coverage before constructing/sending output, and preserves every S1 auth/recipient/diagnostic rule. Exports use generation-pinned raw-export pages rather than live note/station joins; fail explicitly on revocation, expiry or page failure.
+
+**Tasks 19–20 preparation starts during implementation, execution follows dependency readiness.** Prepare deterministic fixture/evidence validation and existing threshold checks, including 1,095,000 orders/3,285,000 pieces with events/facts separately measured, three repetitions, twenty readers, 10× busy-day workload, unchanged read/freshness targets and capture regression checks. Preserve original parity evidence and all failures. Prepare exact-head browser/Preview, five-role, dry-digest, stock/ledger, old-app compatibility and rollback checklists. Actual Preview availability, required secrets and Vercel schedule/runtime entitlement remain external execution/release prerequisites; they do not block offline implementation. Do not provision/upgrade, merge, deploy, query production or mark an unexecuted gate passed.
+
+**Verification and reporting:** focused tests while working; common gate at each completed task checkpoint, exact-commit CI, and one integrated full gate after interacting fixes. Avoid duplicate full-suite runs when the same unchanged commit already has sufficient evidence. Root reviews stable commits as they arrive; findings are fixed before dependent integration or task closure. Log “implemented; runtime gate pending” where applicable rather than falsely ticking a task complete. Report real blockers once, with the affected dependency and independent work continuing. This authorization covers continuous work on Tasks 14–20; it does not authorize a production release.
+
+STATUS: COMPLETE
+
+## Amendment implementation log
+
+- 2026-11-14 (Codex, CJ's overnight delegation): CJ authorized autonomous coordination and routine decisions while asleep. Claude remains the coder; Codex handles planner decisions/review. One writer at a time, commit before handoff. Authorized feature work and necessary staging validation target only `ybrzhrgfrnvtcwymjdrq`, checked before every SQL run; additive staging schema application requires planner review first. Production/other-account access, merges, deployment, purchases, secret disclosure, destructive source cleanup and weakened acceptance/security limits remain excluded.
+- 2026-11-14 (Codex, focused round-3 closure): verified `7a4a323` / handoff `2cb9089` closes R3-1/R3-2; independent focused local tests 82/82, retained collection/hash freshly rechecked with zero problems, non-cancelled publication preserves it. Root verified exact-head PR #7 CI SUCCESS at `2cb9089089b2ebf65b6366916eee2298d4a6ae99` (run `43601917624`, job `132468289904`). See the round-3 review's closure addendum. Task 10 is complete **under CJ-approved v2 criteria**, not the superseded raw long-range gate. All historical FAILED evidence stays unchanged. Tasks 11–20 may proceed sequentially; Vercel entitlement remains a deployment blocker, and Tasks 19/20 still gate release. No new database run or application-code edit was performed for this closure.
+
+- 2026-11-14: CJ approved the reporting-scale spec and requested this plan update. Codex prepared Tasks 10–20 and marked the spec amendment approved. Planning only; no app code, tests, SQL, schedules, credentials, database, merge or deployment changed. Plan approval and all new execution evidence remain pending.
+- 2026-11-14: CJ approved the amended plan and instructed Claude to resume. Codex recorded approval for the sequential coder handoff. Start with Task 10's reopened M6 prerequisite; no new execution evidence is claimed and all new task checkboxes remain open. Production access, SQL application, merge and deployment remain outside this handoff.
+- 2026-11-14 (Claude, Task 10 code; evidence pending): built the `--policy-parity=cases` collector `collectCaseParity` in `tests/staging/policyParityRun.ts`: one connection, one REPEATABLE READ transaction always ending in ROLLBACK (errors, timeouts and Ctrl+C included); installed-policy and standard-membership checks before any case; per-case savepoint with the transaction-local membership change, installed 0036 reads, then a nested savepoint running the shared `PRE_0036_RESTORE` body (moved here from `writeCompatRun.ts`, which re-exports the same array) and the restored reads; nested and case savepoints rolled back and memberships re-checked; then a fresh-statement restoration check (memberships, installed hash, fixture) that is skipped and left missing when ROLLBACK is not confirmed. Role reads now share `readRoleSnapshot` (adds a bypass-RLS and applied-timeout check and the staff foreign-row count). Runner: `--policy-parity=cases` only on its own (`casesModeArgProblems`), atomic artifact write, a new collection replaces any earlier one even when failed, first Ctrl+C aborts into rollback + restoration; report via `caseParityMarkdown`/`caseParityProblems`. Gate report shows the four cases and labels older arrangements as history. Tests: new `policyParityRun.test.ts` (14, fake DB modelling savepoints, memberships and both policy sets; 5 collector mutations each caught) and 2 new gate tests (failed/legacy-only parity → no API timing, no phase; v2.2 records don't advance the v2.3 phase order). README documents the command and required memberships. Gate: `npx tsc -b`, `npm run typecheck:digest`, 679/679 tests, build OK. **Not done (CJ):** the staging `--policy-parity=cases` run and the three v2.3 manager phases; follow-up M6 review and CI. **Hosting entitlement:** Vercel team "Inka Arthouse's projects", project `inka-arthouse-hub` (Vite, Node 24.x, existing 3 daily digest crons). The tools available show no billing plan, so 15-minute cron and 300 s runtime entitlement are **not observed**; the new schedules add 4 × 24 × 3 = 288 calls/day plus manual/retry calls. This is a deployment blocker for CJ to confirm in Vercel billing; nothing was changed or purchased. Staging target remains `ybrzhrgfrnvtcwymjdrq` only.
+- 2026-11-14 (Astra ran on CJ's instruction "let astra run it"; Claude verified the files): staging evidence at revision `76f74d2`, harness `item-counting-gate-v2.3`. `--policy-parity=cases` → `STATUS: COMPLETE`: collection `b31856a9-0090-4e79-a078-d1d157002f6e`, fixture `d644f298…`, restored pre-0036 hash `2ce3f0db8fbf…` = original baseline, installed `b7884efe2260…`; all four cases identical with positive coverage (e.g. baseline owner au/uk/us 155,432/42,340/42,340, staff au 30,018 own rows; manager-all-sites uk/us 42,340 each; owner-/kiosk-denied-uk 0 uk, 155,432 au); restoration passed 09:15:39Z, zero problems. Fresh manager phases against that artifact (parity hash `608b3e12afac…`, policy hash `b7884efe2260…`): denied-before, all-sites (helper `INSERT 2`), denied-after (helper `DELETE 2`, manager back on au, staging) → final `STATUS: COMPLETE`. AU 3-month / busy-day medians (ms): denied-before owner 4,444/1,336, manager 4,755/1,266; all-sites owner 5,868/1,246, manager 5,240/1,346; denied-after owner 5,674/1,260, manager 4,834/1,203 (targets 10,000/2,000). Reports kept as git-ignored `staging-results-item-counting-v23-*.md`. Working tree unchanged by the run. Still open for Task 10: follow-up M6 review and green PR CI; Vercel entitlement remains a deployment blocker for CJ.
+- 2026-11-14 (Claude, review r2): Astra's follow-up review `docs/reviews/item-counting-r2.md` was "changes required" (R2-1…R2-6, S1). Fixed: pending-attempt lifecycle `tests/staging/caseParityMode.ts` (new file), sticky cancellation, baseline catalog/installed authority and exact 8,000 ms, full canonical evidence hash and underlying-evidence checks, positive coverage at every member site including `staging`, per-role other-worker counts, cutoff on every read, exact reader columns/order/limit (three retired reader names replaced by current direct readers), Reports order-lookup lifecycle moved to new `src/lib/repository/supabase/orderLookupSession.ts` with deferred-response tests, and digest later-page clock/staff-name failure tests. S1 answered in the review (needs a DOM test dependency; proposed for Task 17). Gate 712/712, build OK. The `b31856a9…` collection and its three v2.3 phases are now history. **Needs CJ:** approve the two synthetic `staging` probe rows (`staging-parity-probes.sql`), then Astra re-collects four-case parity and the three manager phases.
+- 2026-11-14 (Claude, staging re-collection): CJ approved the probe rows; Astra applied them on staging (`INSERT 2`; a first attempt stopped only because my prompt expected the psql-style tag). The four-case run at `bf90379` then failed in every case: reader replays bound three values even when the SQL used only `$1`/`$2`, and Postgres rejects that ("bind message supplies 3 parameters, but prepared statement \"\" requires 2"). Restoration passed and memberships were standard; no manager phase ran. Fixed: `readerParams` binds only the placeholders each reader uses, and the test FakeDb now rejects any bind-count mismatch like Postgres (restoring the old call reproduces the exact staging error in 4 tests). Gate 713/713, build OK. Report kept as history: `staging-results-item-counting-v23r2-parity-cases.md`. **Needs CJ:** go-ahead to re-collect.
+- 2026-11-14 (Astra on staging at `29e255f`, CJ-approved rerun): four-case parity **COMPLETE**, all four cases identical with restoration passed (collection `90d3da63…`, parity hash `26330a48…`). Manager denied-before recorded with its expected pending status (AU 3 months busy medians: owner 5,278 ms, manager 5,410 ms). **All-sites FAILED:** manager "AU 3 months (busy)" run 2 hit the 8 s statement timeout. Run 1 took 13,327 ms, run 3 took 6,255 ms, and the earlier passing all-sites run at `76f74d2` had a 5,240 ms median. Owner all-sites passed (median 4,609 ms). Astra stopped and restored standard memberships (`DELETE 2`); denied-after did not run. No retry, timeout change or target change. Reports `staging-results-item-counting-v23r3-*.md`. **Needs CJ:** decide on the all-sites manager timeout.
+- 2026-11-14 (Astra on staging at `e4291e5`, CJ-approved "Rerun all-sites"): all-sites **passed** (AU 3 months busy medians: manager 4,772 ms, owner 6,536 ms; same parity hash `26330a48…`). **Denied-after FAILED:** owner "AU 3 months (busy)" run 1 hit the 8 s statement timeout; run 2 took 9,567 ms and run 3 took 4,548 ms (manager median 5,110 ms). Memberships restored (`DELETE 2`). Two of four v2.3r3 phase runs have now timed out on the same 3-month AU load, once as manager and once as owner. The owner's access never changes between phases, so this is not tied to the manager's membership. Server read time for the identical load ranged from 2.4 s to over 11.9 s. Reports `staging-results-item-counting-v23r3b-*.md`. Not retried. **Needs CJ:** decide whether to investigate the timeouts before any further rerun.
+- 2026-11-14 (Claude, read-only timeout diagnostic on CJ's instruction via Codex; staging `ybrzhrgfrnvtcwymjdrq` only, target checked before each SQL; nothing changed): **Correction:** the previous entry's "server read time 2.4 s to over 11.9 s" is wrong. That figure is `headersMs` (request start to response headers), which includes API, network and database time, not database execution alone. The AU three-month load is one `load_production_evidence_v2` call (118,244 rows, about 14.7 MB), not paged reads. Findings and next step are under Open questions ("Task 10 performance gate — intermittent v2 statement timeout").
+- 2026-11-14 (Astra ran the CJ-approved bounded diagnostic once, `STATUS: COMPLETE`; Claude verified the report): ran at 13:27Z on staging; one fresh connection; one transaction, rolled back; owner real claims (510 bytes), `authenticated`, RLS on, 8,000 ms; prepared PostgREST-shape AU three-month v2 call; no other active client backends; one-off scratchpad script, not in the repo. Results:
+  - Run 1 took 5,096 ms of database execution.
+  - Runs 2–6 took 1,701–1,838 ms elapsed (EXPLAIN 1,686 ms) at the server `work_mem` of 2,184 kB, with the same temp spill (read 9,319 / written 5,626 blocks).
+  - With transaction-local `work_mem` 64MB: 1,540–1,618 ms and zero temp blocks.
+  - Same plan shape in all runs; custom plan (no switch to a generic plan); no JIT. Body 15,440,322 bytes every run.
+  - After ROLLBACK, `work_mem` was 2,184 kB again and the user was back to `postgres`.
+  - Report: `staging-results-item-counting-timeout-diag-1.md`. Interpretation under Open questions.
+- 2026-11-14 (Astra): wrote the planner decision and pending Task 10 amendment v2 with matching Task 19/global-constraint proposals, document-only; retained evidence reviewed, no staging/SQL/benchmark run, app edit, checkbox change, commit or approval claimed.
+- 2026-11-14 (Claude, recording CJ's decision): CJ approved "Proposed Task 10 amendment v2" and the matching Task 19 and global-constraints proposals, and explicitly accepted the interim operational risk in the Planner decision ("Approve, accept risk"). Possible intermittent slow or unavailable three-month Reports until the published path is enabled; first-call outliers on operational reads. Task 10 now closes on the retained evidence listed in v2, plus review round 3 (last allowed), focused/common checks, green PR CI and the Vercel entitlement record (still a deployment blocker). No checkbox changed; no staging run requested.
+- 2026-11-14 (Claude): Astra review round 3 (`docs/reviews/item-counting-r3.md`, `0ef8a66`) was "changes required" with two Must-fix: R3-1, a cancel during connection close could still publish COMPLETE; R3-2, OrderLookupCard rendered the old scope's result for one render before its effect. Both fixed in `7a4a323` with regression tests, each verified to fail without the fix; gate 718/718, build OK. Coder response added to the review. PR #7 CI was green at `9881540` (verified by Codex and by Claude with `gh`); later heads need a recheck. **Planner decision needed** (Open questions).
+- 2026-11-14 (Claude, Task 11): steps:
+  - [x] failing cases written first; the focused run failed on the missing module;
+  - [x] implemented;
+  - [x] focused and common gate;
+  - [x] committed as `task 11: define reusable reporting facts and contracts`.
+  - **What was built:**
+    - `src/lib/domain/productionReporting.ts`: rule version `item-counting-summary-v1`; audience/meta/request/summary/detail DTOs including the seven detail-row kinds; explicit selector mappings (`toCountTotals`, `toWorkTypeTotals`, `toCoverageCounts`, `toPublishedWelcome`; no casts); bounded request validation (page default 200, max 1,000); fact types; canonical JSON; a pure synchronous SHA-256 that is browser/Node safe.
+    - `productionReportingProjection.ts`: `projectReportingPartition` classifies each saved event once with the shared rules. A self audience uses only that worker's rows before classification. It throws on another site's rows, a conflicting duplicate, an unknown rule version or an inexact cutoff. Rows after the cutoff are listed, not counted. The result is hashed. Also `referenceSummary` / `referenceTimingLines` (the pure reference query) and `compareReportingProjection`.
+    - `productionCounts.ts`: pure primitives extracted and exported (`classifyEvidenceEvent`, `cancellationPairOutcome`, `UNRESOLVED_PARENT_DETAIL`, `qualificationFrom`, `repeatLineKey`, `evidenceOrderKey`, `isCountEvidenceType`, `isWorkType`, `nonBlank`, `exactInstant`, `samePayload`), and `prepareProductionEvidence` now uses them. Behavior is unchanged: all 180 existing counting/timing/view tests pass unchanged.
+    - Fixtures `tests/fixtures/reporting-history.ts`: every listed counterexample, plus an in-memory mirror of the v2 four-family selection and a seeded random history.
+  - **Tests:** `productionReportingProjection.test.ts`, 56 tests.
+    - Exact parity with `prepareProductionEvidence` + `summarizeProduction` (all fields, issues with details, notes, visibility, overflow) on the four-family snapshot for 13 windows × 6 scopes × site/self audiences.
+    - Day scopes inside a multi-day selection, frame-timing lines for each supported work-type selection, and 72 randomized windows × 2 sites × 2 audiences.
+    - Explicit-value cases plus mutation cases: summed daily Orders, dropped case, merged site, self derived from site facts plus a staff filter, and all-history ambiguity. Each is caught.
+    - 10 code mutations of the reference query (dropping each v2 family, a trimmed-order qualification match, all-history repeats, ignored parent presence, keeping the first timing predecessor, dropping the case key, counting later lines, an unfiltered self audience) are each caught.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 774/774 tests, build OK.
+  - **Finding for Tasks 14/16** (Open questions): exact answers need the range's four-family selection at read time over event-level facts.
+
+- 2026-11-14 (Codex planner, focused Task 11 checkpoint at `b2d1715b99c9d1781326d2550ff5ff5a373dfc28`): **changes required; Task 11 reopened.** This is a task checkpoint under CJ's overnight delegation, not a fourth review of the earlier Task 10 work. The independent reviewer freshly passed 115/115 projection/counts/report/Welcome tests and reproduced two failures with additional in-memory probes. Root verified exact-head CI SUCCESS ([check](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43603440594/job/132472898903)); passing tests do not waive the findings. Claude is paused; planner changes only this document.
+  - **T11-1, P2 — timing predecessor outside selected evidence** (`productionReportingProjection.ts:522`): with predecessor `10:00:00.000100Z`, selection/scope start `10:00:00.000500Z` and next frame at `10:10Z`, the source snapshot contains only the latter. Existing timing gives zero minutes; the reference gives ten. Require predecessor membership in the selected effective evidence and existing scope/type stream; preserve the existing millisecond duration calculation. Add this exact regression and show it fails without the fix.
+  - **T11-2, P2 — incomplete report DTO** (`productionReporting.ts:138`): preserve `activeStaff`, `staffDays`, `avgOrdersPerStaffDay` and the bounded top-20 `skuBoard` currently supplied by `productionReportView.ts:238` and rendered by Reports. Add explicit scalar/bounded fields and mapping assertions. A paginated people list cannot be used to recover full totals by downloading every page. `dispatchedOrders` may remain derived from `byWorkType`.
+  - **T11-3, P2 — malformed optional detail selectors accepted** (`productionReporting.ts:284`): the validator accepts `staffId: {unexpected:true}`, `orderNumber: []` and `cursor: 42`. Validate provided types and blank policy consistently with the summary contract. Later server code still owns cursor decoding/scope/authorization. Add rejection tests; this is a validation gap, not evidence of an access leak.
+  - Reducer extraction, selected-context classification and pre-classification self filtering passed inspection. No source-rule redesign is requested. Deferred review subjects remain Tasks 12–20: SQL/materializer/auth integration, real-role/scale/freshness/capture evidence, browser behavior and release. No production or deployment inspection occurred.
+  - **Next:** Claude fixes only these Task 11 findings, records failing/passing regressions, runs the common gate, commits/pushes and pauses for focused verification before Task 12. The design clarification and narrow internal capture-role policies above are approved implementation details within the existing spec. No new package, timeout increase, smaller acceptance fixture, production action or SQL application is part of this handoff.
+- 2026-11-14 (Claude, Task 11 review fixes; checkbox left open for the planner's focused verification):
+  - **T11-1:** `referenceTimingLines` now walks the selection's own effective timing stream (selected evidence, millisecond range, work type, stream SKU, per worker), exactly as `frameTimingLines` does on the snapshot. It no longer uses the stored full-history predecessor. `TimingFact.prevAll/prevSameType` are documented as index hints that a range read must not trust on their own.
+    - Regression: the exact reproduction (predecessor `10:00:00.000100Z`, selection start `10:00:00.000500Z`, next frame `10:10Z`) gives 0 minutes on both sides.
+    - Companion case: the same-millisecond predecessor IS selected context (a qualification-family line), so both sides give 10 minutes.
+  - **T11-2:** `SummaryResult` now extends a new `ReportScalars`: `activeStaff`, `staffDays`, `avgOrdersPerStaffDay`, and `skuBoard` capped at `SKU_BOARD_MAX = 20`.
+    - Explicit mapping `toReportScalars(view)` rejects a non-integer or negative count, a non-finite or negative average, and more than 20 board rows. `dispatchedOrders` stays derived from `byWorkType`.
+    - Test: maps `buildProductionReportView` exactly for everyone and for a selected person, and checks the 20-row bound and each rejection.
+  - **T11-3:** `validateDetailRequest` rejects any provided `staffId`/`orderNumber`/`cursor` that is not a non-blank string, the same policy as `validateSummaryRequest` (now a shared `optionalText`). Cursor decoding, scope and authorization stay with later server code.
+    - Test: rejects `{unexpected:true}`, `[]`, `42`, `""`, `"  "`, `null`, `7` and a string `limit`; accepts valid strings.
+  - **Regressions proven:** reverting each fix in turn fails exactly its own test (T11-1, two T11-2 reverts, T11-3), with the other 59 passing.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 778/778 tests, build OK.
+  - Raw-order whitespace qualification semantics are unchanged, as the planner directed.
+
+- 2026-11-14 (Codex planner, focused fix verification at `8cf3dcc4664088892ada2b449a7006d88821e8f6`): **T11-1, T11-2 and T11-3 closed; Task 11 approved for continuation to Task 12.** Independent read-only inspection and a fresh 119/119 focused test run (60 projection, 37 counts, 12 report-view, 10 Welcome) verify selected-stream timing and both boundary/context regressions, explicit bounded report scalars, and malformed optional-selector rejection. The existing millisecond timing semantics and counting rules are preserved. Root verified exact-head CI SUCCESS, completed `2026-11-14T14:19:29Z` ([check](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43604191521/job/132475177496)); Claude's full gate records 778/778 tests plus type-checks/build. The timing paragraph now carries the selected-stream rule into Task 16. All future SQL, authorization, scale and release gates remain open. Task 12 may prepare migration/tests and run local checks; pause for planner review before any staging migration application. Staging-only execution will verify `ybrzhrgfrnvtcwymjdrq` before every SQL call under CJ's overnight delegation. No production action is authorized.
+- 2026-11-14 (Claude, Task 12 code; staging evidence pending, checkbox open):
+  - Read-only staging catalog inspection first, with the target checked: `production_events` has no triggers, and 0036 is the last migration. A new function gets PUBLIC execute by default, so 0037 revokes it explicitly.
+  - **`supabase/migrations/0037_reporting_storage.sql`**: one transaction, expand-only, no IF NOT EXISTS / OR REPLACE.
+    - Schema `reporting_private` with the 15 plan tables. Keys/checks: one active batch and one published generation per site; audience shape `(site ⇔ no staff)`; non-negative and safe-integer counts; journal image/key consistency; at least one supported site per change; ≤1 MiB chunks. Explicit tuple keys use `UNIQUE NULLS NOT DISTINCT`. Staged results reference work by a surrogate `work_id`, because a composite FK over the nullable audience would skip site rows.
+    - Facts are versioned by a `generation_seq` interval, with indexes per the plan.
+    - Guards (SECURITY INVOKER, `search_path=''`): any `capture_enabled` change advances `capture_epoch`, which never decreases; a published/superseded/expired generation's identity is immutable and its state only moves forward.
+    - Capture function (SECURITY DEFINER, `search_path=''`, no dynamic SQL, no exception handler): explicit INSERT/UPDATE/DELETE branches; supported old/new site only; identical-row UPDATE skipped; reads only the singleton control row; inserts one journal row with full old/new images; raises if control is missing.
+    - Defaults: capture disabled, processors off, every site `legacy`.
+    - **Access** (per the planner's capture-role clarification):
+      - Role `reporting_capture`: NOLOGIN NOINHERIT NOBYPASSRLS. It gets schema USAGE, control SELECT, changes INSERT and change-id sequence USAGE, plus two policies addressed only to it.
+      - No grants to PUBLIC/anon/authenticated. service_role gets USAGE and DML and cannot execute the trigger functions.
+      - The function is handed to the role via a temporary `GRANT reporting_capture TO CURRENT_USER WITH INHERIT FALSE, SET TRUE` and a temporary schema CREATE. Both are revoked in the same transaction. This is needed because the migration role is not a superuser.
+    - Rollback text is in the header.
+  - **Runner** `tests/staging/reporting-capture.ts` (`npm run staging:reporting-capture`) with pure checks in `tests/staging/reportingCapture.ts`. The second file is not named in the plan; it keeps the runner logic testable.
+    - Modes: `--rehearse-migration` (0037 applied inside a rolled-back transaction), `--check`, `--concurrency`.
+    - Every phase is target-guarded (URL ref plus the staging location and test users) and rolled back. The report is redacted and ends in exactly one STATUS line.
+    - It reuses the Task 4 write-compat replay with capture enabled. `become`/`runSteps` are now exported from `writeCompatRun.ts`, with no behavior change. The new npm script is in `package.json`.
+  - README: `supabase/staging/item-counting/reporting-README.md`.
+  - **Tests:** `tests/reporting/reportingSchema.test.ts`, 41 tests: the migration's text shape, plus the runner's catalog/step/overhead/concurrency/status checks against a designed-good state and 23 rejected deviations. 11 deliberate breaks of the migration (capture on by default, a client grant, CREATE kept, a swallowed failure, an INVOKER capture function, RLS missing on the journal, a client policy, a state-row lock, staging captured, an inheriting role, a journalled no-op) are each caught by a real test.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 819/819 tests, build OK. The new staging files also type-check under strict `tsc --noEmit`.
+  - **Not done:** any staging run. See Open questions "Task 12 staging steps".
+
+- 2026-11-14 (Codex planner, focused Task 12 pre-staging review at `f487679201b5db4812942be187443ac87b806997`): **changes required before rollback-only rehearsal.** Independent read-only review passed 41/41 schema/model tests; root verified exact-head CI SUCCESS ([check](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43605532231/job/132479240479)). These do not prove PostgreSQL execution. No migration or staging runner was executed. Fix the following under CJ's overnight delegation, then commit/push and pause for focused verification:
+  - **T12-1, P1 — migration privilege sequence** (`0037_reporting_storage.sql:535–547`): after ALTER OWNER and membership revocation, the non-superuser migration role lacks the authority/EXECUTE needed by subsequent function REVOKE and CREATE TRIGGER. Create the source trigger and finish function ACL revocation while the migration role still owns the function; transfer ownership and clean up temporary privileges last. Moving CREATE TRIGGER before membership revocation alone is insufficient with INHERIT FALSE. Test statement ordering and later verify actual final owner/ACL/membership in the rollback rehearsal. 0037 is this branch's unapplied draft; correct it before its first application, leaving every pre-existing 0034–0036 migration byte-identical.
+  - **T12-2, P1 — target guard at every query boundary** (`reporting-capture.ts:78–90,196–199,248`): current guards are only per phase. Wrap the actual client query boundary with an immutable staging-target assertion, including migration statements, shared helper queries, role changes and cleanup. The local assertion must check the target contains `ybrzhrgfrnvtcwymjdrq` before issuing SQL and work even in an aborted transaction; do not issue another SQL guard before ROLLBACK. Add tests proving an invalid target issues zero queries and valid cleanup remains possible after an SQL error. Keep the separate staging-marker verification.
+  - **T12-3, P2 — preserve database timeout** (`reporting-capture.ts:75`): remove `statement_timeout: 5 * 60_000`. Preserve and record the applicable existing settings; authenticated steps retain their catalog limit. No session/global/role timeout increase is approved.
+  - **T12-4, P2 — retained failures and truthful restoration** (`reporting-capture.ts:178–183,279–296`, `reportingCapture.ts:357`): use immutable run-specific result names so a new invocation never overwrites a failed result. Attempt a fresh guarded restoration audit after cleanup on both success and failure, including schema, capture role/membership, source trigger/ACL and fixture state. A rollback/disconnect/audit failure is explicit and cannot yield COMPLETE; do not state "nothing kept" until verified. Add runner lifecycle tests for fatal migration failure, cleanup failure and inaccessible verification, alongside successful restoration. Keep partial outputs and redact secrets.
+  - **T12-5, P2 — actual capture plus stock compatibility and ID change** (`reporting-capture.ts:257–263`, `reportingCapture.ts`): keep the unsupported `staging` replay, but add a narrowly scoped rolled-back supported-site case proving journal insertion plus ordinary deduction/idempotent retry together. Use only synthetic test rows and restore stock/ledger/permissions; never alter existing AU production-like fixtures. Add a source event-ID update assertion proving both old/new keys and images survive in the journal.
+  - Existing classification, source policies, inventory implementation and acceptance values remain unchanged. New helper exports from `writeCompatRun.ts` do not alter its previous behavior or invalidate retained Task 10 evidence. Future job/read/scale/browser gates are not reviewed as missing; the activation-boundary checkpoint above must be resolved before a complete publication is possible. No new dependency, production access, merge or deployment is authorized.
+- 2026-11-14 (Claude, Task 12 review fixes; no SQL run; checkbox open):
+  - **T12-1:** 0037 (still an unapplied draft; 0034–0036 byte-identical) now revokes the capture function's ACL and creates the source trigger while the migration role still owns the function. The ownership hand-over and the temporary-privilege cleanup are the last statements before COMMIT: GRANT membership, GRANT CREATE, ALTER OWNER, REVOKE CREATE, REVOKE membership. Nothing after the hand-over touches the function. A text-order test pins this.
+  - **T12-2:** `stagingTarget` parses STAGING_DB_URL once into a frozen target (rejects non-staging). `guardClient` wraps each client so EVERY `query` locally checks the frozen target and the client's own connection `host`/`user` before sending, and refuses with a rejected promise and zero SQL otherwise. The check is local, so cleanup still works in an aborted transaction. The runner creates clients only via `openGuarded` (one `new pg.Client`, wrapped). Helpers (`become`, `runSteps`, `catalog`), migration statements and cleanup all go through it. The staging-marker SQL check runs on every new connection.
+  - **T12-3:** the 300 s client `statement_timeout` is removed. No statement/idle timeout is set. The existing `statement_timeout`/`lock_timeout`/`idle_in_transaction_session_timeout` are recorded in the report. Only the concurrency probe keeps a transaction-local `lock_timeout = 3s`.
+  - **T12-4:** each invocation writes `staging-results-reporting-capture-<mode>-<start>-<random id>.md` and refuses to overwrite. `runCaptureLifecycle` runs the body, attempts ROLLBACK and disconnect (each failure recorded as "cleanup failed"), then ALWAYS opens a fresh guarded connection to audit restoration against the starting snapshot. The snapshot covers schema/ACL/control/site state, capture-role existence, `production_events` triggers, and fixture state: rc-/wc- events, synthetic products, test ledger rows, staging stock and an AU stock fingerprint. COMPLETE requires a verified audit. A failed or inaccessible audit gives "restoration not verified", and the report no longer says "nothing kept" unless verified.
+  - **T12-5:** new steps:
+    - c20–c22: an event-ID change keeps old and new keys and images.
+    - k01–k07: one rolled-back savepoint group at au, while capture is enabled. Two synthetic products (`rc-sup-*`); a kiosk completion; deduction `ok:2:0`; retry `ok:0:2`; stock 10→8 and 5→4 with 2 ledger rows; the completion journalled; afterwards `0:0:0` remaining. Existing AU products are untouched.
+    - The staging-site write-compat replay stays.
+  - **Tests:** `tests/reporting/reportingSchema.test.ts` adds the T12-1 order test. The new `tests/reporting/reportingCaptureRunner.test.ts` (not named in the plan) adds 17 tests: guard/zero-query/drift/aborted-cleanup; runner opener; no timeout override; output names; lifecycle success, fatal migration failure, cleanup failure, inaccessible audit and leftovers; snapshot comparison; stock and ID-change steps.
+  - **Regressions proven:** reverting each fix in turn fails its tests. That covers 10 reverts: old privilege order; per-query guard removed; unguarded runner client; timeout back; no audit after failure; status ignoring restoration; fixed output name; cleanup failure swallowed; stock group removed; ID-change steps removed.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 836/836 tests, build OK; the staging files and new tests also pass strict `tsc --noEmit`.
+  - The activation-boundary issue is left for the planner, as instructed.
+- 2026-11-14 (Claude, recording the planner's focused fix review at `a029bd2` and the two runner integration fixes; no scope change, no SQL run):
+  - **Planner feedback:**
+    - 58/58 tests passed and exact-head CI was SUCCESS (14:50:26Z). Migration order, target guard, no timeout override, retained reports, and the stock and ID scenarios are verified.
+    - Two runner integration defects remained. (1) `openGuarded` could throw on the marker check after connecting, before returning the client, so the lifecycle could not end it and a failed run could hang. (2) In the concurrency probe, the second connection read the private journal while still `staff`, giving 42501 and a silent `seen = -1`.
+  - **Fix 1:** new `openGuardedClient(make, target, marker, redact)` in `tests/staging/reportingCapture.ts` creates and guards the client, connects, and runs the marker. On a connect or marker failure it ends the client, then rethrows the original error with its message and code kept, plus `; cleanup failed: disconnect: …` when `end()` itself fails. A wrong target throws before any connect. `openGuarded` in the runner now only builds the pg config and calls it.
+  - **Fix 2:** the probe moved to `concurrencyProbe(...)` in the same module, with `become` injected and the runner calling it. Only after a SUCCESSFUL second insert does it `reset role` and then read the journal. A failed insert leaves the transaction aborted, so only ROLLBACK follows. A journal read that still fails is an error, not a silent -1. The second connection is always rolled back and ended.
+  - **Tests** (`tests/reporting/reportingCaptureRunner.test.ts`, 8 new; a pg-like fake records each statement and its effective role, and denies the journal to client roles as staging does):
+    - opener: marker failure ends the client; connect failure ends it and keeps the code; a cleanup failure is appended as evidence; success is returned not ended; a wrong target never connects; in the lifecycle, a first-connection marker failure ends that client and fails the run while the audit still runs on a second, ended client;
+    - probe: success order is insert → `reset role` → journal read → rollback, seeing exactly 1 row; a failed insert gives only `rollback`; a failing read raises.
+  - **Regressions proven:** each fix reverted in turn fails its tests (opener not ending the client; runner bypassing the shared opener; no role reset; reading after a failed insert).
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 844/844 tests, build OK; strict `tsc --noEmit` on the runner, module and tests is clean.
+
+- 2026-11-14 (Codex planner, Task 12 verified at `8c11d4ed6dc71bafd176d7843d654554b189a4df`): **Task 12 complete; Task 13 may prepare code.** Root inspected the two localized runner fixes, freshly passed 66/66 focused tests and verified exact-head CI SUCCESS ([check](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43607357722/job/132484777873), completed 14:56:17Z). Claude's full gate records 844/844 tests plus both type-checks/build. Only staging `ybrzhrgfrnvtcwymjdrq` was accessed, with target checks before every SQL call.
+  - Rollback rehearsal `staging-results-reporting-capture-rehearse-migration-20261114T145725840Z-5e5c3d0c.md`: COMPLETE; 85 migration statements executed; grants/roles, actual capture, correction/site/ID moves, rollback/failure behavior, supported-AU deduction/idempotent retry and existing write paths passed; fresh restoration audit passed.
+  - Applied the exact reviewed 0037 through the Inka Staging connector, migration name `reporting_storage`; SHA-256 `531BB2C5706B9AC4D73A7CA3DC74DEAD7E34A53160E57FE2971AAF061C6A6A4F`. Preflight showed PostgreSQL 17.11, schema/role absent and no source trigger. Result `success:true`. Full installation/operator outputs are in ignored `staging-results-reporting-install-20261114T1500Z.md`.
+  - Installed check `staging-results-reporting-capture-check-20261114T150030637Z-14fde372.md`: COMPLETE; fresh restoration passed. Bulk off/on medians 0.529/0.644 ms per row (delta 0.115 ms, 21.8%). Rehearsal was 25.3%. These are diagnostic costs, not a passing Task 19 p95 result; the 10% full-capture gate remains unchanged and open.
+  - Enabled capture at epoch 2 for `staging-results-reporting-capture-concurrency-20261114T150210669Z-35dbd11a.md`: COMPLETE; first transaction held 680 ms, second finished in 90 ms, exact private journal check and fresh restoration passed. Then disabled capture again, epoch 3, pending the activation protocol.
+  - Final fresh SQL: capture false, journal/generations/test events/synthetic products all zero; all three sites legacy/off. Installed schema remains. No production access, source fixture retention, merge or deploy. Evidence artifacts remain ignored/uncommitted; this plan records their disposition.
+  - Task 13 includes the explicit activation/shared-lock and cross-site receipt decisions above. Prepare its code/tests, common gate, commit/push and pause for migration review before any SQL application. Existing 0037 is now installed and immutable. Task 19 performance and Task 20 browser/hosting/release evidence remain open.
+- 2026-11-14 (Claude, Task 13 Part A; no SQL run; checkbox open; Part B blocked on Open questions "Task 13 Part B"):
+  - **`supabase/migrations/0038_reporting_jobs.sql` (draft, Part A)**, one transaction:
+    - **Fence:** `GRANT UPDATE (updated_at)` on control and policy `control_capture_lock` (`FOR UPDATE TO reporting_capture USING (singleton) WITH CHECK (false)`). `CREATE OR REPLACE` of the capture function: the identical 0037 body, except the control read is `FOR SHARE`, before the enabled check. Owner, ACL and trigger are unchanged. Replacing it needs the owner's privileges, so the migration role holds `INHERIT TRUE, SET FALSE` membership for exactly that statement.
+    - **`public.set_reporting_capture(boolean)`:** SECURITY INVOKER, `search_path=''`, service_role only. It sets the transaction-local `lock_timeout` to 3 s only when the current limit is 0 or above 3 s, then updates control only when the value changes (0037's guard advances the epoch) and returns epoch/enabled. No source writes, no exception handler.
+    - **Receipts:**
+      - Internal `site_pending_changes(site)` (STABLE SQL; pending = unacknowledged, touches the site, no PUBLISHED receipt of that site).
+      - Internal `acknowledge_received_changes(site, batch)` (idempotent; acknowledges only when every distinct supported side has a published receipt; `batch_id` = the completing batch or, in a delayed pass, the latest published receipt, as 0037's ack check requires).
+      - New index `batches(site, state)`. `changes.batch_id` is never a claim, and no max-id cursor is used.
+    - **`public.begin_reporting_batch(site)`:**
+      - Lock order: control `FOR SHARE`, then `site_state FOR UPDATE`. An active batch is returned unchanged (`reused`).
+      - Requires processor enabled, capture enabled, and a published base with `source_epoch` = current epoch; otherwise it says a rebuild is required.
+      - It runs the delayed acknowledgement pass, creates a `refresh` batch with fence +1 and a 360 s lease, then freezes in ONE `WITH` statement: exact membership from `site_pending_changes`, plus the current image or tombstone of this site's old/new keys, plus due future keys from `source_current`. No LIMIT.
+    - **`public.get_reporting_job_status(site)`:** metadata only.
+  - **`api/_lib/reporting-jobs.ts`:** typed wrappers (`setReportingCapture`, `beginReportingBatch`, `getReportingJobStatus`) over a minimal RPC interface. Strict row validation; DB error codes are kept; no env or credentials. Also the pure receipt rules (`pendingForSite`, `acknowledgeable`).
+  - **Runner `tests/staging/reporting-jobs.ts --fence`** (`npm run staging:reporting-jobs`; needs 0038 applied): scenarios F1–F6, with pure checks in the new `tests/staging/reportingFence.ts`.
+    - Guarded/marker-checked clients and no timeout override (scenario-local `lock_timeout` only where the scenario is about lock waits).
+    - Source writes are rolled back. Toggles are committed through the RPC as service_role, and capture returns to its starting state.
+    - A fresh audit runs after success and failure. Every scenario connection is rolled back and ended, and every cleanup failure is reported.
+  - **Capture runner and catalog:**
+    - The concurrency probe now records a failed second-connection disconnect (`cleanup failed: second connection disconnect`).
+    - `CATALOG_SQL` and `checkCatalog` gain 0038 expectations: control column UPDATE privileges, the public RPCs' definer/search_path/execute ACL, helper EXECUTE for service_role only, and the lock policy. `catalogLevel` expects all of 0038 when any of its objects is present, so a partial install fails. 0037's expectations are unchanged.
+    - `runCaptureLifecycle` is now generic over the report type.
+  - Shared helpers moved within the capture module; `package.json` gains `staging:reporting-jobs`, and `typecheck:digest` now includes `api/_lib/reporting-jobs.ts` and `tests/reporting/reportingJobs.test.ts`.
+  - **Tests:** `tests/reporting/reportingJobs.test.ts` and additions to the capture runner/schema tests.
+    - The 0037 file hash is pinned to its installed SHA-256.
+    - 0038 text: fence, privileges, lock order, single-statement freeze, receipts, service-only ACLs.
+    - Receipt model: AU→UK in both publication orders, failure/restart, the other site's active batch, delayed acknowledgement, a late smaller id.
+    - Wrapper validation; 0038 catalog acceptance plus 9 rejected deviations; fence checks plus 12 rejected deviations; runner structure; disconnect reporting.
+  - **Mutations:** 13 deliberate breaks are each caught: FOR KEY SHARE; the lock after the enabled check; a capture_enabled privilege; a permissive lock policy; an uncapped timeout; the wrong lock order; pending ignoring the receipt site; ack after one side; a LIMIT/max-id freeze; a swallowed disconnect; the catalog accepting a capture_enabled UPDATE; fence accepting any old-snapshot result; the receipt model ignoring the site.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest` (now incl. the new API module and tests), 890/890 tests, build OK; strict `tsc --noEmit` clean on the runners and tests; 0037 byte-identical. Part B (claim/stage/publish, rebuild/backfill, receipt interleavings on staging) waits for the planner.
+
+---
+
+## Historical plan and evidence — retained, not current reporting instructions
+
+The remainder is the prior plan preserved from `83a3fd4`. It contains superseded approaches and historical approval labels; do not treat them as authority to skip the operative amendment above. Task 4's M6 contract and unfinished evidence, Task 9's browser checklist, source-rule tests and existing implementation log remain prerequisites/history. New work is recorded in the amendment log rather than rewriting historical results.
+
+Prior status: approved by CJ; Tasks 1–8 implemented, Task 9 waiting on CJ's staging browser checklist; review r1 M6 acceptance reopened with collector/evidence still pending.
+
+## Approach
+
+Implement the approved F1 spec as read-only interpretation of saved production events. The spec's paragraphs still labelled “Draft” are part of CJ's approved spec; do not reopen their completion, qualification, quantity, rework or period decisions. Use the existing React/TypeScript, Supabase client, Vitest and XLSX stack. Add no dependencies.
+
+Put the item classifier, event reducer and production-period conversion in small pure modules under `src/lib/domain/`. Add a browser/server-safe production evidence reader under `src/lib/repository/supabase/` that accepts a client instead of constructing one. Reports, Welcome, Production and the digest consume the same evidence and calculations. Keep presentation selectors separate from counting, and separate frame-time observations from the newly expanded Items metric. This avoids changing inventory routing or turning UN output into framing time.
+
+The current source needs more than an eligibility change: Reports derives Orders from verifications and filters people before resolving cancellations; Welcome omits cancellation/parent/case identity; Production increments local counters separately and counts completion rows on reload; the digest has duplicate SKU/date logic, unpaged reads and summed department order counts. `pageThrough.ts` also silently returns after 100 pages. F1 will use its own complete evidence reader rather than changing unrelated callers of that generic helper. The architecture document predates S1; the current authenticated digest and `tests/api/daily-digest.test.ts` are the security baseline.
+
+`Repository.ts`, `DexieRepo.ts` and `SupabaseRepo.ts` stay unchanged: these production screens already read Supabase directly. Both repository backends remain supported for their existing flows; pure calculations run against plain fixtures without either backend. This does not add offline production storage to Dexie. If implementation needs a repository-contract change, stop and amend the plan to implement and test both adapters before proceeding.
+
+Task 4 policy/JWT amendment (pending CJ approval): CJ approved proceeding with fixes (c) and (d) from the newest staging Open question only. Add `0036_production_events_select_initplans.sql` (verify next unused number), replacing only the TWO SELECT policies on `public.production_events` with equivalent statement-cached predicates, and correct the test harness to use realistic session claims and prove policy parity. The previously implemented (a)/(b) changes in 0035/v2 and the loader remain unchanged, as do 0034/v1, encoding, four evidence families, workload, catalog-derived 8 s role timeout and 2 s/10 s targets. No helper functions, other tables' policies, INSERT/UPDATE/DELETE policies, grants, role settings, timeouts, indexes, tables/columns, data, storage or HTTP handlers change. CJ alone applies SQL, staging first. This amendment changes Task 4 and shared approach/performance/hardening/staging/release/out-of-scope text only; Tasks 1–3 and 5–9 need no edits because their loader/snapshot interface is unchanged. Existing checked steps and Implementation log entries are historical records. No counting moves into SQL and no dependencies are added.
+
+All new paths are under already-whitelisted `src/`, `tests/`, `docs/` and `supabase/`; this amendment needs no `.gitignore` change. No credentials or `.env*` files are part of this work. Shared modules must not import `getSupabase`, browser state, `import.meta.env` or server secrets. Server imports use relative paths compatible with `typecheck:digest` and the Vercel build. Browser reads keep the signed-in client; digest credentials remain server-only. Use Supabase's [function security guidance](https://supabase.com/docs/guides/database/functions) and [RLS documentation](https://supabase.com/docs/guides/database/postgres/row-level-security) for caller visibility, and PostgREST's [scalar RPC contract](https://docs.postgrest.org/en/stable/references/api/functions.html) for transport. No SDK upgrade is required.
+
+### Evidence and interface contract
+
+The following names are the interfaces between tasks; define their exported types in the owning module.
+
+- `productionItems.ts`: `classifyProductionSku(sku: unknown): ProductClassification` and `countProductionItems(sku: unknown, quantity: unknown): ItemCount`. Product classification is `eligible | excluded | unclassified`, with reason and a valid piece multiplier for eligible products. Item count is `counted | excluded | unclassified`, with `items`, product classification and issue reasons. Keeping product classification independent of quantity allows an eligible SKU with missing quantity to qualify an Order while warning about Items.
+- `productionPeriods.ts`: `ReportSite = 'au' | 'uk' | 'us'`; `productionDateAt(instant: Date, site: ReportSite): string`; `productionRange(site: ReportSite, firstDate: string, lastDate: string): ProductionRange`; `shiftProductionDate(date: string, days: number): string`; `productionWeekStart(date: string): string`. `ProductionRange` contains site, timezone, first/last production dates, and ISO `startUtc`/`endUtcExclusive`. Validate actual calendar dates and ordered ranges. Unsupported sites have no guessed timezone.
+- `productionCounts.ts`: `ProductionEvidenceEvent` retains `id`, `location`, `staff_id`, `department`, `order_number`, `line_sku`, raw `line_quantity`, `event_type`, `created_at`, `parent_event_id`, `cs_case_id`. Validate runtime facts instead of silently coercing missing quantities. `ProductionSnapshot` contains immutable events, requested range, `asOfUtc`, `loadedAtUtc`, and visibility metadata (`site` or `limited`, with reason). `prepareProductionEvidence(snapshot): PreparedProductionEvidence` resolves identity, cancellation and terminal qualification once. `summarizeProduction(evidence, scope): ProductionSummary` applies a `ProductionScope` with range and optional staff/work-type filters after preparation.
+- `ProductionSummary` exposes separate `normal` and `rework` totals, each with Items and distinct order keys, plus per-work-type, per-person and per-order detail using those same keys. Coverage carries deduplicated event-linked issues: unclassified SKU, invalid quantity/identity/time, missing completion detail, unresolved parent, corrected verification/terminal, ambiguous repeats and limited visibility. Expected excluded lines are counted separately, not as missing history. Keep case IDs in rework detail. Callers may format these outputs but must not independently count events.
+- `productionEvidence.ts`: `loadProductionEvidence(client: SupabaseClient, request: ProductionReadRequest): Promise<ProductionSnapshot>`. The request specifies one site, the enclosing display/comparison range, a fixed `asOfUtc`, visibility metadata and an optional abort signal. It does not accept a display person filter. An incomplete/failed transport read rejects; it never returns a success-shaped empty/partial snapshot.
+- `useProductionSummary.ts`: browser-only hook taking the request, display scope and refresh key, returning loading/current/stale/error status, snapshot/summary and `refresh()`. Query identity includes authenticated user, location, range and visibility; changing identity clears the prior result. Pure selector modules used by each page consume the same prepared evidence, enabling tests without a new DOM testing dependency. Unsupported `default`/`staging` locations show an explicit unavailable-period state; they never silently use AU or browser time.
+
+### Snapshot, context and performance rules
+
+Capture one `asOfUtc` at refresh/request start and pass it with the site and enclosing window to one RPC, including digest comparison days. Display events use `[startUtc, endUtcExclusive)` and every evidence family requires `created_at <= asOfUtc`. Freeze the validated evidence in memory for all projections in that refresh. Future normal writes are picked up by the next refresh; never publish a partial payload or mix refreshes.
+
+The function returns one scalar `json` envelope, not `SETOF`/`RETURNS TABLE`, so PostgREST's max-rows cap cannot limit the evidence array. No internal `LIMIT`, page ceiling, context batch ceiling or success-shaped timeout is allowed. Use typed named RPC parameters, not interpolated SQL/filter strings. V2 omits per-row location, dictionary-encodes staff IDs/SKUs and has no SQL `ORDER BY`, including in aggregates or dictionary construction. Row and dictionary order on the wire are unspecified; the loader normalizes decoded events once by exact `(created_at, id)`. All eleven domain evidence fields survive decoding. Version and validate the encoding before constructing a snapshot; transport completeness is distinct from RLS coverage.
+
+**V2 wire contract:** `public.load_production_evidence_v2(p_site text, p_start_utc timestamptz, p_end_utc_exclusive timestamptz, p_as_of_utc timestamptz) RETURNS json`. The envelope has exactly ten keys: `{version: 2, site, startUtc, endUtcExclusive, asOfUtc, complete: true, rowCount, staffIds, skus, rows}`. `site` is the exact requested site; all three scope timestamps are text representing the exact requested instants, allowing equivalent UTC offsets. `rowCount` is a nonnegative JSON safe integer equal to raw `rows.length` before client deduplication. Invalid SQL inputs return SQL NULL without scanning evidence, exactly as v1: null/blank site, null/nonfinite timestamps or start >= end. A nonblank unknown site is not newly rejected; existing RLS/site predicates determine its empty result. A valid empty result has `rowCount: 0`, `staffIds: []`, `skus: []`, `rows: []`.
+
+| V2 tuple slot (zero-based) | Decoded field / encoding |
+| --- | --- |
+| 0 | `id`: nonempty string. |
+| 1 | `staff_id`: zero-based index into `staffIds`, or JSON null for SQL NULL. |
+| 2 | `department`: string or null. |
+| 3 | `order_number`: string or null. |
+| 4 | `line_sku`: zero-based index into `skus`, or JSON null for SQL NULL. |
+| 5 | `line_quantity`: finite JSON number or null, with no coercion/default. Invalid business quantities still become reducer coverage issues. |
+| 6 | `event_type`: string; existing family/type checks apply. |
+| 7 | `created_at`: PostgreSQL timestamptz JSON text, retaining every microsecond. |
+| 8 | `parent_event_id`: string or null. |
+| 9 | `cs_case_id`: string or null. |
+
+Each row has exactly ten slots; there is no row-level location slot. Decode `location` from the validated envelope `site`. `staffIds` and `skus` contain each distinct nonnull saved value used by the returned evidence exactly once, as strings; preserve case, whitespace, punctuation and empty strings without normalization. Null is never a dictionary entry or a sentinel index. Every nonnull index must be a JSON safe integer with `0 <= index < dictionary.length`; reject strings, booleans, fractions, negative/out-of-range/unsafe indexes. Reject malformed dictionaries, duplicate entries by exact string equality and unused entries, including nonempty dictionaries on an empty result. Build each dictionary only from the final authorized, site/cutoff-bounded evidence set, never from unrelated rows or global staff/product tables. Freeze one mapping per dictionary within the statement and use that same mapping to encode all rows; do not independently aggregate values and indexes in unspecified orders. Use set-based mapping joins, not a linear dictionary lookup for every row. Dictionary order may differ between calls without changing decoded evidence.
+
+Choose timestamp **text**, as in v1: ISO-8601 date/time with explicit UTC offset (`Z` or numeric offset), zero to six fractional digits, no rounding/truncation of nonzero microseconds. Pass `e.created_at` to JSON construction as timestamptz, preserving PostgreSQL's serialization; do not round-trip it through epoch milliseconds. The existing `instantMicros` parser produces bigint comparison keys for scope, cutoff, family checks and the single loader sort; `created_at` stays text in `ProductionEvidenceEvent`. This avoids a new safe-integer epoch-microsecond range restriction or numeric conversion path and leaves Tasks 1–3 unchanged. Equivalent offset spellings compare as instants. The observed 14.1 MB/4.19 s candidate used numeric timestamps, so it is not evidence for this text encoding's size or latency; measure the actual v2 payload and all client costs.
+
+Preserve the current loader's four families in one SQL statement: (1) window `line_verified`, `completed`, `dispatched` and `cancelled` rows; (2) before-window `line_verified` rows whose nonblank order number occurs on a window terminal; (3) before-window rows referenced by a window cancellation's nonempty `parent_event_id`, regardless of parent type so invalid links remain visible to the reducer; (4) cancellations at or after the exclusive window end whose parent is a window verification or terminal. Every table reference/join is same-site, under existing RLS and the fixed cutoff, including context candidates. Use set joins/EXISTS to avoid multiplying rows, and union distinct saved events before encoding. All authorized workers are included; no display-person/work-type/case filtering in SQL. Exact terminal qualification, cancellation validity, item eligibility and credit remain in the TypeScript reducer. Before-window qualification supplies original evidence even if later cancelled; it does not contribute displayed Items. Do not expand this into recursive ancestry or an all-history cancellation fetch: these four families match `Reader.readOnce` and the spec's displayed-item/terminal-qualification rules.
+
+Replace the two validation passes and automatic changed-data retry with the single statement's MVCC snapshot. Spec C and Hardening 1 require a stable read boundary and explicit later-correction semantics, not two passes; PostgreSQL [STABLE functions use the calling query's snapshot](https://www.postgresql.org/docs/current/xfunc-volatility.html). This prevents inter-family insert/update/delete mixtures more directly than comparing two separate reads. Client-supplied timestamps still do not reconstruct transaction history: a backdated write committed after statement start appears on a later refresh, even with the same cutoff. Keep “as of” and “loaded at” labels and test frozen-current versus corrected-next refresh. Retain `ProductionReadError` kinds: `failed` for invalid requests/RPC/transport errors; `incomplete` for malformed, missing or inconsistent envelope/rows and deadlines; `changed` for contradictory payloads for the same event ID (an impossible coherent snapshot, never a valid count); `aborted` for caller cancellation. Identical repeated IDs deduplicate, conflicting ones reject. Ordinary concurrent writes no longer produce `changed` or a second RPC. Never fall back to the old loader if the function is missing or fails.
+
+RLS filtering is not a transport error and cannot be discovered merely from a successful empty response. Use conservative visibility metadata from the current authenticated role/site contract: staff/self-limited or unverified access is labelled “visible records only; coverage limited,” including qualification and correction coverage. Owner/manager/kiosk/CS site access must be verified on staging against existing policies; nav permission is not proof of row access. Never use a server credential in the browser. A digest using an anon fallback must not label an RLS-empty result a complete site report; fail with configuration/coverage error unless full site visibility is established by its existing server credential path.
+
+Prepare indexed maps once. Cancellation resolution and accumulation should be linear; chronological normalization can sort once in O(n log n). Qualify terminal events with a chronological sweep/prefix state per site/order/work-type/case, not repeated full-history scans. Reuse prepared evidence for all display groups. Task 4 records the one RPC, database execution including scalar-body text serialization, payload/transfer, client parsing/dictionary validation/decoding/sorting, reducer and total timings. SQL evidence must use the actual `authenticated` role's `statement_timeout` read from `pg_roles` after each `SET LOCAL ROLE authenticated`; the unchanged value must be 8 s, never raised. Use full realistic Supabase session claims, record their UTF-8 byte size and reject minimal claims. Require the approved policy definitions/hash and before/after parity evidence. Run the real PostgREST scalar statement shape to completion, including full-body conversion to text, before API measurements; EXPLAIN alone is insufficient. SQL cancellation, missing/mismatched settings, claims or policy evidence blocks API timing and fails the gate. Targets remain one-day within two seconds and three-month within ten seconds after authentication; measure the one-day digest end-to-end excluding email in Tasks 8–9. Three-month timing uses the shared harness, not a new range endpoint. Runtime limits fail visibly. A missed target after (c)/(d) blocks Task 4 and requires a new Open question for CJ; no further policy/helper rewrite, changed target, timeout increase, split read or reduced workload is authorized here.
+
+### Review focus
+
+- Same order, different terminal times: later eligible work must not qualify an earlier excluded-only completion (Task 3).
+- Another worker's later cancellation, with a missing case tag on the cancellation: parent identity and saved credit win over the display filter and cancellation payload (Tasks 3–4).
+- Large tied-timestamp payloads and backdated concurrent writes: neither missing rows nor a mixed refresh may be presented as a complete result (Task 4).
+- Fast worker/location changes or midnight-to-04:00 rollover: an old asynchronous response must never replace the new scope's counter (Tasks 6–7).
+- UN set output amid framed observations: Items changes must not change the frame-time denominator, stock payload or packaging selection (Tasks 1, 5, 7 and 9).
+
+## Tasks
+
+Execute in order, with one writer and one commit per task. CJ must approve this draft before the coder starts. Implementation takes place on `feature/item-counting`, never `main`; use the repository's coder handoff process. This planning pass writes only this file and does not run implementation, commit, push, merge, deployment or SQL steps.
+
+**Every task's completion gate:** write its new behavior tests first, run them to demonstrate the intended failure, implement, then run the focused tests and all four commands below. Require exit code 0, all tests passing, and inspect build warnings. Tick that task and add one Implementation log line with commands/results, relevant limitations and staging evidence before making its single `task N: <summary>` commit. CI on the feature PR must be green for the task's committed head before handoff; a local pass is not a CI pass. Build runs per task here, exceeding the once-per-feature minimum. If CJ's manual staging step is pending, record it as pending rather than claiming full completion.
+
+```sh
+npx tsc -b
+npm run typecheck:digest
+npm run test -- --run
+npm run build
+```
+
+### [x] Task 1: Add strict piece counting and lock down routing regressions
+
+- Files: create `src/lib/domain/productionItems.ts`, `src/lib/domain/__tests__/productionItems.test.ts`, `src/lib/domain/__tests__/skuRouting-regression.test.ts`.
+- Consumes: `parseSku`, existing package catalogue constants and routing helpers from `src/lib/domain/skuRouting.ts`.
+- Produces: the classifier/item-count interfaces above. Reuse the parser without changing its capture/routing grammar. Recognize the digest's current `INKA-AUX[A-Z]{2,4}` free-print form in this counting module, plus parsed legacy AUX-FP; classify only known packaging codes/IDs from the existing catalogue as excluded. Unknown packaging-like strings remain unclassified. A malformed S0/S1/S10 or unsupported format never becomes a single. No changes to `isLineMyDept`, `shouldDeductAtDept`, catalogue decomposition or package selection.
+- Do:
+  - [x] Add table-driven failing tests for FB/FW/FN/UN singles and S2–S9 sets, GW sets, PF PB/PW/PN, both free-print forms, gift cards, hooks, packaging, SC, unknown/missing SKU, case/whitespace normalization and unsupported variants/sizes.
+  - [x] Implement finite nonnegative safe-integer quantity validation and safe multiplication without defaulting null to one. Preserve product classification when quantity is invalid; return unclassified item coverage for that invalid quantity, including on an excluded product. Zero is valid. No coercion of strings, fractions or booleans.
+  - [x] Characterize existing routing/deduction results before consumer edits: the approved UN S2 quantity 2 yields four KPI items but keeps the original catalogue quantity calculation; framed/PF/GW/free-print routes and package choices are unchanged. These are reporting-versus-stock regression tests, not a new inventory algorithm.
+- Done when: named cases `unframed_two_sets_are_four`, `frame_is_one_item`, `s0_s1_s10_are_unclassified`, `invalid_quantity_is_not_defaulted` and `kpi_multiplier_does_not_rededuct_components` pass; test null/undefined, negative, fractional, NaN/infinities, unsafe quantity and multiplication overflow. Run `npm run test -- --run src/lib/domain/__tests__/productionItems.test.ts src/lib/domain/__tests__/skuRouting-regression.test.ts`, then the common gate.
+- Commit: `task 1: add shared production item classification`.
+
+### [x] Task 2: Define site-local production dates and windows
+
+- Files: create `src/lib/domain/productionPeriods.ts`, `src/lib/domain/__tests__/productionPeriods.test.ts`.
+- Produces: period interfaces above; AU `Australia/Sydney`, UK `Europe/London`, US `America/Chicago` only.
+- Do:
+  - [x] Test local 03:59:59 versus 04:00, inclusive custom end date, Monday-start week, year/month/leap boundaries, invalid calendar input and unsupported location. Test identical results under different host/browser timezones.
+  - [x] Implement each local 04:00 boundary independently using built-in `Intl.DateTimeFormat(...).formatToParts` and UTC calendar arithmetic. Round-trip the resolved local components; never parse a site-local date in the browser's zone or add 24 UTC hours to get the next boundary. No date library dependency.
+  - [x] Test both DST directions at all three sites. For example UK production date `2026-03-28` is `[2026-03-28T04:00:00Z, 2026-03-29T03:00:00Z)` and `2026-10-24` is `[2026-10-24T03:00:00Z, 2026-10-25T04:00:00Z)`. Add AU dates `2026-04-04`/`2026-10-03` and US `2026-03-07`/`2026-10-31` with independently asserted UTC boundaries.
+- Done when: current production date is the previous local date before 04:00; spring/fall days span 23/25 hours correctly; a selected multi-day range ends exclusively at 04:00 after its final date. Run `npm run test -- --run src/lib/domain/__tests__/productionPeriods.test.ts`, then the common gate.
+- Commit: `task 2: add shared production day boundaries`.
+
+### [x] Task 3: Resolve effective events and distinct completed orders
+
+- Files: create `src/lib/domain/productionCounts.ts`, `src/lib/domain/__tests__/productionCounts.test.ts`, `tests/fixtures/item-counting.ts`.
+- Consumes: Tasks 1–2. Produces: evidence/scope/summary types and preparation/projection functions in the interface contract.
+- Do:
+  - [x] Create a reusable fixture with workers A/B, all four work types, AU/UK/US, normal work and two CS cases. Start with two UN S2 units: four Items before completion, zero Orders; after one qualifying terminal: four Items, one Order. Expected results are explicit constants, not calculated by the function under test.
+  - [x] Deduplicate by `(location,id)`. Identical retrieval repeats disappear; conflicting payloads for one ID make the snapshot invalid. Distinct same-SKU verification IDs remain distinct credit; mark apparent legacy repeat ambiguity without removing it or claiming a scan-attempt identity.
+  - [x] Resolve `cancelled.parent_event_id` before person/work-type/date filters. Require same site, compatible saved order/work type, an earlier-or-equal parent time, and a supported parent type. Ignore cancelling worker/quantity/SKU for credit. A missing cancellation case tag is allowed because current unverify writes omit it; inherit the referenced parent's case for attribution. A conflicting nonnull case, wrong site/order/work type, missing parent, self/cyclic link or unsupported parent is a coverage issue with no guessed subtraction. Parentless mid-progress cancellation does not remove credit. Multiple cancellations remove one parent contribution once.
+  - [x] Count effective `line_verified` pieces at their original time/person/site/work type/case. Terminal quantities never contribute Items. Invalid saved identities/timestamps cannot create valid-looking credit; report issues without reassigning workers. Detect aggregate safe-integer overflow instead of displaying an imprecise total.
+  - [x] Accept `completed` for `a0_framed`, `framed`, `unframed`, and `dispatched` for `dispatch`, with nonblank saved order identity. Use original same-site/order/work-type/case verification evidence at or before each terminal time, from every authorized worker. Eligible product establishes qualification even with invalid quantity or a later cancellation; nonempty entirely positively excluded product context disqualifies. Missing/unclassified context retains the distinct Order with coverage warning. An explicitly reversed terminal contributes nothing; other unreversed repeated terminals still qualify normally.
+  - [x] Normal Orders deduplicate by site/work type/order within the selected period; overall Orders union `(site,order)` across work types and days. Rework additionally keys by case ID, with its own overall union. Person Orders use that person's terminal events, not the verifier. Keep normal/rework groups separate. All-work-type Items sums processed pieces, not unique physical goods.
+- Done when: tests cover prior-period/other-worker cancellation, wrong-parent mismatch, duplicate cancellations, two genuine identical-SKU lines, shuffled inputs, all-excluded/mixed/unknown/missing context, a later eligible line unable to qualify an earlier excluded-only terminal, and mixed-order eligible verification cancellation leaving its Order intact. Test two workers/work types sharing an order, same number at two sites, same order on two days versus full-range distinct union, two case IDs, clock/started events, explicit terminal reversal and overflowing totals. Run `npm run test -- --run src/lib/domain/__tests__/productionCounts.test.ts`, then the common gate.
+- Commit: `task 3: unify effective item and order counting`.
+
+### [x] Task 4: Read complete, authorized production evidence
+
+- Files (remaining amendment): create `supabase/migrations/0036_production_events_select_initplans.sql` (verify next unused number). Modify `tests/staging/generate-query-evidence.ts` and regenerate `supabase/staging/item-counting/03-query-evidence.sql`; modify `tests/staging/itemCountingEvidence.ts`, `tests/staging/itemCountingGate.ts`, `tests/staging/run-item-counting.ts`, `tests/staging/itemCountingReport.ts` and their existing tests (`itemCountingEvidence.test.ts`, `run-item-counting.test.ts`, `itemCountingReport.test.ts`). Create `tests/staging/itemCountingPolicyParity.ts` and `tests/staging/itemCountingPolicyParity.test.ts` for catalog snapshots, claim validation and row-set comparisons; update `tests/staging/measure-item-counting.ts` / `measure-item-counting.test.ts` only for shared session-claims evidence. Update `supabase/staging/item-counting/README.md` with the new gate and manual migration sequence. Keep 0034, 0035, v1/v2 functions, `productionEvidence.ts`, its decoder/tests, fake, encoding and loader contract unchanged. Keep `01-sites.sql`, `02-volume.sql` and `99-remove-volume.sql` unchanged; re-measurement skips setup/seed/cleanup. Existing Implementation log entries remain untouched; the coder appends new evidence only after execution.
+- Consumes: Task 3 types and the implemented v2 reader. Produces: the unchanged `loadProductionEvidence(client, request) -> Promise<ProductionSnapshot>` interface and typed `failed`, `incomplete`, `changed`, `aborted` errors. The v2 RPC name/decoder and real browser/server callers remain unchanged in (c)/(d). Keep request/snapshot fields, `productionVisibilityFor`, `pageThrough.ts` and both repository adapters unchanged. Retain optional `pageSize`/`batchSize` as deprecated compatibility inputs (validate as before but do not cap evidence or send them to the RPC). Dexie is unaffected because this is the direct Supabase production path, not `Repository.ts` or local persistence.
+- Amendment decision (pending CJ approval): implement fixes (c) and (d) only. At b0c1e21, v2's 15.4 MB full-body SQL runs passed under 8 s with minimal 74-byte claims, but five of six AU three-month API runs timed out; the only owner success took 9,360 ms. Counting 118,226 rows with realistic 628-byte claims cost 5.18 s versus 2.95 s with minimal claims; a read-only explicit cached predicate took 78 ms. That comparison motivates this policy amendment, not a promise of production latency or evidence that policies already changed. Keep v1/v2, workload, the 8 s timeout and 2 s/10 s targets fixed. Raising timeouts, splitting evidence reads, reducing workload/targets or adding an index is rejected.
+- Do (checked steps record the original paged reader, v1 and v2 implementations; the new unchecked (c)/(d) steps below supersede only policy evaluation and staging evidence mechanics):
+  - [x] Build a mocked thenable Supabase query harness that actually enforces filters, cursor ordering, page limits and site visibility. Assert selected columns include every identity/parent/case field and retain raw quantities. Assertions must fail if pagination or the site filter is removed.
+  - [x] Implement primary-window, qualification and cancellation/parent batches, including out-of-period corrections and before-period line context. Filter only display results by person/work type. Reuse query results within the request and deduplicate before reduction.
+  - [x] Implement fixed cutoff, complete keyset paging, consistency validation/retry and abort handling. Test a small server row cap, over 1,000 rows, over 100,000 rows, tied timestamps, punctuation in IDs/orders, repeated pages, a failed final/context page, a terminal whose context was denied, concurrent future inserts and backdated inserts/deletes during validation. Empty authorized evidence and failed/limited evidence are distinct states.
+  - [x] Define conservative role visibility metadata without adding auth queries per item. Test staff-limited reads, no cross-site context leak, old responses discarded on cancellation, and absence of browser client construction in the shared reader.
+  - [x] After CJ approves this amendment, write failing RPC contract tests. Extend the fake Supabase harness with a thenable `rpc(name, args).abortSignal(signal)` response, enforce the exact name and four arguments, take a copy of the visible rows at statement start, and derive the four families independently of loader code. Apply fake role/site visibility to every family before joins; do not return a canned all-visible array regardless of arguments. Make unexpected table reads, second RPCs, `.range`/`.limit` calls and write RPCs fail. Retain separate raw-response injection for malformed envelopes and transport failures. Assert one evidence call per successful load, no calls for invalid/pre-aborted/expired requests, and no server row-cap truncation even with `serverCap: 1` and 100,500 evidence rows. Fake tests prove client behavior; CJ's SQL/RLS checks prove the actual function.
+  - [x] Add only `public.load_production_evidence(p_site text, p_start_utc timestamptz, p_end_utc_exclusive timestamptz, p_as_of_utc timestamptz) RETURNS json`, `LANGUAGE sql STABLE SECURITY INVOKER SET search_path = ''`, with one read-only SELECT/CTE statement implementing the four families above. Schema-qualify `public.production_events`; use typed parameters, no dynamic SQL or permission helpers of its own. Reject invalid/null/blank-site, nonfinite timestamp or reversed/empty-window inputs with a null scalar (guard the evidence CTEs so invalid inputs do not scan); the loader rejects these before RPC and treats a null response as incomplete. A cutoff before the window is valid and yields the corresponding empty evidence. Order the union once by `(created_at, id)`. No LIMIT, internal pagination, persisted count or SQL item/order counting. Include raw parent rows of unsupported event types so the reducer can report them.
+  - [x] Define encoding v1 exactly: `{version: 1, site, startUtc, endUtcExclusive, asOfUtc, complete: true, rowCount, rows}`. `rows` is an array of eleven-element tuples in `PRODUCTION_EVIDENCE_COLUMNS` order: `[id, location, staff_id, department, order_number, line_sku, line_quantity, event_type, created_at, parent_event_id, cs_case_id]`. All slots are present; nulls are explicit. `rowCount` is the count of the full distinct evidence relation before encoding; coalesce an empty aggregate to `[]`, with count zero. Echo the four request values (timestamps may be equivalent UTC-offset representations). The complete marker is emitted only by the final successful aggregate. Do not use row objects or repeat field names per row. Metadata contains no visibility claim: the caller owns that label. Aggregate counts here are transport integrity metadata, not production KPIs.
+  - [x] In the same migration transaction, explicitly `REVOKE ALL ON FUNCTION public.load_production_evidence(text, timestamptz, timestamptz, timestamptz) FROM PUBLIC, anon, service_role`, then `GRANT EXECUTE` on that exact signature to `authenticated, service_role`. The explicit service-role regrant is necessary: `api/reports/daily-digest.ts` constructs its server client with `SUPABASE_SERVICE_ROLE_KEY`, and the spec preserves that S1-protected path. SECURITY INVOKER retains that caller's existing bypass privilege without granting it to browser users. No anon fallback permission: a digest without established full-site credentials fails before workbook/email generation. Revoke/check inherited defaults on this new function only; do not alter default privileges, tables, policies, helpers, existing functions or their grants. Check name/signature collisions first; use CREATE FUNCTION, not CREATE OR REPLACE over an unknown object. Document the application/verification steps below. The fixture runner must never discover/apply migrations.
+  - [x] Replace the loader's paging, batches, fingerprint passes and automatic reread with exactly `client.rpc('load_production_evidence', {p_site: request.site, p_start_utc: request.range.startUtc, p_end_utc_exclusive: request.range.endUtcExclusive, p_as_of_utc: request.asOfUtc})`. Retain caller client identity and visibility, browser/server-safe imports, loaded time and immutable snapshot behavior. Preserve abort/deadline semantics across pending fetch, body parsing and validation: combine the caller signal with an internal deadline abort, race an uncooperative pending client with cancellation/deadline, clean timers/listeners in finally, and check again after await and during/before publishing decoded rows. Caller abort is `aborted`; deadline is `incomplete`, including when it interrupts transport. RPC error/HTTP failure/thrown transport error is `failed` (unless abort/deadline caused it). A missing function must fail visibly. Do not automatically retry or silently use a partial/empty payload.
+  - [x] Validate request and returned envelope strictly before reduction: exact v1 fields/types, `complete === true`, finite nonnegative safe-integer `rowCount === rows.length`, echoed site and exact timestamp instants matching the request. Require each tuple's exact length; nonempty string ID/location, string event type and parseable finite timestamp; all six nullable text slots are string or null; quantity is a JSON number or null, retained without coercion/defaults (null, negative, fractional or unsafe business values remain reducer coverage issues). Reject missing slots, objects/arrays in scalar slots, malformed timestamps and non-JSON/nonfinite numbers. Unknown SKU/department or blank business identity stays a reducer issue, not repaired transport. Validate `location === request.site` and `created_at <= cutoff` on every row, and validate family membership in indexed passes: a window count event; a before-start verification matching a nonblank window terminal order; a before-start parent referenced by a window cancellation; or an at/after-end cancellation referencing a window verification/terminal. Reject unrelated context and wrong-window/event-type rows. Compare timestamps without losing PostgreSQL sub-millisecond precision at boundaries; do not round values into the window/cutoff. Deduplicate identical `(location,id)` tuples; contradictory values produce `changed` and no snapshot. Check envelope rowCount against raw tuples before deduplication. Missing authorized parents/qualification cannot be inferred from payload alone: retain coverage warnings and caller-limited visibility.
+  - [x] Exercise parameter mapping, exact start/end/cutoff boundaries (including microseconds), tied timestamps, punctuation in IDs/orders, all four nonempty context families and explicit empty families, distant parents, later cancellations, duplicate terminal deliveries and separate CS cases. Assert explicit normal/rework totals and coverage against Task 3 fixtures. Add malformed/null envelope, unsupported version, missing complete flag/field, wrong echoed scope, short/extra tuple, bad scalar, truncated rows with retained rowCount, RPC error, thrown transport/body failure, cross-site row in each family, out-of-cutoff/unrelated context, identical/conflicting duplicate, abort while pending/decoding and deadline cases. Staff gets only self-visible window AND context rows and remains labelled limited, including an RLS-empty response; a fully authorized empty envelope is a successful empty snapshot. A self-consistent but wrongly shortened server result cannot be proved complete by a client count alone: SQL definition checks and independent staging expectations must catch that defect. Mutations to drop a family/site/cutoff predicate or use the wrong RPC parameter must fail these checks or the SQL staging gate.
+  - [x] Replace the obsolete two-pass changed-data tests with a fake statement-snapshot test: mutate live rows after the response snapshot is captured, assert the first load retains its original coherent evidence without a second call, then a separate refresh sees committed backdated inserts/edits/deletes; future-event rows remain excluded by cutoff. Test conflicting duplicate tuples still produce `changed`. Keep >1,000/>100,000 coverage and module-boundary tests; remove tests that require page cursors or empty continuation requests. The reducer and Task 1–3 rules remain unchanged.
+  - [x] Update `03-query-evidence.sql` to retain labelled independent authorized window/context counts and explicit fixture outcomes, and add function signature/definition/security/grant evidence. Replace the old page EXPLAINs with `EXPLAIN (ANALYZE, BUFFERS) SELECT public.load_production_evidence(...)` for the six unchanged scopes as owner and manager test identities under `authenticated` with RLS on and fixed recorded cutoffs; retain three separately labelled EXPLAIN runs per role/scope outside the timed client loads. Record actual execution/planning time and buffers; an outer Result node can hide internals, so additionally EXPLAIN the exact function body with the same arguments/role for scan/sort/spill evidence, without changing helpers, planner settings or RLS. Identify which timing is the function-call timing, never substitute a privileged SQL-editor run or a simplified count. Verify SQL results against an independent expression of the four-family set and expected fixture IDs/counts; validate small staff/cross-site/empty fixtures too. Record function properties/ACL from the catalogs and old-app compatibility. No index evidence is required.
+  - [x] Instrument every full-load run in the existing staging fetch/report harness: one RPC request; raw response bytes and available encoded wire bytes/content-encoding (label unavailable wire metrics, never equate decoded bytes with compressed transfer); request-to-headers and body transfer duration; JSON parse time measured once at the actual SDK response parsing boundary (instrument the staging process only, restore any parser wrapper in finally, and test that it delegates exactly once without changing values); tuple validation/snapshot assembly time; total loader time; reducer time; and paired loader-plus-reducer total. Do not double-parse a cloned body or add timed instrumentation queries. Record DB EXPLAIN execution separately from network timing, not as an additive component already included in load time. Report transfer throughput/environment and memory/body limits where observed. Scalar RPC Content-Range is not the evidence row count: heartbeat reports pending/bytes, then validated rows after decode, never a false zero/complete. Keep first/slowest timings and the median of the three paired totals. Independent expected counts/context outcomes are collected outside each timed load; retain each run's comparisons, not only the last result.
+  - [x] Add staging-harness tests for missing/wrong function definition, SECURITY DEFINER/volatile/wrong search_path/ACL, missing function-call EXPLAIN or timing/payload/parse/reducer metrics, second evidence RPC, fewer than three completed runs, any run's row/context mismatch (including failure then later success), missing owner/manager/site cases, stopped runs and over-target permitted-site medians. Only complete, correct, within-target evidence may end `STATUS: COMPLETE`; otherwise end `STATUS: FAILED – <reason>` and exit nonzero even if collection finished. Preserve ten-second heartbeats, atomic incremental reports after each statement/run/heartbeat, and Ctrl+C/termination handling; a killed/in-progress report remains FAILED with the exact unfinished case/run. Retain all completed/over-target evidence. Update README's old runtime estimate and evidence-only STATUS wording as historical baseline. Add a `--measure-only` flag to `run-item-counting.ts`, invoked as `npm run staging:item-counting -- --measure-only`, which verifies the existing fixture/function, skips 01/02 and cleanup, and runs only read-only query evidence and benchmarks.
+  - [x] Write failing v2 loader/fake tests before implementation. Assert the literal RPC name `load_production_evidence_v2` and exactly the existing four arguments, one call, no v1/table fallback, and unchanged snapshot/credit results. Encode the shared wire contract independently in the fake; derive all four families under fake RLS before building dictionaries, and deliberately return unsorted rows/dictionaries. Cover null versus empty-string values, index 0 and last valid index, repeated staff/SKU reuse, shuffled dictionary order with remapped indexes, all-null dictionaries and empty evidence. Reject missing/extra envelope keys, v1/unknown versions, malformed/duplicate/unused dictionary entries, string/boolean/fractional/negative/out-of-bounds/unsafe indexes, ten-slot violations, nonfinite quantities, malformed timestamps and inconsistent rowCount. Retain the existing failure/abort/deadline/snapshot tests and >1,000/>100,000-row coverage.
+  - [x] Add only `public.load_production_evidence_v2` in migration 0035, with the signature/security/invalid-input behavior and exact encoding above. Keep the same four families, same-site joins, fixed cutoff and one MVCC statement; preserve qualification/parent overlap deduplication without multiplying rows during dictionary joins. No SQL `ORDER BY`, including dictionary construction; no limit, second query call, writes, table/index/policy/helper/role-setting change or replacement of v1. Use `CREATE FUNCTION` after checking collisions, not `CREATE OR REPLACE`. Schema-qualify referenced objects. In one transaction revoke the new function's PUBLIC/anon/service_role privileges, grant EXECUTE only to authenticated and service_role, inspect other inherited/default ACL entries on this function, comment it and notify PostgREST to reload the schema. Do not edit 0034 or its function/grants. Invalid-input cases must return SQL NULL without an evidence scan.
+  - [x] Switch `EVIDENCE_RPC`, the decoder and fake to v2. Validate every dictionary/tuple before publishing; reconstruct location only from the validated envelope, retain raw scalar values and use indexed passes for the existing family checks. Count raw tuples before deduplication, deduplicate identical decoded events and reject contradictory saved values as `changed`; equivalent timestamp spellings represent the same instant. Check abort/deadline during dictionary validation, row decoding and before/after sorting/publication; keep pending-call cancellation and timer/listener cleanup. Sort the loader's decoded events once by `instantMicros(created_at)`, then exact string ID comparison. Do not sort SQL output or dictionaries to establish correctness, round into a boundary, retry automatically or fall back to v1.
+  - [x] Extend exactness/security regressions: shuffled rows with reversed IDs at timestamps one microsecond apart must sort by the timestamp first; tied exact instants sort by ID. Test start/end/cutoff minus one microsecond, exactly equal and plus one microsecond, including nonzero-microsecond request boundaries and equivalent offsets. Keep all four family fixtures, invalid business facts, identical/conflicting duplicates and staff-limited/empty coverage. With no per-row site the client cannot independently detect a server-mislabelled cross-site row: assert decoded location equals the envelope, and prove site isolation in the fake, migration definition and real SQL/RLS fixtures for every family AND dictionaries. Removing any family/site/cutoff predicate or dictionary bound/uniqueness/use check must fail a targeted test or staging SQL check. Compare decoded fields/IDs to independent authorized table evidence, not only row counts.
+  - [x] Update `generate-query-evidence.ts` to read migration 0035 and generate v2 catalog/ACL/definition, independent family and invalid/empty checks; retain v1 definition/ACL before/after compatibility evidence separately. Remove the existing `ANALYZE public.production_events` from generated 03 so measure-only performs no database/statistics mutation; retain EXPLAIN ANALYZE for observation. After EACH `set local role authenticated` (owner, manager, staff and restored owner), read the exact `statement_timeout=` entry in `pg_roles.rolconfig` for authenticated, validate that it exists once and represents the unchanged 8 s, and apply its catalog value with transaction-local `SET LOCAL statement_timeout`. Use a separate DO statement with `EXECUTE format('SET LOCAL statement_timeout = %L', catalog_value)` for safe dynamic quoting, then a separate assertion/evidence statement before any measured query. Missing, zero/unlimited, malformed or non-8-s settings fail in SQL; never substitute a hardcoded fallback or alter any role/database setting. `SET ROLE` alone does not apply role defaults ([PostgreSQL](https://www.postgresql.org/docs/current/sql-set-role.html)); PostgREST uses [transaction-scoped settings](https://docs.postgrest.org/en/stable/references/transactions.html). Record role name, safe role configs for authenticated/authenticator/anon, effective `current_user`, `session_user`, `statement_timeout`, `row_security`, JWT test identity, `work_mem` and server/PostgREST version. Compare effective timeout to the catalog value (normalized units), with RLS on. Never emit JWT tokens or connection credentials. The runner's connection-level timeout must not override this local limit before any evidence statement.
+  - [x] Add three labelled real scalar-body SQL runs for each owner/manager scope (36 total, in addition to the existing 48 call/body EXPLAIN plans). Reproduce the observed PostgREST `json_to_record` binding of the four typed arguments, one lateral v2 scalar call and `coalesce(json_agg(pgrst_scalar)->0, 'null'::json)` wrapper. Run it as a real SELECT, forcing the full wrapped body through `octet_length(body::text)`; do not measure only `rowCount`, the unwrapped function, EXPLAIN or a discarded/unused body expression. One function evaluation per serialized-body statement; return labelled role/scope/run, byte length and effective timeout, and record that statement's elapsed time from the runner. Keep the exact executed statement shape in evidence, with fixed cutoff and current function identity/hash. This measures server serialization without sending megabytes to the SQL report; API transfer remains a separate required measurement. Any AU three-month serialization or EXPLAIN exceeding 8 s must cancel in SQL and fail before API work starts; propagate the error, rollback and retain the failed statement. Do not catch cancellation as a successful zero, retry at a larger timeout or use SQL timing as end-to-end acceptance.
+  - [x] Extend `itemCountingEvidence.ts` / report / runner so API measurements start only after `checkSqlRuns` returns zero problems and complete v2 facts, not merely after all statements executed without errors. Require exact v2 name/signature/scalar/security/ACL and reviewed definition, applied catalog/effective timeout evidence for every role switch, all 36 serialized-body runs with positive bytes and finite elapsed times, all 48 plans, and independent expectations. Keep all measurements separate and label unavailable wire metrics. Identify phase records by v2 name/signature/definition hash, encoding version and amended harness revision; reject missing identity or any v1/old-harness record. Compare phase order only within that identity. Keep historical reports/records, but never let them satisfy a fresh phase. Record a phase only with its own SQL gate and every required API run passing; refuse an explicit phase flag inconsistent with actual memberships.
+  - [x] Add regression tests in the staging test files, including `run-item-counting.test.ts`: generated SQL freshness, catalog-driven SET LOCAL after every role switch, retained 8 s with no ALTER ROLE/DATABASE or ANALYZE-table mutation, and the actual scalar wrapper/text-length statement. Test missing/different timeout, skipped application, missing/duplicate serialization runs, wrong function/encoding, v1 phase records, stale harness evidence and out-of-order/missing manager phases. Simulate SQL timeout/error and semantic SQL-gate failure and assert zero API measurement calls, FAILED report, nonzero exit and retained failing statement. Test a later successful result cannot erase an earlier failed run; preserve stopped-run reports and heartbeats. Retain one-call/payload/parse/validation/reducer checks; validation timing includes dictionary decoding and the single client sort.
+  - [x] Write failing amendment tests first in `itemCountingPolicyParity.test.ts`, `itemCountingEvidence.test.ts`, `run-item-counting.test.ts` and `itemCountingReport.test.ts`. Cover both SELECT policy names/definitions and permissive PUBLIC scope, changed/missing/extra policies, same count but different IDs, missing role/site/negative case, stale baseline, changed INSERT/UPDATE/DELETE or helper/grant/config evidence, missing/mismatched policy hash and old phase records. Test minimal `{sub,role}` claims, padded minimal claims, missing required keys, malformed metadata/amr, wrong subject/issuer/DB role, expired claims, size mismatch and accidental claim/token logging. Each SQL/claims/parity failure must produce zero API timing calls, no phase record, retained evidence, FAILED and nonzero exit. Existing 48-plan/36-text-run, 8 s timeout, one-call and stopped-run tests remain mandatory.
+  - [x] Capture the pre-migration catalog and parity baseline through the staging-only harness before CJ applies 0036. Add `--policy-parity=before` and `--policy-parity=after` modes to `run-item-counting.ts`; these skip setup/seed/cleanup, performance RPCs and phase recording. Store the baseline and completed comparison in git-ignored `staging-results-item-counting.policy-parity.json`, with a markdown summary ending in the handoff STATUS line. No tokens/claims or passwords in artifacts; only synthetic row identities, evidence metadata and catalog text. Before/after runs must use the same users, memberships, fixed cutoff and unchanged event data; record a privileged fixture fingerprint outside RLS measurements to detect concurrent changes. A mismatch invalidates parity, never silently refreshes the baseline. Both modes retain staging-host checks, catalog-derived 8 s after every role switch, RLS on, atomic reporting and stop-on-error behavior. The baseline mode can report COMPLETE only for a complete baseline; it cannot satisfy Task 4 or record a manager phase.
+  - [x] Add only 0036 with the exact policy SQL below, after comparing the captured definitions with the recovered baseline and checking the membership equivalence prerequisites. Stop on policy/helper/grant drift; do not repair it in this migration. CJ applies the transaction on staging. The runner must never apply 0036 or its rollback. Capture post-migration definitions and verify only the two SELECT predicates changed; INSERT/UPDATE/DELETE definitions, all other policies, helper definitions, grants, RLS flags, role configs and v1/v2 definitions/ACLs must match the baseline.
+  - [x] Implement realistic claims in `generate-query-evidence.ts` / generated 03 and the runner. Sign in the existing owner, manager, staff, kiosk and cs staging users with their real Supabase sessions before collecting SQL evidence; obtain missing test-role credentials through the existing git-ignored `.env.staging.local` settings path (`STAGING_STAFF_EMAIL/PASSWORD`, `STAGING_KIOSK_EMAIL/PASSWORD`, `STAGING_CS_EMAIL/PASSWORD`). Do not change users, metadata or auth settings. Decode each access token's payload in memory and supply its original UTF-8 JSON text as a bound parameter, never as interpolated SQL or logged text. Generated 03's identity switches consume transaction-local `inka_staging.jwt_<role>` settings populated by the runner inside its transaction, then set `request.jwt.claims`; standalone SQL with no supplied claims must fail, never fall back to `{sub,role}`. Return only a boolean from the setter, not its JSON value. Apply this to every switch, including the repeated owner switch and added parity roles. Clear any legacy `request.jwt.claim.sub`/`request.jwt.claim.role` override transaction-locally so `auth.uid()` reads the full claims JSON; record that overrides are absent/empty. Refresh expired sessions before switching and verify SQL subject/profile role/memberships against the intended API user.
+  - [x] Validate and record claims evidence for every switch: required keys `aud`, `exp`, `iat`, `iss`, `sub`, `email`, `phone`, `app_metadata`, `user_metadata`, `role`, `aal`, `amr`, `session_id`, `is_anonymous`, their types/nested shape and UTF-8 byte count (`octet_length(current_setting('request.jwt.claims'))`). Use actual session values: authenticated audience/DB role, staging issuer, matching UUID subject, valid timestamps, metadata objects, amr array and session UUID. App roles still come from profiles, never user-editable metadata. Compare SQL bytes and in-memory shape/text equality with that role's decoded real session payload; record source/session byte size and match booleans, not claim values. Require at least 500 bytes as an explicit minimal-claims guard in addition to exact session-size/shape matching (observed real sessions are about 630 bytes; do not hardcode 628 for all users). A smaller/different real session is a blocking evidence discrepancy, never padded. Keep all 48 EXPLAINs and 36 full-body PostgREST text runs under the unchanged catalog-derived 8 s timeout, and extend timeout/claims-switch expectations for the extra roles. Redact parameter values from SQL errors/report labels too.
+  - [x] Complete `--policy-parity=after` and the role matrix below before performance timing. Record the full `pg_policies` definitions and a deterministic hash: canonical JSON of rows sorted by `(schemaname, tablename, policyname)`, with ordered fields `schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check`, role names sorted and NULL preserved. Hash UTF-8 canonical JSON with Node's built-in SHA-256. Hash ALL `public.production_events` policies, not just one SELECT policy, and retain the original catalog text. Independently assert the reviewed post-0036 definitions/unchanged non-SELECT policies; an arbitrary hash alone is not approval. Record pre/post policy hashes and parity artifact hash. Extend `QueryFacts`, `GateIdentity`, `PhaseRecord`, `sameIdentity`, report and `itemCountingGate.ts` to require `policyHash` plus the existing v2 definition/name/encoding identity; bump `HARNESS_VERSION` to `item-counting-gate-v2.2`. Each phase must reference the completed matching parity artifact. Missing/old hashes or any catalog drift before/after SQL/API measurement invalidate the run. 03 records the current catalog/hash inputs and checks the expected policy set; the gate checks parity and claims before starting API timing. All three phases recorded under the old policies/harness are ineligible even if v2's function hash is identical.
+  - [x] Review and record direct-reader compatibility before/after 0036, with app code fixed: Reports' event stream/order search, Welcome's team summaries, Production/kiosk's verified-line/cancellation state, worker counters, order preflight and clock lookups; also `CurrentlyClockedInCard`, `DailyTimesheetCard`, `LabourHoursTodayCard`, `LiveOrderCompletionsCard`, `PackageHistoryCard` and `RecentActivityCard`. Replay their existing site/person/order/time/event-type filters with the same fixtures, comparing authorized IDs and returned fields and checking clocks/started rows as well as KPI events. Existing limits/order expressions and UI permissions stay unchanged; compare unordered ties as sets, not incidental physical row order. Check Reports correction/delete and kiosk scanned-worker capture on isolated `staging` fixtures because SELECT participates in UPDATE/DELETE visibility. The digest's existing server-only service_role client bypasses RLS; its direct event query and v1/v2 outputs must remain identical, with S1 guards and anon rejection intact. No reader, page, stock/ledger or digest behavior change is part of this amendment.
+  - [x] Obtain fresh CJ-run staging evidence in order: preserve both v1 and v2 FAILED reports; finish before/after policy parity around CJ's staging application of 0036, with 0034/0035 unchanged. Re-run all THREE manager phases from the beginning against the same v2/policy-hash/harness identity: `npm run staging:item-counting -- --measure-only --manager-phase=denied-before` while manager is AU-only; CJ temporarily adds UK/US via the existing membership flow and reauthenticates, then runs `--measure-only --manager-phase=all-sites`; CJ restores AU-only, reauthenticates and runs `--measure-only --manager-phase=denied-after`. Each invocation verifies completed parity/current policies/realistic claims, runs the full SQL gate, then owner AND manager, all six existing scopes, three API runs each. Intermediate reports remain FAILED for outstanding phases and distinguish expected missing evidence from query/performance failures; only CJ directs the next phase/rerun. No pre-0036 phase counts. Preserve the two-year/three-site fixture: AU day 2026-09-15 has 1,287 window rows; AU 2026-08-01..10-31 has 118,226 window + 18 qualification = 118,244 evidence rows. Keep UK/US scopes and cutoff `2026-11-12T00:00:00.000Z`; skip seed/cleanup. Record revisions, policy definitions/hashes/parity, per-role claims sizes, both function definitions/ACLs, catalog/effective settings, memberships, counts and client/network environment. Keep staff/kiosk/CS RPC/table parity, dictionary non-disclosure and independent field/ID checks. Rehearse v1 and the previous S1-protected app with both functions and 0036 present, using `staging` for capture smoke so volume is unchanged. No agent applies SQL or accesses production; unexpected FAILED/missing evidence stops handoff for CJ.
+- Done when: CJ has approved this amendment; `npm run test -- --run src/lib/repository/supabase/__tests__/productionEvidence.test.ts tests/staging` and the common gate pass; append-only migration CI is green with 0034/0035 unchanged. Exact 0036 policy definitions/hash, all-five-role before/after counts AND IDs, cross-site denials, unchanged write policies/helpers/grants/settings, direct-reader/digest compatibility and realistic claims size/shape evidence are recorded. The SQL gate applies authenticated's unchanged catalog 8 s timeout and completes all full-body runs before API timing. All three fresh manager phases pass in order under the same v2/policy-hash/harness identity and reference completed parity. Owner and permitted manager cases at every site meet one-day ≤2,000 ms and three-month ≤10,000 ms (three-run median of paired loader-plus-reducer totals; every individual run complete/correct and recorded). Include SQL call/body EXPLAIN, wrapped-body text bytes/time and API transfer/parse/dictionary-validation/sort/reducer/total metrics. Task 4 stays unticked and Task 5 blocked until these gates pass. The 78 ms predicate experiment and old v1/v2 phases are not acceptance. If (c)/(d) fail, record the bottleneck and stop for CJ; no timeout increase, split read, index, workload reduction or target waiver.
+
+#### Task 4 policy contract and parity proof
+
+**Recovered/live set:** 0012 creates `production_events_read`; 0028 adds `production_events_select` without dropping `production_events_read`; 0033 replaces only `production_events_select`. 0013/0028 change INSERT, and 0032 adds the CS role/helper but does not replace either SELECT policy. The three helpers `can_access_location`, `current_user_role`, `is_manager_or_higher` retain their 0001 definitions in the recovered set. 0034/0035 add functions only. Thus the recovered final set and CJ's reported live staging set both contain TWO permissive SELECT policies, default `TO PUBLIC`, OR-combined. Retain both names, roles and permissiveness. The whole recovered policy set also has INSERT from 0028 and UPDATE/DELETE from 0012. This planning pass has not queried production; CJ must reconcile its live catalog before release because recovered 0027 is missing. An extra policy, changed predicate/helper or incompatible membership grant blocks application, not an invitation to normalize the live schema.
+
+**Location decision:** `can_access_location(location)` is row-dependent; `(select public.can_access_location(location))` remains correlated and is NOT a once-per-statement optimization. Replace it with `location = ANY (ARRAY(SELECT ... user_locations ...))` below. The uncorrelated ARRAY subquery freezes the caller's membership set per statement, with `(select auth.uid())` as an init-plan. 0001's helper is precisely an EXISTS over those memberships; `user_locations.location` is NOT NULL, and `production_events.location` is NOT NULL. 0001's `user_locations_select` allows `is_owner() OR user_id = auth.uid()`, and 0003 grants authenticated SELECT, so every named app role can read all of its own memberships; the explicit user_id filter prevents owner-wide membership visibility from granting access to somebody else's sites. No membership/NULL subject yields an empty array and denies access, as before. Verify these live prerequisites and missing-profile/empty-membership behavior; never replace the helper with a hardcoded AU permission or assume owners bypass location membership. The unchanged membership-table RLS may run helpers per membership row while building the small set; it no longer runs once per production event. Every direct helper/auth call in the two rewritten predicates is an uncorrelated scalar subquery, evaluated once per init-plan (potentially separate init-plans for distinct policy/table references), not per event. EXPLAIN must confirm that distinction; no helper bodies or other policies are rewritten. This follows Supabase's [row-independent init-plan guidance](https://supabase.com/docs/guides/database/postgres/row-level-security#call-functions-with-select).
+
+**Exact 0036 policy SQL** (after the preflight above; plain DROP makes missing policies fail, and the transaction leaves no externally visible interval without both policies):
+
+```sql
+BEGIN;
+
+DROP POLICY production_events_read ON public.production_events;
+DROP POLICY production_events_select ON public.production_events;
+
+CREATE POLICY production_events_read ON public.production_events FOR SELECT
+  USING (
+    location = ANY (ARRAY(
+      SELECT ul.location FROM public.user_locations AS ul
+      WHERE ul.user_id = (SELECT auth.uid())
+    ))
+    AND (staff_id = (SELECT auth.uid()) OR (SELECT public.is_manager_or_higher()))
+  );
+
+CREATE POLICY production_events_select ON public.production_events
+  FOR SELECT
+  USING (
+    location = ANY (ARRAY(
+      SELECT ul.location FROM public.user_locations AS ul
+      WHERE ul.user_id = (SELECT auth.uid())
+    ))
+    AND (
+      staff_id = (SELECT auth.uid())
+      OR (SELECT public.current_user_role()) IN ('owner', 'manager', 'cs', 'kiosk')
+    )
+  );
+
+COMMIT;
+```
+
+**Parity matrix:** collect actual `SELECT location, id FROM public.production_events` results before and after, for each role and each synthetic site's entire saved fixture history at the fixed cutoff, including clock/started/unsupported-parent rows rather than only the four RPC families. Read as database `authenticated`, never postgres/table owner/service_role, with `row_security=on`, full real-session claims and catalog 8 s timeout. Record `current_user`, bypass-RLS=false, table RLS enabled, subject/profile role, memberships and scope. Sort composite `(location,id)` keys in the harness, retain exact sets and counts, and require zero added/missing IDs in both directions; counts or digests alone do not prove parity. After policy parity passes, separately repeat the unchanged six RPC scopes/independent families in the performance gate. The before baseline uses direct table row sets; it does not require the already-failing pre-0036 full-body RPC to pass. Preserve that known failure as historical evidence. Parity collection is outside timed loads and does not split or alter the one-call evidence RPC. Any timed-out/incomplete parity read fails, with no timeout waiver.
+
+| Role / fixture | Required before = after result |
+| --- | --- |
+| Owner | Every worker's rows at each member site; no owner exemption from membership. |
+| Manager | AU-only: all AU workers, zero UK/US. Also baseline and compare with temporary UK/US memberships, then restore AU-only and prove denial again. |
+| Staff | Only its own rows at member AU, including self rows where present; no other worker's rows, zero UK/US. Retain limited-coverage labels. |
+| Kiosk | All workers at member sites, including scanned workers unlike the login identity. No new UPDATE/DELETE powers. |
+| CS | All workers at member AU under 0033, zero UK/US; no new navigation or performance-detail permission. |
+| Cross-site denial for every role | Compare each role with a deliberately absent membership at a populated site; CJ temporarily removes/restores one membership for owner/kiosk as needed, using existing administration, outside timing. Matching baseline/post arrangements must deny even self-attributed rows. |
+
+Capture each arrangement in `--policy-parity=before`, restore standard memberships before CJ applies 0036, repeat identical arrangements in `--policy-parity=after`, then restore owner/kiosk all-sites and manager/staff/CS AU-only before denied-before measurements. These parity arrangements do not count as performance phases. Include granted-site self/other-worker probes, no-membership and null-subject denial, and no-profile self visibility where an existing valid synthetic identity permits it; never manufacture new authorization from metadata. Preserve data throughout the pair; missing fixture coverage blocks the comparison rather than passing an empty equality. Check anon denial and the digest's existing service-role bypass separately, never use them as RLS proof. Verify all INSERT/UPDATE/DELETE catalog fields are byte-identical before/after; run the same permitted/denied capture/correction/delete smoke cases on disposable `staging` rows and roll back test writes, including ledger effects. SELECT influences mutation visibility, so unchanged write-policy text alone is insufficient. Record unchanged helpers, other policies and grants/configs as well as result parity.
+
+For repeatable handoff, parity modes also require `--parity-case=baseline|manager-all-sites|owner-denied-uk|kiosk-denied-uk`; reject a case that disagrees with actual memberships. Baseline collects all five users, including manager AU-only; the other cases change only the named user's membership and compare that user's full result set. CJ makes/restores these membership changes outside the runner. Accumulate the four cases atomically under the same baseline revision/fixture fingerprint in the parity artifact; missing cases cannot certify parity. Recheck baseline after restoration. If existing fixtures lack self/other-worker positive coverage (the current staff busy-day expectation may be zero), CJ adds minimal synthetic probes at the separate `staging` location before baseline capture, grants test memberships there through existing administration, and keeps them identical through after-parity. Include those probes in the comparison, restore memberships afterward, and never alter AU/UK/US performance rows, scope or cutoff. README must list the exact commands and required membership states; parity collection must not enter the existing performance phase state machine.
+#### Task 4 M6 amendment — four-case parity after staging 0036 (approved 2026-11-13)
+
+**Decision and approval.** Adopt the coder's `--policy-parity=cases` proposal with the transaction, evidence and failure requirements below. [Review r1, M6](../reviews/item-counting-r1.md) found that `standard` plus combined `owner-kiosk-without-uk` does not satisfy the four-case contract above. Staging already has 0036, so historical pre-0036 captures for the missing cases cannot now be collected by the original sequence. Restore the exact recorded pre-0036 SELECT policies only inside a rolled-back staging rehearsal, keeping each comparison on one fixture snapshot. Accepting the two old arrangements alone would omit required proof; committing a policy rollback/reapplication would unnecessarily change staging and is rejected.
+
+CJ's blanket loop approval, dated **2026-11-13**, applies to this amendment and its staging collection: **"I approve everything that you do. Go ahead and just take this feature to finish line."** The coder's M1–M5, S1–S3 and N1 fixes are recorded in commit `5cb28a8`; this amendment addresses M6 only. Approval is recorded, not pending. It does not authorize agents to apply migrations, merge, deploy or access production.
+
+**Precedence and scope.** For the remaining M6 work, this section supersedes the earlier requirement to capture these four cases in separate `before`/`after` runs around CJ's application of 0036, and to make their membership changes outside the runner. It also supersedes v2.2 phase eligibility. The earlier prohibition on the runner applying a rollback remains a prohibition on applying migrations or committing policy changes; this explicitly authorized, always-rolled-back rehearsal is the sole additional exception. Earlier checked steps and log entries remain historical evidence, not current certification. All four cases, catalog invariants, direct-reader checks and performance targets remain required. No other task is rewritten or reopened by this amendment.
+
+**Files and interfaces.** Modify `tests/staging/policyParityRun.ts` for the single-transaction collector; `tests/staging/itemCountingPolicyParity.ts` for case evidence and `checkParityArtifact(art, currentPolicyHash)`; `tests/staging/run-item-counting.ts` for mode routing; and `tests/staging/itemCountingGate.ts`, `tests/staging/itemCountingReport.ts` and their existing tests for gating, phase identity and reporting. Extend `itemCountingPolicyParity.test.ts`, `run-item-counting.test.ts`, `itemCountingEvidence.test.ts` and `itemCountingReport.test.ts`; document commands and arrangements in `supabase/staging/item-counting/README.md`. Reuse the exact rollback body already represented by `PRE_0036_RESTORE` in `tests/staging/writeCompatRun.ts`, verifying it against the Policy rollback section below, without changing write-compatibility semantics. No app code, repository interface/backend, loader, function, migration, fixture generator or dependency changes are required.
+
+**Runner contract: `npm run staging:item-counting -- --policy-parity=cases`.** This mode collects all four cases in one invocation; reject combinations with setup/seed/cleanup, performance/manager-phase flags or a single-case/legacy arrangement selector. Retain the existing staging-host/project guard (`ybrzhrgfrnvtcwymjdrq`) for every connection. Obtain the five existing real sessions before collection; all database collection and temporary mutations use one connection in **one `REPEATABLE READ` transaction that always ends in `ROLLBACK`**. The only database work after that transaction is the read-only restoration check. Never execute the rollback section's `BEGIN`/`COMMIT` wrapper, write migration history, apply 0036, or run performance measurements in this mode.
+
+1. As postgres, record the catalog and require the installed policy definitions/hash to match the approved post-0036 definitions and retained post-0036 hash. Retain the original pre-0036 baseline catalog/hash and revision as the restoration authority; a missing baseline or any unexpected catalog drift fails, never silently regenerates that authority. Verify the unchanged non-SELECT policies, helpers, other policy catalogs, grants, RLS flags, role settings and v1/v2 definitions/ACLs.
+2. Record the privileged fixture fingerprint and its deterministic hash, month bounds covering the complete saved history, cutoff `2026-11-12T00:00:00.000Z`, five test-user identities and all their memberships. Require exactly the standard memberships: owner/kiosk on `au,uk,us,staging`; manager/staff/cs on `au,staging`. Do not ignore `staging` or unexpected extra memberships. Preserve the existing two-year/three-site fixture and fixed scope; no seeding or cleanup is allowed here.
+3. Run the following cases independently, each under a case savepoint. As postgres, change only the named user's memberships, verify the complete five-user arrangement, and retain it with the case evidence. Every case starts from standard memberships; the baseline changes none.
+
+   | Case | Transaction-local membership change | Identities read |
+   | --- | --- | --- |
+   | `baseline` | None | Owner, manager, staff, kiosk, cs and the no-subject session |
+   | `manager-all-sites` | Add manager `uk` and `us` | Manager |
+   | `owner-denied-uk` | Remove owner `uk` | Owner |
+   | `kiosk-denied-uk` | Remove kiosk `uk` | Kiosk |
+
+4. For each listed identity, collect complete per-site row sets at `au,uk,us,staging` and all **11 direct-reader replays**, first under installed 0036. Under a nested savepoint, as postgres restore only the exact two pre-0036 SELECT policy texts from **Policy rollback** below, including names, permissive/PUBLIC scope and unwrapped calls; require the resulting policy hash to equal the recorded pre-0036 baseline hash. Collect the same reads again with identical membership, month bounds, cutoff and fixture. Use the existing month-chunked full-history reads, including clocks/started/unsupported-parent rows; do not substitute counts, RPC families or a reduced workload. Restore the same session settings/search path before each side's reads.
+5. Every role read on both sides uses database `authenticated`, `row_security=on`, verified non-bypass identity, real session claims bound in memory, cleared legacy subject/role overrides, and the catalog-derived **8 s** timeout reapplied/verified after every role switch. Retain the existing deliberately subjectless negative session, clearly labelled as such; it is not a replacement for any real role's session. Record claims validation/byte counts without claims, tokens or secrets. After rolling back the nested savepoint, verify 0036 is restored, compare the two sides exactly (IDs in both directions and direct-reader returned fields/results), and require memberships, fixture and every non-SELECT/other catalog invariant unchanged. Then roll back the case savepoint and verify standard memberships before the next case. Savepoint recovery must never erase an earlier failure.
+6. Require positive coverage on **both** policy sets. In `baseline`, every role sees rows at each member site; staff sees only its own rows, with other-worker fixture rows present to prove exclusion; manager/staff/cs see zero UK/US rows; no-subject sees zero at every site. Existing self/other-worker coverage requirements remain. In `manager-all-sites`, manager sees more than zero UK and US rows. In each denied-UK case, that user sees zero UK and more than zero AU rows, with populated UK fixtures proving a real denial. Empty equality or missing probes fails; do not create fixtures to paper over a failure inside this runner.
+7. Always end the outer transaction in `ROLLBACK`, including on exceptions, timeouts and cancellation. After rollback, use a **fresh statement outside that snapshot**, as postgres, to re-read all five users' memberships and require the original standard arrangement exactly; also verify installed post-0036 catalog/hash and unchanged fixture. This is the recorded restoration result. If rollback or the fresh check cannot be confirmed, retain FAILED evidence and stop; never infer restoration from a successful comparison or mark a dropped connection as a passed restoration check.
+
+**Artifact and gate.** Store the four comparisons atomically in the existing git-ignored `staging-results-item-counting.policy-parity.json`, retaining independently reviewable before/after snapshots, exact row sets and replay evidence. Each case records its name, fixture fingerprint hash, fixed scope/month bounds, user identities/memberships, baseline reference, before (restored) and after (installed) policy hashes, method **`"in-transaction policy restore"`**, problems and the final restoration result. “Before” is explicitly a restored-policy rehearsal, not a newly discovered historical capture. All four cases must belong to the same collection and fixture fingerprint, baseline reference, cutoff and user set. Preserve older `standard` and `owner-kiosk-without-uk` evidence as history; it cannot certify completion alone or fill a missing case.
+
+`checkParityArtifact` must reject any missing/duplicate case, mixed fixture/baseline, incomplete role/site/replay evidence, failed coverage, nonzero problems, missing/failed restoration, wrong restored-before hash or after-hash different from the current installed policy hash. Verify underlying snapshots rather than trusting a success summary. A failed/new incomplete collection must not fall back to an older successful one. Hash the completed artifact, including its restoration evidence, for the phase identity. Preserve atomic incremental reports, heartbeats, redaction and the exact final handoff STATUS line; any SQL/claims/parity/restoration failure means nonzero exit, no performance calls and no phase record.
+
+**Sub-steps reopened and execution order.** Reopen the acceptance of the earlier Task 4 amendment-test, parity-capture/comparison, direct-reader parity, parity-hash/phase-gate and fresh-three-phase evidence sub-steps. Existing migration/loader implementation and the separately recorded write-compatibility rehearsal are not undone. Leave existing boxes untouched in this amendment; Task 4's checked heading cannot certify M6 until the following work passes:
+
+1. Write failing regression tests first for all four cases, exact memberships including `staging`, same-count/different-ID and reader-result mismatches, positive coverage, mixed baseline/fixture and restoration failures. Explicitly assert the currently accepted two-arrangement artifact fails `checkParityArtifact`. Test nested/outer rollback on success, timeout/error and cancellation; no commit/migration call; fresh restoration outside the transaction; and zero performance calls/phase writes on failure. Test old/missing parity hashes, v2.2 records and out-of-order/missing phases are rejected. Implement the mode/gate/report changes and make these tests pass.
+2. Run the staging `--policy-parity=cases` command and retain all four clean comparisons plus verified restoration. The new parity artifact/hash replaces the old artifact as acceptance evidence; preserve historical reports.
+3. Bump `HARNESS_VERSION` to **`item-counting-gate-v2.3`** and rerun **all THREE** manager phases, in order, referencing that same completed artifact/hash: `--measure-only --manager-phase=denied-before` with standard memberships; `--measure-only --manager-phase=all-sites` after the already CJ-authorized temporary manager UK/US membership addition and reauthentication; then `--measure-only --manager-phase=denied-after` after restoring standard memberships and reauthenticating. These performance membership transitions remain outside the rolled-back parity transaction and use the existing authorized staging administration flow. Do not relabel/copy old phase records or manufacture timings during the restored-policy rehearsal. Timing runs only under installed 0036. Keep the full SQL gate (48 EXPLAINs, 36 full-body text runs), catalog 8 s timeout, unchanged v2/workload/cutoff, owner and manager scopes, three API runs each and the existing 2 s/10 s median targets. Intermediate missing-phase reports retain their existing explicit pending/FAILED semantics; unexpected failures stop the handoff.
+
+**Done when.** The targeted production-evidence/staging tests and common gate (`npx tsc -b`, `npm run typecheck:digest`, `npm run test -- --run`, `npm run build`) pass; the four-case artifact has zero problems and passed fresh restoration; the gate demonstrably rejects the old two-case artifact; and all three fresh v2.3 manager phases pass against the same new parity hash and current post-0036 hash with unchanged targets. Record the results in the Implementation log and obtain follow-up M6 review/green PR CI. This document records approval and the contract only, not execution or M6 closure. Task 9's pending browser/Preview/release checks remain pending.
+
+**HARDENING and rollback impact.** No release or rollback change beyond the existing text: 0036 remains installed, migration history is untouched, and CJ alone applies any eventual production rollback. No new dependency, endpoint, schema, feature flag, inventory/capture change, historical count rewrite or persistent membership/data change is introduced by parity collection; Dexie and the repository interface remain unaffected. The relevant additional harness checks are failure/cancellation rollback and explicit FAILED recovery, one coherent fixture snapshot with exact identity/coverage checks, real-session RLS and secret redaction, and bounded SQL reads with no timeout waiver. Do not run concurrent fixture/membership administration during collection; drift or a restoration mismatch blocks acceptance without automatic repair/retry. The rehearsed old policy cost is never performance acceptance. Existing shop-floor fallback, S1-protected app rollback, policy rollback SQL, operations monitoring and credit/inventory tests remain required and unchanged; external-service outages, new UI behavior and new API authorization are n/a for this harness-only amendment. Agents never apply migrations or touch production.
+
+- Commit: `task 4: load complete scoped production evidence`.
+
+### [x] Task 5: Reconcile Reports while preserving frame-time calculations
+
+- Files: modify `src/pages/Reports.tsx`; create `src/lib/hooks/useProductionSummary.ts`, `src/lib/domain/productionFrameTiming.ts`, `src/lib/domain/productionReportView.ts`, `src/lib/domain/__tests__/productionReportView.test.ts`, `src/components/ProductionCountStatus.tsx`.
+- Consumes: Tasks 1–4. Produces: shared browser hook/status presentation; `buildProductionReportView(evidence, scope)` for tiles, daily series, leaderboards, person/order drill-downs and output detail; separate frame timing observations.
+- Do:
+  - [x] Characterize existing Reports frame-gap behavior in tests before removing `deriveCompletedLines`: same predecessor selection, positive gap up to 30 minutes, existing framed/PF eligibility and duration/quantity weighting. Preserve its timing stream rather than feeding all new Items into denominators. An intervening UN observation must not become a framing observation or change timing merely because its Items now count. Historical cancellations use the shared resolved parents.
+  - [x] Move fetching to the new reader/hook. Derive today/7d/30d/custom boundaries and daily labels from Task 2; prepare full context before any staff filter. Add retries and stale/loaded-at status, clear prior-user/site data and protect against out-of-order responses. Construct the Supabase client only in the Supabase path so the existing Dexie unavailable state renders without missing-key errors.
+  - [x] Replace all count calculations, including dispatched totals, staff board, daily chart, `StaffProductivityChart` totals/statistics, per-staff orders and order modal calculated counts. Pass shared daily/range projections into the productivity chart instead of letting it re-count raw events or step through UTC days by 86,400,000 milliseconds. Preserve the leaderboard's intentional all-visible-staff scope and label it when a selected person's tiles differ. Recompute longer-period distinct Orders from identities, never by summing daily/department/person counts. Show completion-only people and verification-only Items accurately.
+  - [x] Render normal and CS/rework totals/details, unclassified/missing-detail counts, expected exclusions, corrections, limited-visibility status, production window/timezone and snapshot time. Label combined Items “work processed across selected work types”; disclose overlapping Orders and untagged rework limitations. Use the shared status component without revealing new staff details to a role.
+  - [x] Keep raw CSV export quantities/timestamps unchanged and exclude fetched context outside the selected display range from that export. Fetch its existing note/station columns separately or in the display-row projection, not for every context row. Do not change cancellation/deletion actions, benchmark writes, rates, timesheet algorithms or ledger/package behavior.
+- Done when: report selector tests reconcile tiles/detail/range union against explicit fixture expectations; verify raw quantity 2 remains 2 in raw export while S2 Items is 4, cancellation by B removes A's Items, rework stays separate, and UN cannot enter average-minute/cost/effort denominators. Exercise hook loading/error/identity changes in the staging browser checklist. Run `npm run test -- --run src/lib/domain/__tests__/productionReportView.test.ts`, then the common gate.
+- Commit: `task 5: reconcile report counts and protect frame timing`.
+
+### [x] Task 6: Reconcile Welcome and its existing comparisons
+
+- Files: modify `src/pages/Welcome.tsx`; create `src/lib/domain/productionWelcomeView.ts`, `src/lib/domain/__tests__/productionWelcomeView.test.ts`; reuse Task 5 hook/status component.
+- Consumes: Tasks 2–5. Produces: `buildProductionWelcomeView(evidence, site, asOfUtc)` using shared summaries for the existing cards and chart.
+- Do:
+  - [x] Test every existing count consumer: current-day counters, yesterday totals, per-work-type leaders, same-day-last-week comparison, streak, most-improved calculation and seven-day sparkline. Preserve the existing comparison/ranking intent, but make labels and source periods agree; do not mix today's departmental counts with yesterday's comparison label.
+  - [x] Fetch one enclosing range covering every comparison, including the full streak/improvement lookback, with shared context and cutoff. Use Task 2 date stepping and Monday-start semantics wherever a weekly comparison is shown. Daily chart points can each have a distinct count; any range total unions identities instead of summing those points.
+  - [x] Add separate CS/rework detail and the same coverage/window/as-of presentation at the role's existing level of detail. Use saved staff identity with display-name fallback; no reassignment through current team data and no expanded CS/staff performance permission.
+  - [x] Refresh the production date at site-local 04:00 and on return/focus/explicit refresh; guard stale requests and clear account/site data. Keep greeting cosmetics independent from report dates. Dexie renders its existing unavailable message without constructing an unconfigured Supabase client.
+- Done when: fixture-based tests catch a cancellation outside the visible day, a verification-only non-order, late rework, a same-order repeat and a site/browser timezone mismatch. Confirm changing users/sites and rolling over 04:00 cannot retain prior scope totals. Run `npm run test -- --run src/lib/domain/__tests__/productionWelcomeView.test.ts`, then the common gate.
+- Commit: `task 6: unify Welcome production summaries`.
+
+### [x] Task 7: Make Production counters converge after every saved action
+
+- Files: modify `src/pages/Production.tsx`; create `src/lib/domain/productionCounterView.ts`, `src/lib/domain/__tests__/productionCounterView.test.ts`, `tests/production/item-counting-capture.test.ts`; reuse hook/status component.
+- Consumes: shared evidence/count/period contract. Produces: `buildProductionCounterView(evidence, scope)` for active worker, station work type and current production day, with separate normal/rework counts.
+- Do:
+  - [x] Replace today's two unpaged queries and manual `+1`/quantity increments/decrements with the shared counter result. After each successful verification, unverify, line completion and order completion/dispatch, trigger an immediate authoritative refresh. Mark the counter updating until resolved; never optimistically add a quantity from a UI line that is not confirmed saved evidence. Reload, staff switch and return to the page use this identical path.
+  - [x] Do not await reporting work before completing the existing capture/deduction workflow. A reporting failure shows a retryable counter error or explicitly stale same-scope snapshot, while the already-saved production action stays saved. A failed write must not increment counters. Keep all inserted values, event IDs, cancellation payloads, CS tags, clock behavior, in-flight guards and stock RPC payloads unchanged.
+  - [x] Test successful-save refresh versus fresh reload, repeated completion deliveries, duplicate retrieval, prior-day undo, unverify/reverify, excluded lines, missing context, separate CS cases, failed write and failed KPI read. Protect rapid worker/location/station changes and 04:00 rollover with request identity/abort guards. Never display the previous worker's count while loading the next.
+  - [x] Add a loader/counter integration harness with mocked Supabase tables and write/RPC spies: a successful saved-event fixture followed by refresh/retry performs reads only, never deduction or another insert; failed save fixtures do not add evidence. Keep Task 1's original set component/packaging regression values. Verify the actual page's capture/deduction calls and before/after stock/ledger on staging; pure selector tests alone do not prove page wiring. Do not claim that mocks prove the pre-existing RPC is concurrency-safe; CJ checks the ordinary retry smoke flow on staging.
+- Done when: two UN S2 units show four Items and then one Order after saved completion; refresh yields the same values; double completion remains one Order; undo uses the saved parent's value and never produces a negative next-day count. Run `npm run test -- --run src/lib/domain/__tests__/productionCounterView.test.ts tests/production/item-counting-capture.test.ts`, then the common gate and staging kiosk capture/error checks.
+- Commit: `task 7: unify saved and live production counters`.
+
+### [x] Task 8: Integrate the authenticated digest and calculated exports
+
+- Files: modify `api/reports/daily-digest.ts`, `tests/api/daily-digest.test.ts`; create `tests/api/daily-digest-counts.test.ts`; update `package.json` only to include the new API test in `typecheck:digest` (no dependency change).
+- Consumes: Tasks 1–4 and fixture. Produces: summary/department/staff XLSX and email content using the same normal/rework/coverage counts as the UI.
+- Do:
+  - [x] Extend the API mock so the single evidence RPC, exact site/window/cutoff parameters, scalar payload validation and RPC failures are exercised; retain table paging mocks for other required report reads. Assert the existing server client is passed through, the service-role path works, and an anon fallback cannot generate/send a full-site report. This is the direct Task 4 amendment dependency; no S1 gate changes. Retain all S1 assertions for auth-before-work, recipient override rejection, method/error precedence, diagnostics, dry mode and no-store responses.
+  - [x] Remove the digest's copied parser, item predicates/multiplier and broken midnight range helper. Load current/previous production-day evidence under one cutoff, prepare once, and project each day. Validate supplied calendar dates; invalid/repeated dates return 400 after S1 authentication/method/recipient gates and before report reads. With no date, use the site's current production date. Leave cron expressions and AU/UK/US location validation unchanged.
+  - [x] Replace department-summed overall Orders with the shared distinct union, keep all-work-type Items explicitly labelled as processed work, and render normal/rework totals with coverage on Summary, Departments, Staff, Notes and email text/HTML. Preserve existing clock-based hours and package calculations, but apply the shared production window. Rework-only activity or known data-quality warnings must not be silently skipped as an empty normal day.
+  - [x] Fail before XLSX generation/email on incomplete event/context reads. Check errors on required staff/package/product/ledger reads too; page potentially large ledger/staff reads with stable keys and the same cutoff instead of silently truncating a calculated report. Keep package deduction/write behavior unchanged. Optional absent display names may fall back to saved staff IDs; a failed lookup is not an absent name.
+  - [x] Include production date, timezone, local 04:00 window, UTC boundaries, as-of cutoff and loaded/generated time in output. A scheduled run before closure is labelled as-of, not finalized. Missing/bad historical data can yield a labelled report; failed transport/full-site authorization cannot. Keep all credentials inside the existing server path, with no secret-bearing diagnostic/log additions.
+- Done when: decoded/mocked workbook rows and email text match explicit fixture values; dry mode never calls Resend; rejected requests do no report work; malformed/incomplete evidence RPC or required ancillary-page failure does not generate/send; historical corrections, DST/default date and repeated terminal cases agree with the pure summaries. Run `npm run test -- --run tests/api/daily-digest.test.ts tests/api/daily-digest-counts.test.ts`, `npm run typecheck:digest` and the rest of the common gate. Verify shared imports in a CJ-created Preview, since local Vite does not serve `api/`.
+- Commit: `task 8: share production counting with the protected digest`.
+
+### [ ] Task 9: Verify consumer parity and document the release
+
+- Files: create `tests/production/item-counting-parity.test.ts`, `docs/releases/item-counting.md`; extend the existing fixture/tests as needed; remove the obsolete KPI helper section from `src/lib/domain/skuRouting.ts` after migrating all callers; update this plan's log/evidence.
+- Do:
+  - [x] Run the same explicit fixture through Reports, Welcome, Production selectors and the authenticated digest harness for equal site/person/work-type/window/as-of scope. Compare normal/rework Items/Orders and coverage, not just a direct invocation of the common reducer four times. Include summary versus drill-down, current versus reload, a longer period versus summed days, repeated requests, and frozen snapshot versus a later corrected refresh.
+  - [x] Search all consumers for stale parser copies, raw completion-row counts, `line_quantity ?? 1`, default multipliers, browser-midnight boundaries and frame denominators using expanded Items. Remove residual count paths and the now-unused `isKpiEligibleSku`, `isKpiOrderSku`, `kpiUnitMultiplier` exports from `skuRouting.ts`; all current callers are in the three pages migrated above. Task 5 owns any deliberately preserved frame-only predicate/weighting. This keeps imports one-way from counting/timing to the parser and avoids a compatibility-wrapper cycle. If a new caller appeared since planning, migrate its reporting use or record a scope question; do not alter routing/parser or stock helpers.
+  - [x] Add release notes explaining UN inclusion, historical recomputation, terminal/deduplicated Orders, separate CS/rework, 04:00 site periods, overlapping subtotals/processed work, as-of reports and unknown history that cannot be reconstructed. State that framing-time and inventory rules have not been redesigned. Include current coverage/performance limitations proven during testing.
+  - [ ] Complete the staging checklist below with CJ, recording Preview URL, code revision, fixture IDs/counts, sites, role memberships, period/as-of scope, expected/actual values, timings and pass/fail. Link evidence in the log; never store tokens, credentials, real customer data or secret-bearing URLs. Re-run after any fixes that affect the result.
+- Done when: `npm run test -- --run tests/production/item-counting-parity.test.ts` and the common gate pass; the staging checklist has real evidence, feature PR CI is green, and the planner review checks `docs/HARDENING.md`. Pending external checks stay marked pending and block release. No task completion or review grants merge/deploy authority.
+- Commit: `task 9: verify item counting parity and release guidance`.
+
+## Hardening in the plan
+
+| HARDENING.md area | Handling and evidence |
+| --- | --- |
+| Network/Supabase outage, slow or partial reads | Tasks 4–8: typed read failures, strict v2 envelope/dictionary/tuple validation, one statement snapshot, retry or dated stale state, no successful zero, and no digest generation/send after read failure. SQL timeout/serialization failures stop the gate before API measurements; no fallback to v1. KPI reads do not gate capture. |
+| Retries and concurrency | Tasks 3–4, 7: read-only retries, event-ID/parent deduplication, fixed cutoff and one MVCC statement snapshot, abort/deadline and request identity, unchanged writes. Later backdated changes appear on refresh; no two-pass promise. Existing capture/RPC race risks remain out of scope; do not claim new idempotency guarantees. |
+| Bad scan/order/site input | Tasks 1–4: strict saved-fact validation, no guessed SKU/quantity, parent/site/case checks, missing-context warnings. Existing capture validation remains intact. Shopify/Dropbox/Make/Slack outages are not count dependencies; no enrichment calls. |
+| Attribution and history | Tasks 3–4, 5–8: saved worker/work type/case and original verification time, no reassignment from current team or cancelling worker. V2 preserves raw dictionary strings/nulls and all eleven decoded fields; dictionary bounds, uniqueness and use are checked. Exact microsecond timestamp comparison and client ordering preserve boundaries. Distinct completion rules shared; correction and coverage indicators visible. |
+| UTC and inference | Tasks 2, 5–8: independent site-local boundaries, DST tests, same windows across outputs. No inferred quantities or payroll adjustment; unknown history is labelled. |
+| Auth, RLS, role/site isolation, secrets | Tasks 4–8: 0036 IS a policy change, limited to the two production_events SELECT predicates; preserve both permissive PUBLIC policies and exact role/site visibility. Require before/after counts AND composite IDs for owner/manager/staff/kiosk/cs, all cross-site denials, realistic JWTs and policy definitions/hash. Prove own-membership equivalence and unchanged INSERT/UPDATE/DELETE, other policies, helpers, grants and settings. V1/v2 SECURITY INVOKER, dictionaries and site/cutoff isolation remain unchanged; authenticated/server-only service_role execute, anon/PUBLIC denied. Direct readers and digest retain behavior; S1, navigation and coverage labels stay intact. No new tables/storage or secrets in browser/fixtures/logs. |
+| Cost/spam/external calls | Task 8 retains S1 recipient validation and restricted access; unit tests mock delivery, count verification uses dry mode. No external item API calls or new schedules. Digest replay retains S1 semantics, with no new delivery guarantee. |
+| Expand/contract, rollback, feature flag | Task 4 (c)/(d), pending CJ approval: append-only 0036 atomically replaces both SELECT policies with equivalent predicates, preserving the old-app contract. 0034/0035 and both functions remain unchanged. CJ captures staging parity, completes fresh phases, then applies/verifies production 0036 before deployment. No destructive schema/data change or separate contract removal. App rollback retains functions and policies; a new rollback migration restores both previous policy texts exactly (below). Protected S1 rollback and capture remain available. |
+| Scale | Tasks 3–4, 8–9: unchanged one-call v2 evidence, dictionaries, exact client sort, maps/sweep and >1,000/>100,000 two-year/three-site workload. 0036 caches role/UID/membership checks per statement; verify init-plans. SQL uses full real-session claims (size/shape recorded, minimal claims fail) and pg_roles authenticated timeout via SET LOCAL (8 s). Require 48 EXPLAINs and 36 full-body text runs before API timing, completeness and every timing component. Repeat three manager phases with new policy hash/harness identity; 2 s/10 s targets stay fixed. No helper/index change, split read or timeout/workload/target reduction. |
+| Operations and recovery | Tasks 4–9: visible errors/retry, protected app rollback and explicit policy rollback below. Record function definitions/ACLs, policy definitions/hash, role parity, claims sizes, timeout and SQL/API metrics. Rehearse old-app/v1/direct-reader compatibility. SQL/claims/parity mismatch, timeout, stale/missing phases or missed target blocks Task 5/release. Never log JWT text or credentials; no automatic fallback, timeout waiver or new service. |
+| Tests for credit/inventory/money | Retain Tasks 1–9 tests; add Task 4 policy/claims/hash/phase regressions. Same-count/different-ID, unauthorized membership, changed write policy, minimal/padded claims and stale policy identity must fail before API timing. Staging proves real RLS, direct-reader/digest parity and unchanged capture/stock/ledger; unit/fake tests alone cannot certify policies. Both backends and builds remain green. |
+
+## Release and rollback
+
+- **Migration(s) and why backward-compatible:** 0034/v1 and 0035/v2 stay byte-for-byte unchanged. Add only `0036_production_events_select_initplans.sql` (verify next unused number). This is an explicitly approved policy-replacement scope: drop/recreate both SELECT policies in ONE transaction with identical visibility, names, permissive mode and PUBLIC applicability. Old statements see the old or new complete set, never an intermediate policy gap. Preserve saved facts, schema, write policies, helpers, other policies, all grants/settings and RPC contracts. Expand/contract compatibility rests on retaining the entire old-app read/write contract; there is no data/schema contraction or deferred privilege removal bundled into this release. Never replay recovered migrations as setup.
+- **Application procedure (CJ only):** staging already has 0034/0035. Pass the pre-0036 catalog/role baseline first, including exact rollback policy text and membership-table prerequisites. CJ applies reviewed 0036 in one transaction; any error rolls it all back. Run after-parity, confirm only the two SELECT predicates changed, and complete every fresh manager phase under the new policy hash and realistic claims. The runner never applies migrations or repairs unexpected objects. Only after staging parity, compatibility and timing gates pass may CJ apply 0036 on production, before the app deploy. Live/recovered drift stops rollout for a new decision.
+- **Definition/security verification (staging, repeated by CJ on production before code rollout):** retain exact v1/v2 signature, pg_get_functiondef, SQL/STABLE/scalar-json/SECURITY INVOKER/empty-search_path and expanded ACL checks against unchanged 0034/0035 (authenticated/service_role execute, no PUBLIC/anon/unintended grants). Capture pg_policies text/hash before/after 0036; verify both SELECT expressions against Task 4 SQL and every non-SELECT definition unchanged. Compare helper definitions, user_locations policies/effective grants, table RLS flags, other policy catalogs, role configs and authenticated catalog/effective 8 s timeout. Complete five-role exact-row parity and direct-reader/digest checks on staging with realistic claims. CJ verifies production catalog compatibility with the reviewed baseline/new definitions; agents never develop/test or run the synthetic workload there. Missing objects, drift or failed compatibility blocks rollout.
+- **Does app rollback leave the database usable by old code?** Yes, subject to staging parity proof: old direct reads, v1 and v2 retain identical visibility, fields and contracts. Rehearse the previous S1-protected app with both functions AND 0036, including capture/retry/stock/ledger. Leave both functions/restricted grants and 0036 installed on ordinary app rollback; no data/counter/stock rollback is needed. For a policy regression CJ uses the separate append-only rollback below; app rollback alone does not restore policies. Restoring old policies restores their per-row RLS cost and may reintroduce v2 timeouts, so is not a passing performance gate.
+- **Follow-up contract release?** None for this equivalent replacement. Future policy removal/consolidation, helper/privilege change or v1 retirement needs separate approval after compatibility/rollback needs retire. Never edit applied 0034, 0035 or 0036.
+- **Feature flag?** None required by the approved spec. Existing capture is unaffected; CJ can restore prior counting through a deployment rollback that retains S1.
+
+### Staging setup and verification
+
+Staging project `ybrzhrgfrnvtcwymjdrq` was prepared with production's schema, grants and storage, location `staging` and one test user per role; CJ's first Task 4 run has since added the synthetic sites and volume described below. 0034/v1 and 0035/v2 are already on staging. After approval of (c)/(d), capture the before-policy baseline, CJ applies 0036, and after-policy parity must pass before fresh performance phases or new app code. Verify both functions unchanged and SELECT definitions/hash matching Task 4. Do not ask CJ to recreate/synchronize that schema, copy production data or repeat the one-time setup. **Synthetic `au`, `uk` and `us` location data IS required for F1's end-to-end tests**: application selectors/timezones and the digest accept those keys; `staging` alone cannot prove timezone, site isolation or AU/UK/US digest parity. Do not add a staging-only timezone alias or broaden the production digest's location allowlist.
+
+For Task 4's re-measurement, retain the synthetic location rows and volume already created by CJ's first run; do not shrink/reseed the workload to improve timing. Use `npm run staging:item-counting -- --measure-only` with each explicit manager-phase flag from Task 4, skipping fixture creation/cleanup, after CJ separately applies/verifies 0036 and completes before/after policy parity. Repeat denied-before, all-sites and denied-after against unchanged v2 with the new policy hash/harness revision; no old v1/v2 phases count. Missing/unverified v2, policy/parity drift, minimal/mismatched claims or incomplete SQL/settings/serialization evidence blocks API timing. CJ verifies the three synthetic sites and related test settings/barcodes/products/events/cases, with legal foreign keys and current grants, in staging only. Retain the existing `staging` location. Reuse the five test users with deliberate memberships: owner/kiosk across fixture sites for reconciliation; manager/staff/CS initially AU-only for denied-UK/US tests. Use a second recorded worker identity from an existing test user (such as the manager) for cross-worker credit/cancellation; no real employees or customer records are required. For the Task 4 full-site performance matrix, CJ must temporarily add UK/US membership to the existing manager test user after recording denied-site checks, reauthenticate, run all six permitted-site cases three times, then restore AU-only membership and recheck isolation. These membership transitions use existing administration without further policy/grant changes; record every transition. The separate 0036 SELECT-policy change must already have passed parity. Do not globally relax policies or nav defaults. Values illegal under database constraints (NaN quantities, duplicate primary keys) stay in unit fixtures; staging uses valid rows plus deliberately missing/null legacy detail that the real schema permits.
+
+CJ verifies Preview and any local integration process use only staging for both browser and server clients, including all fallback env-variable names. Preview gets a separate test `CRON_SECRET` and safe recipient/allowlist values; production values remain untouched. Keep credentials out of command history, URLs, files and screenshots. Dry count verification sends no email. Agents do not provision deployments, apply SQL or merge; CJ prepares Preview and staging fixtures.
+
+- [ ] **Owner:** at each synthetic site, exercise all spec A examples, mixed/excluded-only completions, PF/GW/SC, null quantity and unknown/missing history. Compare normal/rework totals, coverage, summaries and drill-downs across Reports/Welcome and authorized digest output with the same scope. Two UN S2 units must be four Items and one completed Order.
+- [ ] **Manager:** permitted-site totals match owner for equal visible scope. With the initial/restored AU-only membership, UK/US reads stay denied; during the recorded temporary memberships, benchmark every site as required above. Check existing Reports access and no new owner-only financial/team privileges. If current staging policy behavior differs from the assumed role contract, record it and stop before asserting scope completeness.
+- [ ] **Staff:** existing Welcome/self scope is labelled correctly; other-worker cancellation/context does not masquerade as fully visible history. Run capture through the already-authorized kiosk scanned identity, not a new staff page grant. Check saved staff attribution across undo/reverify, reload and role/account changes.
+- [ ] **Kiosk:** clock in/out, verify, complete and dispatch with station identity; four Items/one Order remains after reload. Repeat a terminal row, switch worker/site rapidly and force a summary fetch error. Capture continues through reporting failure; counts show updating/unavailable/stale rather than zero. No offline scanner/session feature is implied.
+- [ ] **CS:** create a synthetic authorized replacement case through the existing CS flow and verify separate rework credit via the permitted production flow. Two distinct case IDs remain distinct. Keep CS's existing Welcome/cases/returns access and do not expose a new staff drill-down.
+- [ ] **Digest caller (CJ):** on Preview, download `dry=1` for each of `au`, `uk`, `us` at a fixed production date using the staging bearer secret. Compare Summary/Departments/Staff/Notes and coverage to matching UI scopes; current-day output states as-of time. Test missing/wrong secret, diagnostic auth, methods and recipient allowlist without sending count-test emails. Use only safe test inboxes for any separately authorized S1 delivery smoke test.
+- [ ] **Parent/qualification cases:** cancel A's earlier-day verification as B, duplicate the cancellation and confirm earlier Items falls once while the next day never becomes negative. Undo a mixed order's eligible line: Items falls, Order remains. Explicitly reverse its terminal: Order disappears unless another unreversed qualifying terminal remains. An eligible line saved after an earlier excluded-only terminal never qualifies that earlier completion.
+- [ ] **Identity/scope cases:** distinct same-SKU verification IDs remain separate; repeated retrieval IDs do not. An order handled at two work types has one overall Order and one per work type; another site is independent. Same order on two dates is one over the combined range. Show overlapping personal totals, summed processed work and untagged-rework ambiguity.
+- [ ] **Dates:** test every site's 03:59:59/04:00 edge, before/after DST in both directions, browser timezone unlike site, Monday/month/year boundaries, inclusive custom end date and verification before the range with completion inside. Return to an open page across 04:00 and verify refresh/window labels. Raw CSV timestamps/quantities retain original values.
+- [ ] **Volume and failures:** retain two-year/three-site history with >1,000/>100,000 rows, ties and distant context. First prove policy parity/current hash. Complete 48 EXPLAINs and 36 real wrapped-body text runs under catalog 8 s timeout with full realistic claims; record claims bytes/shape, policy identity and all timing components. Repeat ALL manager phases under the new policy hash/harness revision. Verify function definitions/ACLs, all-role/dictionary isolation and old-app/v1/direct-reader compatibility. RPC/dictionary/partial-body/abort/deadline failures publish no snapshot/email; backdated changes appear on refresh. SQL/claims/parity failure blocks API work; missing evidence/missed targets blocks Task 5/release.
+- [ ] **Inventory/timing regression:** compare stock and ledger movement for the same set/packaging flow before/after F1 and ordinary sequential retry; KPI refresh does not deduct again. Compare framed timing/cost/effort with UN cases interleaved and check benchmark settings remain untouched. If a pre-existing inventory race appears, stop release and record it separately rather than redesigning inventory under F1.
+- [ ] **Full release smoke:** all five role logins; Production capture/clocks; stock once on ordinary retry; safe test Shopify lookup; shipments, CS cases and returns open/save; Dashboard/Reports without console errors; Dexie existing inventory flows and production unavailable states without requiring Supabase credentials. Use only confirmed safe test integration credentials. Rehearse the protected rollback with CJ and record the outcome.
+
+### CJ's release sequence
+
+1. Require approved plan and implementation review, all task gates, green feature PR CI and completed staging evidence. Resolve any Task 4 performance/function/visibility blocker first. Neither approval nor this document authorizes an agent release.
+2. Publish `docs/releases/item-counting.md` to the operational audience before rollout. Record the current production deployment as the rollback target and confirm it contains S1 digest authentication. A source commit alone does not prove which deployment is live.
+3. Confirm production S1 secrets/recipient configuration/server credentials/schedules remain intact. After staging 0036 parity and ALL fresh timing phases pass, CJ backs up production and reconciles migration history, exact v1/v2 signatures and policy/helper/grant baseline. If 0034 or 0035 is absent, apply the unchanged reviewed migration in number order and verify; if present, verify without replay. CJ then applies 0036 transactionally, compares both SELECT definitions/hash with staging, proves non-SELECT policies/helpers/grants/settings and both functions unchanged, and checks old-app direct reads before deployment. Authenticated timeout stays 8 s; PostgREST still discovers both RPCs. A collision/drift/mismatch stops rollout with the previous app live. Record all three migrations/checks; agents never connect to production for this step.
+4. CJ chooses a quiet time away from shift starts/digest schedules, merges the feature PR, observes the deployment and tags the release per `docs/RELEASING.md`. Agents never merge to `main`, deploy or apply SQL.
+5. CJ watches function errors and read-only UI reconciliation for 30 minutes, then checks the next scheduled AU/UK/US digest in logs and the intended inbox. Inspect scope/window/coverage labels as well as Items/Orders. A manual Preview header test does not prove production cron authorization or delivery.
+
+### Rollback
+
+On a count, access, latency or capture regression, CJ restores the recorded S1-protected deployment in Vercel, confirms capture/report access and retains raw events/ledger. Keep `CRON_SECRET`, recipient restrictions and schedules; never restore pre-auth digest code to fix counts. Leave BOTH `load_production_evidence` (0034/v1) and `load_production_evidence_v2` (0035/v2) and their restricted grants in place; do not drop either function or edit migration history. No backup restore, event deletion, stock reversal or counter backfill is part of this rollback. CJ follows the branch/revert/PR procedure in `docs/RELEASING.md` to align source with the restored deployment. Record mismatching scopes and event IDs without customer details for a fix forward.
+
+**Policy rollback (CJ only):** an app rollback does not undo 0036. If its policy evaluation causes a regression, add a new append-only migration at the next unused number (0037 if still free), `0037_restore_production_events_select_policies.sql`; never edit/re-run 0012/0033/0036. Rehearse the rollback body on staging in a test transaction ending in ROLLBACK instead of COMMIT, checking exact role/row parity inside that transaction, so 0036 remains installed and migration history is unchanged. Do not use rollback/reapplication to manufacture fresh successful phase records; final acceptance must be on 0036's reviewed policy hash. The rollback restores BOTH original CREATE POLICY texts below from 0012 and 0033, including implicit permissive/PUBLIC defaults and unwrapped calls. Capture/compare live pre-0036 catalog text first; if it differs, stop before applying 0036 and amend the reviewed forward/rollback pair. Transaction-local search_path only resolves the original unqualified names; no helper/grant/role-setting change is made.
+
+```sql
+BEGIN;
+SET LOCAL search_path = public;
+
+DROP POLICY production_events_read ON public.production_events;
+DROP POLICY production_events_select ON public.production_events;
+
+CREATE POLICY production_events_read ON production_events FOR SELECT
+  USING (
+    can_access_location(location)
+    AND (staff_id = auth.uid() OR is_manager_or_higher())
+  );
+
+CREATE POLICY production_events_select ON production_events
+  FOR SELECT
+  USING (
+    can_access_location(location)
+    AND (
+      staff_id = auth.uid()
+      OR current_user_role() IN ('owner', 'manager', 'cs', 'kiosk')
+    )
+  );
+
+COMMIT;
+```
+
+Both policies are restored atomically; on error the transaction leaves 0036 intact. Verify the restored policy hash equals the captured pre-0036 hash, INSERT/UPDATE/DELETE and all other catalog invariants remain unchanged, and the same staging row sets/direct readers/capture behavior match. Leave v1/v2 and their grants installed. Restoring old policy cost can restore the measured 8 s API failures; preserve that evidence and keep Task 4 blocked instead of raising timeouts. A later forward fix requires its own new migration/review. Production rollback, like application, is CJ's step, with the S1-protected app and secrets retained.
+
+## Out of scope
+
+- F5 managed departments, F6 scanners/offline queues/session attribution, F7 new routing/identity, F8 permissions/trends/export redesign, F9 timing redesign, and F10–F12 external timelines/automations.
+- Canvas credit, broader SKU grammar, catalogue cleanup, automatic history repair, inferred missing quantities, scan-attempt reconstruction and untagged-rework inference.
+- Inventory/packaging deduction changes, existing write-RPC/idempotency redesign, production writes, schema synchronization, new storage or service-role browser access. Task 4 (c)/(d) permits only 0036's two equivalent SELECT-policy replacements and harness/parity corrections; v1/v2 and the loader stay unchanged. Other policy/helper/grant/role-setting changes, indexes, split evidence reads, timeout increases and reduced workload/targets remain out of scope.
+- New cron schedules, finalized second reports, recipients, delivery guarantees, remote station-health monitoring, dependencies or aggregation infrastructure.
+
+## Open questions
+
+Coder writes here when it hits something this plan did not foresee; stop the affected work and obtain the planner/CJ decision rather than improvising scope.
+
+- **M6 — four-case policy parity after staging 0036 — resolved by approved Task 4 amendment, 2026-11-13; implementation/evidence pending.** See **Task 4 M6 amendment — four-case parity after staging 0036** above and [review r1 M6](../reviews/item-counting-r1.md). CJ's quoted blanket approval authorizes the staging-only rolled-back four-case rehearsal and fresh v2.3 manager phases. The old two arrangements cannot certify completion; reopen the specified Task 4 acceptance sub-steps until the new artifact, restoration check and all three phase reruns pass. No additional product decision or rollback change is introduced.
+
+- No product-rule question is reopened by this draft. Task 4's staging performance/visibility measurements and CJ's confirmation of a protected production rollback deployment are required evidence, currently pending. If they fail, record the precise failing query/role/scope, observed result and proposed bounded amendment here. Do not tick the affected gate or manufacture approval.
+
+- **Task 4 staging gate — loader page cost grows with the window — resolved-by-amendment (pending CJ approval; Task 4 remains blocked until its amended gate passes).** Summary: replace option (a) with one compact, read-only SECURITY INVOKER evidence RPC and a single statement snapshot; re-measure the unchanged workload and 2 s/10 s targets.
+  - Historical evidence from 2026-11-12: all 29 SQL statements completed, but CJ stopped the owner benchmark after about 20 min during AU three months; manager did not run. The stopped run is FAILED evidence, not acceptance. Read-only owner EXPLAIN with existing RLS showed no index starting `(location, created_at)` (existing pkey `(location,id)`, department/staff time, order, sku, parent and case indexes). Q1 scanned/sorted the remaining window per page: first page 3.06 s over 118,226 rows; middle page 1.50 s over 60,089 rows, 177,962 buffer hits. About 237 nonempty pages × 1.5 s was roughly six minutes/pass, twelve minutes/load before context; three runs roughly 35 minutes.
+  - **Rejected option (a), never approved by CJ:** add a concurrent non-unique `production_events (location, created_at, id)` index and redundant cursor-time lower bound. Further read-only staging measurements as the owner test user on `ybrzhrgfrnvtcwymjdrq`, with existing RLS unchanged, establish that this cannot meet ten seconds even if scan cost vanished. AU 2026-08-01..10-31 contains 118,226 count rows and 38,272 distinct completed/dispatched orders; there are zero cancellation parents outside the window. Average object row: 369 JSON bytes. The old loader needs about 238 window pages including termination, plus about 383 order batches at at least two requests each: about 1,000 sequential requests/pass, 2,000 with two validation passes. A trivial statement round trip from CJ's machine was about 85 ms, implying about 170 seconds/load regardless of the index, and about 88 MB transfer. The index and cursor lower bound are not implementation steps or release prerequisites in this amendment.
+  - A single SQL statement returning the whole four-family evidence set (window rows UNION before-window line_verified joined to window terminals UNION before-window parents UNION later cancellations, ordered as json_agg) took 6.86 s database execution, including a disk-spilling sort. Owner RLS evaluation alone via count(*) of window rows took 2.96 s, about 25 µs per row from per-row policy helper calls. Compact array-per-row JSON for window plus context is about 20 MB raw versus about 44 MB objects. These are measured database/payload observations supplied by the coder, not a measured RPC/browser/reducer total or proof of acceptance.
+  - CJ chose the one-call approach above. Other historical alternatives—per-production-day paging or changing targets/workload—are not adopted. Replace the implementation's two-pass validation with one MVCC statement snapshot, preserving cutoff and later-refresh semantics required by the spec. This amendment changes Task 4, shared contracts/gates/release text and Task 8's dependent mock/read-failure wording only; existing checked steps and Implementation log entries remain historical records. CJ approval, function application and complete staging re-measurement are pending.
+  - If a target still fails, the coder records a new Open question with role/site/window, each run's completeness and database/transfer/parse/reducer/total costs, then stops for CJ. A later separate RLS-policy rewrite that evaluates helper functions once per statement could be discussed there; it is explicitly NOT a step in this amendment. No target relaxation, additional index, policy/helper rewrite or reduced workload may be improvised.
+
+- **Task 4 staging gate — the one-call RPC times out for AU three months through the API — resolved-by-amendment (pending CJ approval; Task 4 remains blocked until its amended gate passes).** Summary: implement approved fixes (a)+(b) only—append-only 0035/v2 with unsorted, site-inherited dictionary tuples and microsecond-exact timestamp text, plus catalog-derived 8 s SQL timeout and real scalar-body serialization gates; repeat all three manager phases.
+  - Historical run on 2026-11-13, code a127c1f, migration 0034 applied to staging by CJ, function md5 `ffef0f43a32e99832e5b91cc1897d1b5`. The measurements and original proposals below are retained as evidence; the current Task 4/shared v2 contract governs implementation. Option (c) remains a separate future CJ decision, not approved by this amendment.
+  - **Failing evidence:**
+    - AU 2026-08-01..10-31 failed on all six timed runs (owner and manager, three each) with `canceling statement due to statement timeout`, after 8.13–8.47 s to response headers and 0 rows.
+    - Staging Postgres logs show six cancellations per run, about 8.4 s apart.
+    - Every other case passed in both runs with complete rows. Median paired totals:
+      - owner: AU day 346 ms, UK day 269 ms, UK 3 months 695 ms, US day 278 ms, US 3 months 764 ms;
+      - manager (all-sites phase): 311 / 238 / 671 / 218 / 725 ms.
+    - Manager phases recorded: denied-before and all-sites, both FAILED on this case only; denied-after was not run.
+    - The SQL evidence itself passed: function catalog and grants correct; 48 plans; function `rowCount` equals the independent EXISTS expectation for every role and scope (AU three months: 118,244 = 118,226 window + 18 qualification).
+  - **Why direct SQL passed and the API failed** (read-only checks on staging as the owner test user with RLS on; nothing created or changed):
+    1. **Different time limit.** `pg_roles` shows `authenticated` with `statement_timeout=8s` (`authenticator` also 8s, `anon` 3s). PostgREST applies the impersonated role's setting to every API request. The 03 harness connects as `postgres` and runs `set local role authenticated`, which does not apply role settings, so its plans ran under the 120 s server default.
+    2. **EXPLAIN leaves out the output.** The 03 call plans measured execution only: 5.18–6.60 s for AU three months, without converting or sending the result. `pg_stat_statements` shows PostgREST's real statement wraps the scalar as `coalesce(json_agg(pgrst_scalar)->0, 'null')` after `json_to_record` argument binding. That exact shape measured 5.46 s under EXPLAIN. Run for real, with the 21.8 MB body converted to text, it took 6.54 s. Sending that body to PostgREST is also inside the 8 s limit.
+    3. **Small staging instance.** `shared_buffers` 224 MB, `work_mem` about 2 MB and 60 connections (the smallest compute tier). The `ORDER BY (created_at, id)` sort of 118k rows spills to disk (15 MB external merge; about 71 MB temp written per call). Timings for the same query varied from 5.2 to 6.6 s inside one run. Production compute size was not inspected.
+    - Together these put the API statement at or over 8 s. Even without the limit, about 6.5 s in the database plus transfer of 21.8 MB, client parse/validation and the reducer would leave little or no margin under the 10 s target.
+  - **Where the time goes** (AU three months, full window + qualification rows, including conversion to text):
+
+    | Variant | Time | Body |
+    |---|---|---|
+    | Current function shape (sorted, location on every row) | 6.54 s | 21.8 MB |
+    | Same rows, no SQL `ORDER BY` | 4.41 s | 21.1 MB |
+    | No sort, staff and SKU dictionary-encoded, time as epoch microseconds | 4.19 s | 14.1 MB |
+    | Same rows read as the database owner, without RLS (lower bound only, never a design option) | 1.39 s | – |
+
+    So RLS helper calls cost about 3.0 s (about 25 µs per row), the in-database sort and JSON build about 2 s, and the context lookups and the rest under 1 s.
+  - **Proposed bounded fix**, for CJ and Astra; nothing implemented. Keep the workload, security model, RLS policies, the 8 s role timeout and the 2 s / 10 s targets.
+    - (a) **New expand-only migration `0035`** adding `public.load_production_evidence_v2` with the same signature, security (STABLE, SECURITY INVOKER, `search_path=''`), grants and four families, and encoding v2:
+      - no SQL `ORDER BY`; the client sorts once by exact `(created_at, id)`, which it already does after validation;
+      - no `location` in each row; the envelope's `site` applies to all rows;
+      - staff ids and SKUs sent once in dictionary arrays, with rows holding indexes.
+      - `0034` stays in place for old code (contract later); the loader switches to v2 and validates it as strictly as v1.
+      - Measured candidate: about 4.2–4.4 s in the database, including text, and 14 MB, versus 6.5 s and 21.8 MB. That leaves about 3.5 s under the 8 s limit; the end-to-end 10 s target must be proven by re-measuring.
+    - (b) **Harness fix (test-only, no database change).** In `03-query-evidence.sql`, after `set local role authenticated`, apply the role's real settings with `set local statement_timeout = '8s'` (read from `pg_roles`, so it can't drift). Measure the real PostgREST statement shape including the text body (`octet_length`), not only EXPLAIN. The gate then fails in SQL before the API runs.
+    - (c) **Not proposed here, for CJ to decide separately:** most of the remaining 3.0 s is the per-row RLS helper cost. A semantics-preserving policy rewrite that evaluates `current_user_role()` / `can_access_location()` once per statement (for example `(select …)` init-plans) would address it, but it is a policy change and needs its own approved amendment. Also rejected without approval: raising any statement timeout; splitting the read into several calls, which loses the single snapshot; an index, which doesn't address RLS or serialization cost.
+    - If (a)+(b) still miss the AU three-month target on staging, the only levers left are (c) or a target/workload decision, both CJ's.
+
+- **Task 4 staging gate — v2 still times out through the API; the per-row RLS cost depends on JWT size (resolved-by-amendment, pending CJ approval; Task 4 staging gate remains blocked).** Run on 2026-11-13 at code b0c1e21. Astra applied 0035 on staging on CJ's instruction (definition md5 `9b3098a4926cdb26bbda6c5869a79892`; anon can't execute, authenticated can). Manager AU-only; phase denied-before only. Astra stopped as instructed and did not run all-sites or denied-after; the manager was left AU-only (both checked).
+  - **Resolution:** Task 4 specifies (c) append-only 0036 replacing both SELECT predicates with equivalent cached checks and exact role/row parity, and (d) full-session JWT evidence and policy-hashed fresh phases; workload, timeout, targets, functions, encoding and loader stay fixed.
+  - **SQL gate passed, the API failed.** After the 8 s catalog timeout was applied with RLS on, the exact PostgREST statement with the full body as text took 5.09–5.21 s (owner) and 5.56–5.86 s (manager) for AU three months (15.4 MB). Call EXPLAINs took 5.0–6.9 s. All other SQL evidence passed. Through the API:
+    - owner AU three months: run 1 completed in 9,360 ms total (7,943 ms to headers, 300 ms body, 68 ms parse, 398 ms validate, 652 ms reducer; 118,244 rows, 14.7 MB); runs 2–3 were cancelled by the statement timeout (8.6 / 9.4 s);
+    - manager: all three runs cancelled (about 8.3 s);
+    - every other case passed (AU day median owner 439 ms, manager 371 ms).
+  - **Why the SQL harness was still about 2.5 s faster:** the JWT. The harness sets `request.jwt.claims` to `{sub, role}` (74 bytes). The API passes Supabase's full claims (aud, exp, iss, email, app/user metadata, amr, session_id …; about 630 bytes). `auth.uid()` parses that JSON on every call, and the policies call it several times per row (inline `staff_id = auth.uid()` in both SELECT policies, plus `can_access_location()`, `current_user_role()` and `is_manager_or_higher()`, which all call it). Read-only, as the owner with RLS on, counting the 118,226 AU three-month window rows took:
+    - 2.95 s with the 74-byte claims;
+    - **5.18 s with realistic 628-byte claims.**
+    So the real API statement is about 5.1 + 2.2 s, over 8 s.
+  - **What a once-per-statement rule costs.** The same access rule, written so each helper runs once per statement (`(select can_access_location('au'))`, `(select auth.uid())`, `(select current_user_role())`), with the same realistic claims, counted the same 118,226 rows in **78 ms** instead of 5,180 ms. This was read-only, as the table owner, with the rule as an explicit WHERE; no policy was changed.
+  - **Proposed fix (needs CJ's approval as a policy amendment; nothing implemented):**
+    - (c) A new expand-only migration that rewrites `production_events`' two SELECT policies with the same logic, but with every helper/`auth.uid()` call wrapped as a scalar subquery so Postgres evaluates it once per statement (Supabase's documented RLS performance pattern). Who can see what stays the same; no helper, role setting, timeout, target or workload changes.
+      - Verify on staging with the existing role matrix (owner/manager/staff/kiosk/cs, cross-site denial) and before/after row parity.
+      - Rollback is the previous policy text.
+      - Expected: AU three months at about 2–3 s in the database instead of 7+ s.
+    - (d) **Harness correction (test-only):** 03 must set realistic JWT claims, the same shape and size as a real session, so the SQL gate reproduces the API's RLS cost instead of under-measuring it by about 2 s.
+    - Rejected without approval: raising timeouts, splitting the read, reducing the workload or targets.
+  - The saved report is `staging-results-item-counting-v2-denied-before.md` (git-ignored). The earlier v1 copy was renamed `staging-results-item-counting-v1-copy-not-v2.md`.
+
+- **Task 9 (coder, for CJ): three side cards still count from raw rows.** They are not among the plan's four consumers (Reports, Welcome, Production, digest), so I left them unchanged and listed them in the release notes:
+  - `LabourHoursTodayCard`: orders per worker = completion rows, used for cost per order;
+  - `RecentActivityCard`: sums raw `line_quantity`;
+  - `PackageHistoryCard`: package-per-order denominators from its own distinct order sets. The plan freezes package behaviour.
+
+  Decide whether a follow-up should move them to the shared evidence. No change is made under F1.
+- **Task 8/9 (coder, for CJ): `docs/RELEASING.md` digest status table is now incomplete.** The digest adds 400 `Invalid date` and 500 `Full-site report needs SUPABASE_SERVICE_ROLE_KEY`, and no longer falls back to the anon key. The plan does not list RELEASING.md, so I documented these in `docs/releases/item-counting.md` only. Release prerequisite: `SUPABASE_SERVICE_ROLE_KEY` must be set in Production and Preview before deploy.
+
+- **Task 16 (coder, for root/CJ): dev-only embedded PostgreSQL for SQL parity tests.** No local PostgreSQL is available, so the 0044 summary/detail SQL can otherwise be validated only textually and by root's staging harness. Proposal: add `@electric-sql/pglite` as a **devDependency** used only by vitest. It would run the reporting migrations (with the Supabase roles/`auth.users` stubbed) and compare 0044's results with `referenceSummary`/`referenceTimingLines` over the Task 11 fixtures. It changes no app, API or runtime code and adds nothing to the browser bundle. Not added; awaiting a decision. Task 16's server layer and the staging harness proceed independently.
+
+## Implementation log
+
+Coder adds one line per task with focused/full check results, CI evidence and relevant staging outcome. (Written before implementation started; the entries below record what was actually done, including failed runs and amendments.)
+
+- 2026-11-12: CJ approved this plan in chat ("Plan approved"); header Status left as written by the planner.
+- Task 1: added `productionItems.ts` (classifier + strict quantity/overflow checks, current `INKA-AUX…` and legacy `AUX-FP` free prints, catalogue packaging codes + mail-tube IDs excluded) and 52 tests (37 classification, 15 routing/deduction/packaging characterization). Tests failed with the module absent, then passed. Decisions inside the plan's scope: a non-set `GW` single or `GW` picture frame is `unsupported_size` (GW is a set composite per `routeShopifyLineToCatalogueLines`); `S10…` reports `invalid_set_count`. Gate: `tsc -b` OK, `typecheck:digest` OK, 405/405 tests, build OK (only the existing Vite chunk-size warning; new module not yet imported). CI: draft PR #7 `check` passed on d46a1ed.
+- Task 2: added `productionPeriods.ts` (Intl `formatToParts` with `hourCycle: "h23"`, independent round-tripped 04:00 boundaries, Monday weeks, strict calendar validation, no fallback zone for `default`/`staging`) and 18 tests. All six plan DST dates match independently computed UTC boundaries (23h/25h); results identical under UTC, Kiritimati, Los Angeles, Kolkata and Sydney host zones. Small helpers beyond the plan's interface: `isReportSite`, `isProductionDate`, `productionDatesBetween`, `isInProductionRange`. Tests failed with the module absent, then passed. Gate: `tsc -b` OK, `typecheck:digest` OK, 423/423 tests, build OK (existing chunk-size warning only). CI: `check` passed on e6a682f.
+- Task 3: added `productionCounts.ts` (`prepareProductionEvidence` / `summarizeProduction`, distinct-key helpers, `PRODUCTION_EVIDENCE_COLUMNS`), shared fixture `tests/fixtures/item-counting.ts` and 33 tests. Write-path check in `Production.tsx`: unverify always writes at the verifying station (its verified-line query filters by department), so strict same site/order/work-type parent matching is correct; no UI writes terminal reversals today, so reversal support (cancel whose parent is a completed/dispatched row) is exercised only by fixtures. Decisions within the plan: `completed` at dispatch and `dispatched` at a line station are invalid terminals; a verification at the same instant as its terminal counts as context; `started`/clock rows are ignored; issue lists are sorted for deterministic output; aggregate overflow returns `items: null` + incomplete. Tests failed with the module absent; two deliberate mutations (ignore cancellations; let later lines qualify earlier terminals) were caught (5 and 1 failures). Gate: `tsc -b` OK, `typecheck:digest` OK, 456/456 tests, build OK (existing chunk-size warning). CI: `check` passed on 202ce12.
+- Task 4 (code done; **staging gate pending, so the task stays unticked**): added `productionEvidence.ts` (`loadProductionEvidence`, `ProductionReadError` kinds, `productionVisibilityFor`, `quotePostgrestValue`), the enforcing fake `tests/fixtures/fakeSupabaseEvents.ts` (not named in the plan; a test-only harness) and 25 tests, including >1,000 and 100,500-row reads, tied timestamps, punctuation, server cap 1, failed final/context pages, denied context, abort, deadline, future and backdated inserts/edits, cross-site rows and module-boundary checks. Three deliberate mutations (drop keyset cursor, drop site filter, stop on short page) each failed tests. Read strategy, all queries site- and cutoff-bounded: (1) in-window count events; (2) `line_verified` before the window for orders completed in it, 100 orders per request; (3) before-window parents of in-window cancellations, 100 ids per request; (4) ONE paged read of `cancelled` rows with a parent after the window, keeping only those pointing at in-window evidence. This replaces per-id correction batches, which would be ~1,000 requests per pass at 100k in-window rows. RLS checked on staging: `production_events_select` gives owner/manager/cs/kiosk every row at a member site and staff only their own, so `productionVisibilityFor` labels staff (and unconfirmed membership) as limited. Staging has no `(location, created_at)` index (existing: pkey `(location,id)`, `(location,department,created_at)`, `(location,staff_id,created_at)`, order/parent/sku/case); query (1) and (4) are the measurement targets. Gate: `tsc -b` OK, `typecheck:digest` OK, 481/481 tests, build OK (existing chunk-size warning). Pending: CJ staging data + measurements before Task 5.
+- Task 4 staging gate prep: added CJ-run, staging-only scripts in `supabase/staging/item-counting/` (`01-sites.sql`, `02-volume.sql`, `03-query-evidence.sql`, `99-remove-volume.sql`, README) and `tests/staging/measure-item-counting.ts`. None of these files is named in the plan, and none is a migration. Each SQL file refuses to run unless it finds the `staging` location and test users and no `default` location. The measurement script refuses any URL other than the staging project. I checked the volume generator on staging with a read-only SELECT that inserted nothing: 235,732 rows with unique ids and none in the future; 118,226 rows in the AU 2026-08-01..10-31 window; 1,287 on AU 2026-09-15. Insert/query syntax was checked with plan-only EXPLAIN. No SQL was applied. Expected risk: step (2) sends one request per 100 completed orders per pass, so the AU three-month read may exceed 10 s. If it does, it goes under Open questions.
+- Task 4 staging gate, rerun (loop paused at CJ's request): the first staging run stopped at `03-query-evidence.sql` because the tool returned only the last result, and the owner/manager measurements did not run. Added `npm run staging:item-counting` (`tests/staging/run-item-counting.ts`). It reads `.env.staging.local` only and refuses to run unless the staging ref is in the DB host or user and in the Supabase URL. It runs 01–03 one statement at a time and keeps every result set, then measures as owner and as manager. `itemCountingEvidence.ts` checks that every expected result is present and non-empty. The output `staging-results-item-counting.md` ends with `STATUS: COMPLETE`/`FAILED – …`, and the command exits non-zero on failure. **New dev dependency `pg` (+ `@types/pg`)**: the runner needs a direct Postgres connection. PostgREST/supabase-js cannot run DDL/DO blocks, `EXPLAIN ANALYZE` or `set local role`, and `psql` is not available on this machine. `pg` is devDependency-only and never bundled into the app. Also: a dollar-quote-aware SQL splitter (7 tests); evidence checks (7 tests, including the exact "only last result" and "measurements not run" failures); the measurement script is now a function; `.gitignore` explicitly ignores `.env.staging.local` and `staging-results-*.md`; a CI step fails if either is ever tracked; AGENTS.md has a "Handoff gate" rule. Checked locally: a missing env file and a live-host DB URL both produce `STATUS: FAILED` with exit 1, and nothing touches a database.
+- Task 4 staging gate, owner benchmark stopped at about 20 min (see Open questions for the cause): the runner now prints a heartbeat every 10 s (case, run, elapsed time, requests and rows read, taken from the Content-Range header so it adds no parsing to the timed load). It rewrites `staging-results-item-counting.md` after every SQL statement, every finished case and every heartbeat, using write-then-rename. On Ctrl+C or terminate it writes a final report. An unfinished, stopped or killed run always ends with `STATUS: FAILED – run not finished/stopped during <step>`, and finished cases and over-target timings are kept. Report building moved to `tests/staging/itemCountingReport.ts` with 5 tests (not named in the plan). The workload (6 cases, 3 runs, loader unchanged) and targets are unchanged. Checked locally: no settings file gives FAILED and exit 1; an unreachable fake host, then a kill, leaves a report that ends FAILED and says where it stopped. Gate: `tsc -b` OK, `typecheck:digest` OK, 500/500 tests, build OK. The previous stopped report is kept, git-ignored, as `staging-results-item-counting-2026-11-12-stopped.md`.
+- 2026-11-13: CJ approved the Task 4 one-call RPC amendment in chat ("once done just approve it, and work autonomously"), given before Astra finished; Astra's re-amendment ended STATUS: COMPLETE (commit c2a95d8). The coder continues Task 4 up to the CJ-run staging gate; no SQL is applied by agents.
+- Task 4 one-call amendment (code done; **CJ-run staging gate pending, so Task 4 stays unticked**):
+  - **Migration:** `0034_load_production_evidence.sql` adds one function, STABLE SECURITY INVOKER `search_path=''`, returning the v1 json envelope. It revokes execute from PUBLIC/anon/service_role, then grants authenticated + service_role. No other object changes.
+  - **Loader:** `productionEvidence.ts` now makes exactly one `rpc()` call. It validates the envelope strictly before building a snapshot:
+    - scope echo, `complete`, `rowCount` against the raw tuples;
+    - tuple shape, site and cutoff on every row;
+    - family membership, using microsecond-exact `instantMicros`;
+    - identical duplicates are dropped; conflicting ones reject as `changed`.
+    It handles abort and deadline across a pending client. There is no automatic re-read and no table fallback.
+  - **Fake harness:** `fakeSupabaseEvents.ts` is rewritten as an RPC fake. It derives the four families on its own, applies fake RLS before the joins, and fails on table reads or a second RPC.
+  - **Tests:** 30 loader tests. Four deliberate bugs each failed them: dropping the site check, the family check or the cutoff check, and a wrong RPC parameter. The cutoff mutation exposed a gap, so I added an in-window, after-cutoff case. The tests were written after the code, not first; the mutations show they bite.
+  - **Choices inside the plan:**
+    - The window family can't overlap the other three (separate time ranges), so the function de-duplicates only qualification ∪ parents with UNION, not the whole set. The result is the same; this avoids an 11-column sort of 118k rows.
+    - Count and rows come from one aggregate pass.
+    - `validateMs` is derived as load − headers − body − parse, and is labelled that way.
+  - **Measured on staging, read-only:** the function body with literal arguments, as the owner with RLS on and nothing created. AU three months: 4.52 s database execution (it was 7.84 s before the two choices above), 118,244 rows, matching the independent EXISTS count (118,226 window + 18 qualification). AU busy day: 86 ms, 1,313 rows.
+  - **Harness:**
+    - `03-query-evidence.sql` is now generated by `tests/staging/generate-query-evidence.ts` (not named in the plan). A test fails if the file is stale. It holds catalog and grant checks, 48 labelled plans and independent EXISTS expectations, plus staff, empty and invalid fixtures.
+    - The measurement records each run's RPC count, headers/body/parse/validate/load/reducer/total times and raw/wire bytes. Medians are taken over three runs at a fixed cutoff of 2026-11-12T00:00Z.
+    - Gate checks now fail on a missed target, any bad run, or a missing manager phase. The three manager phases are recorded in the git-ignored `staging-results-item-counting.phases.json`; `.gitignore` and the CI leak check now cover `staging-results-*.json` (files not named in the plan).
+    - New `--measure-only` and `--manager-phase=` flags.
+    - New file `tests/staging/measure-item-counting.test.ts`.
+  - **Gate:** `tsc -b` OK, `typecheck:digest` OK, 514/514 tests, build OK. Checked locally: with no settings file, the run ends FAILED with exit 1; a bad `--manager-phase` exits 2.
+- 2026-11-13 staging gate run (a127c1f; CJ applied 0034 on staging): FAILED. AU three months timed out at the API's 8 s `authenticated` statement_timeout on all six owner/manager runs; every other case passed (medians 218–974 ms). Investigation and proposed fix are under Open questions. Task 4 stays unticked; Task 5 not started.
+- 2026-11-13: CJ approved the Task 4 v2 amendment in chat ("Approved, build it"); Astra's amendment ended STATUS: COMPLETE (commit 3c918fd).
+- Task 4 v2 amendment (code done; **staging gate pending, so Task 4 stays unticked**):
+  - **Migration `0035_load_production_evidence_v2.sql`:** same signature, security, families and invalid-input NULL as v1; encoding v2 with no per-row site, staff/SKU dictionaries frozen once as arrays (mapping via `unnest WITH ORDINALITY`, joined to rows), timestamp text and no `ORDER BY` anywhere. 0034 is unchanged.
+  - **Loader:** strict v2 decoding (exact ten envelope keys, dictionaries unique / text / all used, safe in-range indexes, ten-slot tuples, site from the envelope). Duplicate identity compares instants, so equivalent offset spellings are equal. One sort by exact microseconds, then id.
+  - **Tests:** written first (31 of 37 failed on the v1 loader), then 37 pass. Five deliberate decoder bugs each fail them: dropping the unused-entry, upper-bound, uniqueness, cutoff or family check. The uniqueness case needed a both-copies-used test, added.
+  - **Measured on staging (read-only, owner, RLS on, `SET LOCAL statement_timeout='8s'`), nothing created:**
+    - the v2 body in PostgREST's wrapper with the full body as text: AU three months 4.85 s, 15.4 MB (v1: 6.54 s, 21.8 MB);
+    - AU busy day decoded field by field: identical to v1 (1,313 rows, 0 differences; 3 staff and 9 SKU entries);
+    - the AU three-month independent EXISTS count runs in 4.1 s under the 8 s limit.
+  - **Harness:**
+    - `generate-query-evidence.ts` now produces 145 statements: v2 and v1 catalog/ACL; after each of the 4 role switches, a DO block applies authenticated's catalog `statement_timeout` plus an evidence row; 48 plans; 36 real PostgREST-shape full-body text runs; rowCount read by regex on the text (`->>` would re-parse 15 MB under the limit); independent EXISTS counts; field-by-field and dictionary comparison for the 3 day scopes and staff; empty and invalid fixtures. No ANALYZE.
+    - Field-level comparison is limited to day scopes and staff: decoding 118k rows in SQL would not fit the 8 s limit. Three-month scopes compare counts.
+    - The evidence row records the JWT subject, not the email: `authenticated` can't read `auth.users`.
+    - New `itemCountingGate.ts` (not named in the plan) runs the gate in order so it can be tested: API timing only after a clean SQL gate; phases recorded only for clean runs, tagged with v2 name / definition md5 / encoding / harness version; a `--manager-phase` that contradicts memberships is refused. Any calls to the old v1 RPC are counted and fail the run. Pending-only phases give a distinct "awaiting … (expected)" STATUS.
+  - **Gate:** `tsc -b` OK, `typecheck:digest` OK, 536/536 tests, build OK.
+- 2026-11-13 v2 staging gate (b0c1e21; Astra applied 0035 on staging on CJ's instruction, first tries were blocked by Codex sandbox limits, then run with full access): FAILED in phase denied-before. The SQL gate passed, but AU three months timed out through the API on 5 of 6 runs (the one owner success took 9.36 s). Cause and proposed policy fix are under Open questions. Task 4 stays unticked; Task 5 not started.
+- 2026-11-13: CJ approved the Task 4 policy/JWT amendment in chat ("Approved, build it"); Astra's amendment ended STATUS: COMPLETE (commit 6da7f30).
+- Task 4 policy/JWT amendment (code done; **staging parity and phases pending, so Task 4 stays unticked**):
+  - **Read-only preflight on staging:** the live catalog matches the recovered baseline. There are 5 production_events policies (two permissive PUBLIC SELECT policies plus INSERT, UPDATE and DELETE), with the 0001 helpers and RLS on. `user_locations_select` allows `user_id = auth.uid()`. pg's printed form of the new predicates was checked with a temporary view in a rolled-back transaction; it matches the checks.
+  - **Migration `0036_production_events_select_initplans.sql`:** the plan's exact SQL, with the exact rollback text in its header. 0034, 0035, both functions, the loader, fake and encoding are unchanged.
+  - **`itemCountingPolicyParity.ts` (+13 tests):**
+    - canonical SHA-256 of all production_events policies;
+    - the reviewed post-0036 checks, which reject per-row helper calls, `auth.uid()`, RESTRICTIVE policies and missing or extra policies;
+    - real-session claims checks: 14 required keys and their types, ≥500 bytes, staging issuer, UUID subject and session, expiry, amr shape;
+    - before/after comparison by exact `location|id` sets per role and site, and by direct-reader replay id sets;
+    - fixture fingerprint, non-SELECT policy and catalog drift, expected memberships per arrangement, no-subject denial;
+    - redaction of tokens and claims JSON.
+  - **Runner and harness:**
+    - New `stagingSessions.ts` signs in all five test users and keeps each session's claims text in memory; only sizes and shapes are reported.
+    - The runner supplies the claims to 03 right after BEGIN as bound parameters into `inka_staging.jwt_<role>`. Generated 03 has no minimal-claims fallback (`current_setting` without missing_ok). It records claims bytes, shape and booleans, plus profile role and memberships, after every switch, and records the policy catalog.
+    - New `policyParityRun.ts` (`--policy-parity=before|after`, `--arrangement=standard|owner-kiosk-without-uk`) runs one REPEATABLE READ transaction, rolled back. It reads month-chunked row sets under savepoints, plus 11 direct-reader filter replays at the fixed cutoff, for owner/manager/staff/kiosk/cs/no-subject, and writes `staging-results-item-counting.policy-parity.json` and a STATUS report.
+    - Gate identity now includes `policyHash` and `parityHash`; `HARNESS_VERSION` is v2.2. The SQL gate requires claims evidence and completed parity for the current policies before any API timing.
+    - Shared test fixtures are in `gateTestFixtures.ts`.
+    - Files not named in the plan: `stagingSessions.ts`, `policyParityRun.ts`, `gateTestFixtures.ts`.
+  - **Choices:**
+    - The Reports replay uses one month (2026-09) rather than three. Before 0036, a three-month read with real claims is close to the 8 s limit, and Reports takes any user range.
+    - Readers are compared as id sets without their limits, which apply unchanged on top.
+    - Live-order-completions' `limit(500)` tie order is not compared.
+    - `measure-item-counting.ts` was not changed: the API sessions already carry real claims.
+    - Tests were written alongside the parity module, not strictly first.
+  - **Needs CJ:** `.env.staging.local` has no staff/kiosk/cs logins yet.
+  - **Gate:** `tsc -b` OK, `typecheck:digest` OK, 557/557 tests, build OK.
+- 2026-11-13 0036 staging run (code 86dd1c3 + harness fixes; Claude ran it on CJ's instruction, staging only, through the guarded helpers):
+  - **Setup:** reset the staff/kiosk/cs test passwords; they are stored only in `.env.staging.local`. Real session claims are 501–516 bytes.
+  - **Parity before 0036, standard:** COMPLETE. Visible rows: owner/kiosk 240,112; manager/cs 155,432; staff 30,018; no-subject 0.
+  - **Parity before 0036, owner/kiosk without uk:** COMPLETE. Owner/kiosk 197,772 (−42,340 UK); uk restored.
+  - **Applied 0036.** Policy hash 2ce3f0db… → b7884efe…
+  - **Parity after 0036, both arrangements:** COMPLETE. Identical row ids for every role and site and identical replays for all 11 direct readers; only the two SELECT policies changed.
+  - **Harness fixes found while running, test-only:**
+    - two order-lookup reader replays picked sample orders with a site-wide sorted subquery and timed out before 0036; they now use the fixed orders VOL-<SITE>-20260915-1..3 (8 ms via the order index);
+    - the package-history replay window starts 2026-10-01;
+    - one standard after-run lost its connection (ECONNRESET) and crashed; the runner now handles connection errors, and the rerun completed.
+  - **Phase denied-before: passed and recorded.** Median totals: owner AU day 1,216 ms, AU three months 3,895 ms; manager 1,230 / 5,207 ms.
+  - **Phase all-sites: passed and recorded.** Owner AU 1,265 / 3,793 ms, UK 269 / 531, US 267 / 470; manager AU 1,233 / 5,100, UK 276 / 385, US 267 / 416.
+  - **Phase denied-after: FAILED in the SQL gate; no API timing ran.**
+    - The manager AU three-month rowCount statement (03 statement 94) was cancelled at the 8 s timeout after 12.8 s wall time; the same statement took 1.5 s in both earlier runs.
+    - All manager AU three-month SQL in this run was 2–4× slower than earlier (call EXPLAINs 5.3 / 3.6 / 2.2 s, versus about 1.4 s), which points to transient staging-instance load after back-to-back runs, not a code or policy change.
+  - **State left:** standard memberships, 0036 applied, manager AU-only. Task 4 stays unticked until denied-after passes.
+- task 4 (0036 staging, denied-after rerun): CJ approved a rerun after a cool-down. Manager confirmed AU-only beforehand. `--measure-only --manager-phase=denied-after` ended `STATUS: COMPLETE`; the report shows all three phases passed (denied-before and all-sites at 86dd1c3, denied-after at 3d0a79c; same v2 definition, policy hash and harness `item-counting-gate-v2.2`). Medians: owner AU day 1,382 ms / AU three months 6,132 ms, UK 403/478, US 239/513; manager AU 1,320 / 5,670 ms, UK 279/261, US 289/254. All within target. This confirms the earlier denied-after failure was transient staging load. Surprise: the measuring fetch wrapper threw on sign-out's 204 response (null-body status) after timing ended; fixed in `measure-item-counting.ts` with `rebuildResponse` and two tests. Parity-capture steps ticked. Still open in Task 4: the manual sub-items of the direct-reader step (Reports correction/delete and kiosk scanned-worker capture on `staging` fixtures, digest service-role v1/v2 check) and the v1/old-app rehearsal and capture smoke in the fresh-evidence step. Task 4 stays unticked until those are done.
+- task 4 (write paths, digest, rollback rehearsal): added `--write-compat` (`tests/staging/writeCompat.ts`, `writeCompatRun.ts`, 16 tests; files not named in the plan). It replays the app's own capture/deduction/correction/Reports-remove statements on `staging` with real claims, plus v1/v2, the digest's service-role read and anon, once with 0036 and once with the plan's pre-0036 rollback text, in one rolled-back transaction. Result `STATUS: COMPLETE`, all 30 steps identical under both policy sets. Kiosk inserts for the scanned worker are allowed. Deduct removed -2 frame / -1 box once and the retry skipped both. Staff cross-worker insert, update and delete were denied (0 rows). Manager update affected 1 row. Owner remove deleted 2 ledger rows then the event. v1 = v2 for owner/manager (4) and service role AU day (1,313). The digest's service-role read equals the RLS-free reference (1,289 rows, same id md5). Anon was denied on v1, v2 and the table. Restored hash 2ce3f0db… equals the parity baseline; 0036 hash b7884efe… equals the after record. Staging verified unchanged afterwards. App pages/components/api are byte-identical to `main` on this branch, so these statements are the previous S1-protected app's. A browser click-through of the old app was not done here; it stays in Task 9's full release smoke. Task 4 ticked.
+- task 5: Reports now loads one v2 evidence snapshot per refresh through `useProductionEvidence` (new `src/lib/hooks/useProductionSummary.ts`: fixed as-of per refresh, 2 retries on failed/incomplete, stale-with-error on a failed same-scope refresh, identity guard on user/site/window/visibility, abort on change). It projects with `buildProductionReportView` (tiles, leaderboard, per-person days/orders, slowest variants, export rows), and `productionFrameTiming.ts` keeps the pre-F1 timing stream exactly (frame/UN/legacy predicates moved from skuRouting, 30-minute cap, legacy weight; UN stays zero-weight; cancellations from shared parents). Characterization surprise: `INKA-AUXESP` fails open into the timing stream as a legacy title (weight 0), as before. Ranges are site 04:00 production days; `default`/`staging` show the unavailable state. The package-usage card keeps its browser-day window, unchanged. CSV keeps raw quantities/timestamps, exports only the selected days, and fetches note/station separately at export time. The order-lookup item chip now uses the shared reducer and is labelled "processed". The Dexie path no longer constructs the Supabase client. Gate: tsc, typecheck:digest, 585/585 tests, build OK. Hook loading/error/identity changes are not unit-tested (no DOM test dependency); they stay in the staging browser checklist.
+- task 6: Welcome now loads one evidence snapshot for today plus the 8 production days before it (`welcomeRange`), refreshes at the next site 04:00 (re-checked at most every 5 minutes), on focus/visibility and on identity change. It projects with `buildProductionWelcomeView` (new `productionWelcomeView.ts`, 8 tests). The source periods were mixed and are now aligned. Department cards show today so far; the "vs last week" badge compares with the same weekday 7 days earlier and is labelled with that date (it used yesterday minus 7). The streak counts consecutive days ending today with the same top worker (previously yesterday was never checked). Most improved uses completed Orders yesterday versus the person's working days in the 7 days before. Previously its "orders" included order numbers touched by verifications only; the label now matches. The sparkline is completed orders per day for the 7 days to yesterday. Rework is shown separately; names fall back to saved staff IDs; the greeting stays browser time. Dexie no longer constructs the Supabase client. Gate: tsc, typecheck:digest, 593/593 tests, build OK.
+- task 7: the Production bench counter now comes from `useProductionEvidence` for the site's current production day plus `buildProductionCounterView` (new, 8 tests). It shows the active worker at the station's work type, with normal and rework counts and the shared status line (updating, stale or error with retry). The two unpaged "today" queries and every local +1 / ±quantity were removed. Verify, unverify, line completion and order completion/dispatch call `refreshCounter()` after a successful insert, without awaiting it, so capture and the `deduct_inventory_for_event` call are unchanged and never wait on reporting. A failed insert returns before refresh. A worker/station/day switch hides counts until a snapshot read after the switch arrives. The day rolls over at site 04:00 (timer, re-checked at most every 5 minutes) and on focus. Behaviour change by design: repeated completions of one order now count one Order (spec), not one per completion row. New `tests/production/item-counting-capture.test.ts` (4 tests): spied fake client; refresh and retry only read the evidence RPC, a failed save adds nothing, a failed read rejects rather than showing zero, and the fixed cutoff excludes a later save. Surprise: `Production.tsx` has mixed CRLF/LF endings; my edit normalised them, so I restored the original endings on unchanged lines to keep the diff to 176 lines. Staging kiosk capture/stock smoke stays in the Task 9 checklist. Gate: tsc, typecheck:digest, 605/605 tests, build OK.
+- task 8: the digest now does one `load_production_evidence_v2` read for the report day and the day before under one cutoff (`asOfUtc` = request time), using the service-role client with site visibility. It prepares the evidence once and projects each production day with the shared reducer. Changes:
+  - Removed: the copied SKU parser, KPI predicates/multiplier and the midnight `localDayRangeUtc` helper.
+  - Orders: Summary `orders_total` is the distinct union across work types, no longer the department sum. Items are labelled "processed across all departments". Rework totals are added to every sheet and the email.
+  - Labels: every output carries the production window (04:00 local, both UTC instants), timezone, status ("final", or "as of … day not yet closed"), as-of, loaded and generated times.
+  - Notes: coverage issues become warning notes. Rework-only or warning-only days are no longer skipped as empty.
+  - Hours: clock-based hours are kept but read inside the production window, paged and with the same cutoff. Ledger (boxes) reads are paged on (ts, id) under the cutoff; staff-name reads are paged on user_id. Products, ledger, staff-name and clock read errors now fail the report with 500 before any XLSX or email; they were previously ignored.
+  - Dates: `date` must be a valid YYYY-MM-DD production date; invalid, repeated or blank dates get 400 after auth, method and recipient checks and before any read. The default is `productionDateAt(now, site)`.
+  - Credential: with no SUPABASE_SERVICE_ROLE_KEY the digest returns 500 instead of falling back to the anon key, because an RLS-empty result would look like a complete site.
+  - Unchanged: S1 auth, method, recipient and diagnostics code; envcheck still describes the old fallback in its note. Cron expressions and the AU/UK/US allowlist are unchanged.
+  - Tests: the S1 test mock gained the evidence RPC, `order`/`range`/`lte`; all 318 S1 tests pass unchanged. New `tests/api/daily-digest-counts.test.ts` (20 tests) covers explicit workbook and email values, distinct Orders, repeated terminal, prior-day cancellation, UK fall-back DST, the default/as-of date, rework-only and warning-only days, 400 dates, no anon fallback, server credential passthrough, seven read failures (no XLSX/email) and clock paging. `package.json` changed only to add it to `typecheck:digest`.
+  - Surprise: the repo is `"type": "module"` and Vercel's Node ESM functions need explicit extensions on relative imports. The digest imports `../../src/lib/...*.js`, and `productionCounts` → `productionItems` → `skuRouting` now use `.js` specifiers; tsc, Vite and vitest resolve these to the `.ts` files. This must be confirmed on a CJ-created Preview (local Vite does not serve `api/`).
+  - Staging proxy for digest read time: as service_role, the two-day AU read (2026-09-14/15, 2,610 rows, 0.34 MB) took 47 ms server-side. End-to-end Preview timing stays in the Task 9 checklist.
+  - Gate: tsc, typecheck:digest, 625/625 tests, build OK.
+- task 9: new `tests/production/item-counting-parity.test.ts` (4 tests). One explicit UK fixture goes through `buildProductionReportView`, `buildProductionWelcomeView`, `buildProductionCounterView` and the real digest handler (mocked Supabase/XLSX, dry download). It checks:
+  - site/day (7 Items / 2 Orders, rework 1/1), unframed (6/2) and A at unframed (5/2) agree across all four consumers, as do rework and coverage counts;
+  - summary equals the drill-down; reload, shuffle and duplicate retrieval give identical results;
+  - the two-day union is 2 Orders where the days sum to 3;
+  - a frozen snapshot keeps its values while a corrected refresh drops the cancelled Items (the Order stays).
+  
+  Stale-path search: no parser copies, `?? 1` defaults or KPI helper callers remain. `isKpiEligibleSku`, `isKpiOrderSku` and `kpiUnitMultiplier` were removed from `skuRouting.ts`; the frame predicates live in `productionFrameTiming.ts`. The remaining `setHours` uses are the clock-state lookup and package windows, both unchanged by design. Three side cards with their own counts are recorded under Open questions, not changed.
+  
+  Release notes are in `docs/releases/item-counting.md`, including the new SUPABASE_SERVICE_ROLE_KEY prerequisite.
+  
+  Pending (blocks release, CJ): the staging browser checklist on a Preview. It covers role logins, kiosk capture/stock/ledger smoke, `dry=1` digests for AU/UK/US (also proving the server-side `.js` imports load), hook loading/error/identity behaviour and the protected rollback rehearsal. Agents cannot sign in through the browser to staging, so Task 9 stays unticked until that evidence exists.
+  
+  Gate: tsc, typecheck:digest, 629/629 tests, build OK.
+- review r1 M6 (partial; paused at CJ's request for the reporting architecture amendment): implemented the four-case acceptance gate per the Task 4 M6 amendment.
+  - New `tests/staging/itemCountingParityCases.ts` adds the case specs and exact standard memberships (including `staging`).
+  - Per-side checks cover: policy set and hash (restored side = the original pre-0036 baseline hash; installed side = post-0036); identities read; all sites; 11 reader replays; profile roles; non-member denial.
+  - Positive coverage is required at populated member sites. Interpretation recorded: the `staging` site has no saved events (AU 155,432 / UK 42,340 / US 42,340), so it must be read and identical but cannot show rows. Also required: staff sees no other worker's rows, with privileged other-worker rows present; manager sees UK/US in `manager-all-sites`; owner/kiosk see 0 UK and >0 AU in their denied cases.
+  - Comparison checks exact ids both ways, reader results, memberships, non-SELECT policies and other catalog items. The collection check re-derives each comparison from the stored evidence, rejects missing or duplicate cases, mixed collection/fixture/baseline, wrong restored or installed hash, a missing original baseline, non-standard starting memberships, and a missing or failed restoration.
+  - `checkParityArtifact` now certifies only the four-case collection; the old two-arrangement history fails it (tested). `parityArtifactHash` hashes the case comparisons plus restoration. `HARNESS_VERSION` is `item-counting-gate-v2.3`, so every v2.2 phase record is ineligible, and 03 was regenerated.
+  - Tests: gate fixtures now build a passing four-case artifact plus `legacyParityArtifact()`; 9 new four-case tests and 1 evidence test. Gate: tsc, typecheck:digest, 663/663 tests, build OK.
+  - **Not done yet (stopped before starting):** the `--policy-parity=cases` collector in `policyParityRun.ts` (one rolled-back REPEATABLE READ transaction, nested pre-0036 restore, fresh post-rollback restoration check) and its runner mode, README text, the staging collection run, and the three v2.3 manager phase reruns. Until these run, `checkParityArtifact` fails on the real artifact, so the staging gate stays FAILED. That is intended: the earlier certification is withdrawn.
+
+- 2026-11-15 (Claude, Task 13 Part B2a; 0038 still an unapplied draft; 0037 byte-identical; no SQL run):
+  - **0038 schema additions** (nullable only): `batches.sealed_at`/`sealed_work_count`/`sealed_manifest_hash` (all set together or none), `partition_work.expected_chunk_count`/`expected_result_digest`, and `event_facts.production_date`. The `partition_work_guard` trigger refuses new work on a sealed batch and any change to a descriptor.
+  - **Helpers:** `frozen_image` (the batch's view of an event: rebuild candidate; else frozen replacement or tombstone; else mirror), `owner_partition` (trimmed nonblank order, else event id), `work_manifest`, `stage_one` and `check_staged_rows`.
+  - **`plan_reporting_work`:** needs a frozen, unsealed batch under a live fence; at most 1,000 descriptors and 1 MiB. Descriptor shape is exact, and an order key must be a trimmed order. A conflict, inside the call or against saved work, fails the whole call; an identical replay is a no-op.
+  - **`seal_reporting_work`:** the exact count and manifest must match. An identical re-seal is a no-op; a different one fails.
+  - **`claim_reporting_work(p_limit DEFAULT 100)`:** limit 1..1,000, `SKIP LOCKED`, at most 1 MiB, and work ids returned as text.
+  - **`stage_reporting_result` / `stage_reporting_results`:** the bulk call takes at most 100 entries and 1 MiB, and all entries succeed or none do. Each chunk is checked in this order:
+    - the work id is a positive decimal belonging to this batch;
+    - the envelope has exactly its keys and types and is at most 1 MiB;
+    - SHA-256 of the EXACT UTF-8 bytes of `canonicalRows` matches, checked before parsing;
+    - it holds exactly the four arrays and at most 1,000 rows;
+    - each work keeps one chunk count and digest;
+    - an identical replay is a no-op, including after completion, while different content fails, also after completion;
+    - the work is claimed under this fence;
+    - every row has the exact keys (payload cannot set site, audience, partition, rule or validity), parses to its type, is in the frozen view, belongs to the work's partition (and to the self worker where relevant), matches the frozen source's time/order/key/parent, and is not after the cutoff;
+    - the work is done only when every chunk is present and the recomputed digest matches.
+  - **`api/_lib/reporting-stage.ts`** (new, in `typecheck:digest`): descriptor validation; a byte-order (COLLATE "C") manifest with JSON lines that escape exactly as PostgreSQL `to_json` does; `buildChunks` (at most 1,000 rows and 1 MiB with a jsonb margin; an empty result is one chunk; an oversized row fails); `packStageRequests` (at most 100 entries and 1 MiB); typed wrappers that validate before calling.
+  - **Tests:** `tests/reporting/reportingStage.test.ts`, 40 tests:
+    - hash agreement with Unicode, null, quote, backslash and control-character data;
+    - manifest escaping and UTF-8 versus UTF-16 ordering, and the zero-work hash;
+    - descriptor rules; chunk and request bounds;
+    - a reference model of the 0038 staging rules: missing, duplicate and contradictory chunks; forged hash and digest; bad envelope; ownership, self, frozen-view, drift and cutoff; forged trusted metadata; unclaimed or wrong-fence work; bulk rollback and bulk-equals-single;
+    - SQL text for every rule; wrappers.
+  - Gate: `npx tsc -b`, `npm run typecheck:digest`, 982/982 tests, build OK.
+  - **Not done (stopped at the usage limit):** a deliberate-break run for B2a was not performed this time. B2b (publication and runtime runner) is not started; Task 13 is open.
+- 2026-11-15 — T11-4 fix (selected-source warnings; first of two overnight commits). Task 13 stays open.
+  - Projector: a whitespace-only-id row is now a `SourceIssueFact` (raw id, type, instant, staff, raw order, raw parent, shared-TS issue) in `PartitionResult.sourceIssues`, which replaces partition-wide `globalIssues`. An empty id or an unreadable time throws, as the transport/loader does. The self audience filters before capture. Rows after the cutoff go to `futureEventIds`, never to issues.
+  - Reference: `selectFactFamilies` runs the four-family rules over the union of facts and source issues and returns the two separately. Only selected source issues are reported (global, whatever the display filter). They never give parent presence. Counting rules are unchanged. `evidenceIdentityIssue` was extracted from `prepareProductionEvidence` with no behavior change.
+  - Tests: 10 new companion regressions:
+    - Jan 5 whitespace row vs Jan 12 range;
+    - a future or later malformed row;
+    - malformed terminal → prior context;
+    - malformed cancellation → parent;
+    - malformed `started` parent warns;
+    - valid `started` parent is "parent not found";
+    - narrower range/staff/work-type filters;
+    - self visibility;
+    - empty id / bad time throw;
+    - hash sensitivity.
+
+    `randomHistory` now adds unique whitespace ids and whitespace parents to the randomized reducer-parity sweep.
+  - Surprise: the reducer skips a whitespace `parent_event_id` before parent lookup (`productionCounts.ts:359`), so such a cancellation gets no "parent not found". The test asserts only the selected identity warning; counting rules were not touched.
+  - Deliberate breaks (projection suite of 70 tests):
+    - all source issues in every range (the bug): 4 failed;
+    - no selectors from source issues: 3;
+    - future malformed rows captured: 1;
+    - self filter after capture: 18;
+    - hash omits source issues: 1;
+    - malformed rows dropped: 9;
+    - empty id accepted: 1;
+    - source issues give parent presence: 0 — an equivalent mutant, since source-issue ids are always whitespace-only (empty throws, site must match) and blank parents are never looked up.
+  - Gate: `npx tsc -b` OK; `npm run typecheck:digest` OK; 992/992 tests; build OK.
+  - The fifth SQL family (0038 `source_issue_facts`, five-array envelope) lands in the next commit with T13B2a-1..3.
+- 2026-11-15: **fifth staged family plus T13B2a-1..3.** This is the second of the two overnight commits. 0038 is still an unapplied draft; 0034–0037 are byte-identical (0037 SHA-256 531BB2C5…); no SQL was run. Task 13 stays open and B2b is not started.
+  - **Fifth family.** New private table `reporting_private.source_issue_facts`:
+    - versioned like the other result tables, with RLS and service-only grants;
+    - raw id, type, instant, staff, raw order and raw parent, plus the TypeScript issue kind and detail;
+    - 4 indexes and no FK.
+
+    The stage envelope is now exactly five arrays (`stage_one`, `RESULT_TABLES`, `buildChunks`), and the 1,000-row cap counts all five. The staging catalog expects the new table and `staged_row_problem`.
+  - **T13B2a-1 (structure).** The `jsonb_populate_record` parse is gone. `reporting_private.staged_row_problem(table, row)` checks every column of all five arrays before any cast, lookup or save:
+    - required versus null;
+    - JSON type;
+    - lowercase uuid and ISO timestamp/date shapes;
+    - enums;
+    - int4, safe-int and non-negative ranges, with numeric casts only inside a CASE once the shape is known;
+    - the relational rules (verification fields, `invalid_detail`, `parent_role`/`parent_created_at`, `pair`).
+
+    It is generated from the same column spec as the TypeScript `resultRowProblem`, with identical messages. A test makes each column wrong in turn in TypeScript and requires the same SQL message, in the same order, within that table's block.
+  - **T13B2a-2 (binding).** Each array's raw fields must equal its primary frozen image:
+    - **event/source-issue:** type, instant, staff, raw order, parent;
+    - **event:** department, case, sku, quantity, and order key = trimmed raw order;
+    - **occurrences:** terminal type, raw order/key, case, staff, instant;
+    - **timing:** verification type, staff, instant;
+    - **edges:** cancellation type, parent, `is_self`;
+    - every family is held to the cutoff;
+    - a whitespace-only id may appear only as a source issue, and a valid id never as one.
+
+    Parent existence is derived from the frozen view as the audience sees it: a nonblank, due, count-type event, and for a self audience, that worker's own. A valid-id `started` parent therefore never has a parent role, and `parent_created_at` must match. Each predecessor id must be an earlier or same-instant due verification by the same worker. Derived fields (role, work type, items, pair, weight) are not recomputed in SQL.
+
+    Tests use a reference model with full frozen images. They cover wrong worker/time/order/case/sku/quantity/department/type/parent and predecessor problems for the site and self audiences, plus parent visibility (Ben's parent is visible to the site, invisible to Anna's self view).
+  - **T13B2a-3 (claim bytes).**
+    - **Claim.** `claim_reporting_work` measures each returned row as its `json_build_object` text (escaped values, quoted keys, `" : "`/`", "` separators — an upper bound on PostgREST's compact row JSON), plus 4 bytes of list separator, plus 2 for the brackets. Only the 1 MiB prefix is leased and returned; the rest stays pending. A first row that cannot fit alone raises a visible error.
+    - **Planning.** `plan_reporting_work`/`descriptorProblem` refuse any key whose escaped JSON exceeds 1 MiB − 512.
+    - **Wrapper.** It also refuses a response over 1 MiB.
+    - **Byte model.** TypeScript `claimRowBytes`/`claimPrefix` model the same bound.
+    - **Reproduction.** For the review's case (1,000 keys of 3 digits plus 800 quotes), the old estimate is 1,003,000 bytes, while the compact response is over 1.5 MiB. The new bound claims two prefixes covering all 1,000 works, each compact response ≤ 1 MiB, with nothing truncated or stranded.
+  - **Surprise.** The old reference model compared times with `Date.parse`, which drops microseconds. It now compares exact microseconds, as `timestamptz` does.
+  - **Deliberate breaks** (stage suite, 52 tests; every mutant killed):
+    - removing the structural call: 1 failed;
+    - making `order_occurrences.staff_id` nullable in SQL: 1;
+    - dropping the occurrences staff binding: 1. Both of these first survived, because the SQL-text checks searched the whole function body; the tests now scope each assertion to its table's block;
+    - parent visibility ignoring the audience: 1;
+    - dropping the source-issue identity check: 1;
+    - the old claim estimate: 1;
+    - silently skipping an oversized first descriptor: 1;
+    - a four-array envelope: 1;
+    - an SQL message drifting from TypeScript: 1;
+    - the TypeScript validator ignoring NOT NULL: 2;
+    - dropping the verification relation: 1;
+    - the old TypeScript claim estimate: 3;
+    - no wrapper response cap: 1;
+    - accepting unclaimable keys: 1;
+    - four TypeScript tables: 20.
+  - **Not done:** runtime SQL proof of these rules (staging), which belongs to the final reviewed migration rehearsal and the B2b harness, as the plan says. The SQL is verified only by its text and by the reference model.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; 1004/1004 tests; build OK. 0038 SHA-256 is fd3ea601bcb23f4b….
+- 2026-11-15: **T13B2a-1 residual (calendar validation of `production_date`).** Only this residual was fixed; no SQL was run and no migration was applied. 0037 is unchanged (531BB2C5…); the 0038 draft's SHA-256 is now aeba062d….
+  - **SQL.** `staged_row_problem` keeps the same message. After the shape regex it checks, in order:
+    - year ≥ 1;
+    - month 1–12;
+    - day ≥ 1 and within the month (30-day months; February 28/29 by the 4/100/400 leap rule).
+
+    It then confirms with a native `make_date`, which runs only once the arithmetic has passed, so an invalid date never raises mid-check and never reaches the chunk store or publication. Null is still accepted. The site/04:00 production-date semantics are unchanged; SQL does not compute dates.
+  - **TypeScript.** `isCalendarDate` (used by `resultRowProblem`) applies the same rules plus a native UTC `Date` round trip.
+  - **Tests.** The new tests cover:
+    - rejected: 2026-02-30, 2026-99-99, month 00/13, day 00/32, 31st of April/June/September/November, 2026/2023/1900/2100-02-29, year 0000, 5-digit years, unpadded months;
+    - accepted: 2024/2000/2400/1600-02-29, month ends, 0001-01-01 and 9999-12-31.
+
+    A rejected row leaves no stored chunk and the work stays leased. The SQL-text checks scope the date rule to its own block. Surprise: the date CASE contains an inner `END`, which first truncated the message-parity block; that test now bounds each block by the next table header.
+  - **Deliberate breaks** (stage suite, 53 tests). Killed:
+    - regex-only TypeScript (the finding): 1 failed;
+    - regex-only SQL: 1;
+    - Julian leap rule in SQL: 1;
+    - no SQL `make_date`: 1;
+    - unchecked 30-day months in SQL: 1;
+    - year 0000 allowed in TypeScript: 1.
+
+    In TypeScript, weakening the leap rule, the 30/31-day months or the month bound alone survives. These are equivalent, because the native `Date` round trip independently rejects those days. Removing the round trip alone also survives, because the arithmetic covers it. With both layers broken, each combination fails (Julian leap, every year leap, 31-day months, month 13: 1 failed each).
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; 1005/1005 tests; build OK.
+- 2026-11-15 (Claude, Task 13 Part B2b; 0038 still an unapplied draft; 0034–0037 byte-identical, 0037 SHA-256 531BB2C5…; no SQL run, nothing applied, capture/processors untouched; Task 13 stays OPEN until reviewed staging evidence passes):
+  - **0038 additions** (SHA-256 bdc61aa7…):
+    - Owner columns on the four 0037 fact tables: nullable `partition_kind`/`partition_key`, both or neither, with current-owner indexes. On the new `source_issue_facts` they are required.
+    - Retired/installed and current-key indexes.
+    - `batches.published_generation_id`, checked to be present exactly when the batch is published.
+    - Private, versioned `source_versions` with one current image per event and service-only access.
+    - `reporting_private.publication_fingerprint`.
+    - Service-only `public.publish_reporting_batch(p_batch, p_fence)`.
+  - **Publication, in one transaction:**
+    - **Lock order and replay:** control share lock, then the site row, then the batch row. A lost-response replay of a published batch with the same fence returns its generation and writes nothing (another fence fails). After that, `lock_batch` checks epoch/rule/base/fence and the live lease.
+    - **Integrity:** the batch must be sealed and frozen with its manifest unchanged, and every work done with contiguous chunks and the recomputed digest.
+    - **Generation S and fact replacement:**
+      - every current row of every planned (audience, owner) is closed in all five families, so empty replacements delete;
+      - a rebuild closes everything at the site, every audience;
+      - staged rows are installed via `jsonb_populate_recordset`, with site/audience/owner/rule/validity taken only from trusted metadata.
+    - **Refusals:** an undated verification, or two current rows for one event (an unplanned old owner), fail the publication.
+    - **Daily groups:** groups touched by retired/installed verifications or by a changed edge's parent (rebuild: all) are closed and recomputed from current facts:
+      - lines = every effective verification;
+      - Items count only `item_status = 'counted'` (the planner's note: item_status gates Items only, never lines or groups);
+      - a line is cancelled only by a current edge with `pair = 'valid'`, a verification parent, not self, and parent time ≤ cancellation time;
+      - totals above 2^53−1 are stored as overflow;
+      - a group with no effective line is removed.
+    - **Mirror and versions:** a refresh applies the frozen images and tombstones; a rebuild applies the frozen candidate.
+    - **Wrap-up:** the old published generation is superseded with a 7-day expiry, then the new one is published with its fingerprint; the batch is marked published (per-site receipt); the acknowledgement pass runs; the site moves to the new generation and verified cutoff. `read_mode` is never touched.
+  - **Decisions inside the contract, for review:**
+    - **(a) Acknowledgement locking:** the Part A pass `acknowledge_received_changes` now locks candidates in change-id order with `FOR UPDATE … SKIP LOCKED`. Two sites publishing a shared move at once therefore cannot deadlock; skipped rows are left for a later pass, as the Part A contract already allows.
+    - **(b) Fingerprint:** SHA-256 over these lines:
+      - `item-counting-publication-v1`;
+      - site, kind, rule and epoch;
+      - the cutoff in integer microseconds;
+      - the sealed manifest hash;
+      - the result digests in manifest order.
+
+      It has no time-zone or DateStyle dependence, and TypeScript `publicationFingerprint` matches it.
+    - **(c)** A daily group with zero effective lines is removed rather than written as zero.
+    - **(d)** `production_date` is required only on verification facts.
+  - **TypeScript:** new `api/_lib/reporting-publish.ts` (wrapper with the sequence kept as a decimal string, plus the fingerprint model). The shared `tests/fixtures/reporting-rows.ts` maps real projector output to the five arrays, with owners. Both are added to `typecheck:digest`. Catalog expectations: `source_versions`, `publication_fingerprint`, `publish_reporting_batch`.
+  - **Tests (`reportingPublish.test.ts`, 29; `reportingPublicationRunner.test.ts`, 11):**
+    - **Reference model:** a model of `publish_reporting_batch` runs on the real Task 11 projector output for `history()`. Its daily groups equal the reducer for the site audience and Anna's self audience: Items, lines, absent groups, excluded/unclassified zero-Item lines, rework, and the hidden 5008 cancellation, which differs by one line between site and self.
+    - **Semantics:** replacement, empty-replacement deletion, moves (both owners, and refusal when only the new one is planned), rebuild closing a departed audience, a cancellation in another owner's partition, a cancellation saved before its parent, overflow, undated refusal, no-change, replay/fence/unsealed/incomplete, mirror/versions, and AU→UK receipts.
+    - **SQL text and code:** every rule, including closing before install, trusted columns only, item_status appearing exactly once (in the Items sum), step order, and SKIP LOCKED; plus the fingerprint bytes and the wrapper.
+  - **Staging runner** (`npm run staging:reporting-jobs -- --rehearse-migration|--check-installed|--interleavings --sites=A,B [--max-pages=N]`; the module is `tests/staging/reportingPublication.ts`; the `--fence` path is unchanged). Rehearsal applies the whole draft inside ONE outer transaction, with its BEGIN/COMMIT stripped and any inner transaction control refused, then runs the 0038 catalog check and the flow. It ALWAYS rolls back, then a fresh guarded audit compares a baseline: control, site state, reporting row counts, fixtures and per-site source md5. The flow:
+    - **Setup and rebuild:** enable capture and processors inside the transaction, insert `rp-*` fixtures (counted/excluded/unclassified/cancelled/invalid/whitespace-id rows), rebuild A, and plan the fixture owners for both audiences plus 650 keys of 800 quotes.
+    - **Real-SQL regressions:**
+      - B2a-3: each claim is ≤ 1 MiB, more than one call is needed, and nothing is stranded;
+      - B2a-1: null role, 2026-02-30, 2100-02-29;
+      - B2a-2: wrong staff, whitespace id as a fact, valid id as an issue;
+      - a four-array envelope;
+      - no refused chunk is stored;
+      - an incomplete publish is refused.
+    - **Publish checks:** daily totals equal the reducer on the frozen fixture for site and self; mirror = versions = candidate; no ownerless fact; the whitespace-id row is an issue only; replay returns the same generation; another fence fails.
+    - **Refresh A** after an update, a delete, an insert and an A→B move:
+      - an expired lease (fixture time shift inside the transaction) is taken over, and the old fence is refused for both publish and claim;
+      - an empty replacement deletes;
+      - daily totals equal the reducer;
+      - versions are closed;
+      - the move stays pending for B;
+      - the old generation is superseded with a 7-day expiry.
+    - **Then:** rebuild B, which acknowledges the move, and a no-change publication that touches no fact.
+    - **Interleavings** (installed; capture and processors must already be enabled by the operator; every connection rolls back):
+      - I1: a duplicate worker waits on the site row;
+      - I2: an uncommitted write is invisible to a freeze;
+      - I3: a source write during an open publication does not wait;
+      - I4: two sites publish concurrently without deadlock;
+      - I5: a backend killed before commit leaves no generation/batch/mirror row.
+
+      Every cleanup failure fails the run.
+  - **Not covered without commits:** the committed "smaller id commits after the snapshot" case and the cross-connection takeover of a committed batch. Both need committed staging state; the runner never commits, and these are left for the planner's installed checks.
+  - **Deliberate breaks** (92 focused tests; all 20 killed, 1 failed each):
+    - SQL (11): rebuild-only close; lines filtered by item_status; a later cancellation still cancelling; no replay; replay ignoring the fence; one-day retention; no SKIP LOCKED; no timing duplicate check; fingerprint staff order; `read_mode` flipped; tombstone left in the mirror.
+    - TypeScript (3): fingerprint ignoring manifest order; numeric sequence accepted; cutoff in milliseconds.
+    - Runner (6): probe without savepoint rollback; role reset masking errors; inner COMMIT allowed; status ignoring cleanup; connections not rolled back; fixture losing its excluded line.
+  - **Surprises:**
+    - `rp-x1` (blank order) is an invalid verification in Task 11, so it is not a daily line; my first hand count was wrong and the reducer check caught it.
+    - The Part A expand-only test regex flagged the `IS NOT NULL` predicate in a CHECK; it now rejects only real NOT NULL column constraints.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict tsc on the staging runner OK; 1045/1045 tests; build OK.
+- 2026-11-15 — B2b review round 1 (T13B2b-1 to 7) and the prepared installed-commit harness, plus the planner's three early harness notes:
+  - **State:**
+    - 0038 is still an unapplied draft (SHA-256 14a808ea…).
+    - 0034–0037 are byte-identical (0037: 531BB2C5…).
+    - No SQL was run and no staging mode was executed.
+    - Task 13 stays OPEN.
+  - **T13B2b-1:** `publication_fingerprint` now uses valid `EXTRACT(epoch FROM …)`. The test that endorsed the qualified spelling is corrected, and a whole-file guard rejects any schema-qualified special-grammar call (EXTRACT, OVERLAY, POSITION, COLLATION FOR, SUBSTRING/TRIM … FROM).
+  - **T13B2b-2:** the shared `rowsByOwner` fixture now emits:
+    - `order_occurrences` for every terminal with a work type, person and order;
+    - `timing_facts` for effective stream verifications, with the projector's full-history predecessors.
+
+    The fixture asserts that all five families are non-empty.
+    - **Model test:** occurrence/timing install, replacement (old version retained as closed) and deletion by empty replacement.
+    - **Rollback flow:** new order RP-9 (one timing row, one occurrence), deleted in the refresh. New checks:
+      - P2f: all five families are non-empty;
+      - P2g: exact current rows per family and audience after the rebuild;
+      - F9g: exact current rows after replacement and deletion;
+      - F9h: RP-9 has no current occurrence/timing row, and its closed rows are retained at the old generation;
+      - F9i: replaced RP-1 occurrence/timing rows have a retained closed version and a new current one.
+  - **T13B2b-3:**
+    - `runCaptureLifecycle` persists through a sticky, non-throwing `persist()`. A failure is kept in errors, so the run is FAILED, and written to stderr, and rollback, disconnect and the fresh audit still run. An actual-helper injection test shows `open 1, rollback, end 1, open 2, AUDIT, end 2` with two persistence errors.
+    - New `initialReport` refuses the database connection when the report cannot be written. It is used by all three runners (fence, publication, capture).
+    - New `finalReport` records a failed final write and prints the whole report to stderr.
+    - Saves inside a run still throw, which stops further scenario work.
+  - **T13B2b-4:** the audit compares a full-state fingerprint:
+    - every row image of `production_events`, `products`, `ledger`, `user_locations` and `profiles`;
+    - functions (source md5, ACL, config, security definer, owner);
+    - relations, columns (with ACL), constraints, indexes, policies and triggers;
+    - schema ACLs and the capture role with its memberships;
+    - every `reporting_private` table's full rows;
+    - control and site state, field by field.
+
+    Identity-sequence positions are deliberately excluded, because rolled-back inserts advance them. Rollback-only modes allow NO difference, so 0038 left behind after a rehearsal is caught. The committed harness allows exactly its declared capture-epoch increments and the run sites' lease bookkeeping (a fence that goes backwards is refused).
+  - **T13B2b-5:** `migrationBody` classifies statements by their first executable keywords, skipping whitespace, line comments and NESTED block comments. ROLLBACK, END, ABORT, SAVEPOINT, RELEASE and PREPARE TRANSACTION are refused inside the body. Quoted function bodies and `PREPARE name AS …` are not mistaken for transaction control. The reviewer's `BEGIN; /* c */ COMMIT; SELECT 1; COMMIT;` now throws.
+  - **T13B2b-6:** I5 uses `killOwnVictim`. The victim is tagged with a run-unique `application_name`, and `pg_terminate_backend` runs only for that pid AND tag. Expected 57P01 notices are counted as evidence; any other error event or end() failure is a cleanup failure (proved by injection).
+  - **T13B2b-7:**
+    - P2d compares exact (event_id, image) sets of candidate, mirror and current versions in both directions, instead of counts.
+    - F9j checks exact fixture images: mirror = `to_jsonb(source row)`, version = mirror, and deleted ids are not current.
+    - I2, I4, F5 and P3 are relabelled to their narrower evidence and point to the committed cases.
+  - **Installed-commit harness** (`npm run staging:reporting-jobs -- --committed-interleavings --sites=A,B`; module `tests/staging/reportingCommitted.ts`) — PREPARED, NOT RUN:
+    - **Preflight refuses** unless: capture is off; no batch is active anywhere; both sites are legacy with processor off, no generation, no derived/mirror/candidate/batch rows and no unacknowledged journal rows; and the run-unique `rc-<run>-` fixture prefix collides with nothing.
+    - **Ownership** (original settings, fixtures, then batches, generations and sequences as they are created) is saved BEFORE the first commit; a failed save stops with nothing committed.
+    - **Scenarios:**
+      - A: a lower change id, uncommitted while a higher one commits and freezes, commits later and stays pending until the next publication receives and acknowledges it;
+      - B: a committed batch survives its worker's disconnect and is taken over from another connection (only this run's lease is shifted, by a committed update); the old fence is refused for claim and publish;
+      - C: a publication committed on one connection with its response "lost", then replayed from another: same generation, no duplicate credit, no new generation;
+      - D: a committed A→B move of a run fixture. Both sites publish concurrently, with an explicit empty replacement of the old owner, and the change is acknowledged, directly or by at most one recorded deferred pass. The moved facts are current only at B.
+    - **Cleanup** always runs, even after failures:
+      - abandon this run's unfinished batches;
+      - restore capture off (an expected epoch increment, never reset);
+      - classify journal rows by exact id; external rows are RETAINED and reported;
+      - delete only rows scoped to this run's sites AND its generation sequences, generation ids, batch ids, change ids or prefixed fixture ids — no unscoped delete, no trigger/constraint suppression;
+      - remove generations newest first;
+      - then end every session.
+
+      The lifecycle's fresh full audit runs last.
+  - **Planner's early notes:**
+    - **(1)** Every committed service RPC goes through `serviceCall`: begin, become service_role, PROVE `current_user` and the claims role, call, commit. Any failure rolls back, so no role or aborted state leaks. The shared `rpc` delegates to it via `FlowCtx.call`, so the rollback-only module still contains no commit. Owner-role fixture/lease statements stay explicit.
+    - **(2)** `endAll`, cleanup steps and the cleanup-start rollback now keep rollback failures.
+    - **(3)** `cleanupPlan(own, changes, { retainBatches, externalActiveSites })`:
+      - any retained batch keeps ALL the run's facts, daily rows, versions, mirror rows, generations and site pointers, and restores only the processor setting;
+      - journal rows received by a retained batch are kept;
+      - a site whose active batch is not the run's is never touched;
+      - even unretained metadata resets apply only while the site's active batch is the run's, or none.
+  - **Deliberate breaks** (134 focused tests; all 19 killed):
+    - qualified EXTRACT: 2 failed;
+    - no timing rows: 2; no occurrence rows: 2;
+    - save throwing through cleanup: 1; output failure not refusing the connection: 1;
+    - private tables ignored: 1; ledger not hashed: 1; epoch drift accepted: 1;
+    - block comments hiding COMMIT: 1;
+    - unexpected disconnect swallowed: 1; terminate without the tag: 1;
+    - service RPC without the role check: 1; committed RPCs not transactional: 1 (this one first survived a text-only check and was fixed with a behavioural begin/role/proof/call/commit test);
+    - rollback failure swallowed: 1;
+    - retained run still deleting facts: 1; external site reset: 1;
+    - commit before the ownership save: 1; fixture-prefix guard lost: 1;
+    - F9h removed: 1.
+  - **Surprises:**
+    - My first fixture expectations were wrong in two places, both caught by the shared rules: `rp-x1` with a blank order is an invalid verification, and the excluded hook line `rp-v2` is not a timing-stream line.
+    - The cleanup unit test's fake answered every site_state query, which made both sites look externally active; the fake was narrowed.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict tsc on the reporting-jobs and capture runners OK; 1062/1062 tests; build OK.
+  - **Next:** independent review of the fixes and the harness before any staging action. Then the rollback rehearsal, installation of the reviewed draft, the installed and committed interleavings, and the fresh restoration audits.
+- 2026-11-15 — B2b round-2 repair (T13B2b-8 to 13) plus the planner's early-review residuals:
+  - **State:**
+    - No SQL was run and no staging mode was executed. The failed diagnostic artifact `staging-results-reporting-publication-rehearse-migration-20261114T203354246Z-25d65b84.md` is preserved, not retried.
+    - 0038 is unchanged this round (SHA-256 14a808ea…, unapplied); 0037 is unchanged (531BB2C5…).
+    - Task 13 stays OPEN.
+  - **T13B2b-8 (baseline SQL):**
+    - **Casts:** every catalog `name`/`"char"` column concatenated in `STATE_QUERIES` is now cast to text (relkind, tgenabled, relname, nspname, proname, tgname, attname, conname, schemaname/tablename/policyname, and the `pg_get_userbyid` results). A test scans every surface for any uncast concatenation.
+    - **Errors:** each surface runs through `surface()`, so a failure reads `baseline surface <name> failed: <SQLSTATE> <original message>` and keeps `code` and `cause` (the ES2020-safe `Object.assign` pattern).
+    - **New `--baseline-smoke --sites=A,B` mode:** read-only. It takes the full baseline once, records each surface, and lets the lifecycle's fresh audit prove nothing changed — no transaction, no write, no migration, no sign-in.
+  - **T13B2b-9 (refresh equality):** F9j now uses `scopedImageDiff`, an exact, bidirectional comparison of scoped `(event_id, image)` sets for source/mirror/current versions (jsonb text). Each of these fails:
+    - a missing current version for `rp-v6`;
+    - an extra mirror row;
+    - a mismatched image;
+    - a duplicate.
+  - **T13B2b-10 (conservative cleanup):** discovery and deletion run in ONE transaction:
+    - control share lock, then the run sites' `site_state` rows FOR UPDATE;
+    - exact journal ownership by the recorded fixture ids on both sides (no prefix);
+    - external journal rows = rows touching the run's sites with an epoch after the baseline that are not the run's;
+    - unknown batches/generations at the run's sites;
+    - the site pointers.
+
+    `cleanupDecision` retains EVERYTHING — every derived row, the mirror, versions, generations, batches, journal rows, fixtures and pointers — on any of these:
+    - failed discovery;
+    - an external journal row, batch or generation;
+    - a foreign active batch or published generation pointer;
+    - any tentative or uncertain identity.
+
+    In that case it only restores the run's processor setting, and only where no foreign batch is active. Any delete failure rolls back the whole cleanup (nothing half-deleted), and every failure is kept.
+  - **T13B2b-11 (settle first):** every secondary session is rolled back and closed BEFORE capture is restored. A scripted case-A run proves the order: open writer rollback → END → capture-off → locked cleanup → main END. Fixture source rows are deleted only when capture-off is confirmed inside the cleanup transaction, and every session closes even if cleanup fails. No timeout was raised.
+  - **T13B2b-12 (ownership before commit):**
+    - **Tentative before COMMIT:** `ownedCall` records returned batch/generation identities as tentative and persists them BEFORE COMMIT; a failed save rolls back and nothing commits. They are confirmed after the commit.
+    - **Uncertain COMMIT:** the originating session is ended first, and absence is concluded only after its backend is seen gone in `pg_stat_activity` (bounded: 25 × 200 ms). Otherwise the identity stays uncertain.
+    - **Capture accounting** (planner note): the expected epoch increment is the sum of this run's own CONFIRMED capture transitions. Each one locks control FOR UPDATE, reads the epoch, transitions, and persists a before/after receipt before COMMIT. An uncertain transition is an explicit failure and adds nothing, and observed deltas are never used. The successful enable is confirmed before processor setup.
+  - **T13B2b-13 (whole lifecycle):** everything after opening the main session is inside try/finally. A preflight query failure or a failed ownership save closes every session (rollback + end), sends no commit, `set_reporting_capture` or delete, and never runs destructive cleanup (`committedAnything` stays false). The lifecycle's fresh audit still runs.
+  - **Early-review residuals:**
+    - **(1)** A REUSED batch returned by begin that the run does not own is refused BEFORE COMMIT; a known owned replay is allowed.
+    - **(2)** Every resolution path, including cleanup's retry, honours the origin receipt: no absence lookup while the backend is present.
+    - **(3)** The same ≤3 s transaction-local lock cap (a stricter existing limit kept) is set before the capture prelock.
+    - **(4)** `--baseline-smoke` signs nobody in.
+    - **(5)** ES2020 `cause` pattern; duplicate `Db` import removed.
+    - **(6)** The settlement test's matcher no longer matches `publish_reporting_batch` inside PREFLIGHT_SQL, and it compares duplicate lines by entry index.
+  - **Deliberate breaks** (70 focused tests; all 21 killed):
+    - relkind / tgenabled not cast: 1 each;
+    - surface not named: 1;
+    - image diff in one direction only: 1; image diff ignoring missing rows: 1;
+    - external batches ignored: 1; discovery failure treated as clean: 2; foreign generation pointer ignored: 1; uncertain identity ignored: 1;
+    - journal matched by prefix: 1;
+    - non-atomic cleanup: 2;
+    - fixtures deleted with capture on: 1;
+    - secondaries settled after cleanup: 1;
+    - ownership saved only after commit: 1;
+    - origin not settled before concluding absence: 1;
+    - uncertain transitions widening the epoch: 2;
+    - cleanup after a preflight failure: 1;
+    - reused external batch adopted: 1;
+    - retry ignoring the origin receipt: 1;
+    - prelock without the lock cap: 1;
+    - baseline smoke signing in: 1.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1075/1075 tests; build OK.
+  - **Next:** root review of this checkpoint. Then root runs `--baseline-smoke`, followed by the authorized rollback rehearsal if clear. Installation and the committed harness wait for their reviews.
+- 2026-11-15 — B2b runtime-evidence repair (T13B2b-14 and -15 only; no SQL, no staging mode, nothing installed; 0038 SHA-256 still `14a808ea…714b1d`, 0037 still `531bb2c5…`; the failed rehearsal artifact is preserved, not retried):
+  - **T13B2b-14 (fixture):** `rp-x1` now uses `BLANK_ORDER` (three ASCII spaces) instead of `''`. 0030's `length(order_number) > 0` admits it. It still trims to `''` under both `evidenceOrderKey` and 0038's `btrim`, so the event partition and the invalid-verification and deletion semantics are unchanged. No constraint or counting rule changed.
+    - New `productionEventAdmissibility` (in `tests/staging/reportingPublication.ts`) mirrors the source table's own constraints: locations key, uuid staff, 0012 department/quantity, 0029 event types, 0030 order number.
+    - `insertFixtures` refuses an inadmissible row before sending any SQL. Every runner insert goes through it: S1, `rp-v6`, `rp-i2`, `rp-i3` and the committed-mode `fxRow`, which is now exported for the test.
+    - The scripted committed-run test context used `staff: "s"`; it now uses a uuid.
+  - **T13B2b-15 (foreign batches):** new `guardBeginOwnership` runs inside `ownedCall`'s transaction, before either begin RPC. It takes the RPC's lock order (`control` FOR SHARE, then the `site_state` row FOR UPDATE, then the site's live batches FOR UPDATE) and refuses if the active pointer or any live batch is not one of this run's known batch ids.
+    - The locks are held through the RPC and COMMIT, so nothing changes between the check and its use.
+    - On refusal the transaction rolls back before the RPC runs, so the external batch, its state and the pointer are untouched.
+    - A missing control or site row refuses; it is never read as "nothing active".
+    - The existing `reused` check stays as a second line. Timeouts and the migration are unchanged.
+  - **Tests (`tests/reporting/reportingPublicationRunner.test.ts`, 39 → 50):**
+    - All fixtures are admissible. The old `''` fixture fails with exactly `production_events_order_number_check`, and the other constraint breaks fail too. `insertFixtures` sends nothing for a bad row.
+    - The epoch-drifted external batch is refused for both begin RPCs. The fake RPC fails the batch and returns a NEW id if reached; the tests prove it never runs, state and pointer are unchanged, rollback happens and nothing is committed. The lock order is asserted.
+    - Also covered: a foreign pointer alone; a foreign live row alone; a known-owned reused replay inside one transaction (begin, guard, RPC, commit; no duplicate identity); a fresh begin recording the new id tentative then confirmed; missing control/site/site argument; the guard SQL's lock clauses.
+  - **Mutations:** 12/12 deliberate breaks caught:
+    - fixture back to `''`;
+    - length check dropped;
+    - insert guard skipped;
+    - clock-event rule ignored;
+    - begin guard skipped;
+    - pointer ignored;
+    - live rows ignored (this one first SURVIVED; the live-row-only test was added and it is now caught);
+    - all batches treated as owned;
+    - missing control tolerated;
+    - site locked before control;
+    - control lock dropped;
+    - guard only for `begin_reporting_batch`.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1086/1086 tests; build OK.
+  - **Next:** root review of this checkpoint, then the corrected rollback rehearsal. Installation and the committed harness wait for their own checks. Task 13 stays unchecked; no Task 14 work.
+- 2026-11-15 — recovery-runner repair (T13B2b-16, -17, -18 only). No SQL, no staging mode, no migration/app/API change, no Task 14 work. 0037 `531bb2c5…` and 0038 `14a808ea…714b1d` are byte-identical:
+  - **Coordinator moved for testing:** the fence coordinator moved out of `tests/staging/reporting-jobs.ts`, which runs `main()` on import, into the new `tests/staging/reportingFenceRun.ts`. `runFence` owns ordering, stopping, restoration, receipts and the audit. The F1–F6 bodies stay in `reporting-jobs.ts`. `reportingFence.ts` gains `checkFenceObservation` (per observation; `checkFence` uses it) and `captureTransitions` in the report and its markdown. `reportingCommitted.ts` exports `transitionIncrement` (shared; `expectedEpochIncrement` uses it). `package.json` `typecheck:digest` now includes the new test file.
+  - **T13B2b-16 (unconditional restoration):** the scenarios run inside `try`. In `finally`, after every scenario's sessions have settled, `restore` returns capture to its starting state on a FRESH connection through the receipt-carrying toggle. This holds after an exception, a false expectation, a persistence failure or a query failure. A restoration failure is pushed separately (`restoration failed: …`), so the original error is never replaced. The lifecycle then still rolls back and disconnects main and runs the fresh audit.
+    - If persistence is already broken, the restoring toggle's saves are best effort: the failure is recorded and the run is FAILED, but capture is still restored.
+    - Nothing is restored when the run failed before the baseline (no toggle happened).
+  - **T13B2b-17 (stop at the first failure):**
+    - Fence: each observation is checked and saved at once. The run stops on an exception (including scenario-connection cleanup failures), a false expectation or a save failure. Expected refusals that match (F3 40001, F5 55P03, F6 42501) pass.
+    - `runInterleavings`: stops after recording the first failed scenario, which includes the I0 operator precondition, an exception, a scenario-connection cleanup failure or a record/persistence failure. Connections still close; the audit still runs.
+    - Rollback interleavings remain operator-setup-only; I0 still refuses unless capture and both processors are on. No automatic setup was added.
+  - **T13B2b-18 (full fence audit):** the narrow catalog/`rj-*` snapshot is replaced by `fullState`/`compareFullState`, so epoch and `updated_at` are no longer normalized away. The only allowance is `transitionIncrement` over this run's CONFIRMED receipts, plus the control timestamp only when a confirmed receipt changed the row. No site fields are allowed.
+    - Every committed toggle (`ownedToggle`): caps the lock wait at 3 s like the RPC (a stricter existing limit is kept), locks control FOR UPDATE, reads the epoch, calls the RPC and saves a TENTATIVE receipt BEFORE COMMIT. A failed save marks it ABSENT and rolls back. A successful COMMIT confirms it. A failed COMMIT marks it UNCERTAIN, records it and settles the originating session with the reviewed `settleOrigin`; an uncertain receipt is never counted and fails the audit.
+    - F2's held toggle takes the same receipt under a control FOR SHARE lock. FOR SHARE does not conflict with the open writer's share lock, so the toggle's own UPDATE is still the statement that waits, while it blocks any other transition until commit. Disclosed: this one added lock statement changes F2's SQL sequence but not what F2 observes.
+  - **Tests:** `tests/reporting/reportingFenceRun.test.ts` (new, 19) drives the ACTUAL `runFence`/`ownedToggle` against an in-memory fake database. The structural assertions in `tests/reporting/reportingJobs.test.ts` were updated (no direct `commit` in the runner; F2 uses a SHARE receipt lock before its toggle). Cases:
+    - a clean run with an exact allowance;
+    - a save failure after F1's committed toggle (stops; capture restored on a fresh connection; audit verified; both persistence errors kept);
+    - a restoration failure kept separately, with the audit showing capture left on;
+    - a pre-baseline failure (nothing restored);
+    - a false expectation, an exception and a cleanup failure, each stopping at once, while expected refusals pass;
+    - a same-count payload change, external epoch drift and an uncertain lost-response COMMIT, each FAILED;
+    - a failed pre-COMMIT receipt save (absent, nothing committed);
+    - the allowance rule; the lock-cap order; toggle disconnect failures;
+    - rollback interleavings: I0 false, an I0 exception, an I0 cleanup failure and a record failure all stop with no later RPC; I0 passing proceeds.
+    - One real bug was found by these tests and fixed: a failed pre-COMMIT save left its receipt "tentative" instead of "absent".
+  - **Mutations:** 19/19 deliberate breaks caught:
+    - restore skipped;
+    - restoration failure swallowed;
+    - continuing after a failed observation;
+    - no per-scenario save;
+    - allowance counting every receipt state;
+    - timestamp always allowed;
+    - increment derived from observed totals;
+    - uncertain counted;
+    - no pre-COMMIT save;
+    - restoration stopping on a persistence failure;
+    - interleavings continuing after a failure;
+    - interleavings ignoring cleanup failures;
+    - a failed save left tentative;
+    - the audit ignoring tentative/uncertain receipts;
+    - F2 locking FOR UPDATE;
+    - no lock cap;
+    - the per-observation check ignoring errors;
+    - the toggle connection not closed;
+    - the audit tolerating no baseline.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1105/1105 tests (33 files); build OK.
+  - **Next:** root review of this checkpoint. `--fence`, `--interleavings` and `--committed-interleavings` have not run. Task 13 stays unchecked.
+- 2026-11-15 — recovery-runner residual repair, the three residuals only. No SQL, no staging mode, no app/API/migration change, no Task 14 work. 0037 `531bb2c5…` and 0038 `14a808ea…714b1d` are installed, immutable and byte-identical. Unconditional restoration, the full-state audit, the F2 SHARE prelock and every timeout limit are unchanged:
+  - **T13B2b-17, recorded toggle cleanup errors:**
+    - `ownedToggle`: after a successful COMMIT, a disconnect failure is now recorded AND thrown. The receipt stays confirmed and is still counted. After an earlier failure the disconnect error is still kept beside it and the original is rethrown.
+    - `runFence` also stops when a scenario adds report errors even though its observation passes (`<id> recorded a failure (…)`). Restoration and the audit stay unconditional.
+  - **I1 evidence:** `ok` now requires the observed wait AND a successful second begin. An SQL error after the wait fails I1, keeps the SQLSTATE and message verbatim, and the stop-on-first-failure wrapper means I2 onward is never invoked.
+  - **T13B2b-18, F2 settlement:** F2 is extracted to `fenceF2` (with `F2Deps`) in `tests/staging/reportingFenceRun.ts`, so its real orchestration is tested without importing the runner that executes `main`. `reporting-jobs.ts` `f2` delegates to it. `fenceF2` owns the receipt and both launched queries across its whole lifecycle; on every exit:
+    - sessions are rolled back in order a, c, d, mon (a first, so a blocked enable or write can finish) and closed;
+    - each launched query is inspected, and an error that is not the first failure is kept beside it;
+    - a still-tentative receipt becomes ABSENT only when c's rollback is KNOWN to have succeeded; otherwise it stays tentative and that is reported;
+    - confirmed and uncertain receipts are never overwritten;
+    - the first failure stays first in the thrown message.
+  - **Tests:** `tests/reporting/reportingFenceRun.test.ts` 19 → 31. The structural assertions in `tests/reporting/reportingJobs.test.ts` were retargeted to `fenceF2` (SHARE prelock before the toggle, launched queries, no un-awaited held query).
+    - Coordinator: a toggle disconnect failure stops after F1 with exactly 2 commits (F1 and the restoration, not six); the committed receipt is counted; capture is restored. A scenario that only records an error stops.
+    - I1: wait then `40P01 deadlock detected` gives FAILED with the error verbatim and no I2 write. A pass needs both the wait and the begin.
+    - Actual `fenceF2`, 9 cases:
+      - a clean run (confirmed; rollback order; SHARE before the toggle);
+      - the second monitor poll failing (absent; all four sessions settled; no commit);
+      - d's pid failing (absent);
+      - c's rollback unknown (stays tentative, reported beside the first error);
+      - an enable-query failure plus a monitor failure (monitor first, enable kept);
+      - an enable failure alone (not duplicated);
+      - an uncertain COMMIT (stays uncertain);
+      - a save failure after commit (stays confirmed);
+      - a failed tentative save (absent; no commit).
+  - **Mutations:** 12/12 new breaks caught:
+    - the toggle disconnect swallowed;
+    - recorded errors ignored;
+    - I1 passing on the wait alone;
+    - a tentative receipt never made absent;
+    - absent without a known rollback;
+    - launched queries not inspected;
+    - a secondary failure replacing the first;
+    - rollback order reversed;
+    - the first error duplicated;
+    - F2 locking FOR UPDATE;
+    - cleanup overwriting confirmed/uncertain;
+    - F2 sessions not closed.
+    - The previous 19/19 set was re-run and all were caught (M15/M18 retargeted to their new locations).
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1117/1117 tests (33 files); build OK.
+  - **Next:** root review. `--fence`, `--interleavings` and `--committed-interleavings` have still not run. Task 13 stays unchecked.
+- 2026-11-15 — I4 plan-only diagnostic PREPARED, NOT RUN. No SQL, no staging mode, no app/API/migration change, no fix selected, no Task 14 work. 0037 `531bb2c5…` and 0038 `14a808ea…714b1d` are installed, immutable and byte-identical:
+  - **Mode:** `npm run staging:reporting-jobs -- --explain-source-versions --site=uk [--max-pages=N]` (default 200, the same bound I4 used). It takes exactly one supported `--site`; `--sites` is refused. It is wired into the existing guarded `publicationMain`: target-checked guarded client before every SQL; installed-0038 check; report written before connecting; `fullState` baseline taken FIRST; existing `runCaptureLifecycle` (main rolled back and closed); fresh auditor comparing `fullState` with `ROLLBACK_ONLY` (zero allowed changes; generated sequence gaps stay excluded as before).
+  - **Code:** new `tests/staging/reportingPlanDiagnostic.ts` (`runPlanDiagnostic`). `reportingPublication.ts`: the mode, one-site argument parsing, a `diagnostic` report field and a markdown section. `reporting-jobs.ts`: the branch and usage line. `package.json`: `typecheck:digest` now includes the new test.
+  - **Run sequence:** ONE transaction, always ending in ROLLBACK (also after a failure; a rollback failure is kept beside the first error). It stops at the first failure through the shared `step()` helper:
+    - P0: capture and the site's processor enabled INSIDE the transaction.
+    - P1–P3: the reviewed `begin_reporting_rebuild`, `copyAll` and `freeze_reporting_rebuild`.
+    - P4: candidate row count must equal the site's `production_events` count (the original I4 workload; current source_versions count recorded).
+    - P5: role, settings, relation heap/index/TOAST sizes, `pg_stat_all_tables`/`pg_stat_all_indexes` counters and vacuum/analyze timestamps, `reltuples`/`relpages` for `source_candidate`, `source_versions`, `source_current` and `batches`.
+    - P6: as service_role (asserted via `current_user`), `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON)` WITHOUT ANALYZE of the exact rebuild INSERT. It requires a JSON plan.
+    - The diagnostic (full plan, environment, SQL and parameter identities: site, placeholder seq 1, batch id; no source payloads) is persisted before the final rollback.
+  - **Statement fidelity:** `SOURCE_VERSIONS_INSERT_SQL` is the 0038 rebuild-branch INSERT (lines 1943–1947) with `b.site`/`v_seq`/`p_batch` bound as `$1::text`/`$2::bigint`/`$3::uuid`. A test proves the text is identical to the migration after that substitution. `v_seq` appears only in the SELECT list, so the placeholder cannot change the plan.
+  - **Labelled limits:** this is a CURRENT STANDALONE plan with bound values. It is NOT the cached PL/pgSQL plan that timed out, and the uncommitted candidate rows are invisible to the table statistics. Only this statement is planned; the preceding UPDATE is not.
+  - **Allow-list guard:** every statement goes through `diagnosticDb`, an exact allow-list (begin, rollback, become's role and request-claims statements, the four reviewed RPCs, the UK processor update, the measurement SELECTs and the one EXPLAIN). Anything else is refused BEFORE sending: publish, commit/end, seal/claim/stage, VACUUM, ANALYZE, EXPLAIN ANALYZE, any timeout/planner `SET`/`set_config`, DDL, source writes, the bare INSERT.
+  - **Tests:** `tests/reporting/reportingPlanDiagnostic.test.ts`, 33:
+    - statement fidelity and EXPLAIN options;
+    - 15 forbidden statements refused unsent, plus an allow-list audit;
+    - a full run: order; measurements before EXPLAIN; exact params; service_role; full plan emitted; no payload; never publish/commit; one final rollback;
+    - stop-and-rollback for a copy failure, a workload mismatch, missing relation stats, an EXPLAIN failure and an EXPLAIN without a plan (no EXPLAIN sent after an earlier failure);
+    - emit and record persistence failures;
+    - a rollback failure kept beside the first error;
+    - the actual `runCaptureLifecycle` for success, prepare failure, EXPLAIN failure and an unexpected change (main rolled back and closed, fresh auditor, ROLLBACK_ONLY catching a same-count change);
+    - argument parsing and runner wiring (baseline before branch, `return`, ROLLBACK_ONLY audit).
+  - **Mutations:** 15/15 deliberate breaks caught:
+    - publish allowed;
+    - EXPLAIN ANALYZE;
+    - no rollback on failure;
+    - commit instead of rollback;
+    - workload check removed;
+    - EXPLAIN not as service_role;
+    - relation check removed;
+    - statement drifted from 0038;
+    - not persisted;
+    - guard bypassed;
+    - plan check removed;
+    - runner branch falling through;
+    - `--sites` accepted (this one first SURVIVED; a combined-flag regression was added and it is now caught);
+    - a rollback error replacing the first;
+    - plan markdown dropped.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1150/1150 tests (34 files); build OK.
+  - **Next:** root review, then root runs the diagnostic once. I5 and the committed harness still have not run. Task 13 stays unchecked.
+- 2026-11-15 — T13B2b-19 append-only rebuild-insert repair and its rollback proof, PREPARED, NOT RUN. No SQL, no staging mode, nothing installed, no merge/deploy, no Task 14 work:
+  - **Immutable identities:** 0037 `531bb2c5706b9ac4d73a7ca3dc74dead7e34a53160e57fe2971aaf061c6a6a4f` and 0038 `14a808ea0787009650437444baaa886da218349353e3ee4a854a97ef68714b1d` are byte-identical.
+    - Surprise: 0038's working copy is CRLF while git stores it LF (`002d6e58034aef1c83f94863bb89ce83dadeb225106cd804d2a46798193dd68f`). The installed hash `14a808ea…` is the CRLF form, so the new tests pin BOTH forms line-ending-independently; a Linux CI checkout sees the LF form.
+    - 0039 = `supabase/migrations/0039_reporting_rebuild_insert.sql`, LF `05d7eff179993a6eeeba3fadaddd345b83bd20c68676cb6bda709937984c3bd5`, CRLF `96deeed5667ba7d769bb5e6b3a558141b5769cf297b11572aa1ef7b2bbc713cb`. 0040/0041 were checked free and not created.
+  - **Regression first:** `tests/reporting/reportingRebuildInsert.test.ts` was written before 0039 existed. `npx vitest run tests/reporting/reportingRebuildInsert.test.ts` then gave **6 failed / 2 passed** (ENOENT for 0039 and the existence check; the immutability tests passed). After 0039: 8/8; with the rehearsal and monitor tests: 67/67.
+  - **0039:** one BEGIN/COMMIT, one statement: `CREATE OR REPLACE FUNCTION public.publish_reporting_batch(p_batch uuid, p_fence bigint)`.
+    - It is generated from 0038's exact definition, and a test proves byte equality, except for that one INSERT: the rebuild branch's `AND NOT EXISTS (… source_versions v … v.valid_to_seq IS NULL)` becomes `ON CONFLICT (site, event_id) WHERE valid_to_seq IS NULL DO NOTHING`. That targets the existing partial unique index `source_versions_current`. Candidate batch/site filtering and the projected values stay.
+    - The preceding closure UPDATE, the refresh branch, fences, receipts, replay, SECURITY INVOKER, search_path and privileges are unchanged.
+    - No DROP, GRANT, REVOKE, ALTER, index, table, setting, VACUUM, ANALYZE or NOTIFY. Exactly one executable `DO NOTHING`, never untargeted.
+  - **Allocation test:** `tests/reporting/reportingJobs.test.ts`'s check that 0038 is the newest migration now requires 0037, 0038, 0039 as the last three, per the revised allocation.
+  - **Rehearsal mode:** `npm run staging:reporting-jobs -- --rehearse-rebuild-repair --sites=uk,us [--max-pages=N]` runs `rehearseRebuildRepair` in the new `tests/staging/reportingRebuildRepair.ts`. It is wired through `reportingPublication.ts` (mode, parsing, `repair` report field and section) and `reporting-jobs.ts`. The runner takes the fullState baseline first; the lifecycle closes every session; the fresh audit uses ROLLBACK_ONLY (zero changes). Steps:
+    - K0: fixed 0039 path, its SHA-256, 0037/0038 = installed identities, 0039 = the single reviewed statement. Otherwise it refuses before BEGIN.
+    - K1: the installed publisher's `md5(prosrc)` must be 0038's body (LF or CRLF), not 0039's; not SECURITY DEFINER; service_role may execute, authenticated/anon may not. Otherwise it refuses before BEGIN.
+    - K2: 0039 applied through the reviewed transaction-control parser inside ONE transaction.
+    - K3: the in-transaction publisher is 0039 with security, config, ACL, owner and privileges unchanged.
+    - F*: the established `runPublicationFlow`, with its assertions unchanged.
+    - V*: the proof below.
+    - K9: ROLLBACK. It is unconditional; a rollback error is kept beside the first error.
+  - **Statement guard:** every statement passes a deny-list before it is sent. It refuses COMMIT/END/ABORT, VACUUM/ANALYZE/CHECKPOINT, migration-history writes, timeout/planner `SET`/`set_config`, EXPLAIN ANALYZE, and any DDL other than the exact 0039 statement.
+  - **The proof (`runVersionProof`, original full volume of the first site, no fixture cap):**
+    - V0: four run-local rows.
+    - V1: rebuild 1. Candidate = source count; then EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON, no ANALYZE) of the exact 0039 INSERT as service_role, with a test proving fidelity to 0039. `checkRebuildPlan` requires ModifyTable/Insert into source_versions, `Conflict Resolution` NOTHING, `Conflict Arbiter Indexes` exactly `["source_versions_current"]`, and no anti-join or source_versions scan below. Then seal and a timed real publication with existing limits.
+    - V2: change one row, delete one, create one, inside the transaction.
+    - V3: rebuild 2, timed.
+    - V4: `checkVersionIntervals`. Unchanged `[g1,cur)` keeps its image; changed `[g1,g2)` old image then `[g2,cur)` new image; absent `[g1,g2)` with no current version; created `[g2,cur)`.
+    - V5: whole site. Current versions equal the source images in both directions, and no unchanged row is reissued at g2.
+    - V6: lost-response replay returns replay=true at g2, and the site's source_versions fingerprint is unchanged.
+    - V7: savepoint probes. A primary-key duplicate and a check violation each still raise under the targeted clause.
+  - **Monitored I4:** `i4Monitored` and `monitorBackends` in `reportingPublication.ts`. I4 now uses three connections: each worker's `pg_backend_pid()` is read inside its explicit transaction BEFORE publishing.
+    - An independent monitor samples ONLY those PIDs: state, wait_event_type, wait_event, `pg_blocking_pids`, transaction age; no query text, no application_name.
+    - Sampling is bounded (150 × 1 s, beyond the unchanged 2-min `statement_timeout`) and stops when both settle.
+    - A monitor failure is sticky and never strands a publication (both outcomes are always awaited, with no unhandled rejection). I4 passes only if both publish and the monitor did not fail.
+    - Consecutive identical samples are compacted into the report. I0–I3 and I5 are unchanged.
+  - **Tests (67):**
+    - immutability, fidelity, conflict target, closure/refresh preservation, no DDL/grants;
+    - REPAIR_INSERT_SQL equal to 0039;
+    - `checkRebuildPlan` accept plus 8 breaks (anti-join, inner scan, missing clause, other or untargeted arbiter, DO UPDATE, non-insert, no plan);
+    - `checkVersionIntervals` accept plus 6 breaks;
+    - 15 guard refusals plus pass-through;
+    - the coordinator: success order with no COMMIT; 6 refusals before BEGIN; 5 stop-and-rollback cases; an emit failure; a rollback error kept beside; the actual lifecycle for success, proof failure and an unexpected change;
+    - wiring;
+    - the monitor: success (PIDs before publication, only those sampled), publication failure, sticky monitor failure, bound, no unhandled rejection, compaction, I4 wiring.
+  - **Mutations:** 19/19 deliberate breaks caught:
+    - untargeted DO NOTHING;
+    - target without the predicate;
+    - closure UPDATE removed;
+    - refresh edited;
+    - SECURITY DEFINER;
+    - grant added;
+    - candidate filter dropped;
+    - plan checker ignoring the arbiter;
+    - plan checker ignoring an inner scan;
+    - unchanged row reissued;
+    - absent left current;
+    - no rollback;
+    - final commit;
+    - baseline check skipped;
+    - guard allowing COMMIT;
+    - monitor failure ignored;
+    - jobs stranded;
+    - unbounded monitor;
+    - PID read after publishing.
+    - The first attempt hung on the unbounded-monitor break, because a no-op fake `sleep` never yielded to the event loop. The run was stopped and the mutated file restored by hand and verified. The test fake now yields, and the re-run caught all 19 without a hang.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (now includes the new test); strict ES2020 tsc on both runners OK; 1217/1217 tests (35 files); `npm run build` OK.
+  - **CI:** exact-head `de362d212ffb7613e42f6b3f12f604c723184721` [CI SUCCESS](https://github.com/yaralabsPH/inkahub-kpi-app/actions/runs/43683437893).
+  - **Next:** root review, then the rollback-only `--rehearse-rebuild-repair` once; installation of 0039 and the monitored interleavings only after that. Task 13 stays unchecked; Tasks 14–20 stay blocked.
+- 2026-11-15 — T13B2b-20/21 runner corrections, nothing else. No SQL, no staging mode, nothing installed, no Task 14 work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 (LF `05d7eff1…`) are byte-identical; the 0039 SQL is unchanged:
+  - **T13B2b-20 (fail-fast recorder):** new `failFast(ctx)` in `tests/staging/reportingRebuildRepair.ts`. It records (persists) the ORIGINAL observation first, then throws `<id> failed; later steps depend on it` on `ok:false`. A persistence failure stays fatal.
+    - `rehearseRebuildRepair` wraps its context with it, so every K step, the established `runPublicationFlow` (whose `expectEqual`/`refused` previously recorded false without throwing) and the version proof stop at the first recorded failure.
+    - Shared helpers are unchanged. `refused()` already rolls back and releases its savepoint before recording.
+    - V7 moved into the exported `runConstraintProbes` so the real refusal path is testable. The outer rollback, the rollback error kept beside the first error, the lifecycle disconnect and the fresh audit are unchanged.
+  - **T13B2b-21 (monitor coverage):** `monitorBackends` decides exhaustion at loop exit BEFORE awaiting the jobs (`exhausted` = still pending at the bound). That sets a sticky `monitorError` even if the jobs later succeed. Completing exactly at the limit is not exhaustion.
+    - After every job settles, any pinned PID without a sample (`uncovered`) sets `monitorError` (`monitor coverage missing: …`).
+    - `i4Monitored` already fails on any `monitorError`. The report carries `exhausted`/`uncovered` (replacing `bounded`).
+    - Limits are unchanged (150 × 1 s); every job is always awaited.
+  - **Tests (`tests/reporting/reportingRebuildInsert.test.ts`, 67 → 78):**
+    - a flow `expectEqual` false stops the flow and the proof never begins (observation persisted, outer ROLLBACK, no COMMIT);
+    - a proof assertion false stops before a publish call;
+    - V7a unexpectedly succeeding, and V7a with the wrong error: savepoint `rollback to`/`release` in order, V7b never sent, outer ROLLBACK;
+    - V7a/V7b passing in their own savepoints;
+    - a recording persistence failure stays fatal;
+    - `failFast` persisting before throwing;
+    - exhausted-with-pending then both succeed gives I4 FAILED;
+    - exact-limit completion is not exhaustion;
+    - one PID uncovered gives FAILED;
+    - empty/throws/exhausted monitors each settle both jobs with the right error.
+    - The bounded test now asserts `exhausted` and the exact message.
+  - **Mutations:** 10/10 new breaks caught:
+    - fail-fast without a throw;
+    - fail-fast not applied;
+    - throw before persisting;
+    - V7b sent first;
+    - exhaustion decided after awaiting;
+    - exhaustion ignored;
+    - coverage ignored;
+    - limit treated as exhaustion;
+    - jobs not settled after exhaustion;
+    - I4 ignoring `monitorError`.
+    - The previous set was re-run: 18/18 caught (old X17, "jobs stranded", was dropped because its code was rewritten; Y9 now covers it).
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1228/1228 tests (35 files); build OK.
+  - **Next:** root review, then the one-shot rollback `--rehearse-rebuild-repair`. Task 13 stays unchecked.
+- 2026-11-15 — T13B2b-22 connection-failure handling and durable I4 evidence, OFFLINE only. No SQL, no staging mode, no reconnect/retry/auto-termination, no app/API/migration change, no Task 14 work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 `05d7eff1…` are byte-identical:
+  - **Run-scoped watch:** `newConnectionWatch` in `tests/staging/reportingCapture.ts`, plus `WATCH_ENTRY`.
+    - `openGuardedClient(…, watch)` attaches a client `error` listener to the RAW client BEFORE `connect()`. It is never removed, so it stays through disconnect, and a client without `on` is refused.
+    - Every unexpected event immediately appends a redacted, sticky `connection failure (connection #n): <message> [code]` to the report's OWN `errors` store (the final status source) and attempts `save()`.
+    - A persistence failure is retained (`report persistence failed (after a connection failure)`) and also written to stderr.
+    - The listener never throws; even if recording itself throws, it records `connection failure (unrecordable event)`.
+  - **Stopping new work:** `guardClient(…, gate)` refuses new normal SQL before sending once the watch has failed. Target checks still run before every SQL. ROLLBACK is always allowed.
+    - `runCaptureLifecycle` switches the watch to its cleanup phase as soon as the body ends, so main's rollback/disconnect and the independent fresh auditor still run. `runFence` does the same before its unconditional capture restoration; `runCommitted` does it at the start of its cleanup (`enterCleanup`).
+    - Already-started queries settle naturally (node-postgres rejects them); there is no `Promise.race`.
+    - The original error and the rollback/disconnect/persistence/audit failures all stay in FAILED output.
+  - **Wiring:** in `tests/staging/reporting-jobs.ts`, both the publication modes and `--fence` create one watch on their report errors/save and pass it to every opened connection, the lifecycle, interleavings (`evidence`, `armExpected`), the committed harness (`enterCleanup`) and the fence coordinator.
+  - **I5:** `killOwnVictim` arms ONLY its victim, ONLY for `isExpectedTermination` (57P01), right before requesting the termination. Any other client's 57P01, or an unexpected reset of the victim, still fails the run. There is no global exemption.
+  - **I4 durable evidence:** `i4Monitored` requires `ctx.evidence`.
+    - Inside each worker's explicit transaction it reads `I4_OWNER_SQL` (pid, `backend_start`, `xact_start`, `transaction_timestamp` as lossless text; no application_name).
+    - It persists `{kind: "i4-ownership", workers: [{site, session, pid, …}]}` (stamped with run id and report name) BEFORE starting either rebuild. A persistence failure throws before any work.
+    - `monitorBackends(onSamples)` persists every poll's samples incrementally; a sample persistence failure is a sticky monitor failure, and both jobs still settle.
+    - The report gains an `evidence` array and section. No backend termination, reconnect, retry, or change to timeouts or the sample bound.
+  - **Tests:**
+    - New `tests/reporting/reportingConnectionWatch.test.ts`, 21 tests, with EventEmitter clients that behave like node-postgres (pending queries rejected AND `error` emitted). Through the real opener, guard, lifecycle and I4/I5 helpers, it covers:
+      - the original crash reproduced (emit without a listener throws);
+      - the listener installed before connect;
+      - an idle error that is sticky and persisted;
+      - a persistence failure retained;
+      - recording failure retained;
+      - new normal SQL and new connections refused while ROLLBACK and the cleanup-phase auditor are allowed;
+      - I5 arming scoped to one client;
+      - an un-reportable client refused;
+      - idle main, active worker (pending query settles), monitor (both jobs settle), rollback/end and auditor failures through `runCaptureLifecycle` (cleanup and fresh audit attempted, every error kept, FAILED);
+      - a clean run still COMPLETE;
+      - I4 ownership persisted before work with exact strings, samples persisted per poll before I4 returns, ownership persistence failure gives no work, sample persistence failure is sticky, and no evidence sink is refused;
+      - I5's expected 57P01 vs an unexpected reset vs an unarmed 57P01.
+    - The existing I4 tests in `reportingRebuildInsert.test.ts` now answer `I4_OWNER_SQL` and supply `evidence`.
+  - **Mutations:** 13/13 new breaks caught:
+    - silent swallow;
+    - listener attached after connect;
+    - gate never refusing;
+    - gate not wired;
+    - lifecycle never entering cleanup;
+    - missing ownership receipt;
+    - samples not persisted;
+    - global 57P01 exemption;
+    - the listener's fallback rethrowing (this one first SURVIVED; the recording-failure regression was added and it is now caught);
+    - rethrowing after recording;
+    - persistence failure not retained;
+    - victim not armed;
+    - rollback refused.
+    - Prior sets re-run: T13B2b-20/21 10/10. T13B2b-19 18/18, where X19 was retargeted to "rebuild work started before the ownership receipt" because the PID-read code was rewritten.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (now includes the new test); strict ES2020 tsc on both runners OK; 1249/1249 tests (36 files); build OK.
+  - **Next:** root review. The staging gate remains FAILED until the corrected rollback I0–I5 harness passes against installed 0039. Task 13 stays unchecked.
+- 2026-11-15 — T13B2b-23/24, OFFLINE only. No SQL, no staging mode, no reconnect/retry, no app/API/dependency/migration change, no timeout or sample-bound change, no Task 14 work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 `05d7eff1…` are byte-identical; the repair rehearsal was not re-run:
+  - **T13B2b-23 (`tests/staging/reportingCapture.ts`):** the watch gains `fail(reason)`. It latches a redacted, sticky failure into the SAME `errors` store, does not persist again (the save just failed) and never throws.
+    - New `durableEvidence(store, save, watch, stamp, redact)` in `reportingPublication.ts` is the ONLY evidence boundary. `reporting-jobs.ts` uses it. A failed save calls `watch.fail("evidence persistence failed (<kind>): …")` BEFORE rethrowing.
+    - From that moment every next normal statement is gated, including the next step of workers already in progress. Already-issued queries and both I4 jobs are still awaited.
+    - The cleanup phase is unchanged: it is entered only when the body ends, after the workers have settled. Explicit rollback, disconnect and the fresh audit run.
+  - **T13B2b-24 (`reportingPublication.ts` `killOwnVictim`):** after `work()`, inside the victim's still-open explicit transaction, it reads `I5_VICTIM_IDENTITY_SQL`: pid, `backend_start::text`, `xact_start::text`, and `transaction_timestamp() < statement_timestamp()` as proof of an explicit transaction.
+    - A missing or non-transactional identity is refused before any kill.
+    - It persists `{kind: "i5-victim-ownership", scenario: "I5", victim}` BEFORE requesting termination. Then it arms ONLY this victim (`watch.armTermination`) and terminates through `I5_TERMINATE_SQL`, which matches pid = $1 AND backend_start = $2 AND xact_start = $3 and returns the matched identity. application_name is gone, and there is no PID-only fallback.
+    - It persists `{kind: "i5-termination", requested, receipt, terminated}`. `terminated` requires exactly one row with k=true and all three identity fields equal.
+  - **Centralized termination classification:** `ArmedTermination` in the watch, memoized per error object, so the watch's listener and the victim's listener get one decision with one state advance.
+    - Expected: 57P01, then ONLY after it the exact no-code `Connection terminated unexpectedly` (`TERMINATION_FOLLOW_ON`).
+    - Expected events are provisional until `confirm(true)` after a matching receipt. `confirm(false)`, or an early exit (the `finally` always calls `confirm(false)`, a no-op once confirmed), turns each provisional event into a sticky run failure ("expected only with a successful matching kill receipt, which is missing").
+    - An unarmed or other-client error, a follow-on before 57P01, a coded or differently worded follow-on, and ECONNRESET all remain failures. Listeners stay installed through disconnect.
+    - `armExpected` is replaced by `armTermination`, which refuses non-owned or double-armed clients.
+  - **Tests:**
+    - `tests/reporting/reportingConnectionWatch.test.ts`, 21 → 36. The superseded application_name and predicate-arm tests were replaced. New coverage:
+      - T13B2b-23 through the real `durableEvidence`, watch, guarded `openGuardedClient` worker clients, `withConnections`, `i4Monitored`, `zeroWorkRebuild` (now exported) and `runCaptureLifecycle`: both workers are held at an issued copy page, a sample save fails, the held queries then complete, and NO further copy/freeze/seal/publish reaches either raw client. Both jobs settle with the gate error; rollback, disconnect and the fresh auditor run; the status is FAILED starting with the evidence failure.
+      - The pre-work ownership save failure: no rebuild SQL.
+      - `durableEvidence` latching before rethrow without re-persisting.
+      - T13B2b-24: the installed-pg two-event sequence before the kill response and at disconnect with a matching receipt (expected 2, no failure); the order work → identity → ownership save → kill → receipt save; the kill parameters binding all three fields; six failing receipts (false, none, other pid/backend_start/xact_start, two rows); follow-on before 57P01; coded, reworded and reset follow-ons; another client's 57P01; four missing or non-transactional identities; failures at work, identity, ownership save, kill and receipt save; no evidence or watch; memoized centralized classification; and no global exemption.
+    - `reportingPublicationRunner.test.ts`: the T13B2b-6 application_name tests are replaced by an identity/termination SQL binding test.
+  - **Mutations:** 14/14 new breaks caught:
+    - W1 reproduces the reviewed `de45f2e` behavior (the save does not latch) and fails exactly the new T13B2b-23 regression;
+    - no-op `fail`;
+    - identity read before work;
+    - kill without an ownership receipt;
+    - pid-only kill;
+    - receipt ignoring backend_start;
+    - follow-on without a prior 57P01;
+    - coded follow-on accepted;
+    - failed receipt leaving events accepted;
+    - no `confirm(false)` on an early exit;
+    - classification not memoized;
+    - victim listener using its own predicate;
+    - explicit transaction not required;
+    - arming or killing before the ownership save.
+    - The T13B2b-22 set was re-run: 7/7 unchanged entries caught, and 6 entries retargeted to the rewritten watch, 5 caught. The sixth (a rethrow injected after recording, inside the listener's own try) is an equivalent mutant: its catch absorbs it after the failure is already recorded.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1263/1263 tests (36 files); build OK.
+  - **Next:** root review. Only after clearance, root takes a fresh full baseline and runs the corrected rollback I0–I5 once against staging. The staging gate remains FAILED; Task 13 stays unchecked.
+- 2026-11-15 — Task 14 offline implementation (Claude). No SQL, no staging mode, nothing applied, no production, no Task 15+ work. 0037 `531bb2c5…`, 0038 `14a808ea…` and 0039 `05d7eff1…` are byte-identical. New draft 0040 SHA-256 is `4e39243e2ee6526f656eb1b462156d6bc9eabf17cac78fcb2d873cd4498968b2` (LF, unapplied). The Task 14 checkbox stays unchecked pending planner review and 0040 staging evidence.
+  - **Failing first:** `tests/reporting/reportingMaterialize.test.ts` was written before the module and failed to load (missing `api/_lib/production-reporting-materialize`).
+  - **`api/_lib/production-reporting-materialize.ts` (new):**
+    - The production owner mapping `rowsByOwner`/`ownerRows`, moved out of the test fixture, which now re-exports it.
+    - `ownerOfEvent`: trimmed nonblank order, else event id, as SQL `owner_partition`.
+    - `materializePartition`: the shared projector with a self audience filtered BEFORE projection.
+    - The `FrozenReader` contract and `memoryFrozenReader`.
+    - `buildOwnerInput`:
+      - members, parents, inverse children;
+      - an exact predecessor walk per member worker, from the latest member line down past a site-effective line of all types and of each member type below the EARLIEST member line;
+      - consumed candidates' cancellations;
+      - ties kept whole.
+    - `affectedOwners`, the refresh closure:
+      - old and new owners (invalid-identity and due future keys included);
+      - parent owners;
+      - inverse-children owners;
+      - stream successors up to the first site-effective line of all types and of the line's type.
+    - `materializeOwners` (streaming) and `materializeBatch`:
+      - work descriptors whose input hash is SHA-256 of the canonical `FrozenPartitionInput`;
+      - owner rows for the site and for self audiences of current members plus base-image staff of changed keys (empty replacements for moves, restaffing and deletion);
+      - `PartitionTooLargeError` (`partition_too_large`) above 50,000 input events, with no work returned;
+      - stats: owners, works, max and total input, requests.
+  - **`api/_lib/production-reporting-reader.ts` (new):** `rpcFrozenReader` over the 0040 RPCs.
+    - Every read pages until an EMPTY page; a byte-capped short page is never treated as the end.
+    - A member overflow is proven with cap+1 rows, then that owner is skipped.
+    - `byIds` re-requests only the ids after a capped response.
+    - Images are reduced to the 11 evidence fields after site and id binding; keyset order and worker are checked.
+  - **`supabase/migrations/0040_reporting_dependency_reads.sql` (draft):**
+    - `frozen_read_batch`: the existing `lock_batch` plus a FROZEN state check.
+    - Six service-only SECURITY INVOKER, empty-search_path read RPCs: `read_reporting_changed_keys`, `list_reporting_owners`, `read_reporting_owner_members`, `read_reporting_events_by_id`, `read_reporting_children`, `read_reporting_staff_stream`. Each pages ≤1,000 rows and ≤1 MiB with bytewise keysets, fails visibly on an oversized image, and uses no OFFSET.
+    - Refresh reads overlay the base mirror with frozen batch images; rebuild reads the frozen candidate. No data writes and no live-source read.
+    - Four reporting-only indexes: worker stream keysets on `source_current` and `source_candidate`, and bytewise owner keysets on the candidate.
+  - **Bugs found during the work and fixed:**
+    - A walk treated a short page as end-of-stream (wrong with byte-capped SQL pages).
+    - Walks consumed whole pages, which made input hashes depend on page size. They now consume event by event, and an RPC-versus-memory parity test at page caps 1, 2 and 5 proves determinism.
+  - **Tests:**
+    - `tests/reporting/reportingMaterialize.test.ts` (28):
+      - owner mapping and the self filter;
+      - every named plan regression, each with exact full-history oracle parity and complete enumeration: years-old late correction keeps its original day/person; a site move empties the old site and self owners; a hidden worker cancellation stays hidden; a later parent resolves only authorized context; deleting a middle line repairs its successor in another order; rework/null case identities stay distinct; repeated materialization is byte-identical (chunk hashes); a 50,001-row partition fails as `partition_too_large`;
+      - closure, input and descriptor-hash tests;
+      - exact one-row-page walks (same-type predecessor beyond an other-type line, cancelled nearest candidate, below-earliest stop, same-type successor, ties, a non-BMP bytewise/UTF-16 tie, exact input set);
+      - daily-group mapping parity against the existing reducer for the site and each self audience across 04:00 and cancellations;
+      - five randomized histories, each with exact oracle parity at default, 1-row and 2-row pages.
+    - `tests/reporting/reportingDependencyReads.test.ts` (12):
+      - the RPC reader equals the memory reader exactly at caps 1, 2 and 5 for refresh and rebuild;
+      - overflow skip, `byIds` re-request, image binding/reduction and visible errors;
+      - the 0040 text contract (service-only, invoker, frozen-batch locks first, read-only, bounded, bytewise keysets, overlay vs candidate).
+    - Existing allocation tests updated for 0040; `typecheck:digest` includes the new modules and tests.
+  - **Fan-out/memory record:** 300-line fixture, 10 new lines, orders spread over five hours: owners=10, works=40, maxInput=156, totalInput=1,560, requests=96, heap delta ≈28 MiB (GC-dependent). The refresh read only affected owners and their bounded dependencies, not the site history.
+  - **Mutations:** 20/22 deliberate breaks caught across the closure, walks, reader paging and image reduction. The 2 survivors are equivalent in this design:
+    - member inverse children are also fetched by the predecessor walk;
+    - parent owners are also reached by the successor walk.
+    - Earlier rounds found and closed real gaps: per-type need, cancelled candidates, below-earliest stop, whole-page consumption, tie wholeness.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1303/1303 tests (38 files); build OK.
+  - **Next:** planner review of the design notes and open questions below. 0040 needs an independently reviewed rollback rehearsal before any installation.
+- 2026-11-15 — Task 14 repairs T14R1–R4, OFFLINE (Claude). No SQL, no staging mode, nothing applied, no Task 15+ work, no limit or timeout change. 0037 `531bb2c5…`, 0038 `14a808ea…`, 0039 `05d7eff1…` and the 0040 draft `4e39243e…` are byte-identical. New append-only draft `0041_reporting_dependency_read_bounds.sql` has SHA-256 `dfa49d597cc37cef92314a4d2dcaf79d195949741fc0534fc57345c12f419646` (LF, unapplied). Task 16 is now 0042. Task 14 stays unchecked.
+  - **Failing first:** before the repair, 11 of the new materializer regressions failed: six R1 closure cases, the R2 boundary case and four R3 budget cases. The ASCII-tie R1 case already passed. R4's tests were written alongside 0041; removing 0041, or the reader's response check, reproduces their failure (mutations R4a and R4e below).
+  - **T14R1 (`walkSuccessors`):** the anchor keeps its full identity. Every consumed stream line is affected (ties at the anchor's instant included), but only a site-effective line STRICTLY AFTER the anchor in the projector's (instant, UTF-16 id) order can satisfy the stop. Bytewise SQL keyset traversal and whole boundary ties are kept. Old and new positions (worker/time changes) are separate anchors.
+  - **T14R2 (`buildOwnerInput`):** member earliest/latest boundaries and the below-earliest test use the new exported `projectorOrder`. Transport order stays bytewise.
+  - **T14R3 (budgets while reading):**
+    - New `DependencyBudget`: distinct consumed source/dependency ids per owner input or per successor seed. The first id past 50,000 throws `partition_too_large` at once, attributed to the owner or seed owner.
+    - `FrozenReader.children` is now a lazy stream, so the RPC reader requests the next page only when consumed.
+    - Member children are charged one by one.
+    - Each consumed stream candidate reads ONLY its own cancellations, incrementally. Unconsumed lookahead on a fetched page is never charged, read or hashed.
+    - `materializeOwners` reads one owner at a time (the 100-owner member prefetch is removed).
+    - The in-memory test reader is now indexed (per worker sorted with binary search, by parent, by owner), so 50,000-row tests are fast.
+  - **T14R4:**
+    - 0041 replaces all six read functions: same signatures and headers, the same frozen overlay/candidate queries for the five image reads, `frozen_read_batch` first, invoker security, empty search path, no grant changes. Each now has COMPLETE response accounting: 2 bytes of brackets plus, per returned row, `octet_length(jsonb_build_object(<every returned column>)::text) + 1`. jsonb text is never smaller than compact JSON.
+    - A row that alone cannot fit raises; otherwise the page ends short. The 1,000-row cap is kept. `list_reporting_owners` is now a byte-counted loop over one ordered union.
+    - `rpcFrozenReader` rejects any response whose compact JSON exceeds 1 MiB, never slicing it.
+  - **Tests:**
+    - `reportingMaterialize.test.ts` 28 → 41:
+      - R1: middle insertion, cancellation removal, A→B reassignment, timestamp move, ASCII tie, non-BMP tie, same-type successor behind an inserted other-type line — each with exact site/self oracle parity at caps 1, 2 and 200, and identical descriptors across caps;
+      - R2: the exact U+1F600/U+FFFD regression with any-type and same-type predecessors, parity and page-independent hashes;
+      - R3, instrumented: a 50,100-line successor walk stops with `partition_too_large` attributed to its seed, reading ≤ limit + one page of stream rows and no cancellations; 60,000 inverse children stop after exactly 50,000 child rows; a 60,000-cancellation candidate beyond the stop is never read and does not change the input; exactly 50,000 consumed succeeds at caps 1 and 200 with lookahead present; 60 owners × 900 events (54,000 total) stay valid with one owner per member read and 54,000 member rows.
+    - `reportingDependencyReads.test.ts` 12 → 21:
+      - the accounting model is never below compact JSON;
+      - 1,000 owners with 1,200-byte keys page short and continue exactly (0040 would have returned >1 MiB);
+      - multibyte, escaped and non-BMP images near the boundary across members, children, byIds and stream, every response ≤ 1 MiB;
+      - a single oversized row fails; an oversized response is rejected;
+      - effective-definition checks: 0040 hash pinned, six replacements with identical headers and queries, exact column lists, brackets, single-row raise, short-page exit, no image-only accounting, no grants/DDL/DML.
+    - Allocation tests updated for 0041 and 0042.
+  - **Mutations:** 13/13 targeted breaks caught:
+    - strict-after-anchor removed;
+    - bytewise member boundaries;
+    - bytewise below-earliest;
+    - member children read whole before charging;
+    - walk events not charged;
+    - 100-owner prefetch;
+    - lookahead charged (this one first SURVIVED; the exactly-50,000 boundary test was added and it is now caught);
+    - lookahead cancellations read;
+    - reader accepting an oversized response;
+    - image-only accounting in one read;
+    - owner list without accounting;
+    - brackets not counted;
+    - 0041 removed.
+  - **Cost record (planner answer 2):** on the 300-line fan-out fixture: owners=10, works=40, maxInput=156, totalInput=1,560, requests=1,704 (was 96), heap delta ≈54 MiB (GC-dependent). The request rise is the per-candidate incremental cancellation reads that T14R3 requires; batching them must keep equivalent bounded consumption and is a Task 15/19 measurement item, not done here.
+  - **Remaining limitations:** request count and the real wire-size/plan behaviour need PostgreSQL evidence in the reviewed 0040+0041 rollback rehearsal. Task 15 still owns durable cross-invocation enumeration.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1324/1324 tests (38 files); build OK.
+- 2026-11-16 — T14S1 dependency-read rehearsal PREPARED, OFFLINE (Claude). No SQL was executed, no staging mode was run, nothing was installed, no production access, no Task 15+ work, and no limit or timeout was changed. `api/` and every file in `supabase/migrations/` are unchanged: 0037 `531bb2c5…`, 0038 `14a808ea…`, 0039 `05d7eff1…`, 0040 `4e39243e…` and 0041 `dfa49d59…` are byte-identical. Task 14 stays unchecked.
+  - **Prepared command (root runs it; I did not):** `npm run staging:reporting-jobs -- --rehearse-dependency-reads --sites=uk,us`. It refuses `--site`, unknown flags and combined modes. It runs inside the existing guarded lifecycle: staging URL assert, the `ybrzhrgfrnvtcwymjdrq` target checked before every SQL, staging test-user sign-in, full-state baseline first, a fresh ZERO-change (ROLLBACK_ONLY) audit last, and a unique git-ignored `staging-results-reporting-publication-rehearse-dependency-reads-…md` report. The report records the commit, the five migration identities, every observation, the per-read evidence, timings and plans. It holds no credentials, JWTs or source payloads.
+  - **Files:**
+    - new `tests/staging/reportingDependencyRehearsal.ts` (coordinator, cases, fixtures, SQL adapter, pure checks);
+    - new `tests/reporting/reportingDependencyRehearsal.test.ts` (103 tests);
+    - minimal wiring in `tests/staging/reportingPublication.ts`: mode, a `dependency` report field and section, and a status rule. This mode is never COMPLETE unless `dependency.complete === true`;
+    - minimal wiring in `tests/staging/reporting-jobs.ts`: dispatch, flag list, usage and header;
+    - `package.json`: both new files added to `typecheck:digest`.
+  - **Before mutation:**
+    - D0: file identities. 0037/0038/0039 must be the installed identities and 0040/0041 the reviewed drafts. 0040 parses to 25 statements; 0041 to the six replacements, in order.
+    - D1, read-only before BEGIN: the installed publisher is 0039 (invoker, service-only); NO 0040 helper, reads or indexes exist; no active/frozen/publishing batch; the staging marker is present; no `dr-` ids exist.
+  - **One outer transaction that always rolls back:**
+    - D2 applies the parsed 0040 then 0041 bodies (31 statements).
+    - D3 checks the effective functions: 0041 prosrc md5s plus the 0040 helper, SECURITY INVOKER, `search_path=""`, anon/authenticated denied, service_role allowed, and the four indexes present.
+    - The cases follow; then ROLLBACK; then D9.
+    - A rollback failure is kept beside the first error.
+    - Every recorded failure stops at once (`failFast`).
+    - Missing required cases throw, so the evidence is never complete.
+  - **Statement guard (deny-list):**
+    - It refuses COMMIT/END/ABORT, VACUUM/ANALYZE/CHECKPOINT/COPY/LISTEN/NOTIFY, timeout and planner SET or set_config, roles other than anon/authenticated/service_role, migration-history writes, http/dblink/file reads, EXPLAIN ANALYZE, and any DDL (incl. DO) that is not one of the 31 reviewed statements.
+    - Found while writing tests: a DDL statement that starts with a `--` comment bypassed the first-token check. The guard now strips leading comments before classifying.
+  - **Actual SQL adapter:**
+    - `sqlRpcClient` calls only the six allowlisted functions, with exact argument names and 0041-header types (`$n::type` in declared order), on the rehearsal transaction as service_role.
+    - Each call returns `json_agg` text from PostgreSQL. It records calls, rows, max rows, max PostgreSQL bytes, max compact client bytes and time.
+    - It FAILS on more than 1,000 rows or more than 1 MiB compact; it never slices.
+    - It feeds the ACTUAL `rpcFrozenReader` and materializer.
+    - Labelled SQL-serialization evidence, not PostgREST HTTP.
+  - **Cases:**
+    - Sites A=uk, B=us. Workers are the staff, manager, cs and owner staging users.
+    - S0 turns capture and both processors on, inside the transaction.
+    - S1 inserts admissibility-checked named fixtures:
+      - the T14R2 tied pair `dr-😀`/`dr-�` with any-type and same-type predecessors;
+      - the T14R1 prev/next pair;
+      - hidden-worker blank-order and own cancellations;
+      - an orphan whose parent arrives later;
+      - re-owner/re-staff, delete and site-move rows;
+      - a 2099 future row and timestamp ties;
+      - a cross-site duplicate id, plus B's child of an A parent id;
+      - 1,000 owners with 1,200-byte keys;
+      - 15 multibyte/escaped/non-BMP ~90 KB rows with long ids, and 15 big children;
+      - `dr-huge`, padded to an image of exactly 1 MiB − 16 bytes (copyable, but no read row can fit);
+      - `dr-due`.
+    - R0–R9, on a rebuild of A with the ORIGINAL full volume plus fixtures:
+      - R1: candidate = source by count and a per-id image md5 aggregate;
+      - R2: owners exact;
+      - R3–R6: members, by-id, children and before/after streams exact against an independent `to_jsonb(production_events)` view;
+      - R7/R7m/R7s: single-row refusals;
+      - R8: rebuild materialization of 17 controlled owners through the real reader, compared with the in-memory reader and the full-view oracle, including the T14R2 predecessors;
+      - R9: every response ≤ 1,000 rows and ≤ 1 MiB.
+    - X1–X7, each in a savepoint: obsolete fence, wrong batch kind, anon and authenticated permission denied, expired lease, capture disabled, capture epoch changed, and a non-frozen batch.
+    - T1–T2, timed on the full volume:
+      - first and later pages of the largest real owner, and of the busiest real worker in both directions (dr-huge's worker excluded);
+      - `EXPLAIN (VERBOSE, SETTINGS, FORMAT JSON)` of the effective 0041 statements, with variables bound as `$n`. A test proves that un-binding gives back the exact migration text.
+    - P0 (setup only) publishes the rebuild with zero work.
+    - F0 makes the source changes and begins a refresh. F1 checks changed keys; F2 checks overlay members, by-id, children and streams; F3 checks refresh materialization (`materializeBatch`, RPC vs memory vs oracle, T14R1, old-owner empty replacements); F4 refuses the wrong kind.
+    - F5 (setup) publishes the refresh, changes `dr-huge` (same length) and refuses the oversized changed key (F5x).
+  - **Planner early review (5 items), all incorporated:**
+    1. Expected changed keys now come from FULL raw images (`rawView` and `expectedChangedKeys`), then images are reduced for the projector. The 15 note-only changes are now expected in F1 and given to F3's in-memory reader.
+    2. `requiredWorks` projects the full before and after views per audience (site, plus each worker in a changed image) and requires every (audience, owner) whose rows differ. `missingRequired` fails a work missing from either path, so a work missing from both fails. F3 also asserts that the requirement itself contains dr-orph, DR-X and DR-N. R8 requires every non-empty audience of the controlled owners.
+    3. The rebuild fingerprint is now taken before R2; X8 is checked right after R9 and X8t after T2. The refresh fingerprint is taken before F1 and X9 is checked right after F3; the extra read inside X9 was removed.
+    4. R7s is now anchored at dr-huge's exact instant (`after`, empty id, limit 1), so the oversized row comes first.
+    5. `shortPages` is renamed `nonEmptyUnderLimit` (a raw count). The new `cappedContinuations` counts only a non-empty under-limit page that is followed by its EXACT keyset continuation returning rows. R2–R6 and F1 require at least one.
+    - Other fixes: cutoffs are read as exact microsecond UTC text via `to_char` (a JavaScript Date would round to ms), and self-audience oracles see only that worker's events (as the materializer's input does).
+  - **Due probe (planner-approved setup):**
+    - `dr-due` is inserted in S1 at `transaction_timestamp() - 500 ms`.
+    - After T2/X8t and before P0, inside SAVEPOINT `dr_due`:
+      - U1 changes ONLY `source_cutoff` of this run's still-frozen, unsealed rebuild to `transaction_timestamp() - 1 s`, then seals zero work and publishes through the existing RPCs. There is no source edit afterwards. It asserts no pending journal entry for dr-due; the rebuild freeze puts every pending change in its `batch_changes`, and publication gives the receipt.
+      - U2 runs `begin_reporting_batch` at now(). Its changed keys must equal the independent due set; dr-due must be present with identical raw base and frozen images, and inside `base cutoff < created_at <= refresh cutoff` (SQL-checked); the 2099 `dr-fut` must be absent.
+    - The savepoint is rolled back and released on success or failure. A cleanup failure is kept beside the first error.
+    - U3 proves the original frozen rebuild is back (state, cutoff, fence, pre-R2 fingerprint) before P0 continues.
+    - No extra copy, no edit of a published generation, no production-function change.
+    - Labelled in the evidence as a controlled rollback-only time transition, not a wall-clock observation.
+    - I found no conflict with an invariant offline.
+  - **Required cases (never COMPLETE without all):** D0–D3, S0–S1, R0–R9 (with R7m and R7s), U1–U3, P0, F0–F5 (with F5x), X1–X9 (with X6d and X8t), T1–T2, D9.
+  - **Offline outcomes:**
+    - Written failing first: the typecheck-inclusion test (package.json not yet updated) and four first-run failures that exposed real defects: the long keys were 1,199 bytes rather than ≥1,200, and the comment-prefixed-DDL guard bypass; the other two were mistakes in my own assertions.
+    - The 103 focused tests cover:
+      - wiring and status;
+      - identities and bodies;
+      - all six bindings against the 0041 headers;
+      - the adapter's role switch, counts and fail rules;
+      - continuation detection;
+      - the real reader and materializer through the adapter;
+      - plan statement equality;
+      - 30 guard refusals;
+      - comparison sensitivity;
+      - the raw diff, including note-only changes;
+      - required works, including a late parent and missing-on-both;
+      - fixtures;
+      - structural ordering of fingerprints, R7s and the due probe;
+      - the coordinator: refusals before BEGIN, inside failures, recorded-failure fail-fast, an emit failure, a rollback failure kept beside the first error, incomplete evidence, and a real-cases early stop;
+      - the actual lifecycle with a fresh audit (COMPLETE only with complete evidence; FAILED on an audit mismatch).
+  - **Mutations: 16/16 caught.** Two first SURVIVED and were closed with new assertions: counting a full page's continuation as byte-capped, and U2 dropping out of the required cases. The list: guard comment strip; raw membership; missing-on-memory; stream direction in continuation; capped without a short page; >1 MiB accepted; argument order; status without evidence; skipped evidenceProblems; active batch tolerated; X8 moved before R9; R7s from FAR_FUTURE; due cutoff ignoring sealed state; EXPLAIN ANALYZE; U2 not required; rollback skipped.
+  - **Limitations:**
+    - Nothing here has run against PostgreSQL. Function errors, SQL texts and plan binding are checked against the migration text only.
+    - The due probe's savepoint cleanup is proven structurally and by the coordinator tests, not by executing `runDependencyCases` end to end offline.
+    - Full-volume timings are single observations, not a scale certification.
+    - The SQL byte counts are PostgreSQL `json_agg` text, not PostgREST wire bytes.
+    - The `requiredWorks` oracle projects the full UK view once per audience, which is CPU-heavy but finite.
+  - **Request-cost concern (still open, explicit):** T14R3's per-candidate incremental cancellation reads raised the 300-line fan-out fixture from 96 to 1,704 requests. This rehearsal records `sqlCalls` and the per-function call counts for R8/F3, but that is a measurement only. Batching while keeping equivalent bounded consumption remains a Task 15/19 item.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK (includes both new files); strict ES2020 tsc on both runners OK; 1427/1427 tests (39 files); build OK.
+- 2026-11-16 — T14S2 deterministic owner-byte probe, OFFLINE (Claude). No SQL executed, no staging retry, nothing installed, no Task 15+. Edited only `tests/staging/reportingDependencyRehearsal.ts`, its focused test and this log. `api/`, the application, every migration, dependencies, timeouts, fixture volume and every acceptance limit are unchanged. The failed `dcf9924` evidence stays failed and is untouched.
+  - **Cause (as diagnosed in the plan):** R2 judged the owner byte cap from wherever complete enumeration's ordinary 1,000-row pages fell. With 600-odd real owners before `DRK-`, the 1,000 long keys straddled two ordinary pages, each under 1 MiB, so no byte-capped page existed. That is a positioning gap in the harness, not a limiter failure.
+  - **Fix:**
+    - R2 keeps complete `rpcFrozenReader.owners()` enumeration, exact equality with the independently sorted owner list, and the all-1,000-`DRK-` check. It no longer judges the byte cap.
+    - New required case **R2c** (before R3, inside the pre-R2/X8 fingerprint bracket). On the same frozen rebuild and SQL adapter, `runOwnerByteProbe` calls `list_reporting_owners` anchored at `('order', 'DRK-')` with limit 1,000, then once more from the exact last returned key.
+    - The pure `checkOwnerByteProbe` requires all of these:
+      - the independent suffix after the anchor begins with exactly the 1,000 fixture owners (an interleaved real owner fails, naming the first difference);
+      - the uncapped requested page (the first 1,000 suffix owners as compact JSON) exceeds 1 MiB;
+      - page 1 is non-empty and shorter than 1,000;
+      - page 2 is non-empty;
+      - both pages are the exact suffix in order (no missing, repeated or skipped owner);
+      - together they hold all 1,000 long keys;
+      - each page is at most 1 MiB.
+    - Evidence records `ownerByteProbe` (anchor, suffix size, uncapped bytes, per-page rows/bytes, coverage). Incidental pagination elsewhere cannot satisfy R2c.
+    - The six existing `capped(...)` checks are all kept. The owner one is now evaluated in R2c, after the probe, where its evidence is deterministic; left in R2 it would fail again by position. **Please confirm** this matches "all six existing cap checks unchanged". The probe's own direct page checks decide R2c regardless.
+  - **Regression (actual reader and adapter, over a fake `list_reporting_owners` with 0041's byte accounting):** 600 short owners before the 1,000 long keys and 50 after.
+    - Complete enumeration is exact, but `cappedContinuations` stays 0, so the old R2 assertion fails, reproducing the staging shape.
+    - The anchored probe caps page 1 short of 1,000 and continues exactly to cover all 1,000 (`cappedContinuations` becomes 1, two calls).
+    - Rejection cases: truncated continuation, owner missing from page 1, repeated owner, wrong (skipping) continuation, incorrectly full first page, empty first page, empty continuation, a page starting before the anchor, an owner interleaved in the long-key prefix, a fixture under 1 MiB, and a page over 1 MiB. The exact call arguments are asserted too, and there is no continuation after an empty first page.
+  - **Failing first:** against the `dcf9924` module, 15 of the new tests fail. The staging-shape regression passes there by design, because it demonstrates the old check's zero byte-capped pages.
+  - **Mutations: 14/14 caught.** They broke: the full-page check, the continuation key, the anchor, the interleave check, the uncapped-size check, repeat detection, identity/order comparison, coverage, empty continuation, empty first page, page size, R2c as a required case, moving the owner cap check back into R2, and R2 parity.
+  - **Review of R3–R6 and F1 for the same positioning assumption: no concrete further defect found.**
+    - R3: members are read per single owner from that owner's start, and DR-BIG's 15 rows of about 90 KB each (about 1.36 MB) must cap.
+    - R4: by-id requests only the probe ids, including the 15 big rows.
+    - R5: children start at the sorted parent `dr-bp`, whose 15 big children come first.
+    - F1: the refresh has only about 21 changed keys (equal cutoffs, so no due keys). The 15 big keys carry base and frozen images of about 180 KB each, all in the first requested page.
+    - R6 is the only page-positioned walk (worker cs from FAR_PAST, 1,000-row pages). Its 30 big rows (15 owners plus 15 children, about 2.7 MB) are contiguous unless more than about 970 real cs rows fall between 2026-02-12 01:00 and 02:15 UTC. A boundary can split them only into two pages, and one page then holds at least 15 big rows, which is over 1 MiB, so it caps. I have not changed it. A direct anchored stream probe would make it unconditional; that is not done without authorization.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 119/119 focused; 1443/1443 tests (39 files); build OK.
+  - **Limitations:** a passing unit test is not PostgreSQL evidence. Root reviews before one new rehearsal.
+- 2026-11-16 — T14S3 access-path diagnostic PREPARED, OFFLINE (Claude). I did not run it; no SQL was executed. Nothing was installed; there was no production access and no Task 15+ work. `api/`, `src/`, every migration, the dependencies, timeouts, limits and fixture volume are unchanged. The failed (`dcf9924`) and passing (`f072c24`) reports are untouched.
+  - **Prepared command (root runs it once):** `npm run staging:reporting-jobs -- --diagnose-dependency-plans --sites=uk,us`.
+    - The command refuses `--site`, unknown flags and combined modes.
+    - It runs in the same guarded lifecycle as the rehearsal: staging target checked before every SQL, baseline first, a fresh ROLLBACK_ONLY audit last, and a unique ignored `staging-results-reporting-publication-diagnose-dependency-plans-…md` report.
+    - The status is never COMPLETE without complete `dependencyPlans` evidence. COMPLETE means the evidence was collected, not that performance is acceptable.
+  - **Files:**
+    - new `tests/staging/reportingDependencyPlans.ts`;
+    - new `tests/reporting/reportingDependencyPlans.test.ts` (55 tests);
+    - minimal mode, report-section and status wiring in `reportingPublication.ts`;
+    - dispatch, flag and usage in `reporting-jobs.ts`;
+    - both new files added to `typecheck:digest`.
+  - **Shared-helper extraction (allowed by item 1).**
+    - From `reportingDependencyRehearsal.ts`:
+      - `boundReadQuery`, which `planSql` now wraps, producing the identical text;
+      - `dependencyTransaction`, the unchanged D0/D1-before-BEGIN, D2/D3, caller work, always-rollback (failure kept beside), D9 skeleton, which `rehearseDependencyReads` now calls;
+      - an optional exact `allowedExplainAnalyze` set on `dependencyGuard`. The rehearsal passes none, so it still refuses every EXPLAIN ANALYZE.
+    - All 119 rehearsal tests still pass. The 16 T14S1 and 14 T14S2 mutations are all still caught against the refactored skeleton.
+    - One rehearsal assertion was relaxed only to allow a further mode after `--rehearse-dependency-reads` in `main()`'s flag list.
+    - **Guard defect found and fixed:** `SET LOCAL statement_timeout` (and other `SET LOCAL` timeout/planner settings) was not refused; only `SET` and `SET SESSION` were. Neither mode ever sends it. Two rehearsal guard cases were added.
+  - **Transaction (rolled back):**
+    - D0–D3 as in the rehearsal: 0040 and 0041 must be the reviewed drafts, and none of 0040 may be installed.
+    - S0 turns capture and both processors on.
+    - S1 chooses the largest real order owner and the busiest real worker at the first site from `production_events`, then adds three named rows: `dr-pm-1` and `dr-pm-3` in that owner, and `dr-pe` as an event owner.
+    - R0 copies and freezes a rebuild of the FULL original source; R1 checks exact candidate/source identity.
+    - Rebuild probes run next. P0 is a SETUP ONLY zero-work publication that builds the base mirror.
+    - F0 makes named-row changes only: `dr-pm-1` and `dr-pe` overlay replacements, `dr-pm-2` inserted, `dr-pm-3` deleted as a tombstone. It then freezes a refresh, and the refresh probes run.
+    - No materializer and no repeat of the correctness suite.
+  - **Exact SELECTs:**
+    - The bound 0041 member and stream SELECTs, with `$1` batch, `$2` site, `$3` kind, then the call's parameters. A test proves that un-binding gives back the migration text.
+    - ONE split-owner alternative (`splitMembersSql`) replaces ONLY the two OR joins: mirror and candidate. Each is split into mutually exclusive `o.kind = 'order'` (`order_key = o.key`) and `o.kind = 'event'` (`event_id = o.key AND coalesce(order_key,'') = ''`) branches.
+    - Everything else is the same text: equality semantics and collations, ordinality, the batch overlay branch and tombstone NOT EXISTS (duplicated into both mirror branches), the outer cursor, `ORDER BY` and `LIMIT`. Reversing the two replacements gives the original byte for byte.
+    - No COLLATE rewrite, index or setting. It is a diagnostic candidate, not an approved fix.
+  - **EXPLAIN ANALYZE allowlist:** exactly `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT JSON, TIMING OFF) ` plus each of those three statements. The guard refuses, before sending: EXPLAIN ANALYZE of DML, maintenance ANALYZE/VACUUM, any other or altered SELECT, another EXPLAIN option set, a function scan, planner settings, timeout changes and index creation.
+  - **Fixed matrix: 20 explained executions (cap 24, enforced at run time), per batch, rebuild then refresh:**
+    - members original/split first and later at a small diagnostic limit;
+    - members original/split at the normal limit of 1,000;
+    - streams after/before, first and later, at 1,000 rows on the full-volume worker.
+    - Per batch these are preceded by plain SELECTs (as service_role, like the invoker functions):
+      - `M-*-small` and `M-*-normal` require the original and the split to equal the independent frozen pages exactly (identities, order and canonical image) from `to_jsonb(production_events)`;
+      - `C-*-stream` takes the exact later-page cursors and checks result counts.
+    - The small limit is `floor(members/2)`, so the later page is genuinely non-empty. It is labelled pagination diagnosis, not throughput.
+    - Each explain must return exactly the independently expected row count.
+    - Each probe records statement, batch, page, limit, cursor, expected and actual rows, server planning and execution time, settings, and per-node scan, index, index condition, filters, join filter, plan and actual rows, loops, rows removed, sort key and method, and buffers.
+    - Output column lists are dropped; there are no source payloads; at most 80 nodes are kept.
+    - No retries; the first failure stops the run, which then rolls back and closes.
+  - **Offline outcomes.** 55 diagnostic tests cover:
+    - wiring and status;
+    - statement extraction and binding;
+    - split-only-differs and its semantics;
+    - the allowlist and 16 forbidden statements;
+    - the case matrix and evidence completeness;
+    - the non-empty later page;
+    - member ordering;
+    - `comparePages` sensitivity (missing, duplicate, reordered, extra, wrong overlay image, wrong owner index);
+    - plan summaries;
+    - stream counts;
+    - END-TO-END `runPlanCases` over a scripted in-memory database, with exactly 20 allowlisted explains, both batches, rollback and no COMMIT;
+    - failures in parity, first-page-only parity, the explain cap, explain row count, candidate parity, stream count, already-applied 0040 and incomplete evidence;
+    - service_role for every diagnostic SELECT;
+    - an emit failure, and a rollback failure kept beside the first error;
+    - the actual lifecycle with a fresh audit.
+  - **Mutations: 18/19 caught.** The survivor deletes the defensive "later page would be empty" check, which cannot fire: `smallLimit` always leaves a non-empty later page, as tested for every total from 2 to 12. Three earlier survivors (the explain cap, split parity on the first page only, and the service role) were closed with new tests.
+  - **Limitations:**
+    - Nothing has run against PostgreSQL. Plans, estimates, scan counts and timings, and the split's real ordering parity, are only knowable from root's single staging run.
+    - EXPLAIN ANALYZE with TIMING OFF still executes each SELECT; on staging that is 20 bounded reads.
+    - The refresh member probe relies on the overlay holding only the named rows (the cutoffs are equal, so there are no due keys).
+    - A stream rewrite is deliberately not included.
+  - **Gate:** `npx tsc -b` OK; `npm run typecheck:digest` OK; strict ES2020 tsc on both runners OK; 1500/1500 tests (40 files); build OK.
+- 2026-11-16 — T14S3 review repairs at `777f466`, OFFLINE (Claude). No SQL; the diagnostic was not run.
+  - (1) `PLAN_SQL.owner` now tie-breaks on the TEXT key: `order by count(*) desc, reporting_private.order_key(pe.order_number) collate "C"`. The old `1 collate "C"` collated the ordinal.
+  - (2) New `executesExplain`:
+    - It recognises ANY ANALYZE/ANALYSE option before the explained statement, in both the parenthesized and the bare `EXPLAIN ANALYZE [VERBOSE] …` syntax, after leading comments and whitespace. Explicit `ANALYZE false` is denied too (conservative).
+    - The guard refuses every executing EXPLAIN except the exact diagnostic allowlist.
+    - Non-executing plans (`planSql`, plain EXPLAIN) and the exact diagnostic strings still pass.
+  - Regressions: 11 executing forms are refused before sending, including bare SELECT/UPDATE/DELETE/INSERT, ANALYSE, newline/comment-prefixed forms and `ANALYZE TRUE`. Non-executing forms are accepted, and the owner ordering is pinned. Both old forms fail the new tests (2/2 mutations caught).
+  - Gate: `npx tsc -b`, `typecheck:digest` and the strict runners OK; 1513/1513 tests (40 files); build OK.
+- 2026-11-16 — **Task 15 implemented offline; runtime gate pending** (Claude). Nothing was applied: no SQL, staging run, production access, merge or deploy. The Task 15 checkbox stays unchecked until CJ's protected staging refresh/rebuild/disable/recovery evidence and an entitlement record exist. CI for the T14S3 review repair `ed66c5c` is green.
+  - **Files:**
+    - new `supabase/migrations/0043_reporting_worker_state.sql` (draft, unapplied; 0042 left unallocated as reserved);
+    - new `api/_lib/production-reporting-worker.ts`, `api/_lib/reporting-worker-state.ts`, `api/_lib/reporting-auth.ts`;
+    - new handlers `api/reports/refresh-summaries.ts`, `api/reports/reporting-admin.ts`;
+    - new `tests/api/reporting-worker.test.ts` (41 tests);
+    - modified `vercel.json`, `package.json` (typecheck), `docs/releases/item-counting.md`.
+    - **Files the plan did not name:**
+      - `production-reporting-materialize.ts`: two exported units, no behavior change; all 61 materializer/dependency tests unchanged;
+      - `production-reporting-reader.ts`: cursor-resumable enumeration pages;
+      - two pinned assertions updated: the digest cron test now pins only the digest entries; the migration-list test includes 0043.
+  - **0043 durable state:**
+    - Tables:
+      - `worker_progress` (per batch: enumeration cursor, completion, counters);
+      - `worker_owners` (discovered owner, old self staff, planned count);
+      - `worker_runs` (redacted run log).
+    - RLS on, client grants revoked, service_role only.
+    - Service-only invoker RPCs, all fenced through `lock_batch` (live lease):
+      - `save_reporting_enumeration`: discoveries saved WITH the cursor advance; an identical replay is a no-op, any other cursor is refused, completion is final;
+      - `read_reporting_worker_progress`, `list_reporting_worker_owners`;
+      - `plan_reporting_owner`: one owner's descriptors via the existing `plan_reporting_work`, plus the planned mark, in one transaction; exactly one site audience; every old self audience required;
+      - `verify_reporting_plan`: enumeration complete, every owner planned, counters agree, per-owner exact work counts with no missing, extra or orphan rows;
+      - `list_reporting_work_descriptors`: bounded traversal in `work_manifest` order;
+      - `set_reporting_site_mode`, `record_reporting_run`;
+      - `cleanup_reporting_history`:
+        - superseded generations past `expires_at` become expired;
+        - deletes closed versions with `valid_to_seq ≤` the site's minimum published/superseded sequence number, across 7 families;
+        - removes the 30-day run log and finished batches' worker state;
+        - takes the site row lock; never touches source, journal, receipts, batches, work or results.
+    - Responses are ≤1,000 rows / 1 MiB, with single-row refusal.
+  - **Worker (`runReportingCycle`):**
+    - A live lease → `busy`. An expired one → takeover (new fence).
+    - Rebuild copy/freeze resumes from the database cursor.
+    - **Refresh enumeration** works per changed key: the exact per-key slice of `affectedOwners` (old/new owners, parents and their successors, inverse children, successor walks, each seed budgeted). It checkpoints every ≤50 keys / ≤500 owners, and at the deadline inside a page.
+    - **Rebuild enumeration** checkpoints each owner keyset page.
+    - **Plan:** one owner at a time, with old self audiences.
+    - **Seal:** only after `verify_reporting_plan`, using a streaming-SHA-256 traversal of the SAVED descriptors whose count must equal the proof.
+    - **Stage:** bounded claims; each claimed owner is re-materialized once from the frozen view, the input hash must equal the claimed descriptor, then ≤1 MiB chunks are staged.
+    - **Publish:** the existing atomic publication.
+    - Budget and errors:
+      - stops at 240 s;
+      - renews the 360 s lease every 30 s;
+      - transient errors retried after 30/60/120 s only within the budget, otherwise `pending`;
+      - permanent kinds (`partition_too_large`, `conflicting_work`, `invalidated`, `rebuild_required`, …) fail visibly and are never auto-abandoned.
+    - No `materializeBatch`/`affectedOwners` arrays in the production path; a source test enforces this.
+  - **Handlers:**
+    - Constant-time bearer check BEFORE any parsing, environment or database work.
+    - `refresh-summaries`: CRON_SECRET, GET, `site` only; 401 → 405 → 400 → 500 → work.
+    - `reporting-admin`: a separate REPORTING_OPERATOR_SECRET; refused when equal to CRON_SECRET; POST with a strict zod body for status/rebuild/cleanup/set-mode/abandon/disable-capture/enable-capture.
+    - Capture actions report their all-site effect and the rebuilds they require. Every action is run-logged; responses are no-store.
+  - **`vercel.json`:** the three refresh schedules (AU `0,15,30,45`, UK `1,16,31,46`, US `2,17,32,47`) and `maxDuration: 300` for both functions. The digest entries are unchanged.
+  - **Tests:** 41 (failing first — the worker, handlers, migration and schedule did not exist). A fake reporting database models fences, leases, takeover, durable checkpoints, the exact seal, claims, staging and publication, with frozen in-memory views. Covered:
+    - **Parity:** refresh and rebuild publish exactly the whole-batch reference's descriptors and chunks; the per-key union equals `affectedOwners`, including a successor-only owner, an inverse-child owner and an old-self-only owner.
+    - **Resume and replay:** resume from the saved cursor (never from null) for refresh and rebuild; deadline inside a page of keys; lost-response checkpoint replay; leased work returned on takeover over many invocations, with a heartbeat-span check.
+    - **Refusals and failures:** stale fence refused; orphan work and a traversal/proof count mismatch refuse the seal; a tampered claimed input hash fails as `conflicting_work`; `partition_too_large` is a visible failure.
+    - **Operations:** retry/deferral never sleeps past the deadline; a disabled processor does no batch work; a failed run log never masks the result; cleanup repeats bounded passes.
+    - **Handlers:** 401 with zero client calls for missing, wrong, app-JWT and duplicate headers; precedence; operator-secret separation; strict bodies; all-site capture notes.
+    - **Static checks:** the migration text (grants, invoker/search path, fencing, atomic save order, seal proof, cleanup scope) and the exact schedules.
+  - **Mutations: 18/18 caught**, after strengthening fixtures and tests for 9 that first survived:
+    - refresh/rebuild restart from zero;
+    - input-hash check removed;
+    - retry past the deadline;
+    - no heartbeat;
+    - old self audiences dropped;
+    - seal count not cross-checked;
+    - key-loop deadline;
+    - busy detection;
+    - failure classification;
+    - manifest join and order;
+    - handler precedence and extra query;
+    - equal secrets;
+    - non-strict body;
+    - per-key inverse children and successors.
+  - **Limitations and runtime gates still pending:**
+    - The 0043 SQL has not run on PostgreSQL.
+    - Real staging protected refresh/rebuild/disable/recovery with captured output (CJ) is still needed.
+    - The Vercel 15-minute/300 s entitlement is unobserved: a deployment blocker.
+    - The two-pass cost (plan materializes each owner, stage re-materializes it) adds to the open request-cost concern, as a Task 19 measurement item.
+    - Cleanup's `valid_to_seq` deletes rely on existing validity indexes; their cost at scale is a Task 19 item.
+    - Retention is not scheduled automatically; it is the operator `cleanup` action (a schedule can be added once entitlement is known).
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK (includes all new modules); strict runners OK; 1554/1554 tests (41 files); build OK.
+- 2026-11-16 — **Task 16 checkpoint 1: authorized summary/detail server layer, OFFLINE** (Claude). Not complete: the 0044 SQL reader and the staging parity harness are still to be written. No SQL; nothing applied. Task 16 stays unchecked.
+  - **Files:**
+    - new `api/_lib/production-reporting.ts`: principal, audience, freshness, signed cursors, generation checks, `readPublishedSummary`/`readPublishedDetail`, error mapping;
+    - new `api/_lib/production-reporting-rpc.ts`: the 0044 RPC reader contract and Supabase auth/caller-JWT dependencies;
+    - new handlers `api/reports/summary.ts`, `api/reports/detail.ts`;
+    - new `tests/api/reporting-reads.test.ts` (74 tests);
+    - API modules added to `typecheck:digest`. The test is left out because it imports the app's `permissions.ts` through the `@/` alias, which the CLI typecheck does not resolve; vitest runs it.
+  - **Authorization on every request and page:**
+    - The app JWT is verified via `auth.getUser(token)`. The current profile (role, `allowed_nav`) and `user_locations` are read with the CALLER's JWT. Nothing comes from request fields or JWT metadata.
+    - `effectiveNav` is a server mirror of `effectiveNavAccess`, proven equal over 6 roles × 7 overrides.
+    - Audience: owner/manager/kiosk/CS → site; staff → self (limited "own work only"), even when explicitly granted Reports, and even with another worker's `staffId`, which is only a filter inside self.
+    - Reports needs the `reports` nav; Welcome needs `welcome`. No membership → 403; unknown role → 403.
+  - **Generations:**
+    - missing → 503; a missing pinned generation → 410 (reload the whole view);
+    - building, failed or incomplete → 503;
+    - expired, or past `expires_at` → 410;
+    - another site's generation → 400.
+    - Freshness is measured from verified coverage: ≤30 min current, ≤120 min delayed, else outdated. A stale generation is labelled, never zeroed.
+  - **Detail pages and responses:**
+    - Pages are ≤1,000 rows and ≤1 MiB; an oversized page or summary is an explicit 503 TOO_LARGE, never clipped.
+    - Cursors are opaque and HMAC-signed (`REPORTING_CURSOR_SECRET`), binding version, site, audience, filter, generation and kind. Altered, forged or rebound → 400; a site cursor cannot be replayed under a self audience. Only a null cursor ends a sequence.
+    - Welcome returns no people list or SKU board.
+    - 5xx bodies are generic.
+  - **Handler precedence:** 401 (nothing read) → 405 → 400 (unknown or repeated parameters, selectors) → 403 → 410/503 → 200. No-store.
+  - **Mutations: 14/14 caught.** The 5xx-leak check first survived and was closed with a typed-500 case.
+  - **Next (Task 16 remaining):**
+    - `supabase/migrations/0044_reporting_reads.sql`: service-only `read_reporting_generation`, `read_reporting_summary` and `read_reporting_detail`, exactly as the reader contract calls them, aggregating classified facts per `selectFactFamilies`/`evaluateSelection`/`referenceSummary`/`referenceTimingLines` and the Welcome view;
+    - `tests/staging/reporting-read-parity.ts`.
+  - **Proposal for root (recorded under Open questions):** add `@electric-sql/pglite` as a dev-only test dependency to run 0037–0044 in vitest and prove 0044 SQL parity against the TypeScript reference before staging. There is no local PostgreSQL. Without it, the complex 0044 SQL can only be validated textually and by root's staging harness. It changes no app or runtime code. I have not added it.
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK; 1627/1627 tests (42 files); build OK.
+- 2026-11-16 — **Task 16 read-mode signal and Task 17 checkpoint 1 (published client layer), OFFLINE** (Claude). Neither task is complete; both stay unchecked. CI is green for `e02efa2` (Task 15) and `d3a676f` (Task 16 checkpoint 1).
+  - **Task 16 contract addition (scope-consistent decision):** the plan says clients receive the effective per-site read mode only through the authorized API.
+    - `GenerationMeta` now carries the site's `readMode`. `read_reporting_generation` must return `read_mode`; the parser refuses its absence.
+    - A site in `legacy` or `shadow` mode answers 503 `READ_MODE_LEGACY` / `READ_MODE_SHADOW`. The app then keeps its existing reads: an explicit operator-controlled mode, not a silent raw-history fallback.
+    - Tests cover both codes and the missing field.
+  - **Task 17 files:**
+    - new `src/lib/domain/productionReportingFreshness.ts`:
+      - freshness from `verifiedAtUtc`: ≤30 min current, ≤120 "Update delayed", beyond that "Report out of date";
+      - 15-minute refresh due/overdue; non-negative age;
+      - per-site production-date coverage, so an older generation after the 04:00 rollover does not cover "today";
+    - its test (8);
+    - new `src/lib/repository/supabase/productionPublished.ts`: bearer-token GETs to `/api/reports/summary` and `/detail`, no-store, typed `PublishedReadError` with `legacyMode`/`expired`;
+    - new `src/lib/hooks/usePublishedProduction.ts`: a framework-free `PublishedViewController` plus a thin hook;
+    - new `tests/production/published-reporting.test.ts` (9).
+  - **Controller rules:**
+    - The identity is (user, site, view, range, staff, work type). A change clears the old result at once and aborts it; late responses are discarded.
+    - A refresh pins the shown generation. A 410 reloads the WHOLE view at the current generation and drops old pages.
+    - Detail pages are fetched only in the summary's generation; a `BAD_CURSOR` or 410 reloads the whole view. Whole-period totals always come from the summary.
+    - A failed refresh keeps the previous result, marked stale; legacy mode → `legacy`.
+    - The network trace shows only the published endpoints (no raw history).
+  - **Mutations: 10/10 caught.** "Pages kept across generations" first survived because of a loose `toMatchObject({})`; it is now an exact assertion.
+  - **Still to do in Task 17:**
+    - wire Reports/Welcome/ProductionCountStatus to the controller for `summary`-mode sites, keeping the existing path for `legacy`, Production's immediate-feedback path and Dexie unchanged;
+    - the side-card audit and changes (PackageHistory/Usage historical drill-down lazy; DailyTimesheet/CurrentlyClockedIn/LiveOrderCompletions never presenting truncated totals);
+    - the staging browser check.
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK; 1644/1644 tests (44 files); build OK.
+- 2026-11-16 — **Offline PostgreSQL for reporting SQL (CJ approved the PGlite proposal in chat)** (Claude).
+  - **Dependency:** `@electric-sql/pglite` **0.5.13**, an exact devDependency released 2026-10-28; the newest is 0.5.16, but the pinned version is at least two weeks old. It is used only by vitest under `tests/reporting/pg/`; nothing in `src/` or `api/` imports it and it is not in the app bundle. The reason, recorded per guardrail 7: there is no local PostgreSQL, and the reporting SQL must be executed and compared with the TypeScript references before staging.
+  - **Harness (`tests/reporting/pg/harness.ts`):** it stubs only what 0037+ reference outside `reporting_private`:
+    - the roles anon, authenticated and service_role (BYPASSRLS, as in Supabase);
+    - `auth.users`, `public.locations`;
+    - `public.production_events` as of 0030 (columns, checks, PK, RLS on, service_role SELECT).
+    - It then applies the REAL migration files 0037–0043 unchanged. All seven apply.
+  - **`tests/reporting/pg/rpc.ts`:** a PostgREST-like RpcClient (named typed arguments, SET ROLE per call, json_agg result).
+  - **Results, from first execution of 0043 SQL:** the REAL Task 15 worker ran rebuild, then refresh after an insert, a deletion, a re-owner/re-staff and a new cancellation, then a no-change refresh, then cleanup, all over the real SQL.
+    - The published current `event_facts` (site and self audiences) equal the whole-batch in-memory reference exactly. Non-vacuity is asserted: deleted e005 is absent, e007 is in W2's self audience, n-1 is present.
+    - anon/authenticated get `permission denied` on the worker RPCs.
+  - **Limits:** PGlite is one in-process PostgreSQL 17. It proves SQL semantics and parity, not hosted roles, PostgREST, concurrency, timeouts or performance. Staging remains the runtime gate.
+  - **Gate:** `npx tsc -b` OK; 1650/1650 tests (46 files, 27 s); build OK.
+- 2026-11-16 — **Task 16: 0044 read SQL, layer 1 (selection, evaluation, coverage, range totals), executed offline in PGlite** (Claude). This is a draft, not applied. Task 16 stays open: the public summary/detail RPCs, people/timing/SKU board/staff-days/Welcome and the staging parity harness remain.
+  - **New `supabase/migrations/0044_reporting_reads.sql`.** Internal service-only functions over ONE generation's versioned facts (`valid_from_seq <= seq < valid_to_seq`) and ONE trusted audience, mirroring the Task 11 reference:
+    - `sel_rows`: the four families over facts ∪ source issues — window rows; pre-window verifications whose RAW order equals a window terminal's (space-trimmed non-blank); cancelled parents; post-window cancellations of window targets.
+    - `sel_eval`, per selected fact:
+      - `effective`: not cancelled by a VALID edge whose parent is selected, a verification/terminal and not later;
+      - `reversed`;
+      - qualification from the selected original verifications of the same (order, work type, case) at or before the terminal.
+    - `sel_anchored`: coverage issues and notes in the reference's order; selected source issues are unscoped.
+    - `sel_totals`: normal/rework Items (exact numeric, null past 2^53−1), distinct (order, case) Orders, by work type, by production date, plus issue counts (deduplicated by kind and event), notes and issue rows.
+  - **Parity (`tests/reporting/pg/reads-parity.test.ts`, 73 cases):**
+    - Inputs: the Task 11 `history()` and `randomHistory(7, 600)` fixtures, including malformed-identity source rows and one order reworked under two cases. They are saved as source rows, published by the REAL worker, then for each case compared with `referenceSummary` over the same frozen source.
+    - Coverage: 6 windows (full days, a partial day, multi-day, microsecond edges) × site/self(ANNA)/self(BEN) × 4 display scopes (none, staff, work type, work type + staffs).
+    - Compared: totals, by work type, issue counts, notes and issue rows are exactly equal. Non-vacuity is asserted.
+  - **SQL mutations: 10/12 caught:**
+    - a later parent cancelling;
+    - the qualification family, post-window cancellations, and time and case in qualification;
+    - repeats over non-effective lines;
+    - case identity in Orders;
+    - excluded-only terminals;
+    - scoped source issues;
+    - trimmed raw-order matching.
+  - Two first survived because the fixture lacked malformed ids and two-case rework; both were added and are now caught.
+  - Two survivors are equivalent and kept as defensive clauses: non-counted lines are stored with 0 items, and duplicate (kind, event) issues cannot arise from distinct paths.
+  - One pinned test updated: the migration list includes 0044.
+  - **Gate:** `npx tsc -b` OK; full suite run; build OK.
+- 2026-11-16 — **Task 16: 0044 layer 2 (Reports view), executed offline in PGlite** (Claude). This is a draft, not applied. Task 16 stays open: the public RPCs (`read_reporting_generation` with `read_mode`, `read_reporting_summary`, `read_reporting_detail`), the Welcome view and the staging harness remain.
+  - **New SQL:**
+    - `production_date_at`: the site zone with the 04:00 rule. The materializer stores `production_date` only on verifications, so terminals had none and daily Orders and staff-days came out short; this was found by parity and fixed.
+    - `utf16_key`: JavaScript's UTF-16 code-unit order for same-microsecond tie-breaks, which differs from `COLLATE "C"` for non-BMP vs U+E000–U+FFFF.
+    - `sel_timing`: `referenceTimingLines` — effective stream lines in range by millisecond, a per-worker predecessor inside the selected stream, gaps > 0 and ≤ 30 min with weight > 0.
+    - `sel_report`: the Reports view —
+      - tiles, and page coverage for everyone;
+      - a leaderboard with days worked from per-production-date credit, ordered as the app orders it;
+      - active staff, staff-days, average Orders per staff-day;
+      - tile and per-person timing;
+      - per-SKU timing aggregates;
+      - the tile's daily series for every date in the range, zero days included.
+  - **New `api/_lib/production-reporting-sku.ts`:** groups those bounded aggregates into the top-20 variant board with the SAME shared `parseSku` and ordering.
+  - **Parity (`tests/reporting/pg/report-view-parity.test.ts`, 42 cases):** compared with the EXISTING app reducer `buildProductionReportView` over the four-family snapshot of the same source.
+    - Coverage: 5 ranges × site/self × 4 filters (none, staff, work type, staff + type).
+    - Compared: tiles, by work type, coverage, active staff, staff-days, average, timing, the full leaderboard, the SKU board and the person daily series.
+    - Fixture additions: a cancelled timing line between two of one worker's lines.
+    - A direct `utf16_key` order test against JS sort.
+    - Layer-1 parity still passes (73).
+  - **SQL mutations: 14/14 caught**, after the cancelled-stream-line fixture closed the one first survivor:
+    - per-worker predecessor; 30-min cap; zero weight; stream and effective filters;
+    - timed-weight denominator; days-worked rule; derived production date; 04:00 start;
+    - staff-days for a selected person; leaderboard order; active-staff filter; page vs tile coverage;
+    - surrogate encoding.
+  - **Gate:** `npx tsc -b` OK; `typecheck:digest` OK (includes the SKU module); 1765/1765 tests (48 files); build OK.
+- 2026-11-16 — **Task 16: 0044 layer 3 (Welcome), offline in PGlite** (Claude). Draft, not applied; Task 16 stays open.
+  - `reporting_private.sel_welcome` returns per-production-date cells over ONE selection (the Welcome range): (date), (date, type), (date, type, person) and (date, person), with normal/rework Items and distinct (order, case) Orders, plus range and today coverage. New `api/_lib/production-reporting-welcome.ts` (`welcomeFrom`) assembles cards, top worker, streak, most improved, sparkline and team total with the exact rules of `buildProductionWelcomeView`.
+  - Parity (`tests/reporting/pg/welcome-parity.test.ts`, 16): 5 todays × site/self ANNA/self BEN equal `buildProductionWelcomeView` over the same source's Welcome-range snapshot, including range and today coverage. A deterministic most-improved fixture was added, and non-vacuity is asserted.
+  - Gate: tsc -b OK; typecheck:digest OK; 1781/1781 tests (49 files); build OK.
+- 2026-11-16 — **T14S3 guard review 2: comment-aware EXPLAIN/DDL detection, OFFLINE** (Claude). No SQL against any project; the staging diagnostic stays held until this is cleared.
+  - **Cause:** the head regex took a statement keyword inside an interstitial comment (`EXPLAIN /* select */ ANALYZE DELETE …`) as the explained statement. The leading-comment regex also mis-stripped NESTED block comments, so `/* a /* b */ c */ DROP …` could hide DDL from the classifier.
+  - **Fix:** new `stripSqlComments` — a real lexer:
+    - nested `/* */`, `--` to end of line;
+    - respects '…', E'…' escapes, "…" identifiers and $tag$ quotes;
+    - null when anything is unterminated.
+  - The guard classifies only the comment-free text and refuses unterminated or empty statements.
+  - `executesExplain` tokenizes the comment-free text:
+    - `EXPLAIN ( … )` executes if any option is named analyze/analyse, quoted or not, with any value (explicit false denied: conservative);
+    - otherwise a leading ANALYZE/ANALYSE word;
+    - unclosed lists or unterminated text count as executing.
+  - Exact allowlist matching is unchanged.
+  - **Regressions:** 9 comment-hidden executing forms and 4 nested/unterminated DDL or empty forms are refused before sending. Strings, identifiers and dollar quotes holding comment markers or 'analyze' do not trip it. All 31 reviewed migration statements and the 3 diagnostic statements still pass.
+  - **Checked against real PostgreSQL** (`tests/reporting/pg/explain-guard.test.ts`): 16 forms run inside rolled-back transactions. Whenever PostgreSQL actually executed the DELETE, `executesExplain` is true — no false negatives; the only conservative positive is `ANALYZE false`. The `ed66c5c` guard fails 8 of these real-PG cases.
+  - **Gate:** tsc -b, typecheck:digest and the strict runners OK; 1812/1812 tests (50 files); build OK.
+- 2026-11-16 — **Planner review items 3 and 4 (Task 16 auth precedence, Task 17 detail selectors), OFFLINE** (Claude).
+  - **Item 3:** `api/reports/summary.ts` and `detail.ts` now reject a missing, malformed or duplicated bearer header with 401 BEFORE creating any auth, environment, reader or cursor-secret dependency.
+    - Missing header plus missing configuration is 401, with zero calls (5 header shapes, both handlers).
+    - A well-formed token with missing configuration is still the documented 500.
+  - **Item 4:** the controller keys detail pages by the complete selector (`detailKey(kind, orderNumber)`), and the hook's `nextPage` takes `orderNumber`.
+    - One in-flight request per selector: a concurrent call joins it.
+    - A page whose base changed meanwhile is never appended; dispose clears in-flight requests.
+    - Tests: switching orderNumber never reuses another selector's cursor or rows (fails on the old controller); concurrent calls send one request and append one page (fails on the old one); a late page after an identity change is discarded (already correct, now pinned).
+  - **Gate:** tsc -b OK; typecheck:digest OK; 1821/1821 tests (50 files); build OK.
+- 2026-11-16 — Review repair item 2 (Task 16 count safety): implemented; runtime gate pending.
+  - **0044:** every Items sum (totals, byWorkType, daily, people, Welcome cells) goes through `safe_items` and becomes the overflow null outside 0..2^53−1. Every count (Orders, staff-days, active staff, issue rows, totalRows) goes through `safe_count`, which raises outside the safe range.
+  - **0044 public reads:** appended `read_reporting_generation` and `read_reporting_summary`. Both are service_role only. They check the audience shape, the view, the work type, the limits, that the window matches the production-day starts, and that the generation is a retained, complete publication for that site.
+  - **API:** new `api/_lib/production-reporting-dto.ts` strictly parses the response: exact key sets, safe-integer counts, Items as a safe integer or null, finite rates, work types in order, and Welcome present only on the Welcome view.
+    - `rpcPublishedReader` uses the parser; the server overlays trusted visibility on coverage and signs continuation cursors when a page holds fewer than totalRows (no secret → 500 CONFIG).
+    - Added the DTO module to `typecheck:digest`.
+  - **Tests:** 17 response mutations plus paging/cursor cases in `tests/api/reporting-reads.test.ts`. New `tests/reporting/pg/summary-api-e2e.test.ts` (PGlite): the real worker publishes, then the real RPCs feed the real reader.
+    - Two-valid-quantities overflow fixture: 9007199254740990 + 5. Items are null in totals, the work type, the day, the person and Welcome; Orders stay exact; the other person is unaffected.
+    - SQL refusals: a forged window, a wrong-site generation, a malformed audience, and the authenticated role.
+  - **Gate:** tsc -b OK; typecheck:digest OK; 1846/1846 tests (51 files); build OK. No SQL was run against any real database.
+- 2026-11-16 — Review repair item 1 (Task 15 durability): implemented; runtime gate pending.
+  - **0043 (draft, unapplied; 0037–0041 unchanged):**
+    - `worker_seen` is the exact per-key, per-seed DISTINCT dependency-ID budget; its primary key deduplicates an id met through the stream and child paths in any invocation.
+    - `worker_walk_line` is one row per batch holding the paged line's image.
+    - `save_reporting_walk` checkpoints atomically through `save_reporting_enumeration`, so the fence, lease, expected-cursor and replay rules are unchanged. It:
+      - raises partition_too_large when one key/seed passes 50,000 distinct ids, rolling back the cursor, owners, ids and line together;
+      - binds the ids to the cursor's seed;
+      - refuses a switch to another key while the saved cursor is inside one;
+      - bounds `p_seen` to 2,000 ids and 1 MiB;
+      - deletes the key's scratch rows in the transaction that advances the outer changed-key cursor.
+    - Added `read_reporting_walk_line`. Cleanup also removes scratch rows of finished batches.
+  - **TS:**
+    - `walkChangedKey` replaces the whole-key enumeration unit. The key's images and parents come first, then inverse-children pages (500), then each successor seed's stream pages (200) and each line's cancellation pages (1,000).
+    - A checkpoint precedes every source read, with a heartbeat and a stop at the deadline after the save. The outer cursor advances only when the key is complete. Owner saves are at most 1,000 per checkpoint.
+    - Whether a line is cancelled is a monotonic flag OR-ed per page with the shared projector. This is exact because each cancellation is judged only against its own parent (productionReportingProjection.ts:185).
+    - Removed the 1,000-owners-per-key cap and the CHECKPOINT_KEYS/CHECKPOINT_OWNERS batching.
+    - Added `FrozenReader.childPage`, `parseKeyProgress` (strict), `saveWalk` and `readWalkLine`.
+  - **Bounded replay:** resuming inside a seed re-segments that seed's stream pages after the saved consumed position. Unconsumed lookahead rows may be requested again, but a consumed row never is. There are no point rereads and no completed child pages are fetched again.
+  - **Tests:**
+    - `tests/reporting/keyWalk.test.ts`:
+      - equivalence with changedKeyDependencies for every changed key;
+      - interruption at EVERY checkpoint, with a strict multiset no-reread check for byIds and child pages and a semantic stream check;
+      - a multi-page line resume from kidsAfter;
+      - cross-path duplicates counted once;
+      - a first-page-only cancellation fixture;
+      - no read after an over-budget checkpoint;
+      - strict cursor parsing.
+    - `tests/reporting/pg/walk-resume.test.ts` (real SQL):
+      - an interruption after page 2 of a line's cancellations, then a resume with zero byIds and zero earlier child pages, publishing exactly the reference;
+      - k-s1 is one budget row;
+      - the atomic 50,001 rollback, seed binding and cross-key refusal.
+    - FakeDb `save_reporting_walk` is now atomic.
+    - The pg RPC shim now returns single-column TABLE rows as objects, as PostgREST does.
+  - No SQL was run against any real database.
+- 2026-11-16 — **Task 16: published report summaries and details (offline gate green; runtime gate pending)** (Claude). Task 16 stays UNCHECKED: 0044 is a draft, not applied anywhere, and CJ-run real-role/SQL staging parity is still required. This is not release completion.
+  - **0044 (draft, unapplied; 0037–0043 unchanged):**
+    - **Counts:** Items stay exact numerics through every internal calculation (days worked, staff-days, ordering, rates). `safe_items` applies only at the JSON output; counts go through `safe_count`. An overflow-only worked day counts in daysWorked/staffDays (planner T16 rule). Rates use the raw value, which differs from the app reducer's `items ?? 0` only when Items overflow.
+    - **Summary pages:** the daily and people lists are SQL-bounded first pages `{rows, total}` with exact totals (`sel_board`, `sel_people_page`, `sel_daily_page`).
+    - **Shared check:** `checked_generation` validates site, audience, work type, range, exact production-day window and a retained complete generation; both public reads use it.
+    - **`public.read_reporting_detail`** (service_role only) serves all seven kinds over the summary's pinned generation, audience, window and filters. Rows are SQL-bounded (limit+1), with exact `total_rows`/`more`/`last` and strict continuation checks:
+      - days/people: an offset continuing the summary's order;
+      - orders: the overall key in UTF-16 order, as `summarizeProduction` groups it;
+      - events and raw-export: the selection's in-window rows with their `source_versions` image at the generation's seq, keyed [instant, id]; raw values are never coerced;
+      - coverage: issues only, from `sel_anchored`, deduplicated by ord precedence, keyed [kind, eventId];
+      - timing: the `sel_timing` stream, with staff and order applied after predecessors, exact predecessor and completion instants, keyed [completion instant, id].
+    - **Order selector:** trimmed; a blank selector is refused.
+    - **`sel_timing`:** decides "in range" by millisecond, as the app does, over the exact selection (review T11-1).
+  - **API:**
+    - `production-reporting-dto.ts` parses summary pages and every detail kind strictly. Errors are named per RPC, with no shared mutable state.
+    - `rpcPublishedReader.detail` checks the 1..1000 integer limit and the offset cursor before any RPC.
+  - **Tests (new):**
+    - real-SQL PGlite: `tests/reporting/pg/detail-days-people.test.ts`, `detail-orders.test.ts`, `detail-events.test.ts`, `detail-coverage.test.ts`, `detail-timing.test.ts`, `timing-t11.test.ts`;
+    - updated: `summary-api-e2e.test.ts` (overflow-only day), `report-view-parity.test.ts` (paged contract) and `tests/api/reporting-reads.test.ts` (paged summary, per-kind detail mutations, error context, limit guard).
+    - Each detail kind was test-first, with its failing run recorded before its SQL. The oracles are the app reference or independent fixtures, never SQL compared to itself.
+  - **Gate (root, independent):**
+
+    | Check | Result |
+    |---|---|
+    | Focused Task 16 SQL/API set | 9 files, 326/326 |
+    | Full suite | 59 files, 2,036/2,036 |
+    | `npx tsc -b` | exit 0 |
+    | `npm run typecheck:digest` | exit 0 |
+    | `npm run build` | exit 0 (only the existing Browserslist/chunk warnings) |
+    | `git diff --check` | clean |
+  - **Open semantics for review:**
+    - Detail-only extensions: `p_order` narrowing on coverage; the `orders` `workTypes`/`firstAtUtc`/`lastAtUtc`/`verifiedLines` definitions.
+    - The events/raw-export stream is the four counting event types in the window only; `production_events.note` is NOT NULL, so a null note cannot occur.
+    - Each detail page counts its whole scope for `total_rows`; staging should measure this on long ranges.
+  - **Runtime gate pending:** CJ installs 0044 on staging, then runs real-role read parity and authorization checks.
+  - No SQL was run against any real database; no merge or deploy.
+- 2026-11-16 — **Task 17: published management views (offline checkpoint; runtime/staging browser gate pending)** (Claude). Task 17 stays UNCHECKED. Code integration is offline-complete and gated. Runtime and staging browser evidence are pending because migration 0044 is still unapplied. No SQL was run, nothing was deployed or merged.
+  - **Published path:**
+    - Reports and Welcome read the authorized published summary (`usePublishedManagement` → `PublishedViewController`). The identity is the signed-in user, site, view, production dates and staff/work type, and the bearer token is read per call.
+    - The raw-history path (`useProductionEvidence`) runs only after an explicit READ_MODE_LEGACY/SHADOW answer (`rawRangeFor`): there is no dual read and no fallback.
+    - Welcome consumes `summary.welcome`.
+    - Reports tiles, work types, timing, coverage and whole-scope figures come from the summary and are never summed from pages.
+    - The status line shows the source cutoff, the 15/30/120-minute freshness rules and the generation's day coverage. Uncovered days are announced, never shown as zero.
+  - **Controller:**
+    - A refresh is unpinned; detail pages are pinned to the displayed generation.
+    - A stale cursor or 410 reloads the whole view at the latest generation and drops pages, even if that reload fails.
+    - Days/people paging continues from the summary's own cursors.
+    - `reset()` runs when the identity becomes null.
+    - Late responses from an old identity are discarded.
+  - **Lazy, generation-pinned pages and export:**
+    - Detail pages load on demand via `nextPage`: people, production days, a selected person's orders, coverage issues (only when issueRows > 0), and timing observations. Nothing is requested on mount.
+    - The published CSV is opt-in. `collectAll("raw-export")` reads pages of at most 1,000 rows with a token per page and uses the DTO's note/station, with no production_events read. It refuses a partial file on a view/generation change, a page error or no progress, and an abort surfaces as the typed VIEW_CHANGED.
+    - The legacy CSV path is unchanged.
+  - **Side cards:**
+    - The package usage and package history cards load on request only, and a scope change clears them.
+    - The daily timesheet and currently-clocked-in reads page completely ordered by (created_at, id); the 16-hour window and 30-second refresh are kept.
+    - Live order completions uses 500-row pages under one frozen cutoff with a stable descending (created_at, id) keyset ("Load older"), and is never labelled complete after a full page.
+    - `fetchAllRows` validates its options and throws `PageThroughIncompleteError` at its safety cap instead of returning a partial array.
+    - The attendance/packaging definitions, permissions, order lookup and Dexie behaviour are unchanged.
+  - **Production:** the immediate Production/capture path (`useProductionEvidence` current-day) is unchanged.
+  - **Files:**
+    - new: `src/lib/domain/productionPublishedView.ts`, `productionPublishedState.ts`, `src/lib/hooks/usePublishedManagement.ts`, `src/lib/repository/supabase/keysetFilter.ts`; tests `tests/production/published-view-adapter.test.ts`, `side-cards.test.ts`, `keyset-cursor.test.ts`;
+    - modified: `src/pages/Reports.tsx`, `src/pages/Welcome.tsx`, `src/components/ProductionCountStatus.tsx`, the five side cards, `src/lib/hooks/usePublishedProduction.ts`, `src/lib/repository/supabase/pageThrough.ts`, `tests/production/published-reporting.test.ts`.
+  - **Gate (root, current tree):**
+
+    | Check | Result |
+    |---|---|
+    | Focused Task 17 tests | 71/71 |
+    | `npx tsc -b` | clean |
+    | `npm run typecheck:digest` | exit 0 |
+    | `npm run build` | success |
+    | Full suite | 62 files, 2,095 tests |
+    | `git diff --check` | clean |
+  - **Known differences, recorded for review:**
+    - Published per-person orders page in order-key order, not newest-touched first.
+    - Work-type pills follow work-type order.
+    - Items-per-day uses the raw rate on overflow.
+    - The legacy CSV over 100,000 rows now fails explicitly at the cap.
+    - There is no DOM test dependency; page wiring is pinned by source contracts and pure adapters.
+  - **Pending:** CJ applies 0044 on staging, then runs the staging browser checks (warnings, immediate worker confirmation with the worker job stopped, no new data exposure or false zeroes).
+- 2026-11-16 — **Task 18: digest and exports pinned to published generations (offline gate green; runtime/staging gate pending)** (Claude). Task 18 stays UNCHECKED: 0044 is still an unapplied draft (not modified by this task), and CJ's staging dry digests and browser checks are pending. No SQL was run, nothing was deployed or merged, and no test email was sent.
+  - **Digest (`api/reports/daily-digest.ts`):**
+    - It is now `createDigestHandler(deps)`, and the default export uses the real client, fetch and clock.
+    - S1 auth, method, recipient override and allowlist, the diagnostics, recipients, no-store and their precedence are unchanged and still first.
+    - The site's read mode comes from `get_reporting_job_status` (0038). Legacy and shadow keep the existing raw-evidence digest unchanged; an unreadable mode fails the digest rather than falling back.
+  - **In summary mode:**
+    - ONE generation is resolved through the internal `rpcPublishedReader` (no HTTP self-call) and must be published, complete, for this site and still in summary mode.
+    - A generation verified more than 30 minutes earlier is refused with 503 before any summary read, workbook or email.
+    - All 10 summary reads (2 days × all + 4 work types) are pinned to that `p_generation`. People are paged completely, and work-type totals that disagree with the day's breakdown fail the digest.
+    - The workbook prints the source cutoff (`as_of_utc`), `published_at_utc`, `rule_version`, `verified_at_utc`, `generation_id`, `source=published` and `operational_reads_as_of_utc`; the notes and email body add the same labels.
+  - **Operational reads:** clock rows (hours, staff on shift), the completion spans behind the hours fallback, and ledger boxes are bounded paged reads with their own cutoff. They are labelled "live operational reads … not from the published report", and their attendance and packaging definitions are kept.
+    - Known difference: in summary mode, a span-endpoint terminal is excluded when the bounded read holds a cancellation of it. Legacy uses the full reversal rules; this affects the hours fallback only, never counts.
+  - **Workbook ceiling:** an explicit `MAX_DIGEST_XLSX_BYTES` of 4 MiB in both modes, failing with 500 and nothing downloaded or emailed, never truncated.
+  - **Published CSV:**
+    - `collectAll` has a streamed `onPage` mode: bounded pages of at most 1,000 rows, a token per page, and all total/progress checks.
+    - Reports keeps one BlobPart per validated page (the header, then each page as one CRLF-led chunk), with no per-row parts and no whole-file join. The Blob is created only after the whole collection resolves, so a revocation, page failure, view change or lack of progress discards everything.
+    - There is no production_events read; raw quantity, timestamp, note and station come from the generation-pinned DTO.
+  - **Tests:**
+    - new `tests/reporting/pg/digest-published.test.ts` (6, real SQL): digest counts equal the app's live counter at the generation's cutoff across the Summary, Departments and Staff sheets; every summary read is pinned to the one expected `p_generation`, with a single active-generation lookup before the first read; operational reads are labelled; a newer worker save differs until the next publication, then agrees; a stale publication gives no workbook and no email; and the operator API and schema both refuse summary mode without a generation.
+    - new `tests/api/daily-digest-published.test.ts` (21): the mode gate, published refusals (none, incomplete, building, another site, a mode race, a failing read) in both dry and send runs, staleness at 31 and 30 minutes, inconsistent reads, the service-key requirement (RLS/context), the workbook ceiling, and S1 order. Two deliberate breaks (no staleness check, no ceiling) each failed it.
+    - existing `tests/api/daily-digest.test.ts`, `daily-digest-counts.test.ts` and `tests/production/item-counting-parity.test.ts`: their fixtures now answer the read-mode lookup with legacy, and their single-RPC assertions are tightened to [mode lookup, one evidence read].
+    - `tests/production/published-reporting.test.ts` and `published-view-adapter.test.ts`: streamed collection, mid-export revocation (403), page-chunk CSV equality, and the source contract.
+  - **Gate (current tree):**
+
+    | Check | Result |
+    |---|---|
+    | Focused Task 18 set | 9 files, 476/476 (before the final chunking edit) |
+    | Export files after the chunking edit | 61/61 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Full suite | 64 files, 2,128/2,128 |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Runtime limitations:**
+    - The browser CSV still holds the page chunks in memory until the download. There is no streaming file writer, and no page holds more than 1,000 rows.
+    - Digest timing on real data is unmeasured: 10 summary RPCs per digest.
+  - **Pending:** CJ applies 0044 on staging and puts a site in summary mode, downloads dry digests for three sites and verifies counts and cutoffs, then checks the negative auth and stale cases.
+- 2026-11-16 — **Task 18 review repair: digest/management parity proved** (Claude). Task 18 stays UNCHECKED; runtime/staging is still pending.
+  - `tests/reporting/pg/digest-published.test.ts` adds a real-SQL three-way assertion at ONE cutoff. It compares the app's live counter at the generation's exact cutoff, the management summary through `rpcPublishedReader.summary` pinned to the same generation id, and the digest workbook (the same generation id).
+  - Values compared, each non-vacuous and explicit:
+    - overall today: Items 4, Orders 2 (normal and rework);
+    - overall yesterday: Items 2, Orders 1;
+    - framed today: 3 / 1;
+    - one person (Ana) at framed today: 3 / 1.
+  - The newer-save-until-next-publication case is kept. No mismatch was found, so no runtime code changed.
+  - Gate:
+
+    | Check | Result |
+    |---|---|
+    | Real-SQL digest test | 7/7 |
+    | Focused Task 18 set | 10 files, 482/482 |
+    | `npx tsc -b` | 0 |
+  - The broader suite was not rerun: this commit changes only a test and the plan.
+  - No SQL was run, nothing was deployed or merged.
+- 2026-11-16 — **Task 14 access-path repair: append-only 0042 (draft, unapplied)** (Claude). Task 14 stays UNCHECKED until CJ runs the hosted evidence.
+  - **Evidence used:** the ignored T14S3 report `staging-results-reporting-publication-diagnose-dependency-plans-20261116T145318246Z-1989fbb0.md` (SHA-256 CCAED271…F027; not committed).
+    - Rebuild owner members: the 0041 OR join used `source_candidate_owner_order` with only `Index Cond (batch_id, site)`. It read 42,343 rows × 2 loops, and the join filter removed 84,679, to return 7 rows.
+    - Staff streams: the outer direction-CASE sort read every row of the worker (about 29,930) before LIMIT, on both batch kinds.
+    - Refresh member reads were acceptable and are kept.
+  - **`supabase/migrations/0042_reporting_access_paths.sql`** replaces only `read_reporting_owner_members` and `read_reporting_staff_stream`.
+    - Same signatures and RETURNS TABLE; the restated service-only grants are the 0041 ACL.
+    - No index, table, timeout or other function changes; 0037–0041 and 0043/0044 are untouched (0040/0041 LF hashes are pinned in a test).
+    - Members: the rebuild candidate is read by per-owner LATERAL keyed lookups, each bounded to the page after the keyset:
+      - an order owner by `order_key = key` (default collation, `source_candidate_order`);
+      - an event owner by `event_id = key` with a blank order (the primary key).
+
+      Both refresh branches are the exact 0041 text.
+    - Stream: all six branches (overlay, base mirror and candidate, each after/before) have a branch-local direction guard, ORDER BY and `LIMIT p_limit` before the merge, so the final sort sees at most three pages.
+      - The base-mirror and candidate branches match the staff_time indexes.
+      - The `batch_events` overlay branch is NOT claimed bounded. It has only the PK, and still filters and sorts the batch's whole frozen overlay on JSON staff/created_at. It is a measured hosted gate.
+    - Unchanged from 0041: validation, `frozen_read_batch` (locks, fence, lease, drift), the complete-response 1 MiB accounting, bytewise keyset order, ≤1,000 rows, SECURITY INVOKER and the empty search_path.
+  - **Tests:**
+    - `tests/reporting/pg/access-paths.test.ts` (14) runs over the real worker, held at its first frozen read.
+      - Every page equals an independent oracle built from plain table reads, covering:
+        - event, order (padded/trimmed), missing and mixed owners;
+        - first and later cursors and page sizes 1–1,000;
+        - bytewise ties;
+        - both stream directions;
+        - the 1 MiB cap (2 of 4 rows of ~400 KB);
+        - refresh replacements, moved owners, tombstones and inserts.
+      - Parameter checks, fence, client-role refusal and no writes.
+      - EXPLAIN ANALYZE of the exact extracted SELECTs:
+        - 0042 members are keyed and read ≤ member + owner rows, under default settings and with bitmap scans off.
+        - The 0041 OR join, with bitmap scans off (the hosted shape; PGlite otherwise picks a BitmapOr), reads the whole candidate and fails the same assertion.
+        - 0042 candidate and mirror stream branches read ≤ limit+1 rows; 0041 fails the same check.
+        - The overlay branch's reads are measured only.
+    - `tests/reporting/reportingAccessPaths.test.ts` (8) checks:
+      - allocation and immutability;
+      - the statement shape;
+      - that only the FOR query differs from 0041;
+      - default-collation owner equality;
+      - per-branch limits;
+      - the real-catalog effective bodies and ACLs.
+    - `reportingJobs.test.ts`: the migration list now includes 0042.
+  - **Prepared, NOT run:** `npm run staging:reporting-jobs -- --diagnose-access-paths --sites=uk,us`, in `tests/staging/reportingDependencyPlans.ts`.
+    - It uses the same guarded lifecycle and skeleton as T14S3, with the exact pinned 0042 (LF `94440fc0…`) applied inside the rolled-back transaction (A0/A1).
+    - It runs the same 20-explain matrix with slots members-0041 / members-0042 / stream-0042.
+    - It records `reads` per relation for every probe.
+    - The shared skeleton gained an optional extra-DDL allowlist (empty by default; T14S3 and the rehearsal are unchanged).
+  - **Process note:** three mechanical one-line wiring replacements (the mode lists in `reportingPublication.ts` and `reporting-jobs.ts`) were made with sed rather than the Edit tool. The content was reviewed in the diff.
+  - The Task 15 allocation test (`tests/api/reporting-worker.test.ts`) previously asserted that 0042 was unallocated; it now asserts that 0042 is this fix.
+  - **Gate:**
+
+    | Check | Result |
+    |---|---|
+    | `access-paths.test.ts` (real SQL) | 14/14 |
+    | `reportingAccessPaths` + `reportingJobs` | 60/60 |
+    | Diagnostic + rehearsal tests | 213/213 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 66 files, 2,161/2,161 |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Remaining hosted gate (CJ):** review, then run `--diagnose-access-paths --sites=uk,us` once.
+    - Accept 0042 only if the rebuild member reads are bounded by owner rows and the stream reads are about one page per branch.
+    - Judge the overlay (`batch_events`) reads against the expected refresh overlay size.
+    - After that, install 0040 → 0041 → 0042 in order. No SQL was run; nothing was deployed or merged.
+- **Task 14 owner-member keying follow-up (2026-11-17, unchecked; implemented, hosted gate pending)** — commit "task 14: key reporting owner member reads".
+  - **Hosted evidence (CJ run of `--diagnose-access-paths --sites=uk,us` at 3f21c17; STATUS COMPLETE, staging restored; acceptance FAILED).** Ignored report `staging-results-reporting-publication-diagnose-access-paths-20261116T161904522Z-4b20535e.md`, SHA-256 `07234C7D…027DF81C2`, not committed.
+    - 0042 rebuild members (E-rb-ms-1/2/n): 43,804 candidate rows read to return 3–7, about 14–16 ms (0041: 84,686 rows, 37–41 ms). Fast but NOT bounded, so rejected.
+      - Order branch: Index Scan `source_candidate_owner_order`, Index Cond only (batch_id, site), Filter `order_key = o.key`, 42,337 rows removed.
+      - Event branch: Index Scan `source_candidate_owner_event`, Index Cond only (batch_id, site), Filter `event_id = o.key`, 1,460 rows removed.
+    - Cause, from the report's own estimates: the fresh candidate's (batch_id, site) range was estimated at 1 row (actual 42,343). Every candidate index led by (batch_id, site) then cost the same, and the planner kept the bytewise 0040 owner indexes, which cannot serve a default-collation equality.
+    - Stream fix passes: source_candidate/source_current reads exactly 1,000 per probe. Refresh overlay reads 11 (acceptable for this fixture). Refresh members read 7 batch_events + 8 source_current, unchanged.
+  - **Offline reproduction (PGlite, no statistics, which is the hosted condition):** the 3f21c17 0042 gives exactly the hosted plan (both bytewise owner indexes keyed only on (batch_id, site)).
+    - The suggested default-collation-only design was tried first: a new page index `(batch_id, site, order_key, event_id COLLATE "C")` partial on non-blank orders, plus a primary-key event lookup. It flipped with volume:
+      - 3,000 rows: the event lookup used `owner_order` unkeyed (2,900 rows removed);
+      - 45,000 rows: the order lookup skipped the new index (sorted `source_candidate_order` instead).
+    - It was not adopted, and no index was added.
+  - **Decision (CJ, 2026-11-17, in chat):** keep default-collation equality and add the redundant bytewise equality, with the collation invariant proven and locked in tests. CJ's constraint: a C-collated term may narrow nothing versus default-collation equality.
+  - **0042 repair (members only; stream and refresh text unchanged):**
+    - The rebuild members are now two per-kind LATERAL lookups (no shared ordering).
+      - Order owner: `sc.order_key = o.key AND sc.order_key COLLATE "C" = o.key COLLATE "C"`, `ORDER BY sc.event_id COLLATE "C" LIMIT p_limit`.
+      - Event owner: `sc.event_id = o.key AND sc.event_id COLLATE "C" = o.key COLLATE "C" AND coalesce(sc.order_key, '') = ''`, then `LIMIT 1`. The primary key allows at most one row; the LIMIT keeps the lookup per owner instead of letting it be flattened into a join.
+    - With the bytewise twin, the 0040 bytewise owner indexes are keyed too. The cheapest access path at every tested size and statistics state is then owner-keyed.
+    - Why it narrows nothing: the columns and the key use the database default collation; PostgreSQL requires that collation to be deterministic; deterministic text equality is bytewise.
+    - The new LF pin is `e38aba76…`. Statement shape, ACLs, security, locks/fence/lease, keysets, ≤1,000 rows and the 1 MiB accounting are unchanged.
+  - **Invariant lock:**
+    - `COLLATION_INVARIANT_SQL` / `collationInvariantProblems` require:
+      - candidate `order_key`/`event_id` attcollation = 100;
+      - the owner key (`jsonb ->>`) collation `"default"`;
+      - the default collation is deterministic;
+      - default and bytewise equality agree on NFC/NFD, case, ß/ss, ligature, padding and empty pairs.
+    - It runs in PGlite (`reportingAccessPaths.test.ts`) and as the new required hosted step A2, before any probe. A2 failing rolls back and is never complete.
+    - A PGlite parity test shows that case, padding, NFD and look-alike owner keys match nothing extra.
+  - **Structural regression:** `ownerKeyProblems` (whole plan) rejects any candidate scan whose Index Cond / Recheck Cond lacks the owner key, however fast it ran.
+    - Unit-tested on the verbatim hosted nodes (14 ms, rejected).
+    - The diagnostic records `ownerKey` per member probe. A separate `acceptance` verdict (ACCEPTED/REJECTED) is shown in the report; STATUS COMPLETE still only means the evidence was collected.
+    - A scripted run of the hosted shape is COMPLETE but REJECTED.
+    - In PGlite, before ANALYZE (asserted: no pg_stats rows) and after, 0042 first and later pages pass under default settings and with bitmap scans off. The same split without the bytewise twin, and 0041, are rejected.
+    - The regression was confirmed failing against the 3f21c17 0042 (both hosted-shape nodes reported).
+  - **Process notes:**
+    - TDD order was not strict: the 0042 query was edited during the plan experiments, before the regression tests. The regression was then run against the previous draft and failed as intended.
+    - The harness test's import and flag lines were edited with sed (mechanical, reviewed in the diff).
+    - A temporary experiment test was deleted before the commit.
+  - **Gate:** see the table below.
+
+    | Check | Result |
+    |---|---|
+    | `access-paths.test.ts` (real SQL) | 15/15 |
+    | Focused: diagnostic + access paths + jobs + rehearsal | 280/280 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 66 files, 2,169/2,169 |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Remaining hosted gate (CJ):** review, then rerun `npm run staging:reporting-jobs -- --diagnose-access-paths --sites=uk,us` once at this commit.
+    - A2 must pass.
+    - The report's acceptance line must read ACCEPTED: every E-rb-ms probe's candidate scans have the owner key in their Index Cond.
+    - Rebuild member reads of `source_candidate` must be about the owners' rows (E-rb-ms-n ≈ 7 + owners, not 43,804).
+    - Stream reads stay ≈ 1,000 per probe; refresh members stay 7 batch_events + 8 source_current.
+    - Judge the overlay reads against the expected refresh overlay size.
+    - Only then install 0040 → 0041 → 0042. No SQL was run; nothing was installed, deployed or merged; Task 19 was not started.
+- **Task 14 COMPLETE — staging only (recorded 2026-11-17 by the coder from root's evidence; checkbox ticked).**
+  - CI: the exact-head run 43912513408 at 64b45be passed.
+  - **Repaired diagnostic (root ran it once):** ignored report `staging-results-reporting-publication-diagnose-access-paths-20261116T165609312Z-5d4fbadc.md`, SHA-256 `0BBA07EE206E0010472152534582D60AC5C5C0B9C51E9B7782CA5799A148D789`. The coder re-hashed the local file and the hash matches; it is not committed.
+    - STATUS COMPLETE; fresh rollback restoration verified.
+    - A2: `en_US.UTF-8`, deterministic.
+    - Acceptance: ACCEPTED.
+    - 0042 rebuild member candidate reads: exactly 7 for the first/later/normal probes (0.131 / 0.139 / 0.145 ms), against 84,686 for 0041.
+    - Streams: exactly 1,000 candidate rows per probe.
+    - Refresh members: 4 batch_events + 8 source_current in this run.
+  - **Installation (root, Inka Staging `ybrzhrgfrnvtcwymjdrq` only, Supabase `apply_migration`, in order):**
+    - `20261116165846` / `0040_reporting_dependency_reads`
+    - `20261116165854` / `0041_reporting_dependency_read_bounds`
+    - `20261116165901` / `0042_reporting_access_paths`
+  - **Post-install state (root):**
+    - 7 functions and 4 indexes; SECURITY INVOKER, empty search_path, service-only (anon/authenticated false).
+    - 0 active batches; capture OFF at epoch 19.
+    - AU/UK/US: processors off, read legacy, no active ids.
+  - Production is untouched. Release to production remains CJ's step in the controlled rollout (Task 20).
+- **Task 15 protected staging harness for 0043 (2026-11-17, prepared offline; NOT run; Task 15 stays unchecked pending CJ's runtime run and the entitlement record)** — commit "task 15: add protected worker staging harness".
+  - **Mode 1, `npm run staging:reporting-jobs -- --rehearse-worker-state --site=X`** (`tests/staging/reportingWorkerHarness.ts`): rollback-only.
+    - Before any SQL: 0043 LF pin `156ee4d5…`; additive shape only (no DROP / OR REPLACE / TRUNCATE / definer / timeout; no table or function already in 0037–0042).
+    - Before BEGIN: history has exactly root's 0040/0041/0042 rows and no 0043; the 7 installed dependency bodies and their security match; no 0043 object; no active batch.
+    - Inside ONE rolled-back transaction: the exact parsed body through the deny-list guard; every 0043 table (RLS, service-only), index and function (body, invoker, empty search_path, service-only) checked; savepoint behaviour (run log as service_role, refusals, client roles refused).
+    - After ROLLBACK: no 0043 object, nothing active; the fresh audit allows ZERO change.
+  - **Mode 2, `npm run staging:reporting-jobs -- --worker-runtime --site=X [--pace-calls=N] [--max-invocations=N] [--max-lease-wait-ms=N]`** (`reportingWorkerScenario.ts`, `reportingWorkerRuntime.ts`, `serviceRpc.ts`): after 0043 is installed.
+    - The REAL `runReportingCycle` runs over a direct-pg service RpcClient that behaves like PostgREST service_role calls (one transaction per call; request claims; `SET LOCAL ROLE service_role`; only the role's own configured settings; named typed args; errors returned). No service key is needed. One fresh guarded connection per invocation.
+    - R0 refuses before any write on: wrong 0043 file; history or identities not 0040–0043; capture on; any active batch; the site not processor-off/legacy or not clean (batch, generation, derived/mirror or pending journal row); fixture collision. Ownership and both baselines are saved BEFORE the first commit; R0b refuses on drift.
+    - R1 processor-disabled no-work (refresh and rebuild: failed/processor_disabled, no batch).
+    - R2 owned capture enable (the fence runner's receipt-before-COMMIT toggle) and processor on.
+    - R3a paced rebuild stops pending with durable copy progress; R3b immediate busy (live lease); R3c a REAL lease-expiry wait, takeover with a newer fence that continues the saved copy, a lost publish response (committed, then reported lost) replayed to exactly one generation; R3d the old fence is refused and changes nothing.
+    - R4 exact parity: mirror = source; daily totals (site and self) = the independent reducer.
+    - R5 run-owned fixtures `rw-<run>-v1/v2/c1` (3 inserts, 1 update, 1 delete): 5 journal rows, all acknowledged by the refresh batch; one more generation; parity.
+    - R6 one numeric-count run row per invocation; worker catalog unchanged; authenticated refused.
+    - R7a capture disable → refresh failed/capture_disabled, no batch; R7b re-enable → refresh failed/rebuild_required; R7c rebuild recovery publishes with parity.
+    - Cleanup ALWAYS runs, every step independent and every failure kept: abandon this run's live batch (only after a real lease expiry; 0038 refuses to abandon a live batch, so no resume); capture back to its start; delete exactly the fixture ids (only with capture off: no unowned journal row); processor/read mode back.
+    - Fresh audit (separate connection): every surface, catalog, other site and other-site private row identical; the run site's pre-existing journal/run-log rows identical; control epoch = start + this run's CONFIRMED increments only; on the run site only source_epoch, active_generation_id (must be the run's), lease bookkeeping and verified cutoff may differ; every new run-site row must belong to the run's batches/generations/fixture ids; exactly one run-log row per invocation. Unknown tables are compared in full.
+    - **Declared final intended state:** capture off; the site processor off, read legacy, no active batch, pointing at the run's last generation. Retained: the run's generations, batches, mirror and facts, the 5 fixture journal rows and its run-log rows. The report records these with the epoch increments.
+  - **Tests (offline, real 0037–0044 SQL in PGlite; hosted execution is NOT faked):**
+    - `tests/reporting/reportingWorkerHarness.test.ts` (16): pin and shape mutations; history; catalog drift; COMPLETE rehearsal leaving the catalog unchanged; refusals before any SQL or before BEGIN (bad pin, history, 0043 installed, active batch); a mid-transaction failure rolls back; redaction; argument parsing; STATUS; runner wiring; wrong target.
+    - `tests/reporting/serviceRpc.test.ts` (5): PostgREST-shaped transactions and roles; errors and unknown arguments; client role refused; the real worker publishes through it; a lost publish response replays the same generation.
+    - `tests/reporting/reportingWorkerRuntime.test.ts` (5): every private table attributed; parity and parity drift; the audit accepts exactly the owned changes and names unowned batches/generations/mirror rows, a missing run-log row, a wrong epoch and another site's change.
+    - `tests/reporting/reportingWorkerScenario.test.ts` (8): R0–R4 + cleanup; preflight refusals with zero writes (processor on, collision, drift); an injected permanent worker failure (cleanup abandons the owned batch and restores capture/processor); a failing cleanup step does not stop later steps; full R0–R7 COMPLETE, clean cleanup and a problem-free fresh audit with the final state; the audit reports a leftover fixture and another site's change; runtime redaction; no audit without a baseline.
+    - The lease-expiry wait is shimmed ONLY in these offline tests (expiring the lease row); the runner never edits a lease.
+  - **Findings from real SQL while building it:** each capture toggle (enable and disable) advances the epoch; a live batch cannot be abandoned; after a capture disable the refresh fails `capture_disabled`, and after re-enable `rebuild_required`.
+  - **Performance finding (offline; for the planner — see Open question below):** the Task 14 materializer reads `read_reporting_children` one parent per RPC for every member and every consumed stream line, per audience, at plan AND stage. A whole-site rebuild therefore issues about one sequential children RPC per line per pass. An unrealistic fixture (every order spread across one worker's whole history) made each order walk the entire stream (78,882 children RPCs for 1,100 rows, 146 s). The tests now use time-clustered orders (4,400 RPCs, 15 s). That was a test-fixture fault, not a harness or worker loop.
+  - **Process notes:** two earlier attempts stalled (a long single write; a bash heredoc that failed on quoting); work then proceeded in small Write/Edit increments with focused, time-bounded test runs. A few mechanical one-line edits were made with `sed`, reviewed in the diff. Temporary probe/debug code was removed before the commit.
+  - The existing runner test that counts "report before connecting" guards now expects 3 entry points (fence, publication, worker) and checks the worker writes its report before opening a connection.
+  - **Gate:**
+
+    | Check | Result |
+    |---|---|
+    | Focused harness files (each run alone, time-bounded) | 16 + 5 + 5 + 8, all pass (5–30 s per file) |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 70 files, 2,202/2,202 (105 s) |
+    | `npm run build` | 0 (only the existing chunk-size warning) |
+    | `git diff --check` | clean |
+  - **Remaining gates (root/CJ only):**
+    1. Review this commit.
+    2. Root runs `--rehearse-worker-state --site=<smallest site>`; it must be STATUS COMPLETE.
+    3. Root alone applies 0043 to staging.
+    4. Root runs `--worker-runtime --site=<smallest site>` (a real run with lease waits, about 6 minutes each); it must be STATUS COMPLETE with the declared final state.
+    5. CJ records the Task 10 entitlement. Only then can Task 15 be ticked.
+  - **Open question (planner):** at hosted latency, a whole-site rebuild of a large site (uk ≈ 42k rows) costs roughly one sequential `read_reporting_children` RPC per line per pass. Should the runtime gate run on the smallest site only, and should batching children reads (the reader already accepts many parent ids) become an evidence-backed follow-up before Task 19's growth gate? No product code was changed here.
+- **Task 15 hosted runtime evidence and interrupted-run recovery (2026-11-17; planner decision in chat; coder works offline only).**
+  - **Hosted evidence (root):** 0043 is installed on staging and the rollback rehearsal passed. The live UK `--worker-runtime` rebuild batch `3843f2e4-4c21-4c98-8d73-b3c1a171e5c5` copied all 42,340 rows and discovered 16,060 owners, but planning advanced only about 35 owners/minute (201, then 252 planned) because Task 14 issues sequential `read_reporting_children` calls. The gate would take hours. Planner decision: this is a real scale blocker, not a fixture problem. Recover the run safely, then fix the read path (TDD, exact parity).
+  - **Recovery path (prepared offline, not run):** `npm run staging:reporting-jobs -- --recover-worker-run --site=uk --report=<the interrupted run's staging-results-reporting-worker-worker-runtime-*.md>` (`tests/staging/reportingWorkerRecovery.ts`).
+    - Before connecting: the report must be an unmodified `--worker-runtime` report for the site, with a valid run id, prefix, exact fixture ids, a start time, a committed baseline and a starting state of capture off / processor off / legacy.
+    - X0: 0043 installed exactly. X1 (read-only) refuses, writing nothing, on: a foreign active batch; a LIVE lease; any live batch at the site; any batch or generation created at the site since the run started that is not the run's; a source row with the run's prefix that is not one of its fixture ids, or one at another site; capture on without this run's confirmed receipts explaining it.
+    - X2–X5 (each independent, failures kept): abandon ONLY the owned expired batch with its CURRENT fence (no resume, renew or wait; 0038 refuses a live batch); capture off by an owned receipt; delete exactly the fixture ids (only with capture off); processor off + legacy.
+    - The fresh audit compares against the ORIGINAL run's persisted baseline with the same scoped ownership rules. A new, separate report is written; the original report is only read.
+    - Tests (`tests/reporting/reportingWorkerRecovery.test.ts`, 6, real SQL in PGlite): pure refusals; report validation (mode, site, prefix, fixtures, baseline, never committed); a really interrupted run (driver stopped after R3a with a live owned batch) is refused while the lease is live with zero writes, and after expiry recovers to a clean audit with no resume/renew call; a foreign batch is refused; an injected step failure is kept while later steps still run.
+  - **Recovery result (root, staging):** report `staging-results-reporting-worker-recover-worker-run-20261116T184747388Z-af5fac38.md`, SHA-256 `1F18F95EF2E427C5479917EB449022397ABB64F8C41D6132EA0D3CFC8BC5DDA6`, STATUS COMPLETE.
+    - It recovered run `442b8497` from report `staging-results-reporting-worker-worker-runtime-20261116T181622238Z-150545b0.md` (SHA-256 `0670b7da…dc741b`, verified offline by the coder before the run).
+    - The owned batch `3843f2e4…` (fence 12, 252 owners planned, lease expired 18:42:20Z) was abandoned. Capture off, processor off, legacy, 0 fixture rows.
+    - The abandoned batch and its candidate rows stay at uk as evidence, so a NEW `--worker-runtime --site=uk` refuses at R0 (site not clean); this is pinned by a test.
+- **Task 15 scale fix: batched child reads (2026-11-17, TDD, offline; planner direction).**
+  - **Cause (from the hosted evidence):** each owner read its members' children one RPC per member, and each consumed stream line's children one RPC per line, strictly one owner at a time.
+  - **Decision and design (smallest correct):**
+    - (1) An owner's members' children are all required (no early stop), so they are ONE lazy multi-parent read. The reader already accepts many parent ids and yields them in the same bytewise parent-then-id order the old loop charged, so the budget charge sequence and overflow proof are identical.
+    - (2) `coalescingChildren`: the children requests of a bounded group of concurrently materialized owners (members, and each stream line only when it is CONSUMED: nothing is prefetched) are served by one multi-parent read, at most one in flight, at most 1,000 buffered rows. Parents proven complete in that window are answered from it; from a request's first unproven parent on, the existing lazy read serves the rest in order.
+    - (3) `materializeOwnerGroup` + the worker: plan and stage materialize `OWNER_GROUP` (8) owners concurrently over that reader, then plan/stage strictly in list/claim order, raising the first failure in that order after the owners before it, exactly as one at a time. Memory: at most 8 owner inputs (each ≤ 50,000 events) plus one 1,000-row window. Lease heartbeats run before every group and before every plan/stage call; the 240 s budget check is per group.
+    - Unchanged: outputs, descriptors, input hashes, per-owner 50,000 budget and overflow attribution, byte/row-capped pagination, replay/checkpoint behaviour, enumeration (still sequential) and the installed DB contracts (no SQL or migration change).
+    - The single-connection test/harness RPC clients now serialize calls so each stays its own transaction (PostgREST runs requests on separate pooled connections).
+  - **Tests (`tests/reporting/reportingMaterializeBatching.test.ts`, 6; failing first: 1,500 member-path calls, coalescer missing):**
+    - Member batching: identical outputs and child rows, < 60% of the calls.
+    - Grouped + coalesced: identical outputs in owner order, every site row equal to the complete-history oracle; children calls 1,500 → 116.
+    - No lookahead: an unconsumed candidate's 60,000 cancellations are never read, also across a group.
+    - Overflow inside a group: the failing owner reports size 50,001 and earlier owners stay intact.
+    - Page sizes 1 / 3 / 1000 give identical outputs.
+    - Real SQL (PGlite), the worker's plan AND stage over a rebuild then a refresh, `ownerGroup` 1 vs 8: identical work rows (audience, partition, chunk count, result digest, state) and identical published facts. `read_reporting_children` RPCs: rebuild 960 → 225, refresh 79 → 43. (Input hashes embed each database's own frozen cutoff, so they are compared at equal cutoffs by the materializer tests and re-proven per owner by the stage path's planned-hash check.)
+    - The existing Task 14 materializer/budget/walk suites (61) pass unchanged.
+  - **Expected hosted effect (estimate, not measured):** children RPCs per owner drop roughly 4–8×. Members, stream and plan calls are unchanged in count. The harness's single serialized connection gains only from the call reduction; the HTTP worker also overlaps a group's other reads.
+  - The coalescer schedules its flush with `setImmediate`. A first full run with `setTimeout(0)` timed out 10 worker tests at 5 s, because the timer clamp (~15 ms per flush on Windows) accumulated over hundreds of flushes. After the change the worker file passed 41/41 in 17 s at the default timeout.
+  - **Gate:**
+
+    | Check | Result |
+    |---|---|
+    | Batching + materializer suites | 47/47 |
+    | Worker + harness + real-SQL suites (bounded run) | 21 files, 320/320 |
+    | `npx tsc -b` | 0 |
+    | `npm run typecheck:digest` | 0 |
+    | Strict ES2020 tsc on both staging runners | 0 |
+    | Full suite | 72 files, 2,216/2,216 |
+    | `npm run build` | 0 |
+    | `git diff --check` | clean |
+  - uk's retained abandoned batch and its candidate rows are evidence and are NOT cleaned (planner decision).
+  - **Remaining staging gate (root):** `npm run staging:reporting-jobs -- --worker-runtime --site=<au|us>` at this commit, on a site root chooses that passes R0. uk is refused by R0 while its abandoned evidence is retained.
+- **Task 15 second hosted blocker: long-span owners starve the heartbeat (2026-11-17; offline, TDD).**
+  - **Hosted evidence (root, AU at 3d57bec):** clean preflight; 55,620 owners discovered. After the paced copy and a real takeover, only 72 owners / 144 descriptors were planned after about two lease periods. Progress moved 56 → 72 while heartbeat/lease moved 19:21:03/19:27:03 → 19:27:07/19:33:07 UTC, so ONE owner group took about 6 minutes and starved the 30 s heartbeat. Root interrupted after a durable checkpoint and will recover after lease expiry. AU/UK evidence is not touched.
+  - **Diagnosis (code):**
+    - The predecessor walk of an owner whose member lines are far apart in its worker's stream consumes EVERY line between its latest and earliest member, and `exactWalk` read each consumed line's children one round trip at a time. The walk's chain of round trips is as long as the span, even with cross-owner coalescing.
+    - Heartbeats ran only between owner groups, so one long owner held the lease unrenewed and ran past the 240 s budget.
+    - Reproduced offline: one long owner (2,500 in-span lines) made 2,504 sequential children reads; a real-SQL worker group made NO lease renewal for 511 simulated seconds.
+  - **Fix (no SQL, RPC or migration change):**
+    - (1) In the predecessor walk only a line BELOW the earliest member can satisfy the stop, so every line above it on a stream page WILL be consumed and its children are already required. `exactWalk` takes a `cannotStop` predicate; for each page, the leading lines that cannot stop are read in ONE bounded multi-parent read (at most 1,000 rows; only parents proven complete in the window are used, others read as before) and charged in exactly the original order. The first line that could stop, and everything after it on the page, keep the one-line-at-a-time read. Lines beyond the stop are never read. In an overflow inside the span, at most one 1,000-row window is read beyond the proof; attribution (owner, size 50,001) is unchanged.
+    - (2) `guardedReader`: inside owner materialization (plan and stage) every frozen read first checks the 240 s budget (OutOfTime → pending; owners before it in order are kept) and renews the lease when 30 s have passed. `Budget.beat` is single-flight, so concurrently materialized owners never send duplicate renewals.
+  - **Tests (`tests/reporting/reportingWalkBatching.test.ts`, 6; failing first: 2,504 calls; 1,504 calls for a group; a 511 s renewal gap):**
+    - One long owner: identical output and child rows; children reads 2,504 → ≤ 18 (one per 200-line stream page).
+    - A group of 8 long owners over the coalescing reader: identical outputs; under 1/50 of the reference calls.
+    - No lookahead: a line below the predecessor with 60,000 cancellations is never read, at page sizes 1, 7 and 200.
+    - Overflow inside the span: owner and size 50,001 unchanged; reading stops within one window.
+    - Real SQL, simulated 1 s per RPC: renewal gaps ≤ 30 s plus the group's queued reads (31–40 s measured, against one 511 s gap before) and no budget overrun beyond the in-flight calls.
+    - Real SQL, full rebuild of 4 workers × 250 in-span lines: published exactly (mirror = source; daily totals = the reducer for the site and every worker). `read_reporting_children` 1,280 → 360 and all RPCs 2,994 → 2,074 against 3d57bec on identical data.
+  - **Hosted bound (honest status):**
+    - Heartbeat and budget safety now hold by construction: every read checks both, independent of owner size.
+    - The per-owner sequential chain drops from one round trip per in-span line to about three per 200-line page.
+    - AU's total runtime is NOT measured offline. It is root's rerun gate (resumable over many 240 s invocations).
+  - **Gate:** full suite 73 files, 2,222/2,222; `npx tsc -b`, `npm run typecheck:digest` and strict ES2020 tsc all 0; build 0; `git diff --check` clean. Focused worker/materializer/harness/real-SQL suites: 24 files, 387/387, once the test-only timeout was set on the slow in-memory reference.
+  - **Remaining staging gate (root):** after AU's guarded recovery, run `--worker-runtime` at this commit on a site root chooses that passes R0.
+  - **Contingency (only if the hosted rerun still cannot progress; NOT implemented):** a reviewed, read-only, service-only RPC in a new migration that returns, for one frozen batch and ONE worker stream range, the stream page WITH each line's children (same 1,000-row / 1 MiB accounting, keyset by (created_at, event_id C) then child id). That would make the walk one round trip per page.
+- **Task 15 third hosted blocker: the predecessor-page read (0045) (2026-11-17; offline, TDD; planner-approved contingency).**
+  - **Hosted evidence (root, US rerun at bebedcb):** heartbeats renewed safely through a real takeover, but one full 240 s budget planned only 139 of 16,060 owners (42 copied pages, 549 RPCs, about 0.44 s per RPC on the harness connection). The owned batch `314a4cd8-9bb1-476f-ad81-7100c663ebb5` was abandoned after lease expiry; recovery STATUS COMPLETE (capture off, processor off, legacy, zero fixtures). US/UK/AU evidence is not touched.
+  - **Diagnosis (code, confirmed by a failing test first):** every owner's predecessor walk still made several sequential RPCs per stream page: the page (`read_reporting_staff_stream`), the certain lines' children (`read_reporting_children` plus the empty probe that ends them) and the first stop candidate's own children. Red on bebedcb (`tests/reporting/reportingPredecessorPage.test.ts`): a clustered owner's walk made 4 RPCs (in memory: 3 reads), a 600-line-span owner 13 RPCs over 4 pages, and the RPC was missing.
+  - **0045 `public.read_reporting_predecessor_page` (new file; 0037–0044 untouched):**
+    - For ONE frozen batch and ONE worker, it returns the 'before' stream page exactly as 0042 (three frozen-view branches, descending `(created_at, event_id COLLATE "C")`, at most `p_limit` lines). After each line it returns that line's frozen children exactly as 0041 (ascending bytewise), but ONLY for:
+      - `line_verified` lines in the certain range: at or above `(p_certain_at, p_certain_event_id)` bytewise, or the instant alone when the id is NULL;
+      - the FIRST `line_verified` line below that range.
+    - No later line's children are read: no lookahead, nothing beyond the first possible stop line.
+    - Rows are `line` / `line_kids` / `child` / `end`. The `end` row appears only when nothing was cut.
+    - Bounds: at most 1,000 rows including `end`; at most 1 MiB for the complete response, with the same accounting as 0041 (a single row above 1 MiB is an error).
+    - Same `frozen_read_batch` (lock, fence, lease, frozen) and parameter checks. SECURITY INVOKER, empty search_path, execute for `service_role` only. Nothing is written.
+  - **Client:**
+    - `FrozenReader.predecessorPage` is optional. It is implemented by the RPC reader (strict row grammar: worker, descending keyset strictly before the cursor, children of their own line in bytewise order, `end` last) and the in-memory reader (the same rule; `maxPage` caps total rows, so cuts are exercised). It is guarded by `guardedReader` (budget and heartbeat on every read).
+    - `exactWalk` (predecessor walk only) uses it while the walk is not satisfied. The certain bound is the earliest member as (exact instant, id). The id is used only when it has no UTF-16 unit ≥ 0xD800, where bytewise and the projector's UTF-16 order provably agree; otherwise the instant alone, a subset.
+    - Lines are charged in the original order, and the children of non-candidate lines are ignored.
+    - **Planner review applied:** if a bound cut ANY included line's children, the whole combined page is discarded (nothing charged, cursor not advanced) and that page is read exactly the bebedcb way.
+    - After the stop, ties use the plain page. A complete short page proves the stream end, which saves the empty probe.
+  - **Planner hardening:** an empty page proves the stream end ONLY with its `end` row. A page with zero lines and `complete=false` falls back to the plain page from the same cursor. The RPC reader rejects an empty response outright (0045 always returns at least one row). Tested directly: an empty response, a misplaced or non-null `end` row, out-of-order lines or lines at or after the cursor, another worker's line, orphan or foreign children and unknown kinds are all rejected; the empty-incomplete fallback gives an exact input.
+  - **Runtime preflight R0** now also refuses unless 0045's function is installed exactly (body, invoker, search_path, service-only).
+  - **Tests:**
+    - `tests/reporting/reportingPredecessorPage.test.ts` (18):
+      - real SQL: a clustered owner's walk is 1 RPC (was 4); a long owner's is ≤ 1 per page + 1 (was 13); anon and authenticated are refused;
+      - in memory: identical inputs for every owner at row caps 1, 7 and 1,000, with the discard fallback exercised;
+      - no children after the first below-boundary candidate (60,000 old cancellations never read; uncut: exactly bebedcb's child rows);
+      - the 50,000 overflow is attributed exactly (owner, size 50,001; one discarded page, then the previous path).
+    - `tests/reporting/pg/predecessor-page.test.ts` (12), over a frozen REBUILD candidate and a frozen REFRESH overlay (inserted cancellation of a base line, replacement, tombstones, inserted lines):
+      - rows equal an independent oracle built from the installed 0042/0041 reads over 81 cursor/bound/limit cases each;
+      - the bytewise same-instant boundary: exact ties at or above an ASCII id, plus the instant-only fallback for U+FFFD and U+1F600 ids; owner inputs equal the reference;
+      - every worker-0 owner's input equals the reference. Walk RPCs on identical data: rebuild 394 → 111 (97 owners), refresh 106 → 29 (27 owners);
+      - ACL and catalog, no write, parameter and fence refusals;
+      - the 1,000-row cut and the 1 MiB cut (2 KB rows) have no `end` row; the walk re-reads the SAME cursor with the plain page, and the input is exact.
+    - Existing suites: `reportingWalkBatching` pins its in-memory cases to the bebedcb path (the discard fallback). The `reportingDependencyReads` fake RPC gained the 0045 case. The migration allocation lists (`reportingJobs`, `reportingAccessPaths`) include 0045. The Task 14 0040/0041 rehearsal (`tests/staging/reportingDependencyRehearsal.ts` and its test) keeps its reader off 0045, because that rehearsal installs only 0040/0041 (files the plan did not name).
+  - **Worker, real SQL, the same 4 × 250 long-span full rebuild as before, published exactly:** all RPCs 2,074 (bebedcb) → 1,852. Walk reads went from 360 children (plus stream pages) to 424 combined pages plus 152 children.
+  - **Hosted bound (honest status):** the walk is now about one RPC per owner per phase. The remaining per-owner chain is dominated by `read_reporting_owner_members`: 832 of those 1,852 calls, 2 per owner per phase because only an empty page ends a read. Next come the member-children read and the plan/stage call. The harness connection also costs about 6 database round trips per RPC (begin, claims, role, settings, call, commit). Projected from the US evidence, 0045 alone cuts the walk's share but does NOT bring a 16,060-owner rebuild near one budget. The hosted rerun measures it.
+  - **Release and rollback:** 0045 is additive. Old code ignores it; code at this commit needs it (R0 refuses without it). Rollback: deploy the previous worker; the function can stay.
+  - **Remaining staging gate (root):** apply 0045 to staging, then run `--worker-runtime` at this commit on a site that passes R0.
+
+## Planner checkpoint — installed-state reconciliation and next gate, 2026-11-18
+
+**Precedence and verdict.** This section supersedes the preceding instruction to install 0045 and rerun the worker. Reviewed `3d57bec`, `bebedcb` and `96a05683ed3e5a412793982772879e09d9beeee1`, including migration 0045, against AGENTS.md, ARCHITECTURE, the decided F1 roadmap and HARDENING. Tasks and checkboxes above are unchanged. The batching and predecessor-page changes preserve the intended counting contract on inspection, but **the worker is not cleared for another write-capable staging run**: the per-page heartbeat/budget guard is incomplete, and no currently eligible clean site has been established. This is a completed review with a bounded repair handoff, not Task 15 acceptance.
+
+**Reconciled staging facts.** Accept CJ's supplied read-only catalog observations from 2026-11-18 as evidence that functions from every migration 0040–0045 are present on `ybrzhrgfrnvtcwymjdrq`, including the 0042 C-collation changes and the 0045 predecessor function. Do not reapply any of these migrations. The reported `md5(pg_get_functiondef(...))` prefixes are observations, not branch-fidelity proof or installation receipts. Existing tooling compares full `md5(prosrc)` against the extracted migration body; those are different hash inputs. Current capture, processors, read modes, leases and retained rows remain unverified. Production `lkboboagiikvozvbcpvg` is excluded from every action below, including reads.
+
+**Review findings.**
+
+- **Must-fix T15P-1 — guard every underlying read page, not just the outer reader call.** In `api/_lib/production-reporting-worker.ts:167`, the async-iterator wrapper calls `guard()` once and then delegates with `yield*`. `members()` and `byIds()` likewise receive only one guard before their internal paging loops. At line 410 the guard wraps `coalescingChildren(src.reader)`, so the coalescer's flush and fallback can issue multiple raw `read_reporting_children` RPCs without another budget check or heartbeat. This leaves the failure addressed by `bebedcb` possible for large/byte-capped member and cancellation reads; 0045's cut-page fallback still reaches that path.
+  - Fresh offline reproduction at this head: loaded the actual TypeScript modules in memory, composed `guardedReader(coalescingChildren(rpcFrozenReader(fakeClient, ref)), guard)`, and consumed one parent's children. The fake client returned 500 ordered, valid one-row pages with a 600,000-character note (each response below 1 MiB), then an empty page, advancing a simulated clock by 1 second per RPC. Result: **501 RPCs, one guard call, 501,000 ms elapsed against a 240,000 ms guard deadline**, with no stop. No database, source file or clock setting was changed. This is an execution-control defect, not evidence of incorrect totals.
+  - Bounded coder repair: add an optional awaited per-RPC read guard to `rpcFrozenReader`'s internal `call` path and wire the worker's deadline check and single-flight heartbeat there, before each actual frozen-read RPC, including internal member/by-id/children pages, coalesced flushes, fallback reads and 0045. Keep renewal calls outside that guard to avoid recursion. Retain the outer guard for injected readers and non-RPC work; ensure test sources exercise the same page-boundary contract. No SQL, counting-rule, timeout, lease-length or retry-policy changes. At expiry, stop scheduling additional reads and return pending through the existing path; preserve already persisted owners and settle the group's outstanding work before returning.
+  - Regression requirements: the reproduction above stops at the deadline without requesting another page; a multi-page owner-member read and a byte-capped by-id read also check each page; coalescer fallback is covered; renewals remain single-flight and occur at the 30-second boundary plus only already in-flight/queued bounded calls. Exercise plan AND stage through the real worker, then resume and prove identical descriptors, input hashes and publication. Keep existing tie, cancellation, overflow, no-lookahead and replay tests.
+- **Operative run blocker T15P-2 — preserved evidence is incompatible with the current clean-site harness.** `preflightProblems` in `tests/staging/reportingCommitted.ts` rejects any existing batch/generation or derived/mirror/candidate row. The plan records an abandoned UK batch and candidate rows, an interrupted AU run, and an abandoned US batch. A recovery can restore capture off / processor off / legacy while deliberately retaining those rows; it does not make a site clean. The new catalog evidence says nothing about their removal. Therefore do not pick another site speculatively, erase evidence, adopt an abandoned batch, or bypass R0. Check all three sites read-only first. If all remain ineligible, a separately reviewed harness amendment must preserve and audit the old rows before a new runtime run; simply deleting the R0 checks is not that amendment.
+- **Should-fix T15P-3 — separate installation inspection from runtime execution.** There is no read-only fidelity-only CLI mode at this head. R0 has useful checks, but `--worker-runtime` proceeds to committed changes if it passes. `--check-installed` runs the publication flow; `--rehearse-worker-state` expects 0043 absent; the old dependency/access-path rehearsals apply SQL within their transactions. None is an appropriate substitute for the read-only action requested here. Add the small inspection mode defined below, reusing the existing checkers.
+
+**What was sound in the reviewed changes.** `3d57bec` retains per-owner budget/overflow attribution, coalesces required children, and applies settled results in owner order; the single-connection harness serializes RPC transactions. `bebedcb` batches only the certain predecessor range and single-flights heartbeats, subject to T15P-1. `96a0568`/0045 retain the frozen rebuild/refresh branches, C-collated keysets, same-instant handling, site binding and bounded response accounting. An incomplete included child list causes the combined page to be discarded and re-read from the same cursor; only an explicit end marker proves completion. 0045 is additive, SECURITY INVOKER, empty search_path and service-only, with no source/inventory writes. No additional counting, authorization or SQL defect was found in this scope. Hosted throughput remains unproved: the logged 2,074 → 1,852 total calls is about an 11% reduction on that fixture, not proof that a 16,060-owner rebuild fits the harness budget.
+
+**Next operative action — Claude, under the recorded staging delegation; authorised now, staging inspection only.** First implement the following bounded tooling task offline, then run its command **once**. T15P-1 can be repaired after the inspection, but must be reviewed before any worker run. No new CJ permission is needed for this read-only inspection or the bounded offline repairs. This paragraph does not authorise migration installation, a deployment, a staging reset or a worker invocation.
+
+1. Add `tests/staging/reportingInstalledState.ts`, wire `--inspect-installed --sites=au,uk,us` in `tests/staging/reporting-jobs.ts`, and add `tests/reporting/reportingInstalledState.test.ts`. This is a **new mode to implement**, not an existing flag to try at `96a0568`. Reuse the current environment-file loader, staging URL/ref guards, marker check, secret redaction and durable evidence writer. Refuse unknown/mixed flags before connecting. No dependency is needed.
+2. Use a dedicated inspection dispatch, with no worker/recovery/rehearsal lifecycle or cleanup mutations. After guarded connection/marker checks, issue `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, run only the catalog/state SELECTs below, and always `ROLLBACK` and close. Check `transaction_read_only` is on. Do not invoke reporting RPCs, acquire/renew leases, enable capture, change roles/settings, run DDL, EXPLAIN ANALYZE, or write receipts into the database. Use existing timeouts unchanged. Connection or query failure produces a failed report; no automatic retry. On a fresh read-only connection, re-read catalog/history/control/site/active-batch metadata and report drift rather than changing it.
+3. Reuse `fileIdentity`/`bodyHashes` from `reportingRebuildRepair.ts`; `functionBody`/`CASE_SQL.effective` from `reportingDependencyRehearsal.ts`; `dependencyIdentityProblems`, `HISTORY_SQL`, `historyProblems`, `workerObjects`, `WORKER_CATALOG_SQL`, `workerCatalogParams` and `workerCatalogProblems` from `reportingWorkerHarness.ts`; and `COLLATION_INVARIANT_SQL`/`collationInvariantProblems` from `reportingDependencyPlans.ts`. Verify the seven effective dependency functions using 0040 for `frozen_read_batch`, 0042 for members/stream, and 0041 for the other reads. Check **all** 0043, 0044 and 0045 functions, including private helpers, with the catalog/body/security checks, not just the named public entry points. Explicitly require each expected qualified name exactly once and no unexpected overload; extend the dependency check's name-set validation as necessary. Also compare argument/result/default contracts, language and volatility against the effective local definitions. The existing offline PGlite harness (`tests/reporting/pg/harness.ts`) may supply that expected catalog; no migration is executed on hosted staging.
+4. Record full local LF SHA-256 identities and require these reviewed files (no silent repinning):
+
+   | Migration | LF SHA-256 at reviewed head |
+   | --- | --- |
+   | 0040 | `4e39243e2ee6526f656eb1b462156d6bc9eabf17cac78fcb2d873cd4498968b2` |
+   | 0041 | `dfa49d597cc37cef92314a4d2dcaf79d195949741fc0534fc57345c12f419646` |
+   | 0042 | `e38aba760a19a70fa3afdddd5155244fb94acb73a53362855d1f63b1a3536a1c` |
+   | 0043 | `156ee4d525433c8999c52d83ac4175c44629ce6a8f848796a5638ed944c7f633` |
+   | 0044 | `84a07d1bd61d2e69df66bf6efa437f541a184512cb1820cc75217db20e5c9b07` |
+   | 0045 | `5f42f300ba391aa36845329e53d39581a56d4e60c94ab342bb95f91fe8ccefb8` |
+
+   `bodyHashes` permits only the established LF/CRLF alternatives; record which matched. Do not trim, remove comments or otherwise normalise away body differences. Record full installed prosrc hashes separately from full `pg_get_functiondef` hashes. Require invoker, empty search_path, service execution and no PUBLIC/anon/authenticated execution, plus the existing table RLS/grant checks and index presence/validity. A matching body does not certify a different signature or ACL.
+5. Read migration history without editing it. Preserve the three exact recorded 0040/0041/0042 receipts; require one correctly named row each for 0043/0044/0045, recording their actual versions and any available installation artifact/hash. Do not invent missing receipts or infer one from function presence. A missing/duplicate/unexpected receipt is a discrepancy to return to the planner, not a reason to reinstall. Run the read-only collation invariant check. Use `PREFLIGHT_SQL` with `[['au','uk','us'], 'rw-%']`, and evaluate `preflightProblems` separately for each site. Record global capture/epoch, each site's processor/read mode/active generation, active batches with state/fence/lease expiry/heartbeat, and retained batch/candidate/derived/pending-journal counts per site. For old runs, identify their original report/recovery report and hash when available; absent evidence stays explicitly absent. No source payloads, staff details, credentials or production queries belong in the report.
+6. Test the new mode offline for zero mutation calls on success and failure, rollback/close after error, rejected production/wrong/mixed flags before connection, altered body/header/ACL/receipt, absent/duplicate functions, LF/CRLF fidelity, collation failure, all-sites-ineligible and fresh-snapshot drift. A completely collected inspection may report `STATUS: COMPLETE` with `runtimeReady: false`; readiness must be separate and list each failed R0 condition. Identity/receipt/collation failure, incomplete collection or drift must report `STATUS: FAILED – <reason>`. Both outcomes stop here: neither launches a worker.
+
+After those tests pass, the exact read-only command from the repo root is:
+
+```powershell
+npm.cmd run staging:reporting-jobs -- --inspect-installed --sites=au,uk,us
+```
+
+Use the existing `.env.staging.local` privately; do not print or copy its values. The report should be an ignored `staging-results-reporting-installed-<timestamp>-<run>.md` with exact source revision, full file/function hashes, history, observations, eligibility per site, start/end UTC, elapsed time, read-only/rollback evidence, fresh-snapshot comparison, and a final status line. Record its filename, SHA-256 and verdict in this plan's implementation log. The command changes **no staging data, capture epoch, worker state or read mode**; only the local report is written. Allow roughly 1–5 minutes for the hosted inspection, an estimate rather than a timeout extension; offline tooling/repair time is additional.
+
+**Verification and next handoff.** The planner's focused test attempt used `npm.cmd run test -- --run tests/reporting/reportingMaterializeBatching.test.ts tests/reporting/reportingWalkBatching.test.ts tests/reporting/reportingPredecessorPage.test.ts tests/reporting/pg/predecessor-page.test.ts tests/reporting/reportingWorkerHarness.test.ts tests/reporting/reportingWorkerRecovery.test.ts`. It could not load Vite config because esbuild was denied access to the parent directory through this workspace's dependency location; no tests ran. The earlier `npm` spelling was also blocked by PowerShell's script policy. These are environment limitations, not passing tests or demonstrated product failures. The in-memory T15P-1 probe above did execute successfully. Claude must run the new inspection tests and the focused worker set in the normal permitted environment, then the common gate (`npx tsc -b`, `npm run typecheck:digest`, full tests and build), strict staging-runner type-check, and exact-code-head CI before requesting worker clearance. Do not change execution policy or weaken the sandbox to reproduce this review.
+
+**Stop and release boundaries.** A mismatch, missing report/status, live/foreign batch, unexpected state or failed check stops progression and is reported once with the exact missing evidence. Do not retry an unchanged failed run, auto-recover, clean retained rows, raise `--max-invocations`/timeouts or reduce the source fixture. The current `--worker-runtime --site=...` remains **not authorised by this checkpoint** on any site, even if the inspection finds one clean. Return the inspection plus T15P-1 repair/test evidence for planner review; if all sites retain old evidence, that review must first define an explicit preserved-baseline runtime mode and its audit. No usable runtime command exists today for that condition. CJ need not choose a site or reset staging now.
+
+**Hardening / rollback / path to app testing.** These repairs change neither Repository backend contract nor item/stock math, historical attribution, site dates, roles or external integrations; Dexie needs no parallel adapter change. Failure/retry/concurrency and bounded-read tests above are required, and no failed page may produce a partial publication. Keep legacy reads and processors off until a reviewed runtime gate changes them with owned receipts and restoration evidence. Inspection needs no database rollback beyond ending its read-only transaction. Leave installed 0040–0045 immutable; old code can ignore additive 0045. Production release, deployment, SQL application and rollback remain CJ's separate steps. Later staging acceptance still includes exact site/self parity, takeover/replay, role isolation, three-site dry digests, growth/resource gates and the existing rollback tests; this inspection closes none of those tasks. Updated path: **read-only installed-state check → per-page guard repair/review → evidence-preserving worker rehearsal and published generation → reviewed staging summary-mode/Preview setup → CJ tests Reports, Welcome, live counting and dry digest in the app**. Scheduling entitlement and the remaining Tasks 15–20 gates are not waived.
+
+STATUS: COMPLETE
+
+## Coder log — installed-state inspection and T15P-1 repair, 2026-11-18
+
+- **T15P-3 inspection mode (commit `9e01ccd`).** Added `tests/staging/reportingInstalledState.ts`, `--inspect-installed --sites=au,uk,us` in `tests/staging/reporting-jobs.ts` (own dispatch, flags refused before settings/connection), and `tests/reporting/reportingInstalledState.test.ts` (26 tests: zero mutation on success/failure, rollback+close after error with no retry, wrong/mixed/production flags refused, altered body/ACL/definer/volatility/receipt, absent/duplicate function, LF/CRLF, collation failure, all-sites-ineligible, drift). Reuses the named helpers; the expected argument/result/default/language/volatility catalog comes from the real migrations in offline PGlite. Mutations: no ROLLBACK, ignored drift and an open guard are each caught; removing the per-name overload count is masked by the reused `workerCatalogProblems` count (redundant check, still FAILED).
+- **Hosted run (once).** `staging-results-reporting-installed-20261118T131209839Z-b6ef85c3.md`, SHA-256 `5485bbdfc3a06b6cd99bd3a53705c139e37ebdd2982526f4f02d51097432fb39`, revision `9e01ccd`, 8,458 ms, read-only on/on, repeatable read, 28 statements, 0 non-read, both transactions rolled back. **Verdict: `STATUS: FAILED – migration history has 0 receipts for 0044_reporting_reads (expected exactly one) (+1 more)`** (also 0 for `0045_reporting_predecessor_page`). Everything else holds:
+  - all 44 expected functions present exactly once with no overload; every installed body equals the reviewed local body (0 `none`); contracts, invoker, empty search_path, service-only and indexes all pass; no identity problems;
+  - receipts present: 0040 `20261116165846`, 0041 `20261116165854`, 0042 `20261116165901` (exact), 0043 `20261116181444`; **no receipt rows for 0044 or 0045** although their functions are installed (an out-of-band install is the likely cause; not inferred, not repaired, nothing reinstalled);
+  - collation invariant holds; capture off, epoch 25; no active batches; all sites processor off, legacy, no generation;
+  - **AU** fails R0 only on the receipt discrepancy (no retained batch/candidate/derived rows); **UK** and **US** each retain 1 abandoned batch and 42,340 candidate/derived rows (R0 fails: isolated restore impossible); `runtimeReady: false`;
+  - no fresh-snapshot drift; prior run reports listed with exact SHA-256 (3 recoveries COMPLETE for uk/au/us; 4 worker-runtime runs FAILED; 1 rehearsal COMPLETE).
+- **T15P-1 repair (commit `628968c`).** `rpcFrozenReader(client, ref, { beforeRead })` awaits the guard before every actual RPC; the worker wires `b.need()` + single-flight `b.beat()` there for planning/staging (enumeration keeps its own per-page checks on the unguarded reader). `env.source` receives the same `pageGuard` for test sources. No SQL, rule, timeout, lease or retry change. Tests `tests/reporting/reportingPageGuard.test.ts` (7): the planner's reproduction now stops at 240 RPCs with 0 after the deadline (unguarded: 501 / 501 s); multi-page members and byte-capped byIds guard each page; real worker over real SQL keeps bounded overrun and ~30 s renewals, resumes interrupted plan/stage and publishes with exact parity; a 300-cancellation owner read one row per page stays within budget + group (unwired: 74,000/68,000/68,000 ms overruns). Mutations: removing the reader guard fails 3 tests; not wiring it fails the long-owner test.
+- **Open question for the planner.** An owner whose reads alone exceed one invocation's budget never finishes: materialization restarts from the owner's beginning on resume. Shown offline with 300 one-row children pages (stays `pending`, no partial publication). Not introduced by T15P-1 (unwired, the same owner also stayed pending while overrunning ~70 s each time). Needs a bounded decision before hosted runs (e.g. per-owner checkpointing or a larger read page for certain children); not improvised.
+- **Common gate at `628968c`:** `npx tsc -b`, `npm run typecheck:digest`, strict ES2020 tsc on `tests/staging/reporting-jobs.ts` and `tests/staging/reporting-capture.ts`, `npm run test -- --run` 2,285/2,285 (77 files), `npm run build` pass. Note: a fresh Windows worktree checks migrations out as CRLF, which fails the existing raw-byte pins (0037/0038 etc.); re-checked out with `core.autocrlf=false`, nothing in the repo changed.
+- **Not done / not authorised:** no worker run, no migration, no receipt edit, no staging cleanup. `--worker-runtime` stays unauthorised. Awaiting planner review of the receipt discrepancy, the open question and both commits.
+
+STATUS: COMPLETE (coder tasks for this checkpoint); hosted gate FAILED on missing 0044/0045 receipts — planner decision required.
+
+## Planner review — inspection receipts, page guard and owner progress, 2026-11-18
+
+**Scope and evidence.** Reviewed `9e01ccd`, `628968c` and `888799b` against AGENTS.md, ARCHITECTURE, ROADMAP F1, HARDENING and the preceding checkpoint. This section is the operative disposition of that checkpoint; earlier tasks and checkboxes are unchanged. Read the local hosted report `staging-results-reporting-installed-20261118T131209839Z-b6ef85c3.md` and independently verified its exact-byte SHA-256: `5485bbdfc3a06b6cd99bd3a53705c139e37ebdd2982526f4f02d51097432fb39`. Its revision is `9e01ccd67864fbc256ef8755b9c9e67e69d9dd63`, observation interval 13:12:09.841–13:12:18.299 UTC. No staging command, network database access, app edit, commit or state-changing git command was performed for this review. Production `lkboboagiikvozvbcpvg` is excluded, including reads.
+
+**1. Commit verdicts.**
+
+| Commit | Verdict | Findings and disposition |
+| --- | --- | --- |
+| `9e01ccd` — installed-state inspection | **Approved**, with the should-fixes below | No must-fix in its read-only collection or identity checks. Dedicated dispatch, exact SQL allowlist, read-only transactions, rollback/close, fresh snapshot, local pins, all 44 effective function contracts/bodies/security checks and receipt discrepancy reporting are sound. The failed hosted outcome is a correctly detected discrepancy, not a failed inspection implementation. |
+| `628968c` — per-page guard | **Changes required** | The original multi-page bypass is repaired at `api/_lib/production-reporting-reader.ts:71`; the shared call path covers internal pages, coalesced flush/fallback and predecessor reads. **Must-fix T15P-1a:** `api/_lib/production-reporting-worker.ts:408` checks the deadline before awaiting renewal, but never checks again after renewal. A renewal that crosses the deadline lets a new frozen read start after expiry. Keep this repair; add the final check described below. The separate owner-liveness defect is pre-existing, not a regression introduced by this commit. |
+| `888799b` — coder log | **Approved as an evidence log**, not runtime clearance | The report hash, observed state, missing receipts, offline finding and unexecuted gates are accurately recorded at `docs/plans/item-counting.md:3463`–`3472`. Test/build results are coder-reported evidence, not independently reproduced here. **Should-fix:** the status at `docs/plans/item-counting.md:3474` is not the exact machine-readable handoff line required by AGENTS.md. Leave the historical log intact; future outputs must put qualifications above a final exact status line. This review supplies a valid new handoff below. |
+
+**T15P-1a evidence and bounded correction.** A fresh, database-free probe loaded the actual TypeScript `Budget` and RPC reader in memory and used the page-guard body extracted from the current worker. With a 240,000 ms deadline, a renewal began at 239,500 ms, completed at 240,500 ms, and `read_reporting_events_by_id` was then dispatched at **240,500 ms**. This was a newly dispatched read, not a read already in flight when the deadline elapsed. A slow/retried renewal can widen the gap. The probe used a fake clock/client, did not write source files or change clocks, and is separate from the unavailable Vitest run.
+
+- Change the worker's shared `pageGuard` to check `b.need()` both before and immediately after `await b.beat(...)`. Keep the reader's awaited per-RPC hook, outer guards, single-flight renewal and settled-group handling. Do not route renewal through the frozen reader or change deadlines, leases, retry delays or page limits.
+- In `tests/reporting/reportingPageGuard.test.ts`, add a regression using the actual worker guard wiring: a due renewal succeeds after crossing the deadline; zero new frozen-read RPCs start afterward and the cycle returns pending. Include concurrent readers awaiting the same renewal, a renewal retry that crosses the deadline, and a renewal completing before the deadline. Existing in-flight work may settle; it must not schedule another page after the final check fails. Keep plan/stage resume, coalescer fallback and the existing 501-page reproduction coverage.
+
+**Inspection should-fixes, queued for its next maintenance change (not reasons to repeat this hosted inspection):** `tests/staging/reportingInstalledState.ts:418` should make `runtimeReady` false when collection is incomplete or has drift/errors, even if the first snapshot's site checks passed; today `inspectionStatus` still fails safely and no worker is launched. At `tests/staging/reportingInstalledState.ts:415` and `:473`, persist/render the numeric preflight derived/mirror and pending-journal counts, including zero, rather than retaining only their failure strings. The checks already consume these counts; the report should expose them for audit. Add offline assertions for both changes. No relaxation of the SQL allowlist or site preflight is approved.
+
+**2. Receipt decision — accept narrowly scoped installed-function evidence; do not write history.** For staging `ybrzhrgfrnvtcwymjdrq` only, accept this report's exact effective-function identity evidence in place of the absent installation receipts for **0044_reporting_reads and 0045_reporting_predecessor_page only**. This supersedes the preceding checkpoint's requirement that these two history rows exist before further consideration. It establishes what is installed, not when/how/who installed it. All 0044 helpers and public functions and the 0045 function match the reviewed LF/CRLF body alternatives, argument/result/default contracts, language, volatility, invoker/search_path and execution grants. The six local migration pins match; indexes and the collation invariant pass. The three exact 0040–0042 receipts and the observed 0043 receipt `20261116181444` remain required evidence.
+
+Neither CJ nor Claude needs to insert a receipt, repair migration history, reinstall 0044/0045, reset staging or invent an installation timestamp. Keep the original report and its FAILED line unchanged. The discrepancy is explicitly accepted for this staging checkpoint; it is not silently converted into a receipt or a production migration-history policy. Unexpected/duplicate receipts, missing or changed functions, altered ACL/contracts, drift or any other discrepancy still fail. A future staging run needs fresh identity/state checks at its reviewed code head; this dated report alone cannot authorise it. A future checker may encode this exact two-name staging exception with separate raw receipt findings and accepted-discrepancy evidence, but a generic ignore-receipts switch is forbidden. Such tooling must be reviewed offline before use. No new inspection run is authorised here.
+
+**3. Never-finishing owner — require durable continuation, not a larger time allowance.** The finding at `tests/reporting/reportingPageGuard.test.ts:198`–`222` is a real liveness blocker: three bounded invocations remain pending without publishing. `api/_lib/production-reporting-worker.ts:312` and `:359` restart `materializeOwnerWorks`; `api/_lib/production-reporting-materialize.ts:975` rebuilds the owner input from the beginning. A safe timeout alone cannot make progress on an owner whose required reads exceed one whole invocation. This contradicts the already-approved durable per-owner progress requirement at `docs/plans/item-counting.md:918`. It is not sufficient to relabel such an owner `partition_too_large`: the demonstrated owner is below the 50,000 distinct-input limit.
+
+**Bounded queued coder task T15P-4: durable continuation of one owner's materialization, in planning and staging.** This is an execution repair within the existing counting/parity contract. Its scope is the worker, frozen reader, owner-materialization and worker-state adapters, focused tests, and one additive migration if durable storage/RPCs require it (currently the next available number is 0046). Existing 0037–0045 files stay immutable. No UI, classifier, Repository interface, inventory, schedule or dependency change belongs in this task.
+
+- Persist the owner phase and exact continuation positions for member pages, parent lookups, member children and each worker's predecessor walk, together with consumed-ID accounting and the data/state needed to continue. Bind it to site, batch, frozen cutoff, rule version and owner; fence every access with the current lease. Store bounded pages atomically with their expected-to-next cursor transition. Lost responses must replay idempotently; obsolete fences and conflicting replay must fail. An in-memory cache is not a checkpoint.
+- Preserve exact microsecond/UTF-16-versus-bytewise ordering, cancellation context, audience filtering, empty old-self replacements, no-lookahead stopping and the 50,000/50,001 boundary. Incomplete inputs cannot yield a completed owner, descriptor proof, staged replacement or publication. Retain the existing reducer and descriptor/input-hash semantics.
+- Account for checkpoint reloads and result staging as well as source reads. Merely saving a cursor then reloading an equally expensive complete input on every invocation recreates the defect. Likewise, finishing planning but restarting the same expensive work during staging is not a repair. The proposed persisted representation and its bounded recovery path must be written in the plan for planner review before introducing the SQL/API contract; do not improvise a new projector or assume larger pages solve a byte-capped case.
+- The executable acceptance case is the existing 300-cancellation/one-row-page owner, with fresh worker instances between invocations, fixed 240-second budgets and simulated latency on **all** RPCs including checkpoint operations. It must reach publication within a declared finite bound of at most 20 invocations, with durable progress between unfinished invocations, no rescan from the owner's beginning, and exact descriptors, hashes and all five result families compared with the uninterrupted oracle. Exercise interruptions in both plan and stage, process loss, lease takeover, lost checkpoint responses and small/byte-capped pages. Preserve the overflow, ties, hidden cancellations, no-lookahead and old-worker replacement suites.
+- New private state requires RLS and service-only grants, invoker/empty-search-path RPCs, bounded/indexed access and a documented retention lifecycle. No sensitive payloads go into logs. Include offline SQL role/refusal tests and old-code compatibility. No hosted SQL is part of implementation authority. If the bounded representation cannot satisfy the acceptance case without changing projector semantics or accepted limits, return the exact conflict for planner resolution instead of widening scope.
+
+T15P-4 is queued behind the T15P-1a handoff; do not start it as a second concurrent action under this checkpoint. Its persistence contract needs review before implementation of new SQL. The known liveness defect remains a worker-run blocker until the continuation repair and its evidence are reviewed. Raising timeouts/max-invocations, shrinking the fixture, dropping an owner, publishing partial totals or treating repeated pending as success are not accepted solutions.
+
+**4. T15P-2 disposition — AU is the candidate; no preserved-baseline amendment is presently required for AU.** At the report's observation time capture was off (epoch 25), all processors were off, all read modes legacy, no site had an active generation, and no batch was active anywhere. AU had zero retained batches/candidates and no other site-cleanliness failure. Its only reported R0 blocker was the receipt requirement addressed above. UK and US each retained one abandoned batch and 42,340 candidate rows and remain ineligible for the clean-site runtime harness. Preserve them unchanged; do not resume/adopt them or delete them to make a gate pass.
+
+Once the guard/liveness repairs and receipt-exception handling have passed review, AU may be selected subject to fresh R0 and unchanged full baseline/ownership/audit protections. This is candidate selection, **not permission to run**. The existing harness audits unowned state across sites; retain that check so an AU run cannot silently change UK/US evidence. If AU acquires retained state or fresh R0 fails, stop and return the evidence; only then would a separately reviewed preserved-baseline mode be needed. Do not remove preflight checks or switch to UK/US speculatively. A worker rehearsal's cleanup also does not leave an app-ready generation; app enablement remains a later controlled step.
+
+**5. Exactly one next operative action.** **Owner: Claude. Action: implement and locally verify the T15P-1a post-renewal deadline correction and regressions above, then return that single repair for planner review. Authorised now: yes**, under the recorded continuous-delivery/offline-repair delegation. Its staging effect is **none**: no connection, capture transition, receipt write, lease, batch, generation, fixture or read-mode change. CJ has nothing to run or decide for this next action. The queued continuation task, inspection maintenance and future staging gate are not additional next actions. No worker command, reinstall, reset, cleanup, deployment or production access is authorised by this section.
+
+**Verification, hardening and release limits.** The planner attempted `npm.cmd run test -- --run tests/reporting/reportingInstalledState.test.ts tests/reporting/reportingPageGuard.test.ts`; Vite/esbuild failed to load configuration because access to the parent directory through the dependency junction was denied. **No tests ran.** No sandbox/execution-policy change or dependency reinstall was attempted. The in-memory timing probe above did execute. The coder's 2,285-test/common-gate result remains recorded at `628968c`; no fresh CI/build/typecheck pass is claimed here. Claude must provide focused regressions and the common gate, including API/digest and staging-runner typechecks, build and exact-head CI, in the normal permitted environment before repair clearance.
+
+Failure and retry safety require durable progress, idempotent checkpoint writes and no partial publication; concurrency requires single-flight renewals and fenced continuation. Counts, historical credit, timezone rules and audience boundaries remain unchanged. Repository/Dexie changes are n/a because this is the existing server-side reporting worker. Secrets stay server-side. Performance acceptance includes checkpoint transport/reload costs, not only source-page counts. Operations retain explicit pending/failed evidence and legacy shop-floor behavior. No hosted release occurs now; future additive SQL requires its own reviewed staging installation/rehearsal step, with old-code compatibility and retention checks. Rollback keeps legacy reads/processors off and leaves additive schema and preserved evidence intact; no destructive down migration is proposed. CJ retains merge/deployment/production release authority. Five-role isolation, site/self parity, takeover/replay, three-site dry digests, growth/resource acceptance, scheduling entitlement and Tasks 15–20 remain gates.
+
+Updated path to app testing: **guard correction → durable owner continuation and review → fresh AU identity/preflight plus authorised runtime rehearsal → controlled staging generation and Preview/summary-mode setup with remaining role/parity/dry-digest/growth gates → CJ can test Reports, Welcome and live counting in the app**.
+
+STATUS: COMPLETE
+
+## Coder log — T15P-1a post-renewal deadline check, 2026-11-18
+
+- **Repair (commit below this entry's parent; see `git log` for `task 15 (T15P-1a)`).** `api/_lib/production-reporting-worker.ts` `pageGuard`: `b.need()` before and immediately after `await b.beat(...)`. Nothing else changed: the reader's awaited per-RPC hook, outer guards, single-flight renewal, settled-group handling, deadlines, leases, retry delays and page limits are as reviewed.
+- **Regressions** in `tests/reporting/reportingPageGuard.test.ts` (now 11 tests), through the real worker over real SQL in PGlite with a simulated clock. The fixture is one owner whose children are read one row per page, so the due renewal lands inside the per-RPC guard rather than at the between-group checkpoints, which already check the deadline. The first fixture attempt hit only those checkpoints and did not detect the defect; that is why it was replaced.
+  1. A successful renewal ending at deadline + 500 ms: no frozen-read RPC is dispatched afterwards, and the cycle returns `pending`.
+  2. Readers awaiting the same single-flight renewal: no frozen read afterwards.
+  3. Attempt 1 fails transiently before the deadline, then the 30 s retry wait plus a slow attempt 2 ends past it: no frozen read afterwards, and the cycle returns `pending`.
+  4. A renewal completing before the deadline: materialization continues.
+- **Mutation:** removing the post-renewal `b.need()` fails cases 1–3.
+- **Common gate:** `npx tsc -b`, `npm run typecheck:digest`, strict ES2020 staging runners, `npm run test -- --run` 2,289/2,289 (77 files), `npm run build` pass.
+- **Not done:** T15P-4 (durable per-owner continuation) is queued behind planner review of this repair, as instructed. No staging action.
+
+STATUS: COMPLETE
+
+## Planner review — T15P-1a cleared; T15P-4 contract proposal next, 2026-11-18
+
+**Scope and evidence.** Reviewed `d87dd3e` and the coder log in `7b6ec70` against the preceding T15P-1a contract. The earlier planner subprocess produced no output or repository change and was stopped after 35 minutes idle; this section is the operative review. No staging command, database connection, app-code edit, migration, deployment or production access was performed. PR #7 CI is green at exact head `7b6ec700c91ae0cfd385aef93e235dc9abef994b`. A fresh local run of `npm run test -- --run tests/reporting/reportingPageGuard.test.ts` passed 11/11 tests in 14.36 s.
+
+**Verdict on `d87dd3e`: approved.** `api/_lib/production-reporting-worker.ts:406-412` now calls `b.need()` immediately before and immediately after the awaited, single-flight `b.beat(...)`. Therefore the previously reproduced sequence — renewal starts at 239,500 ms, completes at 240,500 ms, then a frozen read starts at 240,500 ms — is stopped by the second check before the reader dispatch. The focused real-worker/PGlite suite covers a successful over-deadline renewal, a retried renewal crossing the deadline, waiting readers and an in-budget renewal; the recorded mutation removes the second check and makes the three expiry cases fail. No deadline, lease, retry, paging or publication rule changed.
+
+**Queued should-fixes, not blockers for this repair or the next design step.** The next time `tests/reporting/reportingPageGuard.test.ts` changes, replace the randomized scenario start with a deterministic per-case sequence and make the waiting-reader case assert observable shared-renewal concurrency rather than only `OWNER_GROUP > 1`. Preserve the current mutation sensitivity. These improve repeatability and proof specificity; they do not change the reviewed runtime path.
+
+**T15P-4 may start only with a persistence-contract proposal.** The prior T15P-4 acceptance contract remains binding, but it does not yet name a concrete bounded representation or transition API. SQL/API/worker implementation is not authorised until that representation is reviewed. The proposal must be appended to this plan as one self-contained coder section and must specify:
+
+1. the additive `0046` private tables, keys, columns, size bounds, indexes, RLS/service-only grants, retention/cleanup ownership and old-code compatibility;
+2. the exact serializable owner state for both planning and staging: phase plus member-page, parent-lookup, member-child and per-worker predecessor-walk positions; consumed-ID accounting; accumulated inputs/results or bounded durable substitutes; descriptor/input-hash continuity; and how no incomplete state can become planned, staged or published;
+3. the fenced RPC surface, argument/result shapes and expected-to-next compare-and-swap transitions, including idempotent lost-response replay, stale-fence refusal, conflicting replay refusal and takeover/process-loss recovery;
+4. the worker/materializer seam and bounded reload path, with checkpoint transport/reload included in the budget and no restart of an already completed source prefix or expensive stage prefix;
+5. the lifecycle through owner completion, plan sealing, stage completion, batch failure, cleanup and retained generations, including how old workers safely ignore the additive state;
+6. the test map for the existing 300-cancellation, one-row-page owner across fresh worker instances, both plan and stage interruptions, lease takeover, lost checkpoint responses, small/byte-capped pages, the 50,000/50,001 boundary, ordering/ties, hidden cancellations, no-lookahead and old-self replacement. Declare a finite worst-case bound of at most 20 invocations with simulated latency on every RPC, including checkpoints, and exact parity with the uninterrupted oracle.
+
+The proposal may include interface signatures and schema sketches but must not create or modify migration/app/test files. If a bounded representation cannot preserve the existing reducer, ordering, hashes, limits and five result families, return the exact conflict instead of widening scope.
+
+**Exactly one next operative action.** **Owner: Claude. Action: append the T15P-4 persistence-contract proposal above to this plan, commit and push that plan-only handoff, then pause for planner review. Authorised now: yes.** Its staging effect is **none**. CJ has nothing to run or decide. No `0046` file, application code, tests, worker command, staging inspection, SQL, cleanup, deployment, merge or production access is authorised by this section.
+
+Updated path to app testing: **T15P-4 contract proposal and review → durable owner continuation implementation and review → fresh AU identity/preflight plus authorised runtime rehearsal → controlled staging generation/Preview setup and remaining role/parity/dry-digest/growth gates → CJ can test it in the app**.
+
+STATUS: COMPLETE
+
+## Planner review — T15P-1a approval and bounded T15P-4 handoff, 2026-11-18
+
+**Scope.** Reviewed `d87dd3e130976b16f5ef29d9a3253a52fed0fd33` and the coder log committed in `7b6ec70`, after reading AGENTS.md, ARCHITECTURE.md, ROADMAP.md (including F1), HARDENING.md and the preceding checkpoint. This appended section is the operative handoff. Existing tasks, checkboxes and the other planner section are preserved. During this review another process moved that existing section to the end and committed it; this review is appended after it. Its test-pass and exact-head CI claims are not independent evidence from this review. This reviewer wrote only this plan and ran no state-changing git command, app/test/migration edit, staging command or production access.
+
+**1. Verdict on `d87dd3e`: approved. Must-fix: none in this correction.** At `api/_lib/production-reporting-worker.ts:412`, `b.need()` now runs immediately after the awaited renewal at `:410`, as well as before it at `:409`. The awaited reader hook at `api/_lib/production-reporting-reader.ts:71` therefore rejects before dispatching the next frozen read. The existing `OutOfTime` handling returns pending; in-flight work may settle. No deadline, lease, retry delay, page limit, counting, publication or authentication contract changed. The real-worker regressions at `tests/reporting/reportingPageGuard.test.ts:297`, `:314` and `:323` cover successful expiry, retried expiry and an in-budget control.
+
+**Independent timing evidence.** A fresh database-free probe transpiled the actual local modules in memory, exposed the actual `Budget`, and extracted the current worker's page-guard body. It used the real renewal adapter and frozen RPC reader with a fake client/clock; no source files or system clock were changed. All six assertions passed:
+
+| Case | Observed result |
+| --- | --- |
+| Original reproduction: deadline 240,000 ms; renewal starts 239,500 and ends 240,500 | Zero frozen reads; `OutOfTime`. The earlier read dispatched at **240,500 ms is now prevented**. |
+| Three concurrent readers await that same renewal | One renewal, zero frozen reads, all three stop with `OutOfTime`. |
+| Transient renewal failure at 200,000; retry starts 230,000 and ends 240,500 | Two attempts, zero frozen reads, `OutOfTime`. |
+| Renewal ends exactly at 240,000 | Zero frozen reads, `OutOfTime`. |
+| Renewal ends at 239,750 | One `read_reporting_events_by_id` dispatch at 239,750; no rejection. |
+| Remove only the final check in memory | The original defect returns: one `read_reporting_events_by_id` dispatch at 240,500. |
+
+**Should-fix, non-blocking for this approval/design handoff:** `tests/reporting/reportingPageGuard.test.ts:306` does not itself prove shared-renewal concurrency: `OWNER_GROUP > 1` at `:309` is a configuration assertion, not evidence that multiple readers were waiting. When this test file is next changed, hold a renewal open, demonstrate at least two waiting readers, then assert one renewal and zero subsequent reads. Also replace the random start at `:261` with deterministic case times. The independent concurrent probe above supplies the missing direct evidence for this review; these test-quality improvements are not additional next actions.
+
+**Verification limits.** `npm.cmd run test -- --run tests/reporting/reportingPageGuard.test.ts` failed before executing tests: Vite/esbuild could not access the parent directory through the dependency location or resolve the config. No sandbox/policy changes or reinstall were attempted. The coder's 2,289-test/common-gate and mutation results remain attributed to the coder log, not freshly reproduced here. No fresh full-suite, build, typecheck or remote CI pass is claimed. Approval is for this narrow correction on source inspection and the executable in-memory reproduction/control; it is not hosted-runtime clearance.
+
+**2. T15P-4 may now start with a persistence-contract proposal only.** The earlier T15P-4 requirements remain binding. The owner-liveness defect is still a worker-run blocker at `api/_lib/production-reporting-worker.ts:312` and `:359`: interrupted owner materialization restarts. A concrete representation and transition API must be reviewed before writing new SQL or application implementation. Claude must append one self-contained proposal to this plan, containing all of the following:
+
+1. **Persistence schema:** exact proposed private table/column names, types, keys, constraints, indexes and row/byte bounds for additive migration **0046** (verify the number remains unused). Bind state to site, batch, frozen cutoff, rule version, owner and plan/stage phase; define format versioning and fence validation. List RLS and service-only grants, revoking public/anonymous/authenticated access. Existing migrations remain immutable. Explain old-code compatibility and behavior if new code encounters a missing migration or an incompatible checkpoint format.
+2. **Serializable state and transitions:** a phase table naming the complete state before/after each bounded step: member-page positions, parent lookup progress including absent IDs, member-child positions, each worker's predecessor position and stopping evidence, exact distinct consumed-ID accounting, audiences including old-self replacements, and accumulated inputs/results or their durable substitutes. Specify how exact ordering, canonical input/descriptor hashes and the existing reducer are preserved. Distinguish completed source input from completed reduction, descriptor planning and result staging; no incomplete phase may satisfy a completion proof or publish.
+3. **RPC contract:** names and exact argument/result/error shapes for load, checkpoint and completion operations, with expected-to-next atomic transitions and durable replay identity. Describe a committed write whose response is lost, identical replay, conflicting replay, obsolete/expired leases, takeover with a new fence and simultaneous attempts. Fenced data and cursor advancement must commit together. Use invoker/empty-search-path functions and bounded/indexed access; each transport call must respect the existing 1,000-row/1 MiB limits, including envelopes.
+4. **Bounded recovery in both planning and staging:** name the seams in worker, reader, materializer and worker-state adapters. Explain how fresh processes resume without rereading completed source prefixes or restarting expensive stage work. Account for loading saved state, hashing/reduction, checkpoint writes, result chunks and retries in the time/memory/transport budget. A cursor plus a full expensive reload on every invocation is not sufficient. State exactly how plan/stage reuse, if proposed, verifies the frozen input/hash and respects the sealed descriptor contract.
+5. **Lifecycle and rollback:** define retention and bounded cleanup ownership for partial/completed owners, failed/abandoned batches and retained generations; preserve recovery evidence and prevent stale checkpoints being adopted into another batch. Keep legacy reads and processor-disable controls as the fallback. Propose only expand-compatible schema, no destructive down migration, production access, source/inventory write, new dependency, UI or Repository change.
+6. **Executable acceptance map and cost bound:** identify test files/cases and expected results for the existing 300-cancellation, one-row-page owner reaching publication in **at most 20 fresh invocations**, each with the unchanged **240,000 ms** budget and declared latency on **every RPC**, including checkpoint/reload/stage calls. Give a phase-by-phase call/byte/time calculation, not just the invocation number. Require durable progress between unfinished invocations, process loss and interruptions in both plan and stage, takeover, lost responses, small/byte-capped pages, and exact descriptors/hashes/all five result families against the uninterrupted oracle. Preserve 50,000/50,001 distinct-input boundaries, microsecond and UTF-16/bytewise ties, hidden cancellations, no-lookahead and old-self replacement. Include offline SQL role/refusal and old-code compatibility tests. Do not raise limits, shrink the fixture, reclassify an admissible owner as too large or alter the projector to obtain a pass.
+
+This is an exact proposal deliverable, not approval of an unspecified 0046 implementation. Schema sketches/signatures belong inside the proposal; no migration/app/test files are authorised at this step. If the representation cannot meet the existing contract, state the precise conflict for planner resolution. A complete proposal then receives planner review before the implementation gate opens.
+
+**Hardening and subsequent staging gates.** Slow/failing renewals and concurrent callers were exercised locally; idempotent continuation, takeover and durable recovery remain T15P-4 obligations. Counting, historical attribution, timezone/audience rules and inventory are unchanged. Repository/Dexie work and external integrations are n/a for this server-worker correction. Existing endpoint auth and server-only secrets remain intact; checkpoint payloads must not appear in logs. Performance and operations require bounded reload/cleanup, explicit pending/failure evidence and unchanged legacy fallback. Later staging acceptance still requires reviewed additive SQL/old-code compatibility, fresh AU identity and R0 checks, authorised runtime/parity/recovery rehearsal, five-role isolation, site/self parity, three-site dry digests, growth/resource checks and Preview setup. The narrowly accepted 0044/0045 receipt discrepancy remains as previously recorded; no history repair is authorised. AU remains only a candidate; UK/US retained evidence stays untouched. No hosted release occurs here, and the approved guard alone does not close Tasks 15–20 or make the app ready for CJ.
+
+**3. Exactly one next operative action. Owner: Claude. Action: append the T15P-4 persistence-contract proposal specified above to `docs/plans/item-counting.md` and return that plan-only handoff for planner review. Authorised now: yes**, within the existing offline-repair delegation. **Staging effect: none**—no connection, inspection, SQL installation, lease, capture, batch, generation, cleanup, fixture or read-mode change. CJ has nothing to run or decide for this next action. Implementation, inspection maintenance and hosted execution are later gates, not parallel next actions. Any future hosted work is staging-only (`ybrzhrgfrnvtcwymjdrq`) under its own explicit clearance; production **`lkboboagiikvozvbcpvg` is never touched, including reads**. This planner review makes no commit or push and authorises no merge/deployment.
+
+Updated path to app testing: **T15P-4 persistence proposal and review → durable continuation implementation and review → reviewed staging schema/identity/preflight and authorised AU runtime rehearsal → staging generation, Preview and remaining role/parity/dry-digest/growth gates → CJ can test it in the app**.
+
+STATUS: COMPLETE
+
+## Coder proposal — T15P-4 durable owner-input continuation (persistence contract for review), 2026-11-18
+
+Plan-only handoff under the planner's 2026-11-18 authorisation. No migration, application or test file is changed by this proposal. Every name below is a proposal for review.
+
+### 0. Idea in one paragraph
+
+Today an owner's input (`buildOwnerInput`: members → parents → members' children → each worker's predecessor walk) lives only in memory, so an interrupted owner restarts from its beginning. The proposal journals the owner's **consumed evidence events**, in consumption order, together with an exact **continuation state** for the next read. Each event is stored in the reduced form `imageToEvent` already produces: the 11 projector/hash fields, not the source image. This journal is used only by owners that are still unfinished after a checkpoint interval. On resume, the worker reloads the compact journal, rebuilds the in-memory `context` and `DependencyBudget` exactly, and continues with the next source read. When the input is complete, the journal is marked `complete` with the per-audience input hashes. Stage then reuses it: it reloads the events and verifies every recomputed hash against the sealed descriptors instead of reading the source again. The reducer, descriptor/input-hash semantics and read order are unchanged. Only *where the in-memory state lives between invocations* changes.
+
+Why the reload is not "an equally expensive full reload": the byte-capped case is caused by large **source images** (notes and other unused columns), but the journal stores only the reduced event (about 250–450 bytes of JSON). The 300-cancellation owner reloads in **1 call** (≤1,000 rows, ≤1 MiB), where reading the source needed 301 children pages. A 50,000-event owner reloads in at most 50 calls, against at least 50 source pages plus their dependencies.
+
+### 1. Persistence schema (additive migration `0046_reporting_owner_inputs.sql`; the number is unused at `7ad2df5`)
+
+```sql
+CREATE TABLE reporting_private.owner_inputs (
+  batch_id         uuid        NOT NULL,
+  partition_kind   text        NOT NULL CHECK (partition_kind IN ('order', 'event')),
+  partition_key    text        NOT NULL CHECK (partition_key <> ''),
+  site             text        NOT NULL CHECK (site IN ('au', 'uk', 'us')),
+  source_cutoff    timestamptz NOT NULL,        -- copied from the batch; checked equal on every access
+  rule_version     text        NOT NULL CHECK (rule_version <> ''),
+  format_version   smallint    NOT NULL CHECK (format_version = 1),
+  phase            text        NOT NULL CHECK (phase IN ('reading', 'complete')),
+  seq              bigint      NOT NULL CHECK (seq >= 1),        -- checkpoints applied (expected-to-next)
+  state            jsonb       NOT NULL CHECK (pg_catalog.octet_length(state::text) <= 8192),
+  event_count      integer     NOT NULL CHECK (event_count BETWEEN 0 AND 50000),
+  input_hashes     jsonb,                        -- complete only: [{audienceKind, audienceStaff, inputHash}], at most 1,000
+  last_payload_md5 text        NOT NULL CHECK (last_payload_md5 ~ '^[0-9a-f]{32}$'),  -- replay identity of seq
+  written_fence    bigint      NOT NULL CHECK (written_fence >= 1),
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (batch_id, partition_kind, partition_key),
+  FOREIGN KEY (batch_id, partition_kind, partition_key) REFERENCES reporting_private.worker_owners (batch_id, partition_kind, partition_key),
+  CHECK ((phase = 'complete') = (input_hashes IS NOT NULL))
+);
+CREATE TABLE reporting_private.owner_input_events (
+  batch_id         uuid    NOT NULL,
+  partition_kind   text    NOT NULL,
+  partition_key    text    NOT NULL,
+  ord              integer NOT NULL CHECK (ord BETWEEN 1 AND 50000),   -- consumption ordinal of the FIRST consumption
+  event_id         text    NOT NULL CHECK (event_id <> ''),
+  event            jsonb   NOT NULL CHECK (pg_catalog.octet_length(event::text) <= 16384),  -- the reduced evidence event
+  PRIMARY KEY (batch_id, partition_kind, partition_key, ord),
+  UNIQUE (batch_id, partition_kind, partition_key, event_id),
+  FOREIGN KEY (batch_id, partition_kind, partition_key) REFERENCES reporting_private.owner_inputs (batch_id, partition_kind, partition_key)
+);
+-- RLS enabled on both, no policies; REVOKE ALL ON both FROM PUBLIC, anon, authenticated;
+-- GRANT SELECT, INSERT, UPDATE, DELETE TO service_role (the 0043 pattern). The PKs serve every access path
+-- (keyset by ord; owner lookups); list by batch uses the owner_inputs PK prefix.
+```
+
+- **Bounds.** At most 50,000 event rows per owner: the 50,001st distinct id raises the existing `partition_too_large` *before* anything is written. Each `event` is ≤16 KiB; real reduced events are about 0.4 KiB, and the check guards against a malformed writer. `state` is ≤8 KiB, in line with the existing `KEY_PROGRESS_MAX_BYTES` approach.
+- **Binding.** Batch, owner and site are the key, and the FK goes to that batch's `worker_owners` row. Cutoff and rule version are copied and checked equal to the batch and to `REPORTING_RULE_VERSION` on every call; a mismatch is an error, never an adoption. The rows can never be used by another batch. One journal covers both the plan and the stage phase (§2).
+- **Format versioning.** `format_version = 1` and `state.v = 1`. New code that finds an unknown version refuses with `owner_input_format`: it does not adopt, delete or rewrite the row, and the invocation fails as `conflicting_work`. The operator path is an evidence-preserving abandon.
+- **Fence validation.** Every RPC first calls the existing `reporting_private.worker_batch(p_batch, p_fence, p_unsealed)`, which locks the batch, rejects an obsolete fence or an expired lease, and requires `frozen`. Planning writes need `p_unsealed = true`; stage reads and the post-publish release use the appropriate non-planning check (§3).
+- **Old code / missing migration.** Old code never touches these tables, so the change is purely additive. If new code calls a 0046 RPC that doesn't exist (SQLSTATE `42883`), the adapter maps it to `migration_missing` and the invocation ends `failed` (fail-closed). A silent fallback to the non-durable path is deliberately not used, because it would reintroduce the liveness defect without anyone seeing it (open point §7.2). The T15P-3 inspection mode gains the 0046 objects in its expected set at its next maintenance change.
+
+### 2. Serializable state and transitions
+
+`state` (JSON, `v: 1`) holds exactly what `buildOwnerInput` keeps in local variables between reads. Events already consumed are **not** in `state`; they are the `owner_input_events` rows. On reload, the worker rebuilds `context` (id → event) and the `DependencyBudget` id set from them in `ord` order. Every budget-taken id is also put into `context` (`keep`, and exactWalk's take + `onEvent`), so the `context` keys equal the budget's ids.
+
+| step | `state` before the step | bounded unit | after |
+|---|---|---|---|
+| M members | `{step:"members", afterIndex, afterId}`: the 0041/0042 member keyset of the one-owner group (`afterId:null` after cap+1) | one `read_reporting_owner_members` page | rows appended to the journal; the keyset advanced; an empty page → P |
+| P parents | `{step:"parents", parentAfter}`: the last requested parent id (bytewise). The sorted parent list is recomputed from the journaled members | one `read_reporting_events_by_id` page (byte-capped continuation, as today) | found parents appended. **Absent ids are implied, not guessed:** a parent id ≤ `parentAfter` that is not in the journal was absent. byIds already treats an empty page as "the remaining ids are absent", and that empty page is what advances P → C |
+| C member children | `{step:"children", afterParent, afterId}`: the `read_reporting_children` keyset over all member ids (bytewise) | one children page | new ids appended. Ids already in `context` are re-charged as today (`take` is a no-op for a seen id, so the order and the overflow point are unchanged) |
+| W worker walks | `{step:"walk", worker, cursor:{createdAt,id}, stopAt, need:[…], line:{id, kidsAfter} or null}`. Workers are the journaled members' staff, bytewise; `earliest`/`latest`/`types` are recomputed from the journaled members | one stream page, one 0045 page, or one line's children page | the consumed events are appended. Resume uses `cursor` = the **last consumed** event (exclusive): the unconsumed rest of a page is fetched again, and unconsumed lookahead is never stored. A consumed line whose cancellations are still being read keeps `line.kidsAfter`. Its kids so far are journaled, and `siteEffective` is evaluated only once they are complete, from the journaled kids plus the remainder. `stopAt` and `need` persist exactly. The end of worker *i* → worker *i+1*; the end of the last worker → X |
+| X input complete | `{step:"complete"}` | — | `phase='complete'`; `input_hashes` = `sha256(canonicalJson(partitionInput(audience, sorted events)))` for site + each member's staff + the **old self staff supplied by the caller** (`worker_owners.old_staff` in plan, the claims in stage, as today; old self audiences are not part of the input) |
+
+- **Ordering preserved.** The resumed read sequence is the uninterrupted sequence with pauses at page or line boundaries, so the distinct-id order (and therefore the 50,001st id and the `PartitionTooLargeError` attribution) is identical. Microsecond instants, projector ties and the UTF-16 versus bytewise `certain` rule (`/^[\u0000-퟿]*$/` on the earliest id) are recomputed from the same journaled members. Hidden cancellations stay correct because the children pages are the same pages.
+- **Reducer unchanged.** The final `events` are the same sorted set, and `partitionInput`, `projectReportingPartition` and `canonicalJson` are untouched, so descriptors, hashes and all five result families are identical by construction. Tests also compare them against the uninterrupted oracle (§6).
+- **Completion proofs.** A `phase='reading'` journal never produces a descriptor (`plan_reporting_owner` is called only after X), never satisfies `seal`, and never stages. Stage reuse requires `phase='complete'` **and** recomputed hashes equal to the claimed descriptors' `inputHash` for every claimed audience (the existing check in `stage`). Otherwise it throws, as today.
+- **Source input vs reduction vs planning vs staging.** X means only that the *source input* is complete. Reduction is recomputed in memory from the events (deterministic and cheap). Planning (`plan_reporting_owner`) and staging keep their existing durable records; the journal adds no completion meaning to them.
+
+### 3. RPC contract
+
+All are `SECURITY INVOKER` with `SET search_path = ''`, `service_role` EXECUTE only, and PUBLIC/anon/authenticated revoked.
+
+1. `public.list_reporting_owner_inputs(p_batch uuid, p_fence bigint, p_after_kind text, p_after_key text, p_limit integer)` → `TABLE (partition_kind text, partition_key text, phase text, seq bigint, event_count integer)`.
+   - At most 1,000 rows, with keyset `(kind, key)` in `COLLATE "C"`.
+   - It is called once per invocation (paged), so the worker knows which owners have a journal without a per-owner probe. It normally returns 0 rows.
+2. `public.load_reporting_owner_input(p_batch, p_fence, p_kind, p_key, p_after_ord integer, p_limit integer)` → `TABLE (row_kind text, ord integer, event_id text, event jsonb, seq bigint, phase text, state jsonb, input_hashes jsonb)`.
+   - The first row (`row_kind='header'`) carries seq, phase, state and the hashes. The rest are event rows with `ord > p_after_ord`, in `ord` order.
+   - The whole response, header included, is cut at 1,000 rows / 1 MiB, accounted the same way as the 0041 envelope.
+   - Only a page with no event rows proves the end. A missing journal returns zero rows.
+3. `public.checkpoint_reporting_owner_input(p_batch, p_fence, p_kind, p_key, p_expected_seq bigint, p_state jsonb, p_events jsonb, p_complete boolean, p_input_hashes jsonb)` → `TABLE (seq bigint, event_count integer, replay boolean)`.
+   - **Atomic.** It locks the batch via `worker_batch`, then the `owner_inputs` row `FOR UPDATE`; it inserts at most 1,000 events (≤1 MiB) at `ord = event_count+1…` and sets `state`, `phase`, `seq = p_expected_seq + 1`, `last_payload_md5` and `written_fence`, all in ONE transaction, so data and cursor commit together. `p_expected_seq = 0` creates the row.
+   - **Identical replay.** If the row already has `seq = p_expected_seq + 1` and `last_payload_md5 = md5(canonical payload)`, it returns `replay = true` and writes nothing. This covers a committed write whose response was lost.
+   - **Conflicting replay.** The same seq with a different payload, or any other seq mismatch, fails with `owner_input_conflict: expected seq n, found m`. The worker maps it to `conflicting_work` and stops the invocation.
+   - **Obsolete fence or expired lease.** `worker_batch` raises its existing errors (`fence … is obsolete`, `lease expired`), and nothing is written.
+   - **Takeover with a new fence.** The data belongs to the batch's frozen view, not to a fence, so the new holder continues from the stored seq; `written_fence` records who wrote each step (as evidence).
+   - **Simultaneous attempts.** Only the lease holder passes `worker_batch`. Two calls from the same holder serialize on the row lock; the second sees seq advanced and is a replay or a conflict.
+   - **Validation.** It rejects `p_events` that are not contiguous from `event_count+1`, that duplicate an existing journal id, or whose JSON keys are outside the 11 reduced fields. `p_complete` requires a valid `p_input_hashes` (site exactly once, unique audiences, 64-hex hashes, at most 1,000) and an empty or final `p_events`.
+4. `public.release_reporting_owner_inputs(p_batch uuid, p_limit integer)` → `TABLE (deleted integer, remaining integer)`.
+   - It is allowed only when the batch is `published` (no fence needed: the batch is final) and deletes that batch's journal rows in bounded pages (≤5,000 rows per call).
+
+### 4. Bounded recovery in planning and staging (seams)
+
+- **Reader (`api/_lib/production-reporting-reader.ts`).** Its behaviour is unchanged. It gains optional start positions on the existing keysets (`members` from `(afterIndex, afterId)`, `children` from `(afterParent, afterId)`, and `byIds` continuing after an id); stream and predecessorPage already take a cursor. The T15P-1 per-RPC guard stays in front of every call.
+- **Materializer (`api/_lib/production-reporting-materialize.ts`).**
+  - `buildOwnerInput` becomes a resumable step machine: the same reads in the same order, with optional `{ resume, checkpoint(delta), due() }`.
+  - Without these options it is byte-for-byte today's behaviour (memory readers, all existing tests, short owners).
+  - `exactWalk` gains an optional resume state (cursor, stopAt, need, line) and reports each consumed event through `onEvent`. It never stores lookahead.
+  - `materializeOwnerWorks` gains `fromJournal(complete)`: it recomputes the works from reloaded events with no source reads.
+- **Worker (`api/_lib/production-reporting-worker.ts`).**
+  - After acquire, it calls `list_reporting_owner_inputs` (normally 1 call, 0 rows).
+  - In `plan`, an owner with a `reading` journal resumes from it. An owner with a `complete` journal recomputes from the reload, then plans.
+  - In `stage`, an owner with a `complete` journal reloads, recomputes and hash-checks against the claims, and is never re-read from the source. An owner without one is materialized as today.
+  - An owner without a journal runs as today. If it is still unfinished when `due()` first fires (the first heartbeat boundary reached inside that owner's own reads, i.e. at least 30 s), it creates its journal with everything consumed so far. From then on it checkpoints at least every 30 s and whenever the delta reaches 1,000 rows / 1 MiB.
+  - Checkpoint, load and list calls go through the same per-RPC `pageGuard` (budget + heartbeat, T15P-1/1a), so they count against the 240 s budget. `OutOfTime` between two checkpoints loses at most one interval of reads, never the prefix.
+  - After a successful publish, it calls `release_reporting_owner_inputs` until `remaining = 0`, continuing in later invocations if it runs out of time.
+- **Worker-state adapters (`api/_lib/reporting-jobs.ts`).** Add typed callers for the four RPCs with the existing error mapping (`fence_obsolete`, `lease_expired`, `conflicting_work`), plus `migration_missing` for SQLSTATE 42883 on these names.
+- **Time, memory and transport.**
+  - Memory is the same as today: one owner's input (≤50,000 reduced events) plus the current delta.
+  - A reload costs `ceil(rows/1000)` calls, or more only if the compact events exceed 1 MiB per call (≥2,300 events per MiB at about 450 bytes).
+  - A checkpoint is 1 call per interval, carrying the delta.
+  - Hashing and reduction are in-memory CPU, the same as today. Every call respects the 1,000-row / 1 MiB envelope.
+- **Plan/stage reuse verification.** Stage never trusts the journal blindly: it recomputes `sha256(canonicalJson(partitionInput(...)))` for every claimed audience from the reloaded events and requires equality with the claim's `inputHash` (fixed at plan time and covered by the sealed descriptor manifest). Any mismatch throws `ReportingJobError`, as the existing check does.
+
+### 5. Lifecycle and rollback
+
+- **Retention.** Journal rows live while their batch is unpublished. After a successful publish, the worker releases them in bounded pages (§4); the published generation never depends on them.
+- **Failed or abandoned batches.** Their journals are **retained** as recovery evidence, consistent with the planner's UK/US preservation instruction. They are never adopted by another batch: the key and FK are batch-scoped. Bulk cleanup of abandoned batches stays an explicitly authorised operator step outside this task.
+- **Retained generations.** They are unaffected, and so is the existing `cleanup_reporting_history`.
+- **Stale checkpoints.** These are impossible across batches. Within a batch, the binding check (cutoff, rule version, format) plus the fence decide.
+- **Fallback.** Legacy reads and `set_reporting_site_mode(..., p_processor_enabled => false)` remain the off switch.
+- **Rollback.** Deploy the previous worker; it ignores the 0046 objects. 0046 stays installed (expand-only, no destructive down migration). It adds no source or inventory writes, no new dependency, no UI or Repository change, and needs no production access.
+
+### 6. Executable acceptance map and cost bound
+
+**Primary case** (new `tests/reporting/reportingOwnerContinuation.test.ts`, real SQL in PGlite with 0037–0046): the existing 300-cancellation owner (a line plus 300 `cancelled` children, all in one order), with the `read_reporting_children` limit forced to 1 (byte-capped). Each invocation is a fresh `runReportingCycle` with no in-memory carry-over and the unchanged 240,000 ms budget. **Every RPC costs 1,000 simulated ms**, including list, load, checkpoint, release, renewals, claims, stage and publish. Between invocations the lease is expired in the database clock (as in `walk-resume.test.ts`).
+
+Phase cost model, at 1 s per RPC:
+
+| invocation | work | calls (≈) |
+|---|---|---|
+| 1 | status, acquire, copy and freeze (fixture-dependent, ≈10), enumeration (≈3). Plan starts the owner: members 1, parents 0, then children pages until the budget. The journal is created at the first heartbeat boundary inside the owner (≈30 s), then checkpointed every ≈30 reads; renewals ≈8 | ≈240 in total, of which ≈190 are children pages, with ≈6 checkpoints → **pending**, with ≈180/301 children pages durable (at most one interval lost) |
+| 2 | status/acquire ≈3, list 1, load 1 (≤301 compact rows ≪ 1 MiB), the remaining ≈121 children pages + ≈4 checkpoints, the walk (1 worker, ≈2 stream pages + the 0045 or line-children reads, ≈5), the complete checkpoint 1, `plan_reporting_owner` 1, seal ≈4, claim 1, load 1 (the complete journal), the hash check (CPU), stage ≈2, publish 1, release 1, renewals ≈5 | ≈155 → **published** |
+
+- **Declared bound.** At most **4 invocations** for this case (2 expected; 4 allows for checkpoint-interval loss and different copy/enumeration costs), against the planner's ceiling of 20. The test asserts `invocations ≤ 20` and records the actual number.
+- **Durable progress.** `event_count` strictly increases between unfinished invocations, and reads in invocation k+1 start strictly after the journaled position. In total, `read_reporting_children` is called with `p_after_event_id = null` for that owner at most once.
+- **No rescan.** The total number of `read_reporting_children` calls across invocations is ≤ 301 + (interruptions × the reads in one checkpoint interval).
+- **Exact output.** The descriptors, `inputHash` values and all five result families are compared with the uninterrupted oracle (a separate fresh DB, the same fixture, one invocation with a budget large enough not to interrupt), plus `parityProblems` for the site and the worker.
+
+**Further cases (same file):**
+
+1. **Interruption in plan and in stage:** the clocks are chosen so one run stops inside `buildOwnerInput` during plan, and another stops after X but before staging completes. Stage must reuse the complete journal (0 source children reads for that owner in stage).
+2. **Process loss:** a fresh worker instance per invocation, with no module-level state.
+3. **A lost checkpoint response:** the client throws after the checkpoint's COMMIT but before the response. The next invocation replays the same checkpoint, gets `replay = true`, and adds no duplicate rows.
+4. **A conflicting replay** (the same seq with a different payload) gives `owner_input_conflict` → `conflicting_work`, and nothing is written.
+5. **Fences:**
+   - an obsolete fence and an expired lease both write nothing;
+   - takeover with a new fence continues from the stored seq;
+   - two concurrent same-holder checkpoints serialize (one wins, the other is a replay or a conflict).
+6. **Small and byte-capped pages:** members limit 1, byIds one per page, and 0045 cut pages that force the plain-page fallback.
+7. **Format and missing migration:**
+   - an unknown `format_version` refuses with no mutation;
+   - a missing-0046 database (PGlite through 0045) gives `migration_missing`, the invocation fails closed, and nothing is written.
+8. **SQL role/refusal tests** (`tests/reporting/pg/owner-inputs.test.ts`):
+   - anon, authenticated and PUBLIC can neither execute nor select, and RLS is on;
+   - invoker and empty search_path;
+   - the envelope bound of 1,000 rows / 1 MiB including the header;
+   - checkpoint validation: `ord` gaps, duplicate ids, unknown keys, bad hashes, complete without hashes;
+   - release refused for an unpublished batch.
+9. **Preserved suites (they must stay green, and gain checkpoint variants):**
+   - the 50,000/50,001 boundary, including a checkpoint at 49,999 (the overflow still throws at the same id, and nothing over 50,000 is ever written);
+   - microsecond and UTF-16/bytewise ties, with a checkpoint between tie members;
+   - hidden cancellations;
+   - no-lookahead (unconsumed lookahead is never journaled);
+   - old-self empty replacement (old_staff audiences hashed at X);
+   - overflow attribution;
+   - and the existing walk-resume, predecessor-page, materialize-batching, page-guard and worker-recovery suites.
+10. **Old-code compatibility:** the full existing suite on 0037–0046 with no journal in use behaves identically, and the T15P-1/1a page-guard cases still pass with checkpoints in the call stream.
+
+### 7. Open points for the planner (no improvisation)
+
+1. **The checkpoint trigger:** time-based (the first heartbeat boundary inside an owner, then every 30 s), so short owners pay nothing. Alternative: also every fixed number of reads. Please confirm or choose.
+2. **Fail-closed on a missing 0046** (proposed) versus falling back to the current non-durable path.
+3. **The journal release after publish** inside the worker (proposed) versus a separate scheduled cleanup.
+4. **Reduced events versus full source images.** The proposal stores the reduced events, which are exactly what the input hash covers. Storing full source images (for audit) would remove the reload advantage in the byte-capped case and change the cost bound.
+5. **The release check.** `release_reporting_owner_inputs` checks `state = 'published'` without a fence. If you prefer it fenced or folded into the existing publication cleanup, say so.
+
+STATUS: COMPLETE
+
+
+## Planner review — T15P-4 persistence proposal: changes required, 2026-11-18
+
+**Verdict: changes required; implementation is not authorised.** Reviewed the proposal at `067e7d82f3a5406631a007bd1ac5a8452ba9b856` against both preceding six-item proposal contracts and the binding T15P-4 acceptance requirements. Reduced evidence storage and reuse of completed inputs are sound directions, but the proposed transitions, recovery bounds and cleanup are not yet a complete implementation contract. The next action remains offline and plan-only under CJ's recorded delegation; CJ need not wake up or decide anything for it.
+
+**Evidence and limits.** Read AGENTS.md, ARCHITECTURE.md, ROADMAP (including F1 and cross-cutting decisions), HARDENING.md, the operative plan sections, and the relevant executable definitions in migrations 0037–0045. Traced `buildOwnerInput`, `exactWalk`, `provenChildren`, `imageToEvent`, the RPC reader's actual grouping/termination rules, worker plan/stage/acquire, worker-state adapters, chunk staging and cleanup. HEAD is the proposal commit; the working tree was clean before this append, and no 0046 file exists. This is static contract review, not a runtime pass: no tests, build, CI check, SQL execution, database connection or network service was used. Existing test results remain historical evidence. Only this appended section is changed; no task, checkbox, earlier proposal or application file is rewritten.
+
+### 1. Disposition against the six required proposal items
+
+| Required item | Disposition |
+| --- | --- |
+| 1. Exact schema, bounds, access and compatibility | Partial: private/service-only intent is correct; the new 16 KiB event restriction, collation/index assumptions, cleanup FK and incomplete byte/format constraints need amendment. |
+| 2. Complete serializable transitions | Incomplete: grouped parent/children completion, member identity, prefetch interruption and stage-first continuation are not fully represented. |
+| 3. Atomic RPC/replay contract | Partial: expected-sequence replay is useful; exact payloads, legal phase transitions, reload consistency, error mapping and post-publication locking are still missing. |
+| 4. Bounded plan AND stage recovery | Not met: a compact full reload is not necessarily cheap, staging can lack a journal, and persisted chunks are not used to bound repeated stage work. |
+| 5. Retention/rollback | Not met: the proposed FK blocks the existing 30-day cleanup, and acquisition cannot rediscover a published batch for unfinished journal release. |
+| 6. Executable acceptance/cost proof | Not met: costs omit actual paging/children paths; event-count progress is false for the specified fixture; stage interruptions need deeper coverage. |
+
+### 2. Required amendments — address all in one replacement proposal section
+
+Append one self-contained revised proposal, explicitly superseding the coder's proposal above. Keep its six required items and answer each numbered correction below with concrete state, signatures and tests; do not leave implementation choices hidden behind “as today.”
+
+**A. Represent grouped reads and membership exactly.** At `production-reporting-materialize.ts:558–603`, parents are requested in groups of 500; at `production-reporting-reader.ts:145–183`, by-ID reads terminate only the current request group on an empty response, while children requests group at 1,000 parent IDs. An empty parent group is not evidence that all later parents are absent; an empty child group is not the end of all member children. Persist the current group's identity/boundary and its intra-group position, including progress across a wholly absent parent group or a child group with no rows. Freeze/reconstruct the original parent list from the completed MEMBERS set, not by reapplying `!context.has(parent)` after found parents have entered context and shifted the groups. Define how the MEMBERS set and its completed boundary are recovered independently of later context rows. For example, persist its ordinal boundary/count once membership ends, with exact rules for partial membership. Define the transition at cap+1 as overflow, never a completed member cursor. Add cases spanning more than 500 requested parents and more than 1,000 member IDs, including empty intermediate groups, absent suffixes, byte-capped pages and interruption at every group transition.
+
+**B. Checkpoint consumed progress at bounded read boundaries, including zero-new-ID steps.** The binding contract requires bounded pages and their expected-to-next transitions to be atomic. A 30-second-only journal permits many completed pages to be reread and leaves its first spill unspecified: before the first timer fires, fast pages can accumulate far more than 1,000 events or 1 MiB. Specify a bounded atomic checkpoint for every consumed page/substep before starting the next dependent read, including empty-page transitions and pages containing only already-seen IDs. If retaining a lazy fast path, spell out its bounded initial spill protocol, replay identity and activation boundary; it must meet the same progress/transport guarantees and cannot write a final cursor before all corresponding events are durable. A clock trigger alone is insufficient.
+
+In `exactWalk:475–522`, the combined 0045 page may be discarded, `provenChildren` may consume many RPC pages before returning, and coalescing may read before the materializer receives any event. Identify safe checkpoint seams for each, not only `onEvent`. A process must not repeatedly spend its whole budget in an uncheckpointed proven/coalesced prefix. Specify whether the resumable route bypasses these optimisations or persists their bounded work; preserve consumption order, no-lookahead, fallback and the exact stopping instant. Explicitly retain the pending line, its consumed child cursor/effectiveness evidence, and “line finished but worker not finished” state. The planned shared reader guard must still run before every actual RPC and after any awaited renewal; checkpoints must not recursively trigger themselves through that guard.
+
+**C. Remove unsupported reload and size assumptions.** `imageToEvent:26–45` has 11 fields but no 16 KiB bound on their strings (and retains the quantity value); 0041 limits a whole response to 1 MiB, not an evidence event to 16 KiB. The proposed 16 KiB CHECK can reject previously admissible frozen evidence. Do not introduce that new data limit, truncate fields or change the canonical input. Supply a bounded representation for existing admissible events, including framing/fragmentation if needed, or return the precise unsatisfied limit for planner resolution.
+
+Even under the proposed limit, 50,000 events near 16 KiB occupy about 781 MiB before envelopes: hundreds of reload calls, which can consume an entire invocation repeatedly. The header leaves at most 999 event rows per 1,000-row response; the specified empty-event termination adds a final call. Thus “50 calls maximum” and “301 rows reload in one call” are not correct for this RPC contract (301 small rows need a data page plus the terminal page). Give exact row/byte accounting for request arguments, state, hashes, duplicated identifiers and response envelopes; ensure a header-only byte cut cannot masquerade as EOF when events remain. Pin the header sequence/count across reload pages and reject mixed snapshots, ordinal gaps, missing rows and count/hash mismatches.
+
+Provide a recovery strategy that makes progress when saved evidence itself is byte-capped and cannot be reloaded/reduced within one budget. “Reduced events are normally 450 bytes” is a fixture estimate, not that strategy. Include bounded hashing/reduction CPU, result memory and owner-group concurrency: the worker defaults to eight concurrent owners, not one. No new projector semantics, lower admissible owner limit or larger invocation budget is approved. If this cannot be reconciled with retaining the current reducer, report that exact conflict rather than claiming universal liveness from the small fixture.
+
+**D. Make stage continuation a real state, not only plan reuse.** The proposed `reading/complete` state and unsealed-only writes do not cover an owner that completed planning without a journal but exhausts its budget when first materialized during stage. Stage can start with less time or slower reads; `worker_batch(..., true)` rejects its sealed batch. Specify stage-origin journal creation/resume, its binding to the existing sealed owner/descriptors and its allowed writes under the current fence, without reopening planning. Alternatively provide a concrete scheme ensuring complete durable input is available for every stage claim; account for its cost.
+
+The current `stage:359–371` rebuilds all chunks and submits them from the beginning. 0038 stores chunks idempotently and claims return `expected_chunk_count/staged_chunks`, but replay safety alone does not ensure forward progress. Define bounded recovery from interruption DURING a multi-request result upload: identify the durable chunks/prefix with validated hashes/digest, skip verified work, and reconcile a lost staging response. Do not assume a count proves a contiguous prefix without enforcing or verifying it. Preserve sealed input hashes, chunk identity and final publication proofs. Cover claim pages that split one owner's audiences (CLAIM_PAGE is 100), old-self empty replacements and a complete input whose plan RPC response was lost. Test stage-origin source continuation and interruption after at least one result chunk commits, not only interruption after X and before stage begins.
+
+**E. Finish the exact schema/RPC protocol and failure mapping.** Provide full SQL argument types/defaults and precise JSON schemas (including whether `p_events` contains ordinals or the server assigns them), result fields and error codes for every operation. Define the only legal expected-state/sequence transitions, reject backwards phase changes and mutation of a complete journal, validate all 11 fields and site/event-ID binding without rejecting evidence the existing projector handles, and enforce hash audience completeness against member/old-self expectations. Bind processing purpose (plan/stage) as well as source-input phase. Validate batch/site/cutoff/rule/format and the current lease on every unfinished access, including reads and identical replay. Use the established control → site → batch lock order.
+
+Retain RLS, invoker functions, empty search_path and explicit service-only table/function grants. Add a bytewise `COLLATE "C"` owner keyset index if the list RPC is retained; a default-collation PK alone is not the indexed bytewise traversal used by 0043. Bound list responses by bytes as well as rows. Do not scan every journal from the beginning each invocation merely to find current owners; specify bounded lookup/list progress tied to current work.
+
+Define a canonical replay payload containing every transition field but excluding the replaceable lease fence. Distinguish retrying an identical in-flight payload after a lost response from a fresh process loading the already-advanced checkpoint; a fresh process cannot be assumed to retain the lost request. Reject conflicting/stale attempts and show takeover behavior for both cases. `written_fence` on one overwritten header is the last writer, not a history of every step; correct that evidence claim.
+
+Place owner-state adapters with the actual worker-state seam (`api/_lib/reporting-worker-state.ts`), naming any necessary `reporting-jobs.ts` changes separately. The current worker's `failureKind` does not map `owner_input_conflict` or `owner_input_format` to `conflicting_work`; specify those mappings and missing-function/schema-cache handling through the real RPC error shape, not SQLSTATE 42883 alone. Resolve the contradiction between checking migration availability after acquire and promising “nothing is written”: acquire can begin/resume a batch and copy/freeze can write before that check. Prefer a bounded, read-only capability/version check before acquisition, with an offline missing-migration test proving no batch/source/lease mutation.
+
+**F. Repair lifecycle compatibility and make cleanup rediscoverable.** 0043 `cleanup_reporting_history:513–530` deletes old `worker_owners` from published, abandoned and failed batches. The proposed non-cascading FK from `owner_inputs` blocks that existing function whenever a retained journal references one of those owners; retaining failed/abandoned journals makes this inevitable. “Old code ignores these tables” is not enough. For the revised proposal, prefer referencing the durable `batches` row and checking discovered-owner existence in live RPCs, while retaining all metadata needed for evidence after ordinary worker-state expiry. Do not add cascading deletion of retained journals. If a different solution requires replacing a cleanup definition, name the precise 0046 replacement and prove unchanged old-caller behavior and evidence retention.
+
+After publication, 0038/0039 clear active batch state; `acquire` does not recover published batches. Therefore “release continues in later invocations” needs an indexed, site-scoped discovery path and a cleanup-mode caller. Define a bounded deletion order (event rows first, then empty headers), an aggregate per-call deletion limit, idempotent replay, and a bounded `more`/existence check rather than an unrestricted `remaining` count. Never use `worker_batch` for published cleanup: it requires frozen state. Use the final-state lock/check described in section 3 below. A successful publish must remain `published` if later housekeeping times out or fails; report cleanup pending separately. Test partial release, process loss after publish, old-code cleanup after 30 days with each terminal batch state, concurrent cleanup and preservation of failed/abandoned evidence. Retained generations must remain readable through 0044.
+
+**G. Correct the acceptance proof and add the missing adverse cases.** In the actual `reportingPageGuard.test.ts:174–222` fixture, the line AND all 300 cancellations belong to PG-LONG. All 301 IDs enter context during MEMBERS. Paging the children mostly adds no distinct IDs. Consequently `event_count strictly increases between unfinished invocations` is impossible here. Assert durable sequence/phase/cursor advancement (and later chunk progress), with a nondecreasing exact distinct count, and no reread of a checkpointed prefix. Label reads by member-children versus predecessor-line-children/coalescing purpose: a global count of `p_after_event_id=null` conflates legitimate separate reads.
+
+Recalculate source calls from the actual path, including the 0045 cut and plain fallback, predecessor line's own children, empty terminators, journal activation/deltas/reloads, capability/list, renewals/retries, descriptor/manifest, claims, stage, publication, cleanup and run logging. The roughly five walk calls in the proposal are not a bound for a line whose 300 children are paged singly. Use fixture byte counts and a phase-by-phase worst-case call/time bound; declare one bound no greater than 20 and assert that bound (if claiming four, assert four as well). Keep 240,000 ms and 1,000 ms on EVERY RPC, fresh worker/process state and durable progress between unfinished invocations. Account separately for CPU and allowed in-flight overrun.
+
+Retain the proposed oracle comparison of exact descriptors, canonical hashes and all five result families, plus all boundary/tie/cancellation/no-lookahead/old-self suites. Add the A–F regressions, real small/byte-capped checkpoint reloads, malformed/mixed reload pages, initially absent journals in sealed stage, no-new-ID cursor checkpoints and prefix-free chunk continuation. The existing “three invocations stay pending” finding must become a positive publication regression once the repair is implemented. If that file changes, include the already-queued deterministic-clock and observable shared-renewal assertions. Offline SQL role tests must cover authenticated owner/manager/staff/kiosk/CS sessions as denied service APIs, anon denial and PUBLIC ACL revocation, plus invoker/search_path/RLS and old-worker compatibility on 0046.
+
+### 3. Decisions on the proposal's section 7
+
+1. **Checkpoint trigger:** choose bounded consumed-page/substep transitions as the persistence trigger; 30 seconds may be an additional flush signal, never the only safeguard. Heartbeat cadence stays unchanged. Short-owner optimisation is acceptable only with the explicit bounded spill/completion protocol in B, not an exemption from durability.
+2. **Missing 0046:** fail closed with a stable, redacted `migration_missing` outcome; no fallback to the known non-durable worker. Check compatibility before acquisition to support the proposed no-mutation guarantee. Incompatible checkpoint format also fails visibly and preserves evidence.
+3. **Release after publication:** use the existing worker's explicit cleanup mode for recoverable, indexed discovery and bounded draining of eligible published journals. An optional budgeted post-publish attempt may call the same helper, but cannot be the only recovery route. No new schedule/cron or automatic cleanup of failed/abandoned journals is authorised.
+4. **Reduced versus full images:** use exactly the reduced evidence covered by the canonical input hash. Full source images are unnecessary for this checkpoint. Preserve every existing field/value and ordering; reduced storage does not justify the new 16 KiB admissibility limit or an unproved reload bound.
+5. **Release fencing:** a live lease is unnecessary for immutable published-batch housekeeping. A service-only RPC must lock in the established control/site/batch order, recheck `state='published'` and its published-generation binding, restrict deletion to that batch's disposable journal, and refuse active/frozen/publishing/failed/abandoned batches. It must not rely on the frozen-only `worker_batch` helper. Specify concurrent/replayed release behavior and preserve the generation and publication receipt.
+
+These decisions resolve the five choices; they are instructions for revising the contract, not conditional approval to implement it.
+
+### 4. Next action, return package and release boundary
+
+**Exactly one next operative action — owner: Claude.** Append the revised, self-contained persistence proposal addressing A–G and section 3 to **`docs/plans/item-counting.md` only**, then return that plan-only handoff for planner review. This is authorised now under the existing offline delegation. Retain earlier tasks/checkboxes. Claude follows the recorded plan-only commit/handoff protocol; this planner makes no commit, push or state-changing git operation.
+
+**Implementation authorisation is NONE at this checkpoint.** No migration file, application edit, test edit/run that contacts a hosted service, staging inspection, worker invocation or database action is authorised. Migration **0046 remains reserved for an offline draft only after the revised contract is approved**; it must never be applied to staging or production under an implementation permission. The later approval must enumerate exact files/tests and commit order. Do not infer those permissions from the candidate seams or test names in this review.
+
+**What must return before any staging step:** first, the revised proposal with complete six-item coverage and an internally consistent cost proof, followed by explicit planner approval of its bounded implementation. After that separately authorised implementation, Claude must return exact commit IDs and changed-file list, the unapplied 0046 draft and migration-immutability evidence, local focused SQL/worker acceptance results (per-invocation progress/calls/bytes/time and oracle parity), failure/replay/takeover/cleanup/role/old-code results, the common typechecks including API/digest and staging-runner checks, full tests/build, and exact-head CI evidence under the normal workflow. Any missing or failed evidence must be stated, not filled in by assumption. The planner must then review the actual implementation and separately name the next staging action, its identity/preflight checks and restoration/rollback procedure. No staging command is pre-authorised by this return-package list.
+
+Hardening remains binding: no partial publication or credit changes; exact historical, UTC/site-time, audience and shared counting semantics; no source/inventory writes, new dependency, UI, Repository or Dexie change (this is a server reporting-worker contract); no checkpoint payloads in logs. Legacy reads and processors off remain the shop-floor fallback. A later rollback keeps additive schema and recovery evidence; no destructive down migration. Migration files 0037–0045 remain byte-identical. The accepted two-receipt staging exception is unchanged, not a history repair. Any future hosted action is staging-only **`ybrzhrgfrnvtcwymjdrq`**, after fresh identity/R0 and separate clearance; AU remains a candidate, UK/US evidence is preserved. Production **`lkboboagiikvozvbcpvg` is never touched, including reads**. No merge, deploy, app-ready generation or closure of Tasks 15–20 is implied.
+
+CJ has nothing to run or decide for the next action. The remaining path is: **revised persistence contract → planner approval → bounded offline implementation and review → separately cleared staging schema/identity/preflight and AU rehearsal → generation/Preview and role/parity/dry-digest/growth gates → CJ app testing**.
+
+STATUS: COMPLETE
+
+## Coder proposal r2 — T15P-4 durable owner-input continuation (supersedes the r1 proposal above), 2026-11-18
+
+Plan-only. It **supersedes the "Coder proposal — T15P-4 …" section in full**, answers the planner's amendments A–G and the §3 decisions, and keeps the six required items. No migration, application or test file is changed. All names are proposals for review.
+
+### 0. Summary of the design
+
+- **What is journaled.** An owner's consumed evidence events, in the exact reduced form `imageToEvent` produces: all 11 fields and values unchanged, so the canonical input is unchanged.
+- **When it is durable.** After every consumed page or substep, before the next dependent read, once the owner is *activated*. Activation happens at a fixed per-owner read count, with a bounded spill of what was consumed before it (B).
+- **Stage.** It can resume or create the journal itself (D), and skips chunks already staged and hash-verified (D).
+- **Cleanup.** Only published journals are drained, by the existing cleanup mode; failed and abandoned journals are kept (F).
+- **Read order and reducer.** The read order is unchanged, and the reducer, descriptor semantics and input hashes are untouched.
+- **What is guaranteed.** Liveness is guaranteed for every owner whose *journal reload plus its remaining work* fits one budget. §C states the exact remaining conflict for owners whose admissible *evidence itself* is too heavy to reload within 240 s. A planner decision is required there; it is not hidden.
+
+### A. Grouped reads and exact membership
+
+- **MEMBERS.**
+  - `state.m = {afterIndex, afterId}` is the 0041/0042 members keyset of the one-owner request. Every consumed members page is checkpointed.
+  - When the members read ends (an empty page), the checkpoint records **`membersCount = n`**: journal ordinals `1..n` are exactly the MEMBERS set, and nothing outside them is a member. This boundary is written once and is immutable.
+  - Partial membership (no `membersCount` yet) means MEMBERS is unfinished, and only the `m` keyset is meaningful.
+  - **cap+1.** A members page that makes the distinct count exceed 50,000 raises `PartitionTooLargeError` *before* checkpointing that page. The journal stays `reading` with ≤50,000 rows and no `membersCount`, so an overflow can never look like a completed member cursor. The owner then fails exactly as today (`partition_too_large`), and its journal is retained as evidence.
+- **PARENTS.**
+  - **The frozen parent list** is recomputed from MEMBERS only: the sorted unique `parent_event_id` of journal rows `1..membersCount` that is not itself one of those member ids. This is exactly today's `!context.has(p)` evaluated when `context` held only members, and it never shifts when found parents enter the context.
+  - `state.p = {group, afterId}`: `group` is the 0-based index of the 500-id request group over that frozen list, and `afterId` is the last returned id inside the current group (bytewise) or null.
+  - The pending ids of the current group are `group ids > afterId` (byte-capped continuation, as `byIds` does).
+  - **An empty response ends only the current group:** the remaining pending ids *of that group* are absent, and the state moves to `{group+1, null}`.
+  - Absent ids are therefore exactly "ids of groups < `group`, plus ids ≤ `afterId` in the current group, that are not in the journal". This is recomputable, never guessed.
+  - A wholly absent group is one call with an empty response, a checkpoint, and then the next group.
+- **MEMBER CHILDREN.** The parent ids are members `1..membersCount`, sorted bytewise, in groups of 1,000. `state.c = {group, afterParent, afterId}` holds the `read_reporting_children` keyset inside the current group. An empty page ends **only that group** and moves to `{group+1, null, null}`. A group with no rows is one empty call plus a checkpoint.
+- **Tests (new).**
+  - more than 500 requested parents (3 groups, with a wholly absent middle group and an absent suffix);
+  - more than 1,000 members (2 children groups, the first with no rows);
+  - byte-capped one-row pages in every group;
+  - an interruption at every group transition (before and after the empty page's checkpoint);
+  - the members cap+1 at 50,001 with a checkpoint at 49,999.
+
+### B. Checkpoint at every bounded read boundary
+
+- **Activation.**
+  - Every owner starts in memory, as today, and counts its own source RPCs.
+  - When the count reaches **K = 16** (or, earlier, when its consumed-but-unjournaled rows reach 1,000 or their reduced bytes reach 900 KiB), the owner **activates** at the next *seam* (below).
+  - Activation writes the bounded initial spill: `checkpoint` calls of at most 999 rows / 1 MiB each, each with the next seq. The first call creates the header with `state = {spill: true}`. The **last** spill call carries the real step state.
+  - No dependent read starts until that last spill call has committed. Before then, a fresh process sees `spill: true` and treats the journal as **not resumable**: it continues the spill only if it has the same events in memory, which a fresh process never has, so it discards the journal and restarts the owner from the source. That loses at most the activation window (≤16 reads, ≤1,000 rows), never more, and the cursor is never written before its events are durable.
+  - Owners that finish within 16 reads never write anything.
+- **After activation**, **every** consumed page or substep is checkpointed before the next dependent read:
+  - each members, parents or children page, including **empty-page group transitions** and pages whose rows are all already-seen ids (the cursor advances, and the delta may be empty);
+  - each stream page;
+  - each 0045 combined page once it has been consumed;
+  - each page of a consumed line's own cancellations.
+- **Seams in `exactWalk`.**
+  - **0045 combined page.** The combined page is one RPC. It is consumed in memory and then checkpointed as one substep. If its kids were cut, the page is discarded *before* any charge, as today, so there is nothing to checkpoint, and the plain fallback continues.
+  - **`provenChildren` and `coalescingChildren`.** An activated owner **bypasses both**, together with the outer coalescing view: it reads through the plain reader, so every RPC it makes is a checkpointable page. A non-activated owner may still use them. Its prefetch is lookahead-only, as today (never charged and never journaled). At activation, unconsumed prefetched rows are dropped and re-read through the plain route. Consumption order and no-lookahead are unchanged because the same pages are consumed in the same order.
+  - **State kept** in `state.w = {worker, cursor, stopAt, need, line}`:
+    - `line = {id, kidsAfter, done}` for a consumed line whose own cancellations are still being read; its kids so far are journaled;
+    - `line.done = true` with `effective` for a line that has finished while its worker is not yet finished, i.e. the "line finished but worker not finished" state (needed because the stop decision depends on it);
+    - `stopAt` once satisfied (ties are kept whole), and `need`.
+  - **Resume.** `cursor` is the last consumed event (exclusive). An unfinished `line` is resumed first, from `kidsAfter`. The stop instant is exactly `stopAt`.
+- **Guard and recursion.** Every source RPC still runs through the T15P-1/1a `pageGuard` (budget + heartbeat, with the post-renewal check). Checkpoint, lookup and load calls go through the **same client but are not frozen reads**, so they don't pass through `rpcFrozenReader.beforeRead`. Instead, the worker calls `b.need()` before each of them, and they never call `beat` themselves. A due renewal is taken only at the next source read's guard, so a checkpoint can never recursively trigger a checkpoint or a renewal. A checkpoint that exhausts the deadline returns pending with that checkpoint durable.
+
+### C. Sizes, reload accounting, and the exact remaining conflict
+
+- **No new data limit.** There is no 16 KiB check. `event` is the unmodified reduced image. Its size is already bounded by admissibility: a source frozen read must return the whole row inside 1 MiB (0041), so every admissible reduced event is ≤ 1 MiB − envelope. Nothing is truncated or altered. One event always fits one load response.
+- **Exact load envelope** (accounted like 0041: the `jsonb_agg` text of the whole response):
+  - the header row (`row_kind`, seq, phase, purpose, `members_count`, `event_count`, `state` ≤ 8 KiB, `input_hashes` ≤ 1,000 × ~110 B ≈ 108 KiB), plus event rows (`row_kind`, `ord`, `event_id`, `event`);
+  - at most **999 event rows** + 1 header per response, ≤ 1 MiB;
+  - the request arguments are fixed-size apart from `p_after_ord`;
+  - **EOF is a header-only response with `eof = true`** (the server sets it when no `ord > p_after_ord` exists). A byte cut always returns at least one event row after the header, so a header-only byte cut cannot happen.
+  - Every page repeats the header's `seq`/`event_count`. The client **pins** them on page 1 and rejects any later page whose header differs (a mixed snapshot), any `ord` gap, a missing row, or a final count ≠ `event_count`.
+  - Reload calls = `max(1, ceil(rows/999), bytes-driven pages) + 1` (the EOF page). The 300-cancellation owner (301 rows ≈ 0.12 MiB in the fixture) reloads in **2 calls**.
+- **Recovery when the evidence itself is heavy (the exact conflict).**
+  - Let `R` = the reload calls for an owner's complete journal, at 1 s/call simulated latency. The worker can make progress while `R + (remaining source calls + their checkpoints)` fits one budget (≈225 usable calls at 1 s). Source reading then progresses across invocations without limit, because each invocation reloads and then continues. A **complete** journal must be reloaded *and reduced* within one invocation to be planned or staged, because `projectReportingPartition` and the canonical hash need the whole input in one process.
+  - For an admissible owner with up to 50,000 events whose reduced size approaches 1 MiB, `R` reaches tens of thousands of calls, and no 240 s invocation can reload it. **The current reducer and canonical hash cannot be computed incrementally across invocations** without new projector or hash semantics, and that is not approved.
+  - This is not caused by the journal. The same owner cannot be read from the source in one invocation today either.
+  - **What this proposal guarantees:** liveness for every owner with `R_complete ≤ 120` (half the call budget, about 119k events of fixture size, or ≈119 MiB of reduced evidence), together with the source-continuation progress for all owners.
+  - **What it does instead of hiding the failure:** an owner whose complete journal exceeds the reload bound is reported as **`owner_input_too_heavy`** (the invocation fails visibly, with the owner and R in the run record). It is never dropped, never truncated and never published partially.
+  - **Planner decision required.** Either:
+    - (i) accept this declared bound as the T15P-4 liveness contract, with `owner_input_too_heavy` as a visible operational failure; or
+    - (ii) commission an incremental reduction/hash design (a separate scope that changes projector internals).
+  - It is not claimed universally.
+- **CPU and memory with concurrency.** Non-activated owners keep the worker's default group of 8 concurrent owners. **Activated owners run alone** (group size 1 for that owner, after the group's other owners settle), so peak memory is one heavy owner's input (≤50,000 reduced events) plus at most 7 light ones. The light ones are below K = 16 reads and 1,000 rows. Hashing and reduction run once per completion and once per stage reuse. That CPU (a few hundred ms for the fixture) is counted against the budget by `b.need()` before the next call, as an allowed in-flight overrun of at most one reduction.
+
+### D. Stage continuation
+
+- **Purpose binding.** The header has `purpose ∈ {'plan','stage'}` and `sealed_at_creation boolean`.
+  - **Plan journals** need `worker_batch(p_batch, p_fence, true)` (unsealed).
+  - **Stage journals** are created or resumed under a new `reporting_private.owner_input_batch(p_batch, p_fence)`. It calls `reporting_private.lock_batch(p_batch, p_fence, true)` (the same control → site → batch lock order and fence/lease checks) and requires `state = 'frozen'` **and** `sealed_at IS NOT NULL`.
+  - A stage write is allowed only for an owner that has sealed work rows in `partition_work` for that batch. It may only write journal rows, and never reopens planning.
+  - A plan journal reaching `complete` is reused by stage without rewriting. A stage journal is never used by plan.
+- **Stage resume.** A claimed owner with:
+  - a `complete` journal reloads, recomputes and hash-checks every claimed audience against the claim's `input_hash`, then stages;
+  - a `reading` journal (either purpose) resumes source reading under the stage purpose, which upgrades a plan journal's purpose to `stage` in that same checkpoint once the batch is sealed;
+  - no journal materializes as today, and activates at K like plan.
+- **Chunk progress.**
+  - `buildChunks(rows)` is deterministic, so a chunk's `chunkNo`, count and hash are fixed by the rows. A new read RPC returns the already-stored chunks: `public.read_reporting_staged_chunks(p_batch uuid, p_fence bigint, p_work_ids text[], p_after_work text, p_after_chunk integer, p_limit integer)` → `(work_id text, chunk_no integer, chunk_hash text)`, keyset `(work_id COLLATE "C", chunk_no)`, ≤1,000 rows, a sealed frozen batch only.
+  - Before uploading an owner's chunks, the worker reads the stored `(work_id, chunk_no, chunk_hash)`. It skips every chunk whose stored hash equals its locally computed hash, and **fails** on any stored hash that differs (`conflicting_work`). It uploads only the missing ones. This does not rely on contiguity or counts.
+  - **A lost staging response** is reconciled the same way on the next attempt: the chunk is present with the same hash, so it is skipped. 0038's per-chunk idempotency remains the second line of defence.
+- **Other stage cases.**
+  - **Claim pages that split an owner's audiences** (CLAIM_PAGE = 100): the journal is per owner, independent of claims. Each claim page uses only its claimed audiences; the hash check covers exactly those.
+  - **Old-self empty replacements:** the old self audiences come from the claims, which carry `audience_staff` from `worker_owners.old_staff`. Their hash is computed from the same events; for them the input is the self-filtered (possibly empty) view, exactly as today.
+  - **A complete journal whose `plan_reporting_owner` response was lost:** the next plan pass reloads, recomputes and calls `plan_reporting_owner` again. 0043 returns `replay = true` for identical descriptors.
+- **Tests.**
+  - a stage-origin journal (an owner that planned fast but has a slow stage, forced by per-phase latency);
+  - an interruption after ≥1 result chunk committed and before the owner's last chunk (the resume skips the verified chunks, and the total chunk uploads are exactly the chunk count + interruptions);
+  - a split claim page;
+  - old-self empty replacement;
+  - a lost `plan_reporting_owner` response;
+  - a lost stage response.
+
+### E. Exact schema and protocol
+
+```sql
+-- 0046_reporting_owner_inputs.sql (offline draft only after approval)
+CREATE TABLE reporting_private.owner_inputs (
+  batch_id         uuid        NOT NULL REFERENCES reporting_private.batches (batch_id),   -- NOT worker_owners (F)
+  partition_kind   text        NOT NULL CHECK (partition_kind IN ('order', 'event')),
+  partition_key    text        NOT NULL CHECK (partition_key <> ''),
+  site             text        NOT NULL CHECK (site IN ('au', 'uk', 'us')),
+  source_cutoff    timestamptz NOT NULL,
+  rule_version     text        NOT NULL CHECK (rule_version <> ''),
+  format_version   smallint    NOT NULL CHECK (format_version = 1),
+  purpose          text        NOT NULL CHECK (purpose IN ('plan', 'stage')),
+  phase            text        NOT NULL CHECK (phase IN ('spill', 'reading', 'complete')),
+  seq              bigint      NOT NULL CHECK (seq >= 1),
+  state            jsonb       NOT NULL CHECK (pg_catalog.octet_length(state::text) <= 8192),
+  members_count    integer     CHECK (members_count IS NULL OR members_count BETWEEN 0 AND 50000),
+  event_count      integer     NOT NULL CHECK (event_count BETWEEN 0 AND 50000),
+  input_hashes     jsonb,
+  last_payload_md5 text        NOT NULL CHECK (last_payload_md5 ~ '^[0-9a-f]{32}$'),
+  last_writer_fence bigint     NOT NULL CHECK (last_writer_fence >= 1),   -- the LAST writer only (not a history)
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (batch_id, partition_kind, partition_key),
+  CHECK ((phase = 'complete') = (input_hashes IS NOT NULL)),
+  CHECK (phase <> 'complete' OR members_count IS NOT NULL)
+);
+CREATE INDEX owner_inputs_keyset ON reporting_private.owner_inputs (batch_id, partition_kind COLLATE "C", partition_key COLLATE "C");
+CREATE INDEX owner_inputs_site_batch ON reporting_private.owner_inputs (site, batch_id);      -- cleanup discovery (F)
+CREATE TABLE reporting_private.owner_input_events (
+  batch_id       uuid    NOT NULL,
+  partition_kind text    NOT NULL,
+  partition_key  text    NOT NULL,
+  ord            integer NOT NULL CHECK (ord BETWEEN 1 AND 50000),
+  event_id       text    NOT NULL CHECK (event_id <> ''),
+  event          jsonb   NOT NULL,
+  PRIMARY KEY (batch_id, partition_kind, partition_key, ord),
+  UNIQUE (batch_id, partition_kind, partition_key, event_id),
+  FOREIGN KEY (batch_id, partition_kind, partition_key) REFERENCES reporting_private.owner_inputs (batch_id, partition_kind, partition_key)
+);
+-- RLS on both (no policies); REVOKE ALL ON TABLE ... FROM PUBLIC, anon, authenticated; GRANT SELECT, INSERT, UPDATE, DELETE ... TO service_role.
+```
+
+**Functions.** All are `LANGUAGE plpgsql`, `SECURITY INVOKER`, `SET search_path = ''`. EXECUTE is REVOKEd from PUBLIC, anon and authenticated and GRANTed to `service_role`.
+
+| function | arguments | result | errors |
+|---|---|---|---|
+| `public.reporting_owner_input_version()` | — | `integer` (1) | — (STABLE; called **before acquire**) |
+| `public.lookup_reporting_owner_inputs` | `(p_batch uuid, p_fence bigint, p_owners jsonb)` — 1..100 `[kind,key]` pairs, ≤64 KiB | `TABLE (partition_kind text, partition_key text, purpose text, phase text, seq bigint, members_count integer, event_count integer)` — only owners that have a journal | `owner_input_args` |
+| `public.load_reporting_owner_input` | `(p_batch uuid, p_fence bigint, p_kind text, p_key text, p_after_ord integer DEFAULT 0, p_limit integer DEFAULT 999)` | `TABLE (row_kind text, ord integer, event_id text, event jsonb, seq bigint, event_count integer, members_count integer, purpose text, phase text, state jsonb, input_hashes jsonb, eof boolean)` | `owner_input_binding`, `owner_input_format`, fence/lease errors |
+| `public.checkpoint_reporting_owner_input` | `(p_batch uuid, p_fence bigint, p_kind text, p_key text, p_expected_seq bigint, p_payload jsonb)` | `TABLE (seq bigint, event_count integer, replay boolean)` | `owner_input_conflict`, `owner_input_transition`, `owner_input_invalid`, `owner_input_binding`, `owner_input_format`, fence/lease errors |
+| `public.read_reporting_staged_chunks` | see D | see D | fence/lease, sealed only |
+| `public.release_reporting_owner_inputs` | `(p_site text, p_limit integer DEFAULT 5000)` | `TABLE (deleted integer, more boolean)` | `owner_input_args` |
+
+**`p_payload` (canonical JSON, keys sorted, no fence).**
+
+```
+{ "v": 1, "purpose": "plan"|"stage", "phase": "spill"|"reading"|"complete",
+  "state": {...}, "membersCount": n|null,
+  "events": [[ord, eventId, event], ...],
+  "inputHashes": [{"audienceKind","audienceStaff","inputHash"}...]|null }
+```
+
+- **Ordinals** are client-assigned; the server requires `ords = event_count+1 … event_count+len` contiguous.
+- **`events`**: 0..999 entries, ≤1 MiB including the envelope.
+- **Each event** must have exactly the 11 `imageToEvent` keys, typed as `imageToEvent` emits them (`line_quantity` as any JSON value, matching `q === undefined ? null : q`), with `location = site` and `id = eventId`. No other content check is made, so nothing the projector handles is rejected.
+- **The replay identity** is `md5(p_payload::text)` over that canonical text. The lease fence is excluded, so a takeover can retry an identical payload.
+
+**Transitions.**
+
+- **Legal:**
+  - none → `spill` (seq 1, first spill page);
+  - `spill` → `spill` (more spill pages);
+  - `spill` → `reading` (the last spill page with the real state);
+  - none → `reading` (activation with a single spill page);
+  - `reading` → `reading` (one substep);
+  - `reading` → `complete`;
+  - purpose `plan` → `stage` only when the batch is sealed, in a `reading` → `reading` or `reading` → `complete` step.
+- **Illegal:** any step out of `complete`, `complete` → anything, a backwards phase, a change of `membersCount` once set, or a change of the binding. These raise `owner_input_transition`.
+- **`complete`** requires `membersCount` to be set, and an `inputHashes` list that is the site audience exactly once plus self audiences, each a 64-hex hash, unique, ≤1,000. The server also requires the self set to **include** every distinct `staff_id` among journal rows `1..membersCount` and every `worker_owners.old_staff` of that owner. Any other self audiences are allowed only if they come from stage claims. For stage purpose, the server cross-checks the hashes against the `partition_work.input_hash` of the batch's sealed work for those audiences.
+
+**The checkpoint step, in order.**
+
+1. `worker_batch(p_batch, p_fence, true)` for purpose `plan`, or `owner_input_batch(p_batch, p_fence)` for `stage`. These lock the batch and check the fence and lease **on every call**, identical replays included.
+2. Check that `worker_owners` has the owner for the batch.
+3. Lock the header row `FOR UPDATE`.
+4. Check the binding: site, `source_cutoff`, `rule_version` and `format_version` equal the batch, the batch's rule version and 1; otherwise raise `owner_input_binding` or `owner_input_format`.
+5. **Replay:** if `header.seq = p_expected_seq + 1` and `last_payload_md5 = md5(p_payload)`, return `replay = true` and write nothing. **Conflict:** if `header.seq ≠ p_expected_seq`, raise `owner_input_conflict`.
+6. Otherwise validate, insert the events, update the header (`seq + 1`, phase, state, counts, hashes, md5, `last_writer_fence`, `updated_at`), all in one transaction.
+
+`load` and `lookup` run the same fence and binding checks.
+
+**Replay versus a fresh process.**
+
+- **Same process, lost response:** it retries the identical payload with the same `p_expected_seq`, and gets `replay = true`.
+- **Fresh process** (no memory of the lost request): it calls lookup, then load, and sees the advanced seq and state. It continues from the stored state and never re-sends.
+- **A stale attempt** (an old process still holding a payload for seq n when the header is at n+2): `owner_input_conflict`.
+- **Takeover:** the new fence passes the check. A fresh process loads, and an in-flight identical payload from the new holder is also a replay. An old fence is refused by `worker_batch` before any check.
+
+**Adapters, error mapping and missing 0046.**
+
+- **Adapters** live in `api/_lib/reporting-worker-state.ts`: `ownerInputVersion`, `lookupOwnerInputs`, `loadOwnerInput` (pins the snapshot and validates ords and counts), `checkpointOwnerInput` and `readStagedChunks`, plus `releaseOwnerInputs` for the cleanup mode. `reporting-jobs.ts` needs **no** change apart from re-using `RpcClient` and `ReportingJobError`.
+- **`failureKind`** in `production-reporting-worker.ts` gains:
+  - `owner_input_conflict` or `owner_input_format` → `conflicting_work`;
+  - `owner_input_too_heavy` → `owner_input_too_heavy`;
+  - `migration_missing` → `migration_missing`.
+- **Missing 0046.** The adapter detects it from the real RPC error shape: PostgREST `PGRST202` / "Could not find the function … in the schema cache", or `42883` from direct SQL. In either case it throws `ReportingJobError("reporting migration 0046 is not installed", "migration_missing")`.
+- **No mutation.** `runReportingCycle` calls `ownerInputVersion` **before `acquire`** (after the existing read-only status read). On failure it returns `failed` / `migration_missing` before any begin, resume, copy, freeze or lease. The offline test runs PGlite through 0045 and asserts that the batches, site_state, worker tables and source tables are byte-identical before and after.
+
+### F. Lifecycle compatibility and rediscoverable cleanup
+
+- **FK.** The FK goes to `batches` only, not `worker_owners`, so the existing 0043 `cleanup_reporting_history` keeps deleting old `worker_owners` unchanged. Live RPCs check the `worker_owners` row explicitly (E, step 2). The 0043 cleanup definition is not replaced.
+- **Evidence after worker-state expiry.** The journal header keeps batch, owner, site, cutoff, rule version, purpose, phase, seq, the counts and the last writer fence, so failed and abandoned evidence stays interpretable after `worker_owners` expiry. There is no cascade.
+- **Release (cleanup mode).**
+  - The existing `runReportingCycle(..., mode: "cleanup")` loop calls `releaseOwnerInputs(site)` after `cleanupHistory` until `more = false`. An optional budgeted post-publish attempt uses the same helper; publication stays `published` regardless, and a pending cleanup is reported separately as `counts.ownerInputsPending = true`.
+  - The server function, `release_reporting_owner_inputs(p_site, p_limit)`:
+    1. locks the control (`FOR SHARE`), then the site_state row (`FOR SHARE`), matching the established control → site → batch order;
+    2. selects up to `p_limit` journal rows via `owner_inputs_site_batch`, joined to batches with `state = 'published'` **and** a published generation for that batch (`generations.state IN ('published','superseded','expired')` with the batch's generation link). Active, frozen, publishing, failed and abandoned batches are never touched;
+    3. locks those batches `FOR SHARE`, deletes **event rows first** (aggregate ≤ `p_limit` rows per call), then the headers whose event rows are gone, within the same limit;
+    4. returns `deleted` and `more` (an `EXISTS` probe for any remaining eligible row, LIMIT 1).
+  - **Concurrency and replay.** A concurrent or replayed release is safe: the deletes are idempotent, and two callers serialize on the batch `FOR SHARE` plus row deletes, so a duplicate delete affects zero rows.
+  - Generations and publication receipts are untouched, so retained generations stay readable through 0044.
+  - `worker_batch` is never used for published cleanup.
+- **Tests.**
+  - a partial release (`p_limit` 10, then more);
+  - process loss after publish (a release runs later via the cleanup mode);
+  - old-code `cleanup_reporting_history` after 30 days for each terminal state (published, failed, abandoned) with journals present: it succeeds, and failed or abandoned journals remain;
+  - concurrent cleanup;
+  - generation readability (0044 reads) after release.
+
+### G. Corrected acceptance proof
+
+**Fixture facts.**
+
+- In `reportingPageGuard.test.ts` the line and all 300 cancellations are members of `PG-LONG`, so MEMBERS adds all 301 ids and later children pages add **no** new distinct id.
+- **Progress assertions** are therefore:
+  - strictly increasing `seq`;
+  - a strictly advancing `(phase, step, group, cursor)` in the decoded `state` between unfinished invocations;
+  - a non-decreasing exact distinct count.
+  - In stage: the stored-chunk set grows, or the owner completes.
+- **Reads are labelled by purpose** through a call-tagging test client (`members`, `parents`, `member-children`, `walk-stream`, `walk-0045`, `walk-line-children`, `coalesced`). The no-reread assertion is per purpose: each `(purpose, group, keyset)` position is requested at most `1 + interruptions` times.
+
+**Actual source path for this owner (1 worker, 1 line), at 1 s on EVERY RPC:**
+
+| phase | source calls | checkpoint calls | notes |
+|---|---|---|---|
+| MEMBERS | 1 page (301 rows) + 1 empty | 0 before activation | activation at K = 16 reads happens later |
+| PARENTS | 0 (every parent is a member) | 0 | |
+| MEMBER CHILDREN | 300 one-row pages + 1 empty (1 group) | activation spill after read 16: 1 call (301 rows < 999, ~0.12 MiB); then 1 per page ≈ 286 | 586 |
+| WALK | 0045 page before the latest instant: cut (300 kids > the page) → discarded → plain page (1) → consume the line (already seen) → its own children: 300 one-row pages + 1 empty → effective? (it is cancelled) → continue: the next plain page is empty (1) → stream end | 1 per page ≈ 304 | ≈ 607 |
+| COMPLETE | — | 1 (complete + hashes) | |
+| plan / seal | `plan_reporting_owner` 1, verify 1, manifest ≈2, seal 1 | — | 5 |
+| stage | claim 1, lookup 1, load 2 (301 rows + EOF), staged chunks 1, upload ≈2 | — | 7 |
+| publish / release | publish 1; release via cleanup mode, or the post-publish attempt 1–2 | — | ≈3 |
+| per invocation | status 1, version 1, acquire/resume 1, progress 1, run record 1, renewals ≈8 | — | ≈13 |
+
+- **Total source and checkpoint work** ≈ 586 + 607 + ~20 ≈ **1,213 calls**, plus ≈13 overhead per invocation. With ≈227 usable calls per invocation, the declared bound is **7 invocations** (≈1,213/214 = 5.7, rounded up, plus 1 for an interruption loss: each interruption loses at most the in-flight call, since every page is checkpointed).
+- **The test asserts `invocations ≤ 7`**, and separately `≤ 20`. It records the per-invocation calls, bytes and phases. CPU (projector per line/page, final reduction twice) is measured and asserted < 5% of the budget. The allowed in-flight overrun is ≤ `(OWNER_GROUP + 2)` calls, as already asserted.
+- **Exact output** against the uninterrupted oracle: descriptors, canonical hashes and all five result families are compared, plus `parityProblems` for the site and the worker.
+- **The existing "stays pending" finding** in `reportingPageGuard.test.ts` becomes a **positive publication regression**: ≤ 7 invocations, then published with parity. The queued deterministic-clock and observable shared-renewal assertions are added in the same change: hold one renewal open with ≥2 waiting readers, then assert one renewal and zero reads after it.
+
+**Further required cases (beyond A, D and F above).**
+
+- small and byte-capped checkpoint reloads (load `p_limit` 1, and a byte-capped event);
+- malformed and mixed reload pages: a changed header mid-load, an ord gap, a missing row, a count mismatch;
+- an initially absent journal in a sealed stage (a stage-origin journal);
+- no-new-ID cursor checkpoints (the member-children pages above);
+- prefix-free chunk continuation (stored chunk 2 of 3 present but chunk 1 missing → only chunk 1 is uploaded; a stored chunk with a different hash → `conflicting_work`);
+- missing-0046 no-mutation;
+- an unknown format;
+- conflict versus replay versus fresh-process continuation;
+- takeover;
+- the `owner_input_too_heavy` path, tested with a forced small reload bound in the test configuration only;
+- all the existing boundary, tie, hidden-cancellation, no-lookahead and old-self suites, plus a checkpoint variant of each.
+
+**Offline SQL role tests** (`tests/reporting/pg/owner-inputs.test.ts`):
+
+- every new function is denied to `authenticated` sessions with the owner, manager, staff, kiosk and CS JWT claims, and to anon;
+- the PUBLIC ACL is revoked;
+- invoker and empty search_path;
+- RLS is on with no policies;
+- the tables are service-only;
+- old-worker compatibility: the existing suites pass on 0037–0046 with the journal unused.
+
+### Decisions adopted from planner §3
+
+1. The trigger is per consumed page or substep after activation (B). Activation is count-based (K = 16) with the bounded spill protocol. The heartbeat cadence is unchanged.
+2. Fail closed with `migration_missing`, checked before acquire (E).
+3. Release runs in cleanup mode with indexed site-scoped discovery and an optional post-publish attempt (F). No new schedule.
+4. The journal stores reduced evidence exactly, with no new size limit (C).
+5. Release takes no fence and locks control → site → batch, with the published plus generation recheck (F).
+
+### Open for the planner
+
+- **§C decision (required):** accept the declared reload bound (`R_complete ≤ 120` calls) with a visible `owner_input_too_heavy` failure, or commission incremental reduction as a separate scope.
+- **Confirm K = 16** and the activation thresholds (1,000 rows / 900 KiB).
+
+STATUS: COMPLETE
+
+## Planner review — T15P-4 r2: changes required; bounded policy decisions, 2026-11-18
+
+**Verdict: changes required. Implementation is not authorised.** Reviewed r2 at `58be6cb9053895295edefb7b51a66028d66deec6` on `feature/item-counting`. R2 answers the earlier review substantially, but its activation, transport and sealed-read protocols still contain gaps that can reproduce the restart loop or reject previously admissible evidence. Claude has one next action under the recorded offline delegation: append a corrected, self-contained r3 proposal to this plan for review. CJ need not act or wake up.
+
+**Review evidence and limits.** Read AGENTS.md, ARCHITECTURE.md, ROADMAP (F1 and cross-cutting decisions), HARDENING.md, RELEASING.md and the operative proposal/review/delegation sections. Checked the actual owner/materializer/reader/worker/state/staging paths, the relevant storage and lease definitions in 0037–0039, bounded reads in 0041–0042, worker lifecycle in 0043, retained-read contract in 0044, and predecessor response in 0045. HEAD is the requested r2 commit; the initial tree was clean and 0046 is absent. This is static contract review, not fresh runtime evidence: no test suite, build, SQL execution, database connection, hosted service or CI was run. Only this section is appended; preceding bytes, tasks and checkboxes are retained. No commit, push or state-changing git command is performed by this planner.
+
+### 1. Explicit decisions on the two open points
+
+1. **Accept the 120-call reload ceiling as an explicit operational limitation for this scope.** An owner exceeding it must fail visibly as `owner_input_too_heavy`, retain its journal and frozen evidence, and block publication of that incomplete batch. This expressly relaxes the earlier demand for universal liveness for every byte-heavy but otherwise admissible 50,000-event owner. It does not lower the distinct-event limit, truncate evidence, change counting/hashing semantics or permit partial publication. Incremental reduction is **not commissioned** in T15P-4; any later design is separate reviewed scope. Legacy reads and processor-disable remain the operational fallback, not an automatic raw-history fallback inside this worker.
+
+   Define `R_complete` using deterministic production load packing, including metadata, fragments if necessary and the terminal EOF call; it is not merely `ceil(event_count/999)`. Pin how this cost is known and persisted, including when a partial journal already proves that completion cannot fit. Stop visibly at that point instead of endlessly returning pending while trying to load the prefix. A test-only smaller page limit must not silently redefine the production policy. The 120-call limit is a capacity policy, **not proof that every owner below it finishes within 240 seconds**: latency, all audiences' CPU/results, chunk discovery and uploads still count. State the latency/CPU assumptions of each liveness claim. Preserve the required deterministic fixture proof and report unsupported runtime capacity honestly. Do not relabel a transient connection failure as a heavy-input failure.
+
+2. **Confirm K = 16 source RPCs and the 1,000 distinct consumed-row / 900 KiB reduced-evidence activation triggers.** Activate on the first reached trigger, before the next dependent source call; K includes calls hidden inside member/by-ID/children iterators and prefetch. The row/byte triggers are activation watermarks, not response-size limits. R3 must state whether it splits consumption or permits one bounded page of overshoot. If it activates only after a whole page, the row bound is at most 1,999, not 1,000, and bytes can exceed 900 KiB by one response's reduced content. Account for this spill explicitly. A completed short owner may skip the journal only if no activation threshold was reached; “finishes within 16 reads” cannot override an earlier byte/row trigger. Heartbeat stays 30 seconds, lease 360 seconds, invocation budget 240,000 ms and evidence limit 50,000/50,001. These parameter decisions are final for r3; they do not clear the implementation defects below.
+
+### 2. Amendment-by-amendment disposition against the real code
+
+| Earlier amendment | R2 disposition and source check |
+| --- | --- |
+| **A — grouped reads/membership** | **Accepted in design.** `buildOwnerInput` freezes parents from members, `byIds` groups at 500 and `children` at 1,000; r2's immutable member-ordinal boundary and group-local empty completion match those paths. Keep its absent-middle/suffix, byte-cap, group-transition and cap+1 tests. Page-level implementation interfaces still need to support these states (correction 1). |
+| **B — bounded checkpoints/activation** | **Not satisfied.** Activated plain reads are the right direction, but inactive `provenChildren`/coalescing can hide hundreds of calls before any consumable seam. Spill discard has no legal RPC/transition. Journal-only work drops heartbeat coverage. See corrections 1–2 and 5. |
+| **C — exact sizes/reload/resource bound** | **Partly resolved by the decision above; transport remains blocked.** Removing 16 KiB is correct. A row fitting 0041's source envelope does not prove it fits r2's repeated header plus event envelope or checkpoint arguments. Eight-owner admission and all-audience reduction costs remain unproved. See corrections 3 and 6. |
+| **D — stage continuation** | **Direction accepted, protocol incomplete.** Stage-origin creation and hash-verified sparse chunk reuse address the actual restart/upload paths at worker `plan`/`stage`. Complete plan journals must be readable after sealing, and stage completion must cover old audiences outside the current claim page. See correction 4. |
+| **E — schema/protocol/errors** | **Partial.** Expected-sequence replay excluding fence, last-writer semantics, service-only invoker/RLS intent, worker-state adapter placement and real missing-function errors are sound. Reset, sealed reads, exact state validation, work-ID types and transport bounds remain incomplete. See corrections 2–5. |
+| **F — lifecycle** | **FK/discovery design accepted; locking claim needs correction.** Referencing `batches` avoids blocking 0043's 30-day `worker_owners` deletion, and cleanup-mode discovery fixes post-publication recovery. `FOR SHARE` does not serialize two release callers; specify a real serialization/order policy while retaining the aggregate deletion bound. See correction 7. |
+| **G — acceptance proof** | **Progress assertions corrected; cost proof still inaccurate.** All 301 PG-LONG events are members, so cursor/seq progress with nondecreasing count is correct. The existing fixture does not cut 0045 as r2 claims. Keep the oracle and adverse-case matrix, with the corrections in 8. |
+
+**Earlier §3 decisions:** (1) bounded-page checkpointing is adopted in intent but fails before activation; (2) fail-closed capability check before acquisition is accepted, subject to the no-mutation/logging detail below; (3) cleanup mode plus optional post-publish attempt is accepted; (4) exact reduced evidence remains mandatory, now with the explicit reload-cap exception but no new per-event size restriction; (5) no live fence for published cleanup is accepted, with control → site → batch order and a published-generation recheck. These are the only policy changes; old rules and publication proofs remain binding.
+
+### 3. Precise corrections for one replacement proposal
+
+**1. Expose bounded seams before activation as well as after it.** `rpcFrozenReader.members` and `byIds` collect multiple RPC pages before returning. `provenChildren` (`production-reporting-materialize.ts:408`) and `coalescingChildren` (`:1009`) may consume up to 1,000 one-row pages before yielding useful work. R2 bypasses them only after activation, leaving the initial starvation path intact. Specify page-level reader methods and exact request/result/continuation state, plus either a bounded prefetch interruption that returns control at K or bypassing these aggregating optimisations from the start of the durable route. Count/discard unconsumed prefetch without charging it or advancing the source cursor. No owner may wait for an unbounded helper to finish before checking its activation counter. Define the outer phase discriminator and pending stream-page handling: checkpoint a line before its dependent children reads; resume its child cursor before advancing to another line; do not mark a whole stream page consumed while any included candidate is unfinished. Retain `stopAt`, pending-line effectiveness and exact tie/no-lookahead behavior. Test crossing K inside each hidden loop, including repeated zero-new-ID pages, not only ordinary child iteration.
+
+**2. Supply a legal, bounded initial-spill recovery operation.** R2 says a fresh process discards `phase='spill'`, but E lists no reset RPC, no reset transition and no permitted live deletion. The PK, contiguous ordinals and expected-seq rules prevent simply inserting seq 1 again. Specify the reset/replay protocol (or make spill resumable without reset): exact signature, expected seq/attempt identity, fence/binding checks, deletion/write bound, lost-response replay and takeover. Only an unfinished spill of the current live owner may be reset; reading/complete and failed/abandoned evidence must not be deleted. Pin how the new attempt avoids reusing an old payload's replay identity. Recalculate maximum replay loss using correction 1's actual row/byte overshoot. Test a crash after every spill page, including the last response lost, stale reset and new-fence recovery. Preserve the rule that no final source cursor becomes durable before all its evidence.
+
+**3. Replace the unsupported single-event-fit assertion with exact transport framing.** 0041 bounds the entire source response, not a reduced event plus arbitrary new metadata. R2 repeats an up-to-8-KiB state and an audience hash list on every load page; that list is also larger than the proposed `1,000 × ~110 B` estimate when field names and UUIDs are included. A near-1-MiB source row can therefore fail both load and checkpoint envelopes. Provide a framing/fragment protocol or a proved envelope representation that carries every previously admissible event unchanged. This includes the FULL RETURNS TABLE row shape (null fields still serialize), RPC arguments and owner key, ordinals, duplicated identifiers, JSON escaping/JSONB whitespace, header/hash bytes and EOF. Do not claim load arguments are fixed-size: `p_key` is text. The lookup's 64-KiB request limit also needs splitting or a single-owner route for an already-admissible larger key; it cannot become an undocumented new owner limit. Keep all requests/responses at ≤1 MiB and responses at ≤1,000 rows, reject mixed seq/header snapshots and gaps, and never emit false EOF when an event cannot fit. Test near-boundary multibyte/escaped evidence with a large valid header, byte-cut pages and header-only EOF. Distinguish framing failure from the accepted aggregate 120-call capacity limit.
+
+**4. Make read/write purpose rules and stage audience coverage internally consistent.** `worker_batch(..., true)` in 0043 rejects sealed batches. R2 says load/lookup use the same checks as plan writes, yet stage must load a `purpose='plan', phase='complete'` journal after sealing without changing it. Define a read gate that permits that immutable reuse under a current frozen-batch fence; retain unsealed-only plan writes and sealed-only stage writes. Specify which purpose controls the gate for the legal plan→stage transition. Add `sealed_at_creation` to the actual schema/payload/binding or remove the contradictory promise in D. For stage-origin completion, enumerate all required audiences from full members, full `worker_owners.old_staff` and the sealed work, not only the current ≤100 claims: current worker stage passes only claimed self audiences as `oldStaff`. Reconcile this with E's all-audience hash requirement, including a missing old-self audience on a later claim page. Fully type/validate the state union, phase/group/cursor transitions, replay preconditions and hash audience shape; `state={...}` plus an 8-KiB CHECK is not a transition contract. Test sealed complete-plan load, plan→stage continuation and >100 audiences split across claims with an old-self empty replacement on a later page.
+
+**5. Restore guards and match existing adapter/storage types.** Use the nonrecursive `need → due single-flight beat → need` guard before each actual journal lookup/load/checkpoint, staged-chunk read/upload and each retry attempt while a live batch is held. Renewal calls themselves bypass that guard; this is already how the source guard avoids recursion. `b.need()` alone during a 120-call reload allows about two minutes without the required heartbeat. Include a renewal that finishes after the deadline and concurrent waiters on journal calls in the tests. Cleanup has no live lease and needs only budget/locking controls.
+
+`partition_work.work_id` and `partition_results.work_id` are **bigint** (0037), with a `(work_id,chunk_no)` index. Replace D's text/`COLLATE "C"` work-ID keyset with bounded bigint parameters and numeric ordering consistent with that index; keep decimal-string transport in the adapter where needed. Specify argument bounds/defaults, same-batch checks and whole-response byte bounds for staged-chunk reads, including unknown/foreign/extra chunk rejection. Use a numeric `counts.ownerInputsPending` flag (0/1) or explicitly propose the necessary type change: current cycle counts and run records are numeric, not boolean. Specify stable redacted heavy-input diagnostics and where the owner reference/cost survive: the existing `recordRun` call saves counts/failure kind, not the `problems` array. Also state whether pre-acquire `migration_missing` skips run logging: the existing unconditional `recordRun` writes a worker row. The promised byte-identical worker-table test requires an early return without that write, or an explicitly narrowed guarantee; choose the early return for this no-mutation path, including cleanup mode before any cleanup mutation.
+
+**6. Bound admission and completion costs, not only reload reads.** “Activated owners run alone after the other owners settle” is not sufficient with `materializeOwnerGroup`'s `Promise.allSettled`: several peers can activate, block one another's settlement or retain heavy inputs/results. Specify a nondeadlocking admission/parking sequence, which state is durable when a peer is parked and which arrays are released before the heavy owner proceeds. Preserve deterministic plan/stage order and the default eight-owner light path. Show the actual peak bound including one-response overshoot, prefetch and result arrays. `materializeOwnerWorks` runs `projectReportingPartition` and canonical hashing **per audience** and retains their outputs; “once per completion” understates that cost. Account for every allowed audience, chunk construction/hash discovery and useful upload progress after reload. Define the early heavy-cap check and the safe pending/failure behavior when a completion cannot fit; do not claim source continuation for all owners after accepting the heavy-input exception. Test multiple simultaneous activations, worst allowed audience fan-out and a near-ceiling reload followed by at least one durable plan/stage advancement. Do not increase budgets, change the reducer/hash semantics or treat unbounded synchronous reduction as an acceptable overrun.
+
+**7. Correct published-cleanup concurrency and lifecycle evidence.** Use a genuinely serializing site/batch or journal-row locking strategy in control → site → batch order; `FOR SHARE` locks are compatible with one another. Row deletes may wait, but that alone is not the claimed whole-release serialization or a deterministic multi-row lock order. Prefer the existing cleanup's site `FOR UPDATE` pattern and bounded, consistently ordered batch/journal selection. Pin `b.published_generation_id = g.generation_id`, site equality and published/superseded/expired generation eligibility under the locks, then delete event rows followed by empty headers with a single aggregate `p_limit`. Preserve index-based rediscovery, idempotent replay, failed/abandoned retention and retained-generation reads. Test true concurrent sessions or identify that proof as a later explicit gate if the offline engine cannot supply independent sessions. No unlimited retention cleanup for failed/abandoned evidence is added. Post-publish housekeeping failure must remain `published`, with numeric pending diagnostics.
+
+**8. Correct the fixture model and return a verifiable acceptance calculation.** The existing PG-LONG wrapper changes `p_limit` only for `read_reporting_children`. 0045 has its own 1,000-row/1-MiB response budget; its `p_limit` limits stream lines, not all response rows. The one line plus 300 small children plus `end` fits, so the asserted “300 kids > the page” cut is not this fixture's actual SQL path. Keep the original fixture as a positive publication regression and add a separately specified true combined-page cut/fallback case. Do not silently change the original fixture to match the estimate. Include copy/freeze/enumeration, capability checks, every reload, spill/replay/reset if applicable, empty terminators, renewals, claim/chunk discovery, publication and run logging in each case's call table. Count CPU and retries separately. Require ≤7 invocations for the declared r2 scenario only if the corrected calculation supports it; any revised exact bound must be stated and remain ≤20 with 1,000 ms on EVERY RPC and the unchanged 240,000 ms budget. State the interruption schedule: one allowed loss is not a guarantee under arbitrarily many crashes. No-reread assertions exclude only explicitly bounded initial activation replay and the in-flight uncommitted unit, label read purpose, and retain durable seq/cursor/chunk progress. Keep all A–G oracle/role/fence/old-code compatibility cases and the deterministic clock/observable shared-renewal corrections already queued for `reportingPageGuard.test.ts`.
+
+### 4. Hardening, next handoff and release boundary
+
+**Hardening disposition:** failure/retry/concurrency safety remains blocked by corrections 1–2, 4–5 and 7; data correctness remains exact member/context evidence, unchanged shared projector and immutable frozen UTC cutoff with the existing site-local reporting semantics (no new attribution, time or inference rule); security remains service-only private storage, RLS, invoker/empty search_path, explicit grants/revokes and bounded validated inputs, with denied anon and authenticated owner/manager/staff/kiosk/CS tests; performance remains blocked by 3, 6 and 8; operations use a redacted heavy-input failure, retained evidence and existing processor/read-mode controls; tests must cover each correction. Repository/Dexie changes, inventory/ledger changes and external integrations are n/a for this server reporting continuation repair and are not authorised.
+
+**Exactly one next T15P-4 action — Claude:** append r3 to `docs/plans/item-counting.md` only, superseding r2, incorporating these two decisions and all eight corrections without reopening accepted A/F design choices. Include the exact proposed implementation file list, draft SQL/API shapes, test-file/case map and a proposed commit order (protocol/storage with offline SQL tests, resumable input/adapters, worker plan/stage/cleanup integration and integrated evidence). Return the proposal with a correction-by-correction cross-reference and its offline cost tables. Do not implement opportunistic fixes while revising the contract. Independent work already authorised by CJ may continue only within its existing offline scope.
+
+**Implementation authorisation remains NONE:** no app/test edits and no 0046 file yet. `0046_reporting_owner_inputs.sql` stays reserved for an **offline draft only after explicit planner implementation approval**, never applied to staging or production under this delegation. Existing migrations stay byte-identical. No dependency, UI, Repository, source-capture, stock, schedule or reducer change is approved. No hosted calls, staging inspection/run, CI invocation, merge, deployment or push belongs to this overnight review/revision. Production **`lkboboagiikvozvbcpvg` is never touched**. The planner does not commit; this review does not expand the coder's existing local handoff protocol.
+
+**Later evidence/release gate:** after r3 approval and separately bounded implementation, return exact commits and changed-file list, append-only migration proof, focused regressions and exact local typecheck/API-typecheck/full-test/build results, invocation traces (calls/bytes/CPU/progress), exact descriptor/hash/five-family parity, role/fence/replay/cleanup/old-worker proof and all unexecuted limitations. No fresh CI or staging success is implied here. A later separately authorised staging gate must cover worker interruption/takeover and heavy-input visibility, retained-read parity, all five denied service roles, old-app compatibility and rollback controls. CJ retains SQL application, merge and deployment. Rollback remains processor disable/legacy mode or prior compatible code, retaining additive tables/evidence without destructive down SQL. This review completes the requested planner decision; the implementation gate is failed for the reasons above, and only the r3 proposal may proceed.
+
+STATUS: COMPLETE
