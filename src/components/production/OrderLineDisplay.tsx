@@ -37,6 +37,22 @@ const TONE_CLASS: Record<OrderLineColourTone, string> = {
     "bg-slate-100 text-slate-600 ring-2 ring-slate-300 dark:bg-slate-800 dark:text-slate-300 dark:ring-slate-600",
 };
 
+// Only real frame colours are announced as a frame colour; neutral
+// blocks are announced as a style so they never imply a frame.
+function colourBlockLabel(tone: OrderLineColourTone, colourLabel: string): string {
+  switch (tone) {
+    case "black":
+    case "white":
+    case "natural":
+      return "Frame colour: " + colourLabel;
+    case "unframed":
+    case "canvas":
+      return "Style: " + colourLabel;
+    case "unknown":
+      return "Style: Unknown";
+  }
+}
+
 export function OrderLineDisplay({
   title,
   sku,
@@ -116,7 +132,7 @@ export function OrderLineDisplay({
       </div>
 
       <div
-        aria-label={"Frame colour: " + pres.colourLabel}
+        aria-label={colourBlockLabel(pres.colourTone, pres.colourLabel)}
         className={
           "shrink-0 w-24 sm:w-28 min-h-[4rem] rounded-xl px-2 flex items-center justify-center text-center text-sm font-black uppercase tracking-wide leading-tight " +
           TONE_CLASS[pres.colourTone]

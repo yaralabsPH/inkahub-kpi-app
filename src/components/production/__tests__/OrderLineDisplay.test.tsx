@@ -199,7 +199,7 @@ describe("OrderLineDisplay", () => {
   it("labels unframed prints without a frame colour", () => {
     const html = render({ sku: "INKA-S2BON0064-A1-UN", variantTitle: null });
     expect(html).toContain(">Unframed<");
-    expect(html).toContain("Frame colour: No frame");
+    expect(html).toContain("Style: No frame");
     expect(html).not.toContain(">Framed<");
   });
 
@@ -208,6 +208,28 @@ describe("OrderLineDisplay", () => {
     expect(html).toContain(">Frame only<");
     expect(html).toContain("Frame colour: White");
     expect(html).not.toMatch(/print/i);
+  });
+
+  // Only real frame colours are announced as "Frame colour"; neutral
+  // blocks are announced as a style so nothing implies a frame.
+  const labelCases: Array<[string, string, string | null, string]> = [
+    ["framed black", "INKA-KAN0566-A4-FB", null, "Frame colour: Black"],
+    ["framed white", "INKA-KAN0566-A3-FW", null, "Frame colour: White"],
+    ["framed natural", "INKA-S3WIL0049-A2-FN", null, "Frame colour: Natural Timber"],
+    ["frame-only black", "INKA-PF0004-A0-PB", null, "Frame colour: Black"],
+    ["frame-only white", "INKA-PF0004-A2-PW", null, "Frame colour: White"],
+    ["frame-only natural", "INKA-PF0004-A4-PN", null, "Frame colour: Natural Timber"],
+    ["unframed", "INKA-S2BON0064-A1-UN", null, "Style: No frame"],
+    ["canvas", "INKA-KAN0566-A0-SC", null, "Style: Stretched canvas"],
+    ["unknown", "OLD-SKU-123", "A4 21x30 cm / Framed Print (Black)", "Style: Unknown"],
+    ["gift card", "INKA-GC0001-100", null, "Style: Unknown"],
+    ["AUX", "INKA-AUX-HOOK", null, "Style: Unknown"],
+  ];
+
+  it.each(labelCases)("announces the %s block (%s)", (_name, sku, variantTitle, label) => {
+    const html = render({ sku, variantTitle, orientation: null });
+    expect(html).toContain('aria-label="' + label + '"');
+    if (label.startsWith("Style:")) expect(html).not.toContain("Frame colour:");
   });
 
   it("keeps the Shopify description for unknown SKUs and does not guess a colour", () => {

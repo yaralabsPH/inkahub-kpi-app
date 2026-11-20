@@ -69,3 +69,4 @@ This follows the selected component-and-helper approach in the spec. It avoids a
 ## Implementation log
 
 - Task 1: added `getOrderLinePresentation` + `OrderLineDisplay` (18 tests, red first) and swapped the Production line body for it; handlers, `<li>` state styling and badges stay in `Production.tsx`. Canvas shows "Unframed" + "Stretched canvas"; gift cards/AUX show "Unknown style" with their description. Removed four now-unused imports. `Production.tsx` has mixed CRLF/LF endings; new lines use LF.
+- Review fix: colour-block `aria-label` now derives from tone - "Frame colour: …" only for black/white/natural (prints and frame-only), "Style: No frame" / "Style: Stretched canvas" / "Style: Unknown" for unframed, canvas, unknown, gift-card and AUX; 11-case label matrix added red first. Visual text unchanged.
