@@ -27,7 +27,7 @@ This follows the selected component-and-helper approach in the spec. It avoids a
 
 ## Tasks
 
-### [ ] Task 1: Add and integrate the order-line presentation
+### [x] Task 1: Add and integrate the order-line presentation
 
 - Files: `src/components/production/OrderLineDisplay.tsx`, `src/components/production/orderLinePresentation.ts`, `src/components/production/__tests__/OrderLineDisplay.test.tsx`, `src/pages/Production.tsx`
 - Interfaces:
@@ -68,4 +68,4 @@ This follows the selected component-and-helper approach in the spec. It avoids a
 
 ## Implementation log
 
--
+- Task 1: added `getOrderLinePresentation` + `OrderLineDisplay` (18 tests, red first) and swapped the Production line body for it; handlers, `<li>` state styling and badges stay in `Production.tsx`. Canvas shows "Unframed" + "Stretched canvas"; gift cards/AUX show "Unknown style" with their description. Removed four now-unused imports. `Production.tsx` has mixed CRLF/LF endings; new lines use LF.
