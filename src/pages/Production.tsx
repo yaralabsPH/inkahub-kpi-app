@@ -7,6 +7,7 @@ import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
+import { OrderLineDisplay } from "@/components/production/OrderLineDisplay";
 import {
   loadStationConfig, saveStationConfig, clearStationConfig,
   type StationConfig,
@@ -16,11 +17,7 @@ import {
   isSkuProductionRelevant,
   isSkuVerifiable,
   isLineMyDept,
-  describeSku,
   skuTypeBadge,
-  variantChipClass,
-  friendlySize,
-  friendlyVariant,
   parseSku,
   kpiUnitMultiplier,
   isKpiEligibleSku,
@@ -1975,101 +1972,64 @@ function ActiveScreen({
                     className={containerCls + (orient ? " relative pl-3" : "")}
                     onClick={verifiable && !isVerified ? () => onVerifyLine(line) : undefined}
                   >
-                    <div className={
-                      "text-xl font-bold tabular-nums w-12 text-right " +
-                      (line.quantity > 1 ? "text-red-600 dark:text-red-400" : "text-slate-700 dark:text-slate-300")
-                    }>
-                      {"x" + line.quantity}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <div className={"text-sm font-semibold truncate " + (isMine ? "text-slate-900 dark:text-slate-100" : "text-slate-500")}>
-                          {line.title || line.sku}
-                        </div>
-                        <span className="shrink-0 inline-flex items-center rounded-full bg-slate-200 dark:bg-slate-700 text-[9px] font-bold uppercase tracking-wide text-slate-700 dark:text-slate-200 px-1.5 py-0.5">
-                          {skuTypeBadge(line.sku)}
-                        </span>
-                        {!isMine && verifiable && !isVerified ? (
-                          <span className="shrink-0 inline-flex items-center rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5">
-                            {line.dept ? PRODUCTION_DEPARTMENT_LABELS[line.dept] : "Other dept"}
+                    <OrderLineDisplay
+                      title={line.title}
+                      sku={line.sku}
+                      quantity={line.quantity}
+                      variantTitle={line.variantTitle ?? null}
+                      orientation={orient}
+                      isMine={isMine}
+                      badges={
+                        <>
+                          <span className="shrink-0 inline-flex items-center rounded-full bg-slate-200 dark:bg-slate-700 text-[9px] font-bold uppercase tracking-wide text-slate-700 dark:text-slate-200 px-1.5 py-0.5">
+                            {skuTypeBadge(line.sku)}
                           </span>
-                        ) : null}
-                      </div>
-                      {parsed && parsed.size ? (
-                        <div className="mt-1 flex items-center gap-2 flex-wrap text-[12px] text-slate-700 dark:text-slate-200">
-                          <span className="font-semibold">{friendlySize(parsed.size)}</span>
-                          {parsed.variant ? (
-                            <span className={variantChipClass(parsed.variant)}>
-                              {friendlyVariant(parsed.variant)}
+                          {!isMine && verifiable && !isVerified ? (
+                            <span className="shrink-0 inline-flex items-center rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5">
+                              {line.dept ? PRODUCTION_DEPARTMENT_LABELS[line.dept] : "Other dept"}
                             </span>
                           ) : null}
-                          {orient ? (
-                            <span
-                              className={
-                                "inline-flex items-center gap-1.5 rounded-md text-[11px] font-bold uppercase tracking-wide px-2 py-0.5 ring-1 " +
-                                (orient === "portrait"
-                                  ? "bg-blue-100 text-blue-900 ring-blue-400 dark:bg-blue-900/40 dark:text-blue-100 dark:ring-blue-600"
-                                  : "bg-orange-100 text-orange-900 ring-orange-400 dark:bg-orange-900/40 dark:text-orange-100 dark:ring-orange-600")
-                              }
-                              aria-label={orient === "portrait" ? "Portrait orientation" : "Landscape orientation"}
-                            >
-                              <span
-                                className={
-                                  orient === "portrait"
-                                    ? "inline-block w-1.5 h-2.5 bg-blue-800 dark:bg-blue-200 rounded-[1px]"
-                                    : "inline-block w-2.5 h-1.5 bg-orange-800 dark:bg-orange-200 rounded-[1px]"
-                                }
-                                aria-hidden="true"
-                              />
-                              {orient === "portrait" ? "Portrait" : "Landscape"}
-                            </span>
-                          ) : null}
-                          {parsed.type === "set_print" ? (
-                            <span className="text-[10px] uppercase tracking-wide text-slate-500">
+                          {parsed?.type === "set_print" ? (
+                            <span className="shrink-0 text-[10px] uppercase tracking-wide text-slate-500">
                               Set of {parsed.setCount}
                             </span>
                           ) : null}
-                        </div>
-                      ) : (
-                        <div className="text-[12px] text-slate-600 dark:text-slate-300 mt-0.5 truncate">
-                          {line.variantTitle ?? describeSku(line.sku)}
-                        </div>
-                      )}
-                      <div className="text-[10px] font-mono text-slate-400 dark:text-slate-500 truncate mt-0.5">
-                        {line.sku}
-                      </div>
-                    </div>
-                    {isVerified ? (
-                      <div className="flex items-center gap-2">
-                        <div className="flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300 font-semibold whitespace-nowrap">
-                          <Check size={14} />
-                          <span>
-                            {staffNames.get(verifiedRec.staff_id) ?? "Staff"} - {verifiedTime}
-                          </span>
-                        </div>
-                        {isMine ? (
+                        </>
+                      }
+                      actions={
+                        isVerified ? (
+                          <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300 font-semibold whitespace-nowrap">
+                              <Check size={14} />
+                              <span>
+                                {staffNames.get(verifiedRec.staff_id) ?? "Staff"} - {verifiedTime}
+                              </span>
+                            </div>
+                            {isMine ? (
+                              <button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); onUnverifyLine(line); }}
+                                className="text-[11px] text-slate-500 hover:text-rose-600 dark:hover:text-rose-400 underline underline-offset-2 font-medium"
+                              >
+                                Undo
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : !verifiable ? (
+                          <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold whitespace-nowrap">
+                            No verify needed
+                          </div>
+                        ) : (
                           <button
                             type="button"
-                            onClick={(e) => { e.stopPropagation(); onUnverifyLine(line); }}
-                            className="text-[11px] text-slate-500 hover:text-rose-600 dark:hover:text-rose-400 underline underline-offset-2 font-medium"
+                            onClick={(e) => { e.stopPropagation(); onVerifyLine(line); }}
+                            className="px-3 py-1.5 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 whitespace-nowrap"
                           >
-                            Undo
+                            Verify
                           </button>
-                        ) : null}
-                      </div>
-                    ) : !verifiable ? (
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold whitespace-nowrap">
-                        No verify needed
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={(e) => { e.stopPropagation(); onVerifyLine(line); }}
-                        className="px-3 py-1.5 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 whitespace-nowrap"
-                      >
-                        Verify
-                      </button>
-                    )}
+                        )
+                      }
+                    />
                   </li>
                 );
               })}
