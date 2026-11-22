@@ -364,6 +364,24 @@ The user reproduced the coder's 2026-11-22 notes in this planning request, remov
 - **Operational conclusions retained:** static access token/old Shopify version are not adequate evidence for sustained integrations; add refresh credentials and current pinned catalogue version, with CJ reauthorisation/registration. A webhook is account notification plus durable cursor processing, not a file payload. No reliance on Dropbox's small-image thumbnail API is needed for the chosen baseline; any future fast path requires a separate verified eligibility test.
 - **Still unverified:** live schemas/Storage policies, current originals/aliases across shops, remote webhook registrations/scopes, Vercel plan/Fluid memory/cadence and worst-case performance. These have explicit Tasks 3, 8, 10, 13–14, 17, 22 gates; closing question 8 does not mark them complete.
 
+### Coder stop — Task 3 blocked: Vercel project is not on Pro (2026-11-22)
+
+CJ confirmed on 2026-11-22 that the Vercel project is **not on Pro**. Question 4's default assumed a confirmed 4 GB paid allocation and per-minute crons, so by this plan Task 3 stops and Tasks 4–22 do not start. No benchmark endpoint, `vercel.json` change or Preview deployment has been made.
+
+What the current plan needs that a non-Pro account does not give (recheck against [Vercel limits](https://vercel.com/docs/functions/limitations) for this account; not measured):
+
+- **Memory.** The resource envelope (150 MB / 300 MP sources, combined memory under 3 GB) was sized for a 4 GB function. Hobby functions are capped well below that (2 GB published). A full 300 MP decode is roughly 0.9 GB at 8-bit RGB and about 2.4 GB at 16-bit RGBA before libvips overhead, so the worst cases in the fixture suite cannot be shown to fit.
+- **Cadence.** Hobby crons run at most once a day. The one-minute recovery and 15-minute catch-up crons cannot be configured, and the plan already says daily-only recovery cannot silently meet the target.
+- **Duration.** The 120 s end-to-end target and 90 s worker budget need to be confirmed against this account's maximum duration.
+- **Terms.** Vercel's Hobby tier is described as for personal, non-commercial use; this app runs a business. CJ should confirm this is acceptable independently of F3.
+
+Decision needed from CJ (the coder does not choose or redesign):
+
+1. **Upgrade the project to Pro.** The approved spec and plan stand unchanged; Task 3 proceeds as written once 4 GB and 120 s are confirmed.
+2. **Keep the current plan tier and ask the planner to revise** the worker/scheduler design and the resource envelope. Directions the planner could weigh include a lower source envelope that fits the available memory, an external scheduler for the recovery/catch-up cadence, or the dedicated converter service from question 6. Any of these changes the spec's limits or architecture and needs a revised spec/plan and CJ approval before Task 3.
+
+Tasks 1–2 (type-check gate, converter, hashing, policy and tests) are independent of the hosting choice and stay valid either way; their limits are constants in `src/lib/domain/artworkImagePolicy.ts`.
+
 Provider links in the draft spec remain the implementation reference for OAuth, raw-body HMAC, paging and post-response lifetime. Supabase changelog/storage docs, Vercel limits and Sharp constructor were consulted during planning on 2026-11-22; re-check API versions/package compatibility during implementation, without treating documentation as proof of this account's setup.
 
 ## Implementation log
@@ -371,3 +389,4 @@ Provider links in the draft spec remain the implementation reference for OAuth, 
 - Planning only, 2026-11-22: draft written from the template/spec; supplied discovery notes reconciled. No implementation task, staging benchmark, database test or CI run has been completed by this planning pass. No app code, provider configuration or migration was changed.
 - Task 1, 2026-11-22: added `tsconfig.artwork-api.json` + `npm run typecheck:artwork` (strict, Node types, allowJs/checkJs for .mjs) and a CI step; whitelisted the config. It immediately caught a type-only error in `api/dropbox/artwork-image.ts` (file not listed in the plan): `.catch` on a PromiseLike query builder; wrapped in `Promise.resolve`, same runtime behaviour. Negative check (deliberate error in `tests/api/artwork/`) failed as expected, then removed.
 - Task 2, 2026-11-22: pinned `sharp@0.35.5` (libvips 8.18.7; lockfile carries linux-x64 prebuilds). Added pure `artworkImagePolicy.ts` (limits, format/depth/pages policy, output check, row-major `setCellLayout` with 4 px gaps on a 400 px square), server `contentHash.ts` (Dropbox 4 MiB block hash + capped, deadline-bound streaming to a new file, which also covers the download cap; no extra file), `converter.ts` + `converter-child.mjs` (fork per job, concurrency 1, cache off, TMPDIR in scratch, probe → policy in parent → convert, SIGKILL + reap at deadline, budget/scratch checks, compose on #f2f2f2, `verifyReducedImage`). Surprises: Sharp cannot write 16-bit TIFF, so that fixture moved to the Task 3 suite (`tests/artwork/fixtures/README.md`); `api/` imports use explicit `.js` extensions because Vercel runs these files as ES modules — Task 3 must confirm Vercel resolves `../../../src/lib/domain/artworkImagePolicy.js` and bundles the child `.mjs` (it is referenced via `new URL(..., import.meta.url)`). Policy module was written before its tests (tests then passed first run); server tests were written first and observed failing. Local timing (Windows, Node 24): 48 MP JPEG 217 ms, 25 MP noise PNG 407 ms — not Task 3 evidence. 15 policy + 32 server tests pass.
+- Task 3 stopped, 2026-11-22: CJ confirmed the Vercel project is not on Pro. Recorded under Open questions ("Coder stop — Task 3 blocked"); no benchmark code, vercel.json change or deployment made. Waiting for CJ: upgrade to Pro, or planner revision of worker/scheduler/envelope.
