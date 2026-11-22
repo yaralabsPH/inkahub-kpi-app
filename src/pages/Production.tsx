@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Settings as SettingsIcon, LogOut, ScanLine,
   Play, Check, X as XIcon,
 } from "lucide-react";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
+import { useOrderPackaging } from "@/lib/hooks/useOrderPackaging";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
@@ -15,6 +16,7 @@ import {
   readTabOverride,
   resolveStationUi,
   stationNeedsPackaging,
+  type StationPackagingMode,
 } from "@/components/production/station/stationScreenModel";
 import {
   loadStationConfig, saveStationConfig, clearStationConfig,
@@ -356,11 +358,24 @@ function ProductionStation({
     } | null;
   } | null>(null);
 
+  // F4 box-auto-pick. In scan mode (default) this only reads the site
+  // setting; every packaging path below behaves exactly as before.
+  const packaging = useOrderPackaging({
+    client: supabase,
+    location,
+    department: station.department,
+    order: currentOrder,
+    csCaseId: activeCase?.caseId ?? null,
+    onError: onScanError,
+  });
+  const packagingMode = packaging.mode;
+
   // Auto-assign mail tube at unframed station based on order contents.
   // Runs whenever the current order changes. Cleared when order clears.
   useEffect(() => {
     if (!currentOrder) return;
     if (station.department !== "unframed") return;
+    if (packagingMode === "auto") return; // F4: the rules pick the tube
     const skus = currentOrder.lines.map((l) => l.sku);
     const tubeId = autoMailTubeForUnframedOrder(skus);
     if (tubeId) {
@@ -371,7 +386,7 @@ function ProductionStation({
         return next;
       });
     }
-  }, [currentOrder, station.department]);
+  }, [currentOrder, station.department, packagingMode]);
   // Phase 5: when an order loads, fetch line_verified + cancelled events,
   // filter out verifies that have been cancelled, and resolve the verifier
   // display names via staff_barcodes.
@@ -1043,8 +1058,12 @@ function ProductionStation({
       // Add packages to the deduction list. They deduct from the same RPC -
       // the cache key is the product code (for scanned packages) or product
       // id (for auto-assigned mail tubes); the RPC handles both.
-      for (const [pkgKey, qty] of packages.entries()) {
-        componentMap.set(pkgKey, (componentMap.get(pkgKey) ?? 0) + qty);
+      // F4: in auto mode packaging goes through packaging_apply below, never
+      // through this call.
+      if (packagingMode !== "auto") {
+        for (const [pkgKey, qty] of packages.entries()) {
+          componentMap.set(pkgKey, (componentMap.get(pkgKey) ?? 0) + qty);
+        }
       }
       if (componentMap.size > 0) {
         const componentArray = Array.from(componentMap.entries()).map(
@@ -1065,11 +1084,15 @@ function ProductionStation({
     } catch (e) {
       console.error("[auto-deduct] exception:", e);
     }
+    // F4: record and deduct the packaging for this completion. A no-op in
+    // scan mode. Not awaited: a slow or failed save queues on the device and
+    // never holds up the bench.
+    if (packagingMode === "auto") void packaging.applyAfterEvent(inserted, currentOrder.number);
     window.setTimeout(() => {
       setCurrentOrder(null);
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.applyAfterEvent]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
@@ -1559,7 +1582,7 @@ function ProductionStation({
           ) : null}
           activeCase={activeCase}
           packages={
-            stationNeedsPackaging(station.department)
+            stationNeedsPackaging(station.department, packagingMode)
               ? {
                   required: true,
                   auto: station.department === "unframed",
@@ -1690,6 +1713,8 @@ function ProductionStation({
               })
             }
             onClearPackages={() => setPackages(new Map())}
+            packagingMode={packagingMode}
+            packagingSlot={null}
             verifiedLines={verifiedLines}
             onVerifyLine={(line) => void handleVerifyLine(line)}
             onUnverifyLine={(line) => void handleUnverifyLine(line)}
@@ -1854,7 +1879,7 @@ function ActiveScreen({
   currentOrder, lineStates, dispatchFlash,
   onStartLine, onCompleteLine, onCancelLine, onClearOrder, onCompleteOrder, onScrapOrder, todayLineUnits,
   onManualOrderSubmit,
-  packages, onRemovePackage, onClearPackages,
+  packages, onRemovePackage, onClearPackages, packagingMode, packagingSlot,
   verifiedLines, onVerifyLine, onUnverifyLine, staffNames, activeCase,
   supabase, location, onSetActiveStaff,
 }: {
@@ -1877,6 +1902,10 @@ function ActiveScreen({
   packages: Map<string, number>;
   onRemovePackage: (key: string) => void;
   onClearPackages: () => void;
+  /** F4: "auto" hides the box-scan panels and never blocks Complete on packaging. */
+  packagingMode: StationPackagingMode;
+  /** F4: the auto-pick panel, shown in place of the scan panels in auto mode. */
+  packagingSlot: ReactNode;
   verifiedLines: Map<string, { event_id: string; staff_id: string; dept: string; time: string }>;
   onVerifyLine: (line: OrderLine) => void;
   onUnverifyLine: (line: OrderLine) => void;
@@ -2194,8 +2223,11 @@ function ActiveScreen({
             </div>
           </div>
 
+          {/* F4 auto mode: the app picks the packaging; no scan panels. */}
+          {packagingMode === "auto" ? packagingSlot : null}
+
           {/* Package selector - shown when station requires packaging */}
-          {stationRequiresPackages(department) ? (
+          {packagingMode !== "auto" && stationRequiresPackages(department) ? (
             <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 p-5">
               <div className="text-xs uppercase tracking-widest text-slate-500 mb-3 flex items-center justify-between">
                 <span>Packages for this shipment</span>
@@ -2245,7 +2277,7 @@ function ActiveScreen({
           ) : null}
 
           {/* Auto mail-tube info shown at unframed station */}
-          {department === "unframed" && packages.size > 0 ? (
+          {packagingMode !== "auto" && department === "unframed" && packages.size > 0 ? (
             <div className="rounded-2xl ring-1 ring-emerald-200 dark:ring-emerald-800 bg-emerald-50/60 dark:bg-emerald-900/20 p-4">
               <div className="text-[10px] uppercase tracking-widest text-emerald-700 dark:text-emerald-300 font-bold mb-1">
                 Auto-assigned packaging
@@ -2264,6 +2296,7 @@ function ActiveScreen({
             onScrapOrder={onScrapOrder}
             department={department}
             packagesSet={packages.size > 0}
+            packagingMode={packagingMode}
           />
           {/* Inline error during line operations */}
           {error ? (
@@ -2506,15 +2539,16 @@ function LiveClock() {
 // fires onScrapOrder.
 // ============================================================
 function OrderActionBar({
-  onCompleteOrder, onScrapOrder, department, packagesSet,
+  onCompleteOrder, onScrapOrder, department, packagesSet, packagingMode,
 }: {
   onCompleteOrder: () => void;
   onScrapOrder: () => void;
   department: ProductionDepartment;
   packagesSet: boolean;
+  packagingMode: StationPackagingMode;
 }) {
   // Same predicate the new station screen uses (stationScreenModel).
-  const blocked = packagingBlocksComplete(department, packagesSet ? 1 : 0);
+  const blocked = packagingBlocksComplete(department, packagesSet ? 1 : 0, packagingMode);
   const [scrapConfirm, setScrapConfirm] = useState(false);
   return (
     <div className="space-y-2">

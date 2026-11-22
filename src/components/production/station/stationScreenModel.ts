@@ -163,13 +163,27 @@ export function scrollBehaviorFor(prefersReducedMotion: boolean): ScrollBehavior
   return prefersReducedMotion ? "auto" : "smooth";
 }
 
-/** Stations whose Complete is blocked until packaging is set (same as classic). */
-export function stationNeedsPackaging(department: ProductionDepartment): boolean {
+/** F4: "scan" is the old box-scan behaviour; "auto" means the app picks the packaging. */
+export type StationPackagingMode = "scan" | "auto";
+
+/**
+ * Stations whose Complete is blocked until packaging is set (same as classic).
+ * In auto mode (F4 box-auto-pick) no station is ever blocked by packaging.
+ */
+export function stationNeedsPackaging(
+  department: ProductionDepartment,
+  mode: StationPackagingMode = "scan",
+): boolean {
+  if (mode === "auto") return false;
   return department === "a0_framed" || department === "dispatch" || department === "unframed";
 }
 
-export function packagingBlocksComplete(department: ProductionDepartment, packageCount: number): boolean {
-  return stationNeedsPackaging(department) && packageCount === 0;
+export function packagingBlocksComplete(
+  department: ProductionDepartment,
+  packageCount: number,
+  mode: StationPackagingMode = "scan",
+): boolean {
+  return stationNeedsPackaging(department, mode) && packageCount === 0;
 }
 
 /**

@@ -206,7 +206,7 @@ ids, rule sets and order numbers).
 - Done when: tests cover result parsing, malformed responses, enqueue /
   drain / replay-safe drop, corrupted storage, and the cap.
 
-### [ ] Task 8: Complete-blocking rule and station hook
+### [x] Task 8: Complete-blocking rule and station hook
 
 - Files: `src/components/production/station/stationScreenModel.ts` (+ its
   tests), `src/lib/hooks/useOrderPackaging.ts`, `src/pages/Production.tsx`
@@ -400,3 +400,4 @@ Coder adds one line per task.
 - Task 5: 0047_packaging_auto_pick.sql (number provisional, not confirmed with CJ yet; see Open questions). Additive only: the only DROP/ALTER statements are DROP POLICY IF EXISTS / ENABLE RLS on the four new tables. Differences from the plan text: apply derives order, packing point, shipment key and staff from the event instead of taking them as arguments; state is derived server-side from p_resolved/predicted/target; ledger key uses a per-pick posting counter (post_seq) rather than revision so a retry can never reuse a key; added mode_changed_at. Ran migration twice + verify script in a local in-memory Postgres (PGlite, scratch dir, not a project dependency) against both on-hand floor variants: all checks pass. Not applied to any real database.
 - Task 6: 01-verify.sql (single transaction, ROLLBACK, synthetic f4t-/F4T- data) + README with the two-session race check and the old-app check. Verified locally in PGlite; running on staging is CJ's release step.
 - Task 7: orderPackaging.ts (typed outcomes, config load that falls back to scan), packagingOutbox.ts, 25 tests. Queue caps size by refusing new entries; it does not drop by age (dropping would lose a deduction silently; the attention list covers aged entries).
+- Task 8: stationScreenModel gets a packaging mode (auto never blocks); useOrderPackaging hook; pure session.ts and packagingSubmit.ts carry the logic because the test setup has no React renderer for hooks (tests cover them instead of the hook). handleCompleteOrder changes are one guarded branch plus one call. completeBlockReason left alone: it has no packaging rule. Replacement work predicts nothing (spec Q2 default: the station has no case lines), worker chooses or it is flagged. Not in the plan: src/lib/domain/packaging/session.ts, src/lib/state/packagingSubmit.ts. Finding for CJ, not changed: in scan mode the scanned-box list is never cleared after Complete, so boxes carry to the next order unless the worker taps Clear all.

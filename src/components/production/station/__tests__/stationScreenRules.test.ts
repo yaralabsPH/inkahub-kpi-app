@@ -137,3 +137,23 @@ describe("readTabOverride", () => {
     expect(readTabOverride("?ui=fancy", memStorage())).toBeNull();
   });
 });
+
+describe("packaging in auto mode (F4 box-auto-pick)", () => {
+  const all = ["a0_framed", "dispatch", "unframed", "framed"] as const;
+
+  it("never blocks Complete on packaging at any station", () => {
+    for (const d of all) {
+      expect(packagingBlocksComplete(d, 0, "auto")).toBe(false);
+      expect(packagingBlocksComplete(d, 2, "auto")).toBe(false);
+    }
+  });
+
+  it("scan mode, explicit or by default, keeps the old rule", () => {
+    for (const d of ["a0_framed", "dispatch", "unframed"] as const) {
+      expect(packagingBlocksComplete(d, 0, "scan")).toBe(true);
+      expect(packagingBlocksComplete(d, 0)).toBe(true);
+      expect(packagingBlocksComplete(d, 1, "scan")).toBe(false);
+    }
+    expect(packagingBlocksComplete("framed", 0, "scan")).toBe(false);
+  });
+});
