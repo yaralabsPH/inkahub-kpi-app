@@ -351,14 +351,17 @@ function WorkingView(props: StationOrderScreenProps & { order: StationScreenOrde
     .map((k) => views.find((v) => v.key === k)!)
     .filter(Boolean);
 
-  const packagesBlocked = !!props.packages && props.packages.required && !props.packages.auto && props.packages.rows.length === 0;
+  // Same rule as the classic action bar: A0 Framed / Unframed need packaging set.
+  const packagesBlocked = !!props.packages && props.packages.required && props.packages.rows.length === 0;
   const canComplete = progress.allDone && !packagesBlocked;
   const pct = progress.required > 0 ? Math.round((progress.checked / progress.required) * 100) : 0;
   const lockedLabel = !progress.allDone
     ? progress.required === 0
       ? "Nothing to check here"
       : `${progress.remaining} ${progress.remaining === 1 ? "item" : "items"} left to check`
-    : "Scan a box to finish";
+    : props.packages?.auto
+      ? "No packaging assigned"
+      : "Scan a box to finish";
 
   return (
     <main className="st-layout">

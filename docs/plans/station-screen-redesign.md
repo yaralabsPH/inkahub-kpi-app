@@ -53,7 +53,7 @@ for side-by-side testing).
 
 ## Tasks
 
-### [ ] Task 1: Screen logic module
+### [x] Task 1: Screen logic module
 
 - Files: `src/components/production/station/stationScreenModel.ts`,
   `src/components/production/station/__tests__/stationScreenModel.test.ts`
@@ -64,14 +64,14 @@ for side-by-side testing).
   lines, other-department lines, qty > 1 pieces, current-line selection and
   the classic switch.
 
-### [ ] Task 2: Design tokens and fonts
+### [x] Task 2: Design tokens and fonts
 
 - Files: `tailwind.config.js`, `index.html`
 - Do: add the reference colours, radii and Inter / JetBrains Mono families;
   load fonts from Google Fonts with system fallbacks.
 - Done when: build passes; existing pages unchanged (tokens are additive).
 
-### [ ] Task 3: New station screen
+### [x] Task 3: New station screen
 
 - Files: `src/components/production/station/StationOrderScreen.tsx`,
   `src/components/production/station/__tests__/StationOrderScreen.test.tsx`
@@ -80,7 +80,7 @@ for side-by-side testing).
 - Done when: render tests cover the groups, current/done/partial states,
   locked/ready Complete and the idle screen.
 
-### [ ] Task 4: Wire the switch and Complete rule
+### [x] Task 4: Wire the switch and Complete rule
 
 - Files: `src/pages/Production.tsx`
 - Do: render `StationOrderScreen` for non-dispatch stations unless classic;
@@ -114,4 +114,7 @@ for side-by-side testing).
 
 ## Implementation log
 
--
+- Task 1 (62da70f): `stationScreenModel.ts` + 20 tests. Groups: framed prints and frame-only to TO FRAME, everything else of this station to PACK FLAT, other-department lines to a third "OTHER STATIONS" group (info only, excluded from progress).
+- Task 2 (d69d996): tokens live in a scoped `station.css` (CSS variables under `.st-root`, with dark-mode values) instead of `tailwind.config.js`, so no other page can be affected; fonts added to `index.html`.
+- Task 3 (6299ae3): `StationOrderScreen.tsx` + 9 render tests. Toasts fire only after the verify/unverify event is actually saved (state change), not on tap. Set prints get an extra SET chip; legacy SKUs show the Shopify variant text next to the SKU.
+- Task 4: switch + Complete rule wired in `Production.tsx`. Classic code paths untouched; new screen gets its own clock-out helper (same insert as classic). Complete still blocks on packaging for A0 Framed (box scan) and Unframed (auto mail tube), same as classic.

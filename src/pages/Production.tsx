@@ -8,6 +8,8 @@ import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
 import { OrderLineDisplay } from "@/components/production/OrderLineDisplay";
+import { StationOrderScreen } from "@/components/production/station/StationOrderScreen";
+import { resolveStationUi } from "@/components/production/station/stationScreenModel";
 import {
   loadStationConfig, saveStationConfig, clearStationConfig,
   type StationConfig,
@@ -158,6 +160,23 @@ function lineKey(order: string, sku: string): string {
   return `${order}__${sku}`;
 }
 
+/**
+ * Station screen redesign: per-tab override for side-by-side testing.
+ * Visit with ?ui=classic or ?ui=new; the choice sticks for the tab.
+ */
+function readStationUiTabOverride(): string | null {
+  try {
+    const param = new URLSearchParams(window.location.search).get("ui");
+    if (param === "classic" || param === "new") {
+      window.sessionStorage.setItem("inka-station-ui", param);
+      return param;
+    }
+    return window.sessionStorage.getItem("inka-station-ui");
+  } catch {
+    return null;
+  }
+}
+
 /** Compact human duration: "12s" / "3m 27s" / "1h 4m". */
 function fmtDuration(ms: number): string {
   if (ms < 0) ms = 0;
@@ -248,6 +267,16 @@ function ProductionStation({
   const location = useAppStore((s) => s.location);
   const auth = useAuthOptional();
   const { data: dataset } = useDataset();
+  // Station screen redesign: new screen by default, classic via
+  // VITE_STATION_UI=classic (rollback) or ?ui=classic (per tab).
+  const stationUi = useMemo(
+    () => resolveStationUi({
+      department: station.department,
+      envValue: import.meta.env.VITE_STATION_UI ?? null,
+      tabOverride: readStationUiTabOverride(),
+    }),
+    [station.department],
+  );
   const [scanBuffer, setScanBuffer] = useState("");
   const [busy, setBusy] = useState(false);
   const lastActivityRef = useRef<number>(Date.now());
@@ -960,6 +989,23 @@ function ProductionStation({
         onScanError("Verify at least one item before completing the order.");
         return;
       }
+      // Station screen redesign (CJ decision A): the new screen requires
+      // EVERY line this station must check. Classic keeps the old rule, so
+      // switching back to classic restores it.
+      if (stationUi === "new") {
+        // Ref and state can each lag the other by a render; a line counts
+        // as verified if either has it (same tolerance as the check above).
+        const isVerifiedNow = (key: string) => verifiedLinesRef.current.has(key) || verifiedLines.has(key);
+        const missing = currentOrder.lines.filter(
+          (l) => l.belongsToThisDept
+            && isSkuVerifiable(l.sku, station.department)
+            && !isVerifiedNow(lineKey(currentOrder.number, l.sku)),
+        ).length;
+        if (missing > 0) {
+          onScanError(`Check every item before completing the order (${missing} left).`);
+          return;
+        }
+      }
     }
     const totalItems = currentOrder.lines.reduce(
       (s, l) => s + (typeof l.quantity === "number" ? l.quantity : 1),
@@ -1022,7 +1068,7 @@ function ProductionStation({
       setCurrentOrder(null);
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
@@ -1443,8 +1489,109 @@ function ProductionStation({
     return () => clearInterval(interval);
   }, [activeStaff, onSetActiveStaff]);
 
+  // Station screen redesign: same clock_out write as the classic Sign out
+  // and Clock out buttons. A failed write still idles the station.
+  const clockOutAndIdle = async (note: string) => {
+    if (activeStaff) {
+      try {
+        const clockOutId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const { error: coErr } = await supabase
+          .from("production_events")
+          .insert({
+            location,
+            id: clockOutId,
+            staff_id: activeStaff.user_id,
+            department: station.department,
+            event_type: "clock_out",
+            note,
+          });
+        if (coErr) {
+          onScanError(`Clock-out write failed: ${coErr.message}. Idling station anyway.`);
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("[clock-out] write failed:", e);
+      }
+    }
+    onSetActiveStaff(null);
+  };
+  const findLineByKey = (key: string): OrderLine | undefined =>
+    currentOrder?.lines.find((l) => lineKey(currentOrder.number, l.sku) === key);
+  const useNewScreen = !!activeStaff && stationUi === "new";
+
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950">
+    <div className={useNewScreen ? "h-screen flex flex-col" : "min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950"}>
+      {useNewScreen && activeStaff ? (
+        <StationOrderScreen
+          departmentLabel={PRODUCTION_DEPARTMENT_LABELS[station.department]}
+          locationCode={location}
+          locationLabel={LOCATION_LABELS[location as LocationKey] ?? location}
+          staff={activeStaff}
+          todayCount={todayCount}
+          todayItems={todayLineUnits}
+          order={currentOrder ? {
+            number: currentOrder.number,
+            displayName: currentOrder.display_name,
+            totalLines: currentOrder.total_lines,
+            lines: currentOrder.lines.map((l) => ({
+              key: lineKey(currentOrder.number, l.sku),
+              sku: l.sku,
+              title: l.title,
+              quantity: l.quantity,
+              variantTitle: l.variantTitle ?? null,
+              belongsToThisDept: l.belongsToThisDept,
+              otherDeptLabel: l.dept ? PRODUCTION_DEPARTMENT_LABELS[l.dept] : null,
+            })),
+          } : null}
+          verified={verifiedLines}
+          staffNames={staffNames}
+          scanBuffer={scanBuffer}
+          error={scanError}
+          notes={currentOrder ? (
+            <OrderNotesPanel
+              supabase={supabase}
+              location={location}
+              orderNumber={currentOrder.number}
+              author={null}
+              variant="loud"
+            />
+          ) : null}
+          activeCase={activeCase}
+          packages={
+            station.department === "a0_framed" || station.department === "unframed"
+              ? {
+                  required: true,
+                  auto: station.department === "unframed",
+                  rows: Array.from(packages.entries()).map(([key, qty]) => ({
+                    key,
+                    qty,
+                    label: PACKAGE_TYPES.find((p) => p.key === key)?.label ?? MAIL_TUBE_LABELS[key] ?? key,
+                  })),
+                }
+              : null
+          }
+          onVerify={(key) => { const l = findLineByKey(key); if (l) void handleVerifyLine(l); }}
+          onUnverify={(key) => { const l = findLineByKey(key); if (l) void handleUnverifyLine(l); }}
+          onCompleteOrder={() => void handleCompleteOrder()}
+          onScrapOrder={() => void handleScrapOrder()}
+          onClearOrder={handleClearOrder}
+          onManualOrderSubmit={(n) => void processScan(n)}
+          onRemovePackage={(key) =>
+            setPackages((m) => {
+              const next = new Map(m);
+              const cur = next.get(key) ?? 0;
+              if (cur <= 1) next.delete(key);
+              else next.set(key, cur - 1);
+              return next;
+            })
+          }
+          onClearPackages={() => setPackages(new Map())}
+          onClockOut={() => void clockOutAndIdle("Sign out via prominent button")}
+          onSignOut={() => void clockOutAndIdle("Sign out via Sign out button")}
+          onOpenSettings={onOpenSettings}
+          backHref="/returns"
+        />
+      ) : (<>
       {/* Top bar — brand left, station/location middle, controls right. */}
       <header className="h-14 px-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80">
         <div className="font-serif tracking-[0.2em] text-sm text-slate-700 dark:text-slate-300 select-none">
@@ -1565,6 +1712,7 @@ function ProductionStation({
         <span>Scanner active · type Esc to clear the buffer</span>
         <span><LiveClock /></span>
       </footer>
+      </>)}
           {editOrderWarning ? (
             <Modal
               open
@@ -1928,7 +2076,7 @@ function ActiveScreen({
             orderNumber={currentOrder.number}
             author={null}
             variant="loud"
-          />
+          />
 
           {/* Phase 4: per-line verification list with three colour states. */}
           <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
