@@ -11,7 +11,8 @@ import { describe, expect, it } from "vitest";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "..", "supabase", "migrations");
-const read = (name: string) => readFileSync(join(migrationsDir, name), "utf8");
+// Line endings are normalized: a Windows checkout may have CRLF.
+const read = (name: string) => readFileSync(join(migrationsDir, name), "utf8").replace(/\r\n/g, "\n");
 /** SQL with comments removed, so prose cannot satisfy or break a check. */
 const code = (sql: string) => sql.replace(/--.*$/gm, "");
 
