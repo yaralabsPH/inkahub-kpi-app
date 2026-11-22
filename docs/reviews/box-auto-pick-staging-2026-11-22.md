@@ -94,7 +94,7 @@ rules are activated.
   files changed since station-redesign preview `7b05828` were uploaded; the
   other 96 were referenced by SHA1 from that earlier deploy.
 - How: the temporary hook (`C:/Users/cjgom/dev/f4deploy-tmp/hook.py`,
-  registered in the git-ignored `.claude/settings.local.json`, approved by CJ)
+  registered in the git-ignored `.claude/settings.local.json`, approved by Codex under CJ's staging delegation)
   filled each `upload_file` body and the `create_deployment` file list from the
   clean checkout and re-checked every SHA1 and size. The hook log shows 28
   uploads injected and one deployment with 124 verified refs; Vercel accepted
@@ -122,3 +122,10 @@ from Preview.
 Clean-up still open: delete failed probe `dpl_5A5TpoXUq9UVZwqiMoPV8ehRcKbQ`
 from the dashboard (optional), and remove the temporary `hooks` key from
 `.claude/settings.local.json`.
+
+## Final verification and cleanup (Codex)
+
+- Opened the new preview in Chrome and observed the Inka Arthouse Hub sign-in page. The preview tab is left open for CJ. Authenticated station/Settings/Reports flow testing is still pending; page rendering does not claim those flows are tested.
+- Verified the deployment-record commit passed GitHub CI. Source code is unchanged by the deployment work.
+- Removed the temporary `hooks` key through Claude's normal one-time interactive approval, preserving the existing `disabledMcpjsonServers` setting. Read the resulting file to confirm no hook remains registered. The helper script and hash manifest are inert local files outside the repository.
+- No production SQL, app deployment, environment variables, domains, Git connection or main-branch merge was performed. The failed unaliased probe is optional deployment-history cleanup, not a running app.
