@@ -109,4 +109,29 @@ Use only the staging Supabase project and synthetic/test orders. This review did
 
 ## Coder response
 
-(Coder fills this in after fixing.)
+Fixed in commit `review r1: …` (see branch log).
+
+**Must-fix**
+
+1. **Fixed: sidebar actions are always reachable.** The working sidebar now has a scroll body (`.st-side-body`) holding the order, progress, replacement case, done list and box panel. The actions block (error, ready note, Complete, Scrap or its inline confirmation) sits outside it and never moves. The error moved into the pinned actions so it's always seen next to the buttons. Checked in the browser at 1280×800 with your combination (A0 replacement with customer name, two box rows, a save error): Complete 636–694, Scrap 704–754, open confirmation 695–739, viewport 800. Regression test: `StationOrderScreen.test.tsx` "keeps the error, Complete and Scrap outside the scrolling part of the sidebar".
+2. **Fixed: reduced motion.** Auto-scroll uses `scrollBehaviorFor(matchMedia('(prefers-reduced-motion: reduce)').matches)`, which is `auto` when reduced motion is on and `smooth` otherwise. `scrollTargetFor()` decides when to scroll (only when the current line changes). Both are covered in `stationScreenRules.test.ts`.
+3. **Fixed, with one disagreement on approach.**
+   - The Complete rule is now one tested function, `completeBlockReason()`. `handleCompleteOrder` calls it for every station, and the new screen and classic share it. Tests cover:
+     - the new screen rejecting a partial order and accepting a complete one;
+     - classic keeping its one-verified-line rule;
+     - dispatch staying exempt, including with `?ui=new`;
+     - other-station and gift lines not blocking;
+     - zero verified lines still being refused.
+   - Packaging is one predicate, `packagingBlocksComplete()`, now used by the classic `OrderActionBar` too. It's tested for both modes (A0 box scan and Unframed auto tube), empty and filled. The screen tests now also assert the disabled and enabled states.
+   - Toast timing is `diffCheckedKeys()`. Tests cover: silent on first render, silent while a save is pending or failed, done and undo only after a saved change, and a 2-piece line verifying once on its last piece.
+   - The piece counts reset when the order changes, because the working view is now keyed by order number (a React remount), rather than through a reset effect.
+   - **Disagreement:** I didn't add mounted, DOM-level tests. The repo has no jsdom or Testing Library, and AGENTS.md rule 7 says no new dependencies without a reason in the plan. Instead, every decision those tests would cover now lives in a pure function that the component and `Production.tsx` call. A whole-page `Production` test with mocked Supabase would be a large new harness, and is better done as its own approved task if CJ wants it. The wiring itself is thin: `handleCompleteOrder` returns on any `completeBlockReason` and makes no write, as shown in the diff. The browser click-through results are in the plan's implementation log.
+
+**Should-fix**
+
+1. **Fixed.** A second width tier (≤1180px) lets the spec chips wrap and the card grow instead of clipping. At 1024×768 no chip overflows its card (measured in the browser), and the actions stay on screen.
+2. **Fixed.** `readTabOverride()` returns a valid `?ui=` even when storage throws or is missing (tested). The precedence (a remembered `?ui=new` beats `VITE_STATION_UI=classic` until the tab gets `?ui=classic`) is documented in the function and in the plan's rollback notes.
+3. **Fixed.** Non-verifiable lines show "NO CHECK NEEDED" before any group check. The reference group is renamed "FOR REFERENCE · Not checked at this station". The test now uses real routing (`belongsToThisDept: false` for gift cards).
+4. **Fixed.** The menu is now a simple disclosure: a button with `aria-expanded` and `aria-controls`, holding ordinary controls. Focus goes to the first item when it opens, and Escape or an outside click closes it and returns focus to the toggle.
+
+Checks: `npx tsc -b` passes; `npm run test -- --run` passes (6 files, 430 tests); `npm run build` passes.

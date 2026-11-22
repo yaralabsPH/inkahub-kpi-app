@@ -75,7 +75,7 @@ describe("StationOrderScreen - working on an order", () => {
     const html = renderToStaticMarkup(<StationOrderScreen {...props({ order: order(SIX) })} />);
     expect(html).toContain("TO FRAME");
     expect(html).toContain("PACK FLAT");
-    expect(html).not.toContain("OTHER STATIONS");
+    expect(html).not.toContain("FOR REFERENCE");
     expect(count(html, "<article")).toBe(6);
     expect(count(html, "is-current")).toBe(1);
     expect(html).toContain("CURRENT");
@@ -126,16 +126,70 @@ describe("StationOrderScreen - working on an order", () => {
     );
     expect(html).toContain("Scan a box to finish");
     expect(html).toContain("BOXES FOR THIS SHIPMENT");
+    expect(html).toMatch(/st-btn-complete locked" disabled/);
+  });
+
+  it("enables Complete once a box is scanned", () => {
+    const one = [line("INKA-DIV0147-A0-FN")];
+    const verified = new Map([[one[0].key, { staff_id: "u1", time: "2026-11-22T01:00:00Z" }]]);
+    const html = renderToStaticMarkup(
+      <StationOrderScreen
+        {...props({ order: order(one), verified, packages: { rows: [{ key: "A0", label: "A0 box", qty: 1 }], required: true, auto: false } })}
+      />,
+    );
+    expect(html).toContain("st-btn-complete ready");
+    expect(html).not.toMatch(/st-btn-complete[^"]*" disabled/);
+  });
+
+  it("blocks Complete at Unframed until a mail tube is auto-assigned", () => {
+    const one = [line("INKA-HIG0207-A3-UN")];
+    const verified = new Map([[one[0].key, { staff_id: "u1", time: "2026-11-22T01:00:00Z" }]]);
+    const empty = renderToStaticMarkup(
+      <StationOrderScreen {...props({ order: order(one), verified, packages: { rows: [], required: true, auto: true } })} />,
+    );
+    expect(empty).toContain("No packaging assigned");
+    expect(empty).toMatch(/st-btn-complete locked" disabled/);
+    const assigned = renderToStaticMarkup(
+      <StationOrderScreen
+        {...props({ order: order(one), verified, packages: { rows: [{ key: "tube", label: "Mail tube", qty: 1 }], required: true, auto: true } })}
+      />,
+    );
+    expect(assigned).toContain("st-btn-complete ready");
+    expect(assigned).toContain("AUTO-ASSIGNED PACKAGING");
+  });
+
+  it("keeps the error, Complete and Scrap outside the scrolling part of the sidebar", () => {
+    const html = renderToStaticMarkup(
+      <StationOrderScreen
+        {...props({
+          order: order(SIX),
+          error: "Verify failed",
+          activeCase: { caseId: "42", issueType: "damaged", urgency: "high", customerName: "A Customer" },
+          packages: { rows: [{ key: "A0", label: "A0 box", qty: 1 }], required: true, auto: false },
+        })}
+      />,
+    );
+    const body = html.indexOf("st-side-body");
+    const actions = html.indexOf('class="st-actions"');
+    expect(body).toBeGreaterThan(-1);
+    expect(actions).toBeGreaterThan(body);
+    const scrollPart = html.slice(body, actions);
+    expect(scrollPart).toContain("CASE #42");
+    expect(scrollPart).toContain("BOXES FOR THIS SHIPMENT");
+    expect(scrollPart).not.toContain("Scrap order");
+    expect(html.slice(actions)).toContain("Verify failed");
+    expect(html.slice(actions)).toContain("Scrap order");
   });
 
   it("shows other-department and gift lines without check buttons", () => {
     const lines = [
       line("INKA-DIV0147-A2-FN"),
       line("INKA-DIV0147-A0-FN", { belongsToThisDept: false, otherDeptLabel: "A0 Framed" }),
-      line("INKA-GC0001-50", { title: "Gift card" }),
+      // Real routing: gift cards belong to no station.
+      line("INKA-GC0001-50", { title: "Gift card", belongsToThisDept: false }),
     ];
     const html = renderToStaticMarkup(<StationOrderScreen {...props({ order: order(lines) })} />);
-    expect(html).toContain("OTHER STATIONS");
+    expect(html).toContain("FOR REFERENCE");
     expect(html).toContain("A0 FRAMED STATION");
     expect(html).toContain("NO CHECK NEEDED");
     expect(html).toContain(">of 1 checked<");

@@ -127,6 +127,77 @@ export function orderDoneKeys(keys: string[], checkedAt: ReadonlyMap<string, str
     .sort((a, b) => Date.parse(checkedAt.get(b)!) - Date.parse(checkedAt.get(a)!));
 }
 
+/** A confirmation the screen shows after a saved verify / unverify. */
+export interface CheckChange {
+  kind: "done" | "undo";
+  key: string;
+}
+
+/**
+ * Compare the saved checked-set before and after a render. Toasts are
+ * driven by this, so they only appear once the event has actually been
+ * saved (a failed or pending write changes nothing and shows nothing).
+ * `prev === null` is the first render: no toasts for already-saved lines.
+ */
+export function diffCheckedKeys(
+  prev: ReadonlySet<string> | null,
+  next: ReadonlySet<string>,
+  orderedKeys: string[],
+): CheckChange[] {
+  if (!prev) return [];
+  const out: CheckChange[] = [];
+  for (const key of orderedKeys) {
+    if (next.has(key) && !prev.has(key)) out.push({ kind: "done", key });
+    else if (!next.has(key) && prev.has(key)) out.push({ kind: "undo", key });
+  }
+  return out;
+}
+
+/** Auto-scroll to the new current card only when the current line changes. */
+export function scrollTargetFor(prevKey: string | null, nextKey: string | null): string | null {
+  return nextKey && nextKey !== prevKey ? nextKey : null;
+}
+
+/** No smooth scrolling for people who asked the OS to reduce motion. */
+export function scrollBehaviorFor(prefersReducedMotion: boolean): ScrollBehavior {
+  return prefersReducedMotion ? "auto" : "smooth";
+}
+
+/** Stations whose Complete is blocked until packaging is set (same as classic). */
+export function stationNeedsPackaging(department: ProductionDepartment): boolean {
+  return department === "a0_framed" || department === "dispatch" || department === "unframed";
+}
+
+export function packagingBlocksComplete(department: ProductionDepartment, packageCount: number): boolean {
+  return stationNeedsPackaging(department) && packageCount === 0;
+}
+
+/**
+ * Why Complete must be refused, or null when it may proceed. Shared by the
+ * classic and new screens so the rule lives in one tested place:
+ *  - dispatch: always allowed (one-tap finalise);
+ *  - classic: at least one line verified;
+ *  - new screen (CJ decision A): additionally every line this station must
+ *    check (its own lines that are verifiable) is verified.
+ */
+export function completeBlockReason(args: {
+  department: ProductionDepartment;
+  stationUi: StationUi;
+  verifiedCount: number;
+  lines: Array<{ key: string; sku: string; belongsToThisDept: boolean }>;
+  isVerified: (key: string) => boolean;
+}): string | null {
+  if (args.department === "dispatch") return null;
+  if (args.verifiedCount === 0) return "Verify at least one item before completing the order.";
+  if (args.stationUi === "new") {
+    const missing = args.lines.filter(
+      (l) => l.belongsToThisDept && isSkuVerifiable(l.sku) && !args.isVerified(l.key),
+    ).length;
+    if (missing > 0) return `Check every item before completing the order (${missing} left).`;
+  }
+  return null;
+}
+
 export type StationUi = "new" | "classic";
 
 /**
@@ -134,6 +205,34 @@ export type StationUi = "new" | "classic";
  * `envValue` = VITE_STATION_UI (build-time rollback switch).
  * `tabOverride` = ?ui=classic|new remembered for the tab (testing).
  */
+/**
+ * Read ?ui=classic|new for this tab, remembering it in sessionStorage.
+ * A valid URL choice wins even if storage is unavailable (it just isn't
+ * remembered). Note: a remembered "new" overrides VITE_STATION_UI=classic
+ * until the tab is opened with ?ui=classic or closed.
+ */
+export function readTabOverride(search: string, storage: Pick<Storage, "getItem" | "setItem"> | null): string | null {
+  let param: string | null = null;
+  try {
+    param = new URLSearchParams(search).get("ui");
+  } catch {
+    param = null;
+  }
+  if (param === "classic" || param === "new") {
+    try {
+      storage?.setItem("inka-station-ui", param);
+    } catch {
+      // Storage blocked: honour the URL for this load anyway.
+    }
+    return param;
+  }
+  try {
+    return storage?.getItem("inka-station-ui") ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function resolveStationUi(args: {
   department: ProductionDepartment;
   envValue?: string | null;

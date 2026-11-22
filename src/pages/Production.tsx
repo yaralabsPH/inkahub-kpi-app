@@ -9,7 +9,13 @@ import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
 import { OrderLineDisplay } from "@/components/production/OrderLineDisplay";
 import { StationOrderScreen } from "@/components/production/station/StationOrderScreen";
-import { resolveStationUi } from "@/components/production/station/stationScreenModel";
+import {
+  completeBlockReason,
+  packagingBlocksComplete,
+  readTabOverride,
+  resolveStationUi,
+  stationNeedsPackaging,
+} from "@/components/production/station/stationScreenModel";
 import {
   loadStationConfig, saveStationConfig, clearStationConfig,
   type StationConfig,
@@ -165,16 +171,13 @@ function lineKey(order: string, sku: string): string {
  * Visit with ?ui=classic or ?ui=new; the choice sticks for the tab.
  */
 function readStationUiTabOverride(): string | null {
+  let storage: Storage | null = null;
   try {
-    const param = new URLSearchParams(window.location.search).get("ui");
-    if (param === "classic" || param === "new") {
-      window.sessionStorage.setItem("inka-station-ui", param);
-      return param;
-    }
-    return window.sessionStorage.getItem("inka-station-ui");
+    storage = window.sessionStorage;
   } catch {
-    return null;
+    storage = null; // storage blocked: the URL choice still applies
   }
+  return readTabOverride(window.location.search, storage);
 }
 
 /** Compact human duration: "12s" / "3m 27s" / "1h 4m". */
@@ -983,28 +986,26 @@ function ProductionStation({
     // actually meant to scrap. Dispatch is a one-tap finalise so it's
     // exempt. Read from the ref so a fast "verify -> click Complete"
     // never sees a stale empty map from a not-yet-rebuilt closure.
-    if (station.department !== "dispatch") {
-      const verifiedCount = Math.max(verifiedLinesRef.current.size, verifiedLines.size);
-      if (verifiedCount === 0) {
-        onScanError("Verify at least one item before completing the order.");
+    // Station screen redesign: the Complete rule lives in the tested
+    // completeBlockReason(). Dispatch is exempt; classic needs at least one
+    // verified line; the new screen (CJ decision A) needs every line this
+    // station must check. Ref and state can each lag the other by a render,
+    // so a line counts as verified if either has it.
+    {
+      const blockReason = completeBlockReason({
+        department: station.department,
+        stationUi,
+        verifiedCount: Math.max(verifiedLinesRef.current.size, verifiedLines.size),
+        lines: currentOrder.lines.map((l) => ({
+          key: lineKey(currentOrder.number, l.sku),
+          sku: l.sku,
+          belongsToThisDept: l.belongsToThisDept,
+        })),
+        isVerified: (key) => verifiedLinesRef.current.has(key) || verifiedLines.has(key),
+      });
+      if (blockReason) {
+        onScanError(blockReason);
         return;
-      }
-      // Station screen redesign (CJ decision A): the new screen requires
-      // EVERY line this station must check. Classic keeps the old rule, so
-      // switching back to classic restores it.
-      if (stationUi === "new") {
-        // Ref and state can each lag the other by a render; a line counts
-        // as verified if either has it (same tolerance as the check above).
-        const isVerifiedNow = (key: string) => verifiedLinesRef.current.has(key) || verifiedLines.has(key);
-        const missing = currentOrder.lines.filter(
-          (l) => l.belongsToThisDept
-            && isSkuVerifiable(l.sku, station.department)
-            && !isVerifiedNow(lineKey(currentOrder.number, l.sku)),
-        ).length;
-        if (missing > 0) {
-          onScanError(`Check every item before completing the order (${missing} left).`);
-          return;
-        }
       }
     }
     const totalItems = currentOrder.lines.reduce(
@@ -1558,7 +1559,7 @@ function ProductionStation({
           ) : null}
           activeCase={activeCase}
           packages={
-            station.department === "a0_framed" || station.department === "unframed"
+            stationNeedsPackaging(station.department)
               ? {
                   required: true,
                   auto: station.department === "unframed",
@@ -2512,7 +2513,8 @@ function OrderActionBar({
   department: ProductionDepartment;
   packagesSet: boolean;
 }) {
-  const blocked = (department === "a0_framed" || department === "dispatch" || department === "unframed") && !packagesSet;
+  // Same predicate the new station screen uses (stationScreenModel).
+  const blocked = packagingBlocksComplete(department, packagesSet ? 1 : 0);
   const [scrapConfirm, setScrapConfirm] = useState(false);
   return (
     <div className="space-y-2">

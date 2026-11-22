@@ -3,9 +3,12 @@ import { Layers, LogOut, Menu, Settings as SettingsIcon, Undo2 } from "lucide-re
 import { detectOrientation, skuTypeBadge } from "@/lib/domain/skuRouting";
 import {
   buildStationProgress,
+  diffCheckedKeys,
   getStationLineView,
   nextPickCount,
   orderDoneKeys,
+  scrollBehaviorFor,
+  scrollTargetFor,
   sortByGroup,
   type StationGroup,
   type StationLineInput,
@@ -78,16 +81,26 @@ interface ToastState { kind: ToastKind; title: string; sub: string; id: number }
 
 const TOAST_BG: Record<ToastKind, string> = { done: "#0A7F4F", partial: "#D68000", undo: "#5A6270" };
 const PAPER: Record<string, [number, number]> = { A0: [26, 36], A1: [22, 31], A2: [18, 25], A3: [14, 20], A4: [10, 15] };
-const GROUP_HEADINGS: Record<StationGroup, string> = { frame: "TO FRAME", flat: "PACK FLAT", other: "OTHER STATIONS" };
+const GROUP_HEADINGS: Record<StationGroup, string> = { frame: "TO FRAME", flat: "PACK FLAT", other: "FOR REFERENCE" };
 
 export function StationOrderScreen(props: StationOrderScreenProps) {
   const { order } = props;
   return (
     <div className="st-root">
       <TopBar {...props} />
-      {order ? <WorkingView {...props} order={order} /> : <IdleView {...props} />}
+      {/* Keyed by order: a new order starts with fresh piece counts,
+          scroll position and no open scrap confirmation. */}
+      {order ? <WorkingView key={order.number} {...props} order={order} /> : <IdleView {...props} />}
     </div>
   );
+}
+
+function prefersReducedMotion(): boolean {
+  try {
+    return typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -116,15 +129,31 @@ function initials(name: string): string {
 
 function TopBar(props: StationOrderScreenProps) {
   const focused = useWindowFocus();
+  // Simple disclosure (button + list of ordinary controls): opens with focus
+  // on the first item, Escape or an outside click closes it and returns
+  // focus to the toggle.
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const firstItemRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (!menuOpen) return;
+    firstItemRef.current?.focus();
     const close = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setMenuOpen(false);
+        toggleRef.current?.focus();
+      }
+    };
     window.addEventListener("mousedown", close);
-    return () => window.removeEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
   }, [menuOpen]);
 
   return (
@@ -155,21 +184,23 @@ function TopBar(props: StationOrderScreenProps) {
       </div>
       <div className="st-menu-wrap" ref={menuRef}>
         <button
+          ref={toggleRef}
           type="button"
           className="st-icon-btn"
           aria-label="Station menu"
           aria-expanded={menuOpen}
+          aria-controls="st-station-menu"
           onClick={() => setMenuOpen((o) => !o)}
         >
           <Menu size={18} aria-hidden="true" />
         </button>
         {menuOpen ? (
-          <div className="st-menu" role="menu">
-            <button type="button" role="menuitem" className="danger" onClick={() => { setMenuOpen(false); props.onSignOut(); }}>
+          <div className="st-menu" id="st-station-menu">
+            <button ref={firstItemRef} type="button" className="danger" onClick={() => { setMenuOpen(false); props.onSignOut(); }}>
               <LogOut size={16} aria-hidden="true" /> Sign out
             </button>
-            <a role="menuitem" href={props.backHref}>Back to app</a>
-            <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); props.onOpenSettings(); }}>
+            <a href={props.backHref}>Back to app</a>
+            <button type="button" onClick={() => { setMenuOpen(false); props.onOpenSettings(); }}>
               <SettingsIcon size={16} aria-hidden="true" /> Station settings
             </button>
           </div>
@@ -291,42 +322,40 @@ function WorkingView(props: StationOrderScreenProps & { order: StationScreenOrde
     return () => window.clearTimeout(t);
   }, [toast]);
 
-  // New order: forget piece counts and any open scrap confirmation.
-  useEffect(() => {
-    setPicked(new Map());
-    setConfirmScrap(false);
-  }, [order.number]);
-
-  // Toast on real verify/unverify results (only after the event is saved).
+  // Toast on real verify/unverify results: only after the saved state
+  // changes (diffCheckedKeys), never on the tap itself.
   const prevChecked = useRef<Set<string> | null>(null);
   useEffect(() => {
-    const prev = prevChecked.current;
+    const changes = diffCheckedKeys(prevChecked.current, checkedKeys, views.map((v) => v.key));
     prevChecked.current = checkedKeys;
-    if (!prev) return;
-    for (const v of views) {
-      if (checkedKeys.has(v.key) && !prev.has(v.key)) {
+    for (const c of changes) {
+      const v = views.find((x) => x.key === c.key);
+      if (!v) continue;
+      if (c.kind === "done") {
         showToast(
           "done",
           v.quantity > 1 ? `All ${v.quantity} pieces checked` : "Checked",
           [v.title, v.size, v.frameLabel].filter(Boolean).join(" · "),
         );
-      } else if (!checkedKeys.has(v.key) && prev.has(v.key)) {
+      } else {
         showToast("undo", "Unchecked", v.title);
         setPicked((m) => { const n = new Map(m); n.delete(v.key); return n; });
       }
     }
   }, [checkedKeys, views]);
 
-  // Keep the current card in view after every check.
+  // Keep the current card in view after every check (no smooth scrolling
+  // when the OS asks for reduced motion).
   const cardRefs = useRef(new Map<string, HTMLElement>());
   const lastCurrent = useRef<string | null>(null);
   useEffect(() => {
-    const key = progress.currentKey;
-    if (key && key !== lastCurrent.current) {
-      const el = cardRefs.current.get(key);
-      if (el && typeof el.scrollIntoView === "function") el.scrollIntoView({ behavior: "smooth", block: "center" });
+    const target = scrollTargetFor(lastCurrent.current, progress.currentKey);
+    lastCurrent.current = progress.currentKey;
+    if (!target) return;
+    const el = cardRefs.current.get(target);
+    if (el && typeof el.scrollIntoView === "function") {
+      el.scrollIntoView({ behavior: scrollBehaviorFor(prefersReducedMotion()), block: "center" });
     }
-    lastCurrent.current = key;
   }, [progress.currentKey]);
 
   const onCheck = (v: StationLineView) => {
@@ -366,6 +395,9 @@ function WorkingView(props: StationOrderScreenProps & { order: StationScreenOrde
   return (
     <main className="st-layout">
       <aside className="st-sidebar live" aria-label="Order progress">
+        {/* Everything above the actions scrolls when replacement details,
+            boxes or a long done list don't fit; the actions never move. */}
+        <div className="st-side-body st-scroll">
         <div className="st-side-head">
           <div className="st-pill live"><span className="st-live-dot" aria-hidden="true" />WORKING ON</div>
           <button type="button" className="st-link-btn" onClick={props.onClearOrder}>Clear</button>
@@ -417,9 +449,10 @@ function WorkingView(props: StationOrderScreenProps & { order: StationScreenOrde
         </div>
 
         <PackagesPanel packages={props.packages} onRemovePackage={props.onRemovePackage} onClearPackages={props.onClearPackages} />
-        {props.error ? <div className="st-error" role="alert">{props.error}</div> : null}
+        </div>
 
         <div className="st-actions">
+          {props.error ? <div className="st-error" role="alert">{props.error}</div> : null}
           {canComplete ? (
             <div className="st-ready-note">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7 7 7-7" /></svg>
@@ -460,7 +493,7 @@ function WorkingView(props: StationOrderScreenProps & { order: StationScreenOrde
               <div className="st-group-head">
                 <h2>{GROUP_HEADINGS[g]}</h2>
                 {g === "other" ? (
-                  <span className="st-group-note">Shown for reference · handled at another station</span>
+                  <span className="st-group-note">Not checked at this station</span>
                 ) : countable.length === 0 ? null : (
                   <span className={"st-count-pill" + (countable.length > 0 && done === countable.length ? " full" : "")}>
                     {done} / {countable.length}
@@ -537,8 +570,13 @@ function LineCard({
   const btnLabel = multi ? `Check piece ${picked + 1} of ${line.quantity}` : isCurrent ? "Done – check off" : "Check off";
   const skuLine = line.fallbackDescription ? `${line.sku} · ${line.fallbackDescription}` : line.sku;
 
+  // Order matters: a line nobody checks (gift card) says so even though it
+  // sits in the reference group, so it isn't mistaken for another
+  // station's work.
   let action: ReactNode;
-  if (isDone) {
+  if (!line.verifiable && !isDone) {
+    action = <span className="st-status-text">NO CHECK NEEDED</span>;
+  } else if (isDone) {
     action = (
       <>
         <div className="st-checked"><span className="c"><TickIcon size={20} color="#0A7F4F" /></span>Checked</div>
@@ -551,8 +589,6 @@ function LineCard({
     );
   } else if (line.group === "other") {
     action = <span className="st-status-text">{otherDeptLabel ? `${otherDeptLabel.toUpperCase()} STATION` : "OTHER STATION"}</span>;
-  } else if (!line.verifiable) {
-    action = <span className="st-status-text">NO CHECK NEEDED</span>;
   } else {
     action = (
       <>

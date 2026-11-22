@@ -66,6 +66,11 @@
 @keyframes st-livePulse { 0% { box-shadow: 0 0 0 0 rgba(14,203,129,.55); } 70% { box-shadow: 0 0 0 10px rgba(14,203,129,0); } 100% { box-shadow: 0 0 0 0 rgba(14,203,129,0); } }
 .st-sidebar { flex: 0 0 340px; min-height: 0; background: var(--surface); border-radius: var(--r-panel); padding: 26px; display: flex; flex-direction: column; gap: 22px; }
 .st-sidebar.live { animation: st-edgeGlow 3s ease-in-out infinite; }
+/* Working sidebar: content scrolls, actions stay pinned and reachable. */
+.st-sidebar.live { gap: 16px; }
+.st-side-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 22px; margin-right: -10px; padding-right: 10px; }
+.st-side-body .st-done-wrap { flex: 1 0 auto; min-height: 140px; }
+.st-side-body .st-done-list { overflow: visible; }
 .st-sidebar.idle { border: 1px solid var(--border); }
 .st-pill { display: inline-flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700; letter-spacing: .1em; padding: 7px 12px 7px 10px; border-radius: 999px; align-self: flex-start; }
 .st-pill.live { background: var(--green-tint); color: var(--green-ink); }
@@ -230,6 +235,23 @@
   .st-spec-val { font-size: 17px; }
   .st-action { flex-basis: 160px; }
   .st-btn-check { width: 160px; font-size: 15px; padding: 0 6px; white-space: nowrap; }
+}
+
+/* Small tablets / zoomed browsers (e.g. 1024x768): spec chips wrap and the
+   card grows instead of hiding frame, quantity or set details. */
+@media (max-width: 1180px) {
+  .st-topbar { gap: 12px; padding: 0 16px; }
+  .st-today { gap: 10px; }
+  .st-layout { padding: 16px; gap: 16px; }
+  .st-sidebar { flex-basis: 280px; padding: 18px; }
+  .st-order-no { font-size: 28px; }
+  .st-big-count { font-size: 40px; }
+  .st-card { height: auto; min-height: 156px; padding: 14px 18px; gap: 14px; }
+  .st-thumb { width: 64px; height: 84px; }
+  .st-specs { flex-wrap: wrap; overflow: visible; }
+  .st-spec-ico { width: 32px; height: 32px; }
+  .st-action { flex-basis: 150px; }
+  .st-btn-check { width: 150px; font-size: 14px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

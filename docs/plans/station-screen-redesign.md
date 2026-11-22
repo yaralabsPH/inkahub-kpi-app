@@ -94,7 +94,7 @@ for side-by-side testing).
 - No data writes change; every write still goes through the existing
   handlers (Task 4 only reorders which component calls them).
 - Complete gating is UI + handler side, never weaker than today.
-- Rollback: `VITE_STATION_UI=classic` + redeploy, or revert the branch.
+- Rollback: `VITE_STATION_UI=classic` + redeploy, or revert the branch. A tab that was opened with `?ui=new` remembers it and overrides the env switch until it is opened with `?ui=classic` or closed.
 
 ## Release and rollback
 
@@ -119,3 +119,4 @@ for side-by-side testing).
 - Task 3 (6299ae3): `StationOrderScreen.tsx` + 9 render tests. Toasts fire only after the verify/unverify event is actually saved (state change), not on tap. Set prints get an extra SET chip; legacy SKUs show the Shopify variant text next to the SKU.
 - Task 4: switch + Complete rule wired in `Production.tsx`. Classic code paths untouched; new screen gets its own clock-out helper (same insert as classic). Complete still blocks on packaging for A0 Framed (box scan) and Unframed (auto mail tube), same as classic.
 - Visual check (local preview page with the reference's sample order, not committed): fixed spec chips clipping at 1280px with a <=1400px spacing tier, landscape/portrait now replaces the SIZE label, and dark mode gets a light outline so black frames stay visible. Click-through verified: check, 2-piece pick, undo, scrap confirm, complete -> idle with counts, dark mode, 1280x800 and 1440x900, no console errors.
+- Review r1: Complete rule extracted to `completeBlockReason()` (used by both screens), packaging to `packagingBlocksComplete()` (classic action bar now calls it too), toast timing to `diffCheckedKeys()`, scroll to `scrollTargetFor()`/`scrollBehaviorFor()`, URL override to `readTabOverride()`; sidebar scroll body with pinned actions; <=1180px wrap tier; disclosure menu. No DOM test dependency added (see review r1 coder response).
