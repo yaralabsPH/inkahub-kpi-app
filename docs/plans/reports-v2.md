@@ -1,0 +1,25 @@
+# Reports v2 implementation plan
+
+Use executing-plans; Claude is the only app writer. Codex owns spec/review and staging operations.
+Goal: practical period, person and department reports from published F1 counts.
+Spec: docs/specs/reports-v2.md
+Branch: feature/reports-v2, based on accepted feature/item-counting-integration.
+Stack: existing React/TypeScript, Supabase/Postgres, Vercel functions. No new dependencies.
+
+## Tasks
+
+- [ ] 1. Contract and server aggregation. Read existing reporting-auth, summary/detail handlers, checked_generation/sel_eval and source_versions. Create src/lib/domain/reportsOverview.ts for DTO/filter/CSV helpers, api/_lib/reports-overview.ts for authorized orchestration, api/reports/overview.ts, and supabase/migrations/0057_reports_overview.sql. Reuse exact F1 qualification, do not duplicate its counting engine. Test exact period Orders across days/groups, set/UN quantities, rework/cancellation/manual attribution and recorded department identity/labels. Add service-only RPC permissions, date/cardinality bounds and role tests. Extend existing PGlite bootstrap narrowly for new columns/prerequisites; never rewrite old migrations. Commit.
+- [ ] 2. UI and permissions. Create src/components/ReportsOverview.tsx, hook/repository helpers as useful; integrate into src/pages/Reports.tsx with restricted-role wrapper that avoids mounting legacy team/payroll hooks. Reuse productionPeriods and current auth/nav conventions. Today/week/month/custom, person and managed-department filters, Items/Orders/rework, daily trend, people/departments and summary CSV. Visible cutoff, loading/not-ready/error+Retry, abort/discard old identity response. Preserve F7 raw CSV and F4 cards. Test role routing, filter/CSV consistency and stale request behavior where practical. Commit.
+- [ ] 3. Gate and handoff. Run tsc, typecheck:digest, typecheck:api, complete tests and build. Fix actual regressions only. Update this plan and concise release notes. Return SHA, checks and SQL/hosted prerequisites, with STATUS line. No SQL apply, push or deploy; root handles them.
+
+## Review focus
+
+Whole-period orders are distinct rather than subgroup sums; historical departments use frozen event snapshots; staff/CS never run legacy team hooks; generation filters cannot mix; errors never leave another user's data visible; large history stays server-side and bounded.
+
+## Staging and rollback
+
+Root runs SQL rollback fixtures and authenticated API/browser checks against isolated staging only, deploys Preview with staging env, checks unchanged production deployment identity. Previous Preview and legacy reporting mode remain rollback. No source events/stock modifications except exact disposable test fixtures; cleanup verifies hashes. Cutoff 2026-11-23 02:00 UTC; report incomplete honestly.
+
+## Progress
+
+Awaiting implementation.
