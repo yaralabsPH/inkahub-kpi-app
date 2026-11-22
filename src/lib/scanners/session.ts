@@ -22,6 +22,11 @@ export interface ScannerPerson {
 export interface ActiveIdentity extends ScannerPerson {
   activatedAt: number;
   lastFramingAt: number;
+  /**
+   * F7 dispatch shift: absolute end of this identity (next site 04:00, at
+   * most twelve hours). When set there is no idle timeout.
+   */
+  expiresAt?: number;
 }
 
 export interface PendingActivation {
@@ -94,6 +99,7 @@ export type RejectCode =
   | "no_person"
   | "identity_expired"
   | "pending_timeout"
+  | "shift_ended"
   | "unknown_scanner";
 
 export const REJECT_TEXT: Record<RejectCode, string> = {
@@ -104,6 +110,7 @@ export const REJECT_TEXT: Record<RejectCode, string> = {
   pending_timeout: "Checking the badge took too long. Scanner signed out: scan the badge again, then any order not shown as queued.",
   no_person: "Scan your badge on this scanner first.",
   identity_expired: "Signed out after 10 minutes without a scan. Scan your badge again.",
+  shift_ended: "Your dispatch sign-in ended (04:00 workday change or 12 hours). Scan your badge again.",
   unknown_scanner: "This scanner is not configured on this station.",
 };
 
@@ -121,6 +128,7 @@ export type FrameDecision =
   | { action: "reject"; scannerId: string; code: RejectCode; clearedIdentity: boolean };
 
 function isExpired(identity: ActiveIdentity, now: number): boolean {
+  if (identity.expiresAt !== undefined) return now >= identity.expiresAt;
   return now - identity.lastFramingAt > IDENTITY_IDLE_MS;
 }
 
@@ -184,7 +192,8 @@ export function decideFrame(
   }
   if (isExpired(slot.identity, ctx.now)) {
     next[slot.scannerId] = cleared(slot);
-    return { slots: next, decision: { action: "reject", scannerId: slot.scannerId, code: "identity_expired", clearedIdentity: true } };
+    const code: RejectCode = slot.identity.expiresAt !== undefined ? "shift_ended" : "identity_expired";
+    return { slots: next, decision: { action: "reject", scannerId: slot.scannerId, code, clearedIdentity: true } };
   }
   const person: ScannerPerson = {
     personId: slot.identity.personId,
@@ -199,7 +208,7 @@ export function decideFrame(
 }
 
 export type ActivationResult =
-  | { outcome: "activated"; personId: string; displayName: string }
+  | { outcome: "activated"; personId: string; displayName: string; expiresAt?: number }
   | { outcome: "unknown_badge" }
   /** A badge that exists but cannot be used here: never an order fallback. */
   | { outcome: "unusable_badge" }
@@ -240,7 +249,10 @@ export function resolveActivation(
     next[scannerId] = {
       ...slot,
       pending: null,
-      identity: { personId: result.personId, displayName: result.displayName, badge: pending.badge, activatedAt: now, lastFramingAt: now },
+      identity: {
+        personId: result.personId, displayName: result.displayName, badge: pending.badge, activatedAt: now, lastFramingAt: now,
+        ...(result.expiresAt !== undefined ? { expiresAt: result.expiresAt } : {}),
+      },
     };
     return { slots: next, stale: false, order: null, rejected: null };
   }
@@ -306,5 +318,6 @@ export function clearOne(slots: Slots, scannerId: string): Record<string, Scanne
 /** Ms until this identity expires, or null. */
 export function msUntilExpiry(identity: ActiveIdentity | null, now: number): number | null {
   if (!identity) return null;
+  if (identity.expiresAt !== undefined) return Math.max(0, identity.expiresAt - now);
   return Math.max(0, identity.lastFramingAt + IDENTITY_IDLE_MS - now);
 }

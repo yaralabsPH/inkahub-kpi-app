@@ -19,6 +19,7 @@ import Dexie, { type Table } from "dexie";
 import { z } from "zod";
 import type { CapturedOrder } from "./session";
 import type { PreparedFraming } from "./order";
+import { applyChoices, CHOICE_CODES, isPreparedDispatch, type FramerChoice, type PreparedDispatch, type ScanMode } from "./dispatch";
 
 /** Unfinished jobs (queued, prepared, blocked, unreadable) a device may hold. */
 export const MAX_ACTIVE_JOBS = 200;
@@ -39,6 +40,27 @@ export function scopeKey(s: JobScope): string {
   return [s.backend, s.callerId, s.location, s.receiverId].join("|");
 }
 
+/**
+ * F7: dispatch jobs carry this suffix on their scope. The F6 app only ever
+ * claims the exact scope key, so after a rollback to it a queued dispatch
+ * job is kept but never sent as framing work. Framing jobs (old and new)
+ * keep the unchanged F6 key.
+ */
+export const DISPATCH_SCOPE_SUFFIX = "|dispatch";
+
+export function jobScopeKey(s: JobScope, mode: ScanMode): string {
+  return mode === "dispatch" ? scopeKey(s) + DISPATCH_SCOPE_SUFFIX : scopeKey(s);
+}
+
+function inScopeKey(jobScope: string, key: string): boolean {
+  return jobScope === key || jobScope === key + DISPATCH_SCOPE_SUFFIX;
+}
+
+/** Jobs written before F7 have no mode: they are framing jobs. */
+export function jobMode(job: Pick<ScannerJob, "mode">): ScanMode {
+  return job.mode === "dispatch" ? "dispatch" : "framing";
+}
+
 export interface JobBlock {
   code: string;
   message: string;
@@ -55,6 +77,8 @@ export interface JobOutcome {
 export interface ScannerJob extends JobScope {
   requestId: string;
   scope: string;
+  /** F7. Absent on F6 jobs (= framing). Captured at scan time; delivery never uses the screen's mode. */
+  mode?: ScanMode;
   scannerId: string;
   personId: string;
   displayName: string;
@@ -63,8 +87,12 @@ export interface ScannerJob extends JobScope {
   scannedAt: string;
   orderNumber: string;
   status: JobStatus;
-  /** Exact payload committed; immutable once set. */
-  prepared: PreparedFraming | null;
+  /**
+   * Exact payload committed; immutable once a commit may have been sent.
+   * (F7: a dispatch job waiting for a framer choice is definitely unsent and
+   * changes only through chooseFramers.)
+   */
+  prepared: PreparedFraming | PreparedDispatch | null;
   /** Commit requests sent. */
   attempts: number;
   /**
@@ -91,6 +119,7 @@ export interface ScannerJob extends JobScope {
 const JobSchema = z.object({
   requestId: z.string().uuid(),
   scope: z.string().min(1),
+  mode: z.enum(["framing", "dispatch"]).optional(),
   backend: z.literal("supabase"),
   callerId: z.string().min(1),
   location: z.string().min(1),
@@ -246,7 +275,13 @@ export function memoryJobStore(opts: { failWrites?: () => boolean } = {}): JobSt
 
 function readJob(value: unknown): ScannerJob | null {
   const r = JobSchema.safeParse(value);
-  return r.success ? (value as ScannerJob) : null;
+  if (!r.success) return null;
+  const job = value as ScannerJob;
+  // Mode, scope suffix and payload must agree; anything else is shown as unreadable, never guessed.
+  const dispatch = jobMode(job) === "dispatch";
+  if (dispatch !== job.scope.endsWith(DISPATCH_SCOPE_SUFFIX)) return null;
+  if (job.prepared !== null && isPreparedDispatch(job.prepared) !== dispatch) return null;
+  return job;
 }
 
 const ACTIVE: ReadonlySet<JobStatus> = new Set(["queued", "prepared", "blocked"]);
@@ -260,7 +295,7 @@ export interface ScopeView {
 }
 
 export interface ScannerOutbox {
-  enqueue(order: CapturedOrder, scope: JobScope, requestId: string): Promise<ScannerJob>;
+  enqueue(order: CapturedOrder, scope: JobScope, requestId: string, mode?: ScanMode): Promise<ScannerJob>;
   /**
    * Claim the next ready job. The returned job's `leaseOwner` is a fresh
    * per-claim lease token: pass it to every later step. Steps with a stale
@@ -269,7 +304,18 @@ export interface ScannerOutbox {
    * can never change a job another claim has moved on.
    */
   claimNext(scope: JobScope, owner: string): Promise<ScannerJob | null>;
-  setPrepared(requestId: string, lease: string, prepared: PreparedFraming): Promise<ScannerJob>;
+  setPrepared(requestId: string, lease: string, prepared: PreparedFraming | PreparedDispatch): Promise<ScannerJob>;
+  /**
+   * F7: a dispatch job whose framed lines lack a measured framer. Stores the
+   * unsent draft and blocks the job until the dispatcher chooses. False (and
+   * nothing changed) when the lease is stale.
+   */
+  awaitChoice(requestId: string, lease: string, draft: PreparedDispatch, block: JobBlock): Promise<boolean>;
+  /**
+   * F7: the dispatcher's choice for one waiting job. Only a blocked dispatch
+   * job with no possibly-saved attempt can change; anything else is refused.
+   */
+  chooseFramers(requestId: string, scope: JobScope, choices: readonly FramerChoice[]): Promise<void>;
   markAttempt(requestId: string, lease: string): Promise<ScannerJob>;
   /** Saved / already recorded: the server's truth, accepted from any claim; never undone. */
   markDone(requestId: string, outcome: JobOutcome): Promise<void>;
@@ -306,7 +352,7 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
   const backoff = (tries: number) => Math.min(60_000, 2_000 * 2 ** Math.min(tries, 5));
 
   return {
-    async enqueue(order, scope, requestId) {
+    async enqueue(order, scope, requestId, mode = "framing") {
       return store.tx(async (t) => {
         const rows = await t.all();
         const active = rows.filter((r) => {
@@ -319,7 +365,8 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
         const job: ScannerJob = {
           ...scope,
           requestId,
-          scope: scopeKey(scope),
+          scope: jobScopeKey(scope, mode),
+          ...(mode === "dispatch" ? { mode } : {}),
           scannerId: order.scannerId,
           personId: order.person.personId,
           displayName: order.person.displayName,
@@ -355,7 +402,7 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
         const ready = (await t.all())
           .map((r) => readJob(r.value))
           .filter((j): j is ScannerJob =>
-            !!j && j.scope === key && (j.status === "queued" || j.status === "prepared") &&
+            !!j && inScopeKey(j.scope, key) && (j.status === "queued" || j.status === "prepared") &&
             j.nextAttemptAt <= at && (j.leaseOwner === null || j.leaseUntil <= at))
           .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
         const job = ready[0];
@@ -376,9 +423,41 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
           return job;
         }
         if (prepared.orderNumber !== job.orderNumber) throw new OutboxStorageError("Prepared order does not match the scan.");
-        const next: ScannerJob = { ...job, status: "prepared", prepared: JSON.parse(JSON.stringify(prepared)) as PreparedFraming, updatedAt: iso() };
+        if (isPreparedDispatch(prepared) !== (jobMode(job) === "dispatch")) throw new OutboxStorageError("Prepared payload does not match the scan's mode.");
+        const next: ScannerJob = { ...job, status: "prepared", prepared: JSON.parse(JSON.stringify(prepared)) as PreparedFraming | PreparedDispatch, updatedAt: iso() };
         await t.put(next);
         return next;
+      });
+    },
+
+    async awaitChoice(requestId, lease, draft, block) {
+      return store.tx(async (t) => {
+        const job = await mustGet(t, requestId);
+        if (!live(job, lease)) return false;
+        if (jobMode(job) !== "dispatch" || job.status !== "queued" || job.prepared !== null || job.uncertain || job.attempts > 0) {
+          throw new OutboxStorageError("Only an unsent dispatch scan can wait for a framer choice.");
+        }
+        if (draft.orderNumber !== job.orderNumber || !CHOICE_CODES.has(block.code)) throw new OutboxStorageError("Framer choice does not match the scan.");
+        await t.put({
+          ...job, status: "blocked", prepared: JSON.parse(JSON.stringify(draft)) as PreparedDispatch, blocked: block,
+          lastError: block.message, leaseOwner: null, leaseUntil: 0, updatedAt: iso(),
+        });
+        return true;
+      });
+    },
+
+    async chooseFramers(requestId, scope, choices) {
+      await store.tx(async (t) => {
+        const job = await mustGet(t, requestId);
+        if (!inScopeKey(job.scope, scopeKey(scope))) throw new OutboxStorageError("That scan belongs to another account, site or receiver.");
+        // Pre-commit only: a send that may have saved freezes the payload (exact replay only).
+        if (jobMode(job) !== "dispatch" || job.status !== "blocked" || !job.blocked || !CHOICE_CODES.has(job.blocked.code)
+            || job.uncertain || (job.priorUnknown ?? false) || !isPreparedDispatch(job.prepared)) {
+          throw new OutboxStorageError("This scan is not waiting for a framer choice.");
+        }
+        const applied = applyChoices(job.prepared, choices);
+        if (!applied.ok) throw new OutboxStorageError(`Choose who framed every line without a framing scan (${applied.error}).`);
+        await t.put({ ...job, status: "prepared", prepared: applied.prepared, blocked: null, lastError: null, tries: 0, nextAttemptAt: 0, updatedAt: iso() });
       });
     },
 
@@ -458,8 +537,15 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
     async retryBlocked(requestId, scope) {
       await store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        if (job.scope !== scopeKey(scope)) throw new OutboxStorageError("That scan belongs to another account, site or receiver.");
+        if (!inScopeKey(job.scope, scopeKey(scope))) throw new OutboxStorageError("That scan belongs to another account, site or receiver.");
         if (job.status !== "blocked") return;
+        // F7: Retry on a dispatch job waiting for a framer choice re-reads the
+        // order and the framing records (a scan may have arrived since). Safe
+        // only because nothing can have been saved for it.
+        if (jobMode(job) === "dispatch" && job.blocked && CHOICE_CODES.has(job.blocked.code) && !job.uncertain && !(job.priorUnknown ?? false)) {
+          await t.put({ ...job, status: "queued", prepared: null, blocked: null, lastError: null, tries: 0, nextAttemptAt: 0, updatedAt: iso() });
+          return;
+        }
         await t.put({ ...job, status: job.prepared ? "prepared" : "queued", blocked: null, tries: 0, nextAttemptAt: 0, updatedAt: iso() });
       });
     },
@@ -467,7 +553,7 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
     async dismiss(requestId, scope) {
       await store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        if (job.scope !== scopeKey(scope)) throw new OutboxStorageError("That scan belongs to another account, site or receiver.");
+        if (!inScopeKey(job.scope, scopeKey(scope))) throw new OutboxStorageError("That scan belongs to another account, site or receiver.");
         // Only a definitely-refused job can be dropped; an unknown outcome must be resolved first.
         if (job.status !== "blocked" || job.uncertain) throw new OutboxStorageError("Only a blocked scan can be dismissed.");
         await t.put({ ...job, status: "dismissed", updatedAt: iso() });
@@ -482,7 +568,7 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
         for (const r of await t.all()) {
           const j = readJob(r.value);
           if (!j) corrupt.push({ key: r.key, raw: r.value });
-          else if (j.scope === key) jobs.push(j);
+          else if (inScopeKey(j.scope, key)) jobs.push(j);
         }
         jobs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
         return {

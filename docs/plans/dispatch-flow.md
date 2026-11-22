@@ -24,7 +24,8 @@ Routine implementation details may be chosen and logged. Material conflicts go t
 
 ## Execution log
 
-- [ ] Task 1: evidence, shift and persisted job contracts.
+- [x] Task 1: evidence, shift and persisted job contracts.
+  - Log: new `src/lib/scanners/dispatch.ts` (strict `prepareDispatchOrder`: framed F6-grammar SKUs incl. A0 for attribution, unframed/free-print/accessory/gift supported, picture frame/canvas/legacy/blank/GW-single -> classic dispatch; components = exactly classic `shouldDeductAtDept(dispatch, dispatched)`; F4 Dispatch parcel only when the order packs something at Dispatch; `items` = classic dispatched.line_quantity), pure choice helpers (`withEvidence`, `missingSkus`, `applyChoices`, `choicesFor`) and `dispatchShiftEnd` (min of next site 04:00 and 12 h). Evidence itself is resolved only by one SQL reader shared by preview and commit (T2), so there is deliberately no TS copy of the rule. Session: optional absolute `expiresAt` (no idle timeout, `shift_ended`); F6 identities unchanged. Outbox: optional `mode`; dispatch jobs use scope `<F6 key>|dispatch` so a rolled-back F6 app never claims one as framing (old rows keep the exact F6 key, read as framing); `awaitChoice`/`chooseFramers` explicit pre-commit transition (refused when uncertain/priorUnknown); Retry on a waiting dispatch job re-reads evidence. Client: dispatch activation/evidence/people/commit wrappers and a mode branch in `processNext` using each job's captured mode. Small refactor: `orderHeaderProblem` shared by framing and dispatch (same checks, same order). 34 new focused tests (`dispatch.test.ts`, `outbox-dispatch.test.ts`).
 - [ ] Task 2: atomic dispatch, attribution and SQL assertions/races.
 - [ ] Task 3: dispatch mode, compact picker and report labels/CSV.
 - [ ] Task 4: final checks, review, runbook and staging acceptance.

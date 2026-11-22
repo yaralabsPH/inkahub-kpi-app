@@ -90,7 +90,8 @@ export type PrepareCode =
   | "packaging_not_auto"
   | "packaging_unresolved";
 
-export type PrepareResult = { ok: true; prepared: PreparedFraming } | { ok: false; code: PrepareCode; message: string };
+export type PrepareRefusal = { ok: false; code: PrepareCode; message: string };
+export type PrepareResult = { ok: true; prepared: PreparedFraming } | PrepareRefusal;
 
 export const EDIT_WARNING_TAGS = ["Edit Order", "oe-staff-edit"] as const;
 export const MAX_LINE_QUANTITY = 100;
@@ -98,8 +99,36 @@ export const MAX_ORDER_LINES = 50;
 
 const CLASSIC = " Use the classic station for this order.";
 
-function no(code: PrepareCode, message: string): PrepareResult {
+export function no(code: PrepareCode, message: string): PrepareRefusal {
   return { ok: false, code, message: message + CLASSIC };
+}
+
+/**
+ * Whole-order checks shared by framing and dispatch (F7): found, complete,
+ * exact, not cancelled, no edit tag, no open replacement case, bounded.
+ * Returns the refusal, or null when the order may be prepared.
+ */
+export function orderHeaderProblem(
+  lookup: OrderLookup,
+  n: string,
+  openCase: boolean,
+): PrepareRefusal | null {
+  if (!lookup.found) return no("not_found", `Order #${n} was not found in Shopify.`);
+  if (lookup.complete !== true || lookup.truncated === true) {
+    return no("incomplete_order", `Shopify did not return the complete order #${n}.`);
+  }
+  if (lookup.order_name !== `#${n}`) {
+    return no("name_mismatch", `Shopify returned ${lookup.order_name ?? "another order"} for #${n}.`);
+  }
+  if (lookup.cancelled_at) return no("cancelled", `Order #${n} is cancelled.`);
+  const tags = lookup.tags ?? [];
+  const edit = EDIT_WARNING_TAGS.find((t) => tags.includes(t));
+  if (edit) return no("edit_warning", `Order #${n} has the "${edit}" tag and needs a manager check.`);
+  if (openCase) return no("open_case", `Order #${n} has an open replacement case.`);
+  if ((lookup.line_items ?? []).length > MAX_ORDER_LINES) {
+    return no("too_many_lines", `Order #${n} has more than ${MAX_ORDER_LINES} lines.`);
+  }
+  return null;
 }
 
 export function prepareFramingOrder(
@@ -112,19 +141,10 @@ export function prepareFramingOrder(
   },
 ): PrepareResult {
   const n = ctx.orderNumber;
-  if (!lookup.found) return no("not_found", `Order #${n} was not found in Shopify.`);
-  if (lookup.complete !== true || lookup.truncated === true) {
-    return no("incomplete_order", `Shopify did not return the complete order #${n}.`);
-  }
-  if (lookup.order_name !== `#${n}`) return no("name_mismatch", `Shopify returned ${lookup.order_name ?? "another order"} for #${n}.`);
-  if (lookup.cancelled_at) return no("cancelled", `Order #${n} is cancelled.`);
-  const tags = lookup.tags ?? [];
-  const edit = EDIT_WARNING_TAGS.find((t) => tags.includes(t));
-  if (edit) return no("edit_warning", `Order #${n} has the "${edit}" tag and needs a manager check.`);
-  if (ctx.openCase) return no("open_case", `Order #${n} has an open replacement case.`);
+  const header = orderHeaderProblem(lookup, n, ctx.openCase);
+  if (header) return header;
 
   const items = lookup.line_items ?? [];
-  if (items.length > MAX_ORDER_LINES) return no("too_many_lines", `Order #${n} has more than ${MAX_ORDER_LINES} lines.`);
 
   const bySku = new Map<string, FramingLine>();
   const allLines: Array<{ sku: string; quantity: number }> = [];

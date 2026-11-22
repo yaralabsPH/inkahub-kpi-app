@@ -11,7 +11,7 @@ import {
 } from "../outbox";
 import { classifyRpcError, commitParams, processNext, type CommitOutcome, type DeliveryDeps, type LookupOutcome } from "../client";
 import type { CapturedOrder } from "../session";
-import type { OrderLookup } from "../order";
+import type { OrderLookup, PreparedFraming } from "../order";
 
 const scope: JobScope = { backend: "supabase", callerId: "kiosk-1", location: "au", receiverId: "wall-1" };
 const otherCaller: JobScope = { ...scope, callerId: "kiosk-2" };
@@ -414,7 +414,7 @@ describe("R1 corrections", () => {
     stationOpen = true;
     const d2 = deps({ outbox: base });
     expect(await processNext(d2)).toMatchObject({ kind: "saved" });
-    expect(d2.commits[0].p_lines).toEqual(payload!.lines.map((l) => ({ sku: l.sku, quantity: l.quantity, work_type: l.workType })));
+    expect(d2.commits[0].p_lines).toEqual((payload as PreparedFraming).lines.map((l) => ({ sku: l.sku, quantity: l.quantity, work_type: l.workType })));
   });
 });
 

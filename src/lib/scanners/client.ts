@@ -12,7 +12,17 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { prepareFramingOrder, type CatalogueProduct, type OrderLookup, type PackagingSetup, type PreparedFraming } from "./order";
-import { LeaseLostError, type JobScope, type ScannerJob, type ScannerOutbox } from "./outbox";
+import { jobMode, LeaseLostError, type JobScope, type ScannerJob, type ScannerOutbox } from "./outbox";
+import {
+  isPreparedDispatch,
+  prepareDispatchOrder,
+  unresolvedSkus,
+  withEvidence,
+  type DispatchFramedLine,
+  type DispatchPrepareResult,
+  type FramerEvidence,
+  type PreparedDispatch,
+} from "./dispatch";
 import { parseRuleSetBody } from "@/lib/domain/packaging/ruleSet";
 
 export interface Rejected {
@@ -42,6 +52,9 @@ const REJECTION_TEXT: Record<string, string> = {
   missing_stock_code: "A stock code is missing at this site. Nothing was saved. Use the classic station.",
   stock_floor: "Stock would go below zero and the database refused it. Nothing was saved.",
   unavailable: "Shared scanners are not set up on this database yet.",
+  framer_missing: "A framed line has no framing record and nobody was chosen. Choose who framed it.",
+  framer_inactive: "The person chosen as framer is no longer active at this site. Choose again.",
+  evidence_overflow: "This order has too many framing records to check safely. Use the classic dispatch station.",
 };
 
 const TRANSIENT_SQLSTATE = /^(08|40|53|57)/;
@@ -92,7 +105,11 @@ export function newRequestId(): string {
 // ---------------------------------------------------------------------------
 
 export type ActivateOutcome =
-  | { outcome: "activated"; personId: string; displayName: string; clockedIn: boolean }
+  | {
+      outcome: "activated"; personId: string; displayName: string; clockedIn: boolean;
+      /** F7 dispatch activation: UTC ms of the next site 04:00 workday start. */
+      workdayEndsAt?: number | null;
+    }
   | { outcome: "unknown_badge" }
   | { outcome: "unusable_badge" }
   | Rejected
@@ -125,15 +142,127 @@ export async function activateBadge(
   return { outcome: "activated", personId: d.person_id, displayName: d.display_name, clockedIn: d.clocked_in };
 }
 
+const DispatchActivateSchema = z.union([
+  z.object({
+    status: z.literal("activated"), person_id: z.string().uuid(), display_name: z.string(), clocked_in: z.boolean(),
+    workday_ends_at: z.string(),
+  }),
+  z.object({ status: z.literal("unknown_badge") }),
+  z.object({ status: z.literal("unusable_badge") }),
+]);
+
+/**
+ * F7: the dispatch badge sign-in. Same rules as F6 activation, but a new
+ * clock-in is recorded as dispatch work, and the answer carries the end of
+ * the site workday (the shift identity's latest end).
+ */
+export async function activateDispatchBadge(
+  client: SupabaseClient,
+  a: { location: string; requestId: string; receiverId: string; scannerId: string; badge: string; expectedCaller: string },
+): Promise<ActivateOutcome> {
+  const res = await rpc(client, "scanner_activate_dispatch", {
+    p_location: a.location,
+    p_request_id: a.requestId,
+    p_receiver_id: a.receiverId,
+    p_scanner_id: a.scannerId,
+    p_badge: a.badge,
+    p_expected_caller: a.expectedCaller,
+  });
+  if ("outcome" in res) return res;
+  const parsed = DispatchActivateSchema.safeParse(res.data);
+  if (!parsed.success) return malformed("activation");
+  const d = parsed.data;
+  if (d.status === "unknown_badge") return { outcome: "unknown_badge" };
+  if (d.status === "unusable_badge") return { outcome: "unusable_badge" };
+  const end = Date.parse(d.workday_ends_at);
+  return {
+    outcome: "activated", personId: d.person_id, displayName: d.display_name, clockedIn: d.clocked_in,
+    workdayEndsAt: Number.isFinite(end) ? end : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// F7: framing evidence and the attribution picker's people
+// ---------------------------------------------------------------------------
+
+export type EvidenceOutcome = { outcome: "ok"; evidence: FramerEvidence[] } | Rejected | NetworkError;
+
+const EvidenceSchema = z.object({
+  status: z.literal("ok"),
+  lines: z.array(z.object({
+    sku: z.string(),
+    status: z.enum(["measured", "missing", "conflict"]),
+    person_id: z.string().uuid().nullable(),
+    display_name: z.string().nullable(),
+    verified_event_id: z.string().nullable(),
+    completed_event_id: z.string().nullable(),
+  })).max(50),
+});
+
+export function evidenceLines(lines: readonly DispatchFramedLine[]): Array<{ sku: string; quantity: number; work_type: string }> {
+  return lines.map((l) => ({ sku: l.sku, quantity: l.quantity, work_type: l.workType }));
+}
+
+/** The server's reading of who framed each SKU (the same reader the commit uses). */
+export async function fetchFramerEvidence(
+  client: SupabaseClient,
+  a: { location: string; orderNumber: string; lines: readonly DispatchFramedLine[]; expectedCaller: string },
+): Promise<EvidenceOutcome> {
+  const res = await rpc(client, "scanner_dispatch_evidence", {
+    p_location: a.location,
+    p_order_number: a.orderNumber,
+    p_lines: evidenceLines(a.lines),
+    p_expected_caller: a.expectedCaller,
+  });
+  if ("outcome" in res) return res;
+  const parsed = EvidenceSchema.safeParse(res.data);
+  if (!parsed.success) return { outcome: "network_error", message: "Unreadable framing records answer; will ask again." };
+  return {
+    outcome: "ok",
+    evidence: parsed.data.lines.map((l) => ({
+      sku: l.sku, status: l.status, personId: l.person_id, displayName: l.display_name,
+      verifiedEventId: l.verified_event_id, completedEventId: l.completed_event_id,
+    })),
+  };
+}
+
+export interface PickerPerson {
+  personId: string;
+  displayName: string;
+}
+
+const PeopleSchema = z.object({
+  status: z.literal("ok"),
+  people: z.array(z.object({ person_id: z.string().uuid(), display_name: z.string() })).max(500),
+});
+
+/** Active badge holders who are members of the site: ids and names only. */
+export async function fetchDispatchPeople(client: SupabaseClient, location: string): Promise<{ outcome: "ok"; people: PickerPerson[] } | Rejected | NetworkError> {
+  const res = await rpc(client, "scanner_dispatch_people", { p_location: location });
+  if ("outcome" in res) return res;
+  const parsed = PeopleSchema.safeParse(res.data);
+  if (!parsed.success) return malformed("people");
+  return { outcome: "ok", people: parsed.data.people.map((p) => ({ personId: p.person_id, displayName: p.display_name })) };
+}
+
 // ---------------------------------------------------------------------------
 // Framing commit
 // ---------------------------------------------------------------------------
+
+export interface SavedAttribution {
+  sku: string;
+  source: "scan" | "manual";
+  personId: string;
+  displayName: string;
+}
 
 export interface SavedResult {
   pieces: number;
   eventIds: string[];
   negativeCodes: string[];
   replayed: boolean;
+  /** F7 dispatch: who framed each framed SKU, as stored. */
+  attributions?: SavedAttribution[];
 }
 
 export type CommitOutcome =
@@ -188,6 +317,69 @@ export async function commitFraming(client: SupabaseClient, job: ScannerJob, pre
   const d = parsed.data;
   if (d.status === "already_recorded") return { outcome: "already_recorded", reason: d.reason };
   return { outcome: "saved", result: { pieces: d.pieces, eventIds: d.event_ids, negativeCodes: d.negative_codes, replayed: d.replayed ?? false } };
+}
+
+// ---------------------------------------------------------------------------
+// F7: dispatch commit
+// ---------------------------------------------------------------------------
+
+const DispatchSchema = z.union([
+  z.object({
+    status: z.literal("saved"),
+    items: z.number(),
+    event_ids: z.array(z.string()),
+    negative_codes: z.array(z.string()).default([]),
+    attributions: z.array(z.object({
+      sku: z.string(), source: z.enum(["scan", "manual"]), person_id: z.string().uuid(), display_name: z.string(),
+    })).default([]),
+    replayed: z.boolean().optional(),
+  }),
+  z.object({ status: z.literal("already_recorded"), reason: z.string() }),
+]);
+
+/** The exact arguments for one dispatch job. Same job -> same arguments, always. */
+export function dispatchParams(job: ScannerJob, prepared: PreparedDispatch): Record<string, unknown> {
+  return {
+    p_location: job.location,
+    p_request_id: job.requestId,
+    p_receiver_id: job.receiverId,
+    p_scanner_id: job.scannerId,
+    p_staff_id: job.personId,
+    p_badge: job.badge,
+    p_order_number: prepared.orderNumber,
+    p_scanned_at: job.scannedAt,
+    p_items: prepared.items,
+    p_lines: evidenceLines(prepared.framed),
+    p_components: prepared.components,
+    p_packaging: prepared.packaging
+      ? {
+          rule_set_id: prepared.packaging.ruleSetId,
+          rule_set_version: prepared.packaging.ruleSetVersion,
+          resolved: prepared.packaging.resolved,
+          predicted: prepared.packaging.predicted,
+          target: prepared.packaging.target,
+          snapshot: prepared.packaging.snapshot,
+        }
+      : null,
+    p_choices: prepared.choices.map((c) => ({ sku: c.sku, person_id: c.personId })),
+    p_expected_caller: job.callerId,
+  };
+}
+
+export async function commitDispatch(client: SupabaseClient, job: ScannerJob, prepared: PreparedDispatch): Promise<CommitOutcome> {
+  const res = await rpc(client, "scanner_commit_dispatch", dispatchParams(job, prepared));
+  if ("outcome" in res) return res;
+  const parsed = DispatchSchema.safeParse(res.data);
+  if (!parsed.success) return { outcome: "network_error", message: "Unreadable answer from the server; will ask again." };
+  const d = parsed.data;
+  if (d.status === "already_recorded") return { outcome: "already_recorded", reason: d.reason };
+  return {
+    outcome: "saved",
+    result: {
+      pieces: d.items, eventIds: d.event_ids, negativeCodes: d.negative_codes, replayed: d.replayed ?? false,
+      attributions: d.attributions.map((a) => ({ sku: a.sku, source: a.source, personId: a.person_id, displayName: a.display_name })),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +493,10 @@ export interface DeliveryDeps {
   /** Called only for orders with A0 framed lines. */
   packaging(): Promise<PackagingSetup | "network">;
   commit(job: ScannerJob, prepared: PreparedFraming): Promise<CommitOutcome>;
+  /** F7: the server's framing evidence for a dispatch job's framed lines. */
+  evidence?(orderNumber: string, lines: readonly DispatchFramedLine[]): Promise<EvidenceOutcome>;
+  /** F7: the dispatch commit. */
+  commitDispatch?(job: ScannerJob, prepared: PreparedDispatch): Promise<CommitOutcome>;
   /** False once the station was closed or its account/site changed: start nothing new. */
   active?(): boolean;
 }
@@ -311,6 +507,8 @@ export type DeliveryReport =
   /** `uncertain`: an earlier attempt may still have saved it (do not re-record). */
   | { kind: "blocked"; job: ScannerJob; code: string; message: string; uncertain: boolean }
   | { kind: "waiting"; job: ScannerJob; message: string; auth: boolean }
+  /** F7: a dispatch job is waiting for the dispatcher to choose who framed it (nothing sent). */
+  | { kind: "needs_choice"; job: ScannerJob; message: string }
   /** Another claim owns the job now, or the station stopped: nothing changed. */
   | { kind: "superseded"; job: ScannerJob };
 
@@ -340,7 +538,52 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
     return superseded();
   };
 
+  // The job's own mode, captured at scan time (F6 jobs have none: framing).
+  const mode = jobMode(job);
+
   try {
+    if (job.status === "queued" && mode === "dispatch") {
+      const products = d.products();
+      if (!products) return wait("Product catalogue still loading.");
+      const [lookup, openCase] = await Promise.all([d.lookupOrder(job.orderNumber), d.openCase(job.orderNumber)]);
+      if (!active()) return stopped();
+      if (lookup.kind === "network") return wait(lookup.message, lookup.auth ?? false);
+      if (openCase === "network") return wait("Couldn't check replacement cases.");
+      const ctx = { orderNumber: job.orderNumber, openCase, products, packaging: null as PackagingSetup | null };
+      let prep: DispatchPrepareResult = prepareDispatchOrder(lookup.lookup, ctx);
+      if (!prep.ok && prep.code === "packaging_not_auto") {
+        const packaging = await d.packaging();
+        if (!active()) return stopped();
+        if (packaging === "network") return wait("Couldn't load the box rules.");
+        prep = prepareDispatchOrder(lookup.lookup, { ...ctx, packaging });
+      }
+      if (!prep.ok) {
+        if (!(await d.outbox.markBlocked(job.requestId, lease, { code: prep.code, message: prep.message, stage: "prepare" }))) return superseded();
+        return { kind: "blocked", job, code: prep.code, message: prep.message, uncertain: job.uncertain };
+      }
+      let draft = prep.prepared;
+      if (draft.framed.length > 0) {
+        if (!d.evidence) return wait("Framing records are not available on this station.");
+        const ev = await d.evidence(job.orderNumber, draft.framed);
+        if (!active()) return stopped();
+        if (ev.outcome === "network_error") return wait(ev.message, ev.auth ?? false);
+        if (ev.outcome === "rejected") {
+          if (!(await d.outbox.markBlocked(job.requestId, lease, { code: ev.code, message: ev.message, stage: "prepare" }))) return superseded();
+          return { kind: "blocked", job, code: ev.code, message: ev.message, uncertain: job.uncertain };
+        }
+        const withEv = withEvidence(draft, ev.evidence);
+        if (!withEv) return wait("Unreadable framing records answer; will ask again.");
+        draft = withEv;
+        if (unresolvedSkus(draft).length > 0) {
+          // Definitely pre-commit: park the unsent draft until someone chooses.
+          const message = `#${job.orderNumber}: framing scan missing. Choose who framed it.`;
+          if (!(await d.outbox.awaitChoice(job.requestId, lease, draft, { code: "framer_missing", message, stage: "prepare" }))) return superseded();
+          return { kind: "needs_choice", job, message };
+        }
+      }
+      job = await d.outbox.setPrepared(job.requestId, lease, draft);
+    }
+
     if (job.status === "queued") {
       const products = d.products();
       if (!products) return wait("Product catalogue still loading.");
@@ -367,6 +610,8 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
 
     const prepared = job.prepared;
     if (!prepared) return wait("Scan has no prepared payload.");
+    if (isPreparedDispatch(prepared) !== (mode === "dispatch")) return wait("Stored scan does not match its mode.");
+    if (mode === "dispatch" && !d.commitDispatch) return wait("Dispatch saving is not available on this station.");
     if (!active()) return stopped();
     const before = { attempts: job.attempts, uncertain: job.uncertain, priorUnknown: job.priorUnknown ?? false };
     job = await d.outbox.markAttempt(job.requestId, lease);
@@ -382,12 +627,13 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
     throw e;
   }
   const prepared = job.prepared!;
-  const res = await d.commit(job, prepared);
+  // The exact stored payload for the job's own mode; never re-derived here.
+  const res = isPreparedDispatch(prepared) ? await d.commitDispatch!(job, prepared) : await d.commit(job, prepared);
   switch (res.outcome) {
     case "saved":
       await d.outbox.markDone(job.requestId, {
         kind: "saved",
-        message: `${job.displayName}: #${job.orderNumber} saved`,
+        message: mode === "dispatch" ? `${job.displayName}: #${job.orderNumber} dispatched` : `${job.displayName}: #${job.orderNumber} saved`,
         pieces: res.result.pieces,
         warnings: res.result.negativeCodes.length ? [`Stock now below zero: ${res.result.negativeCodes.join(", ")}`] : [],
       });
@@ -395,7 +641,9 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
     case "already_recorded":
       await d.outbox.markDone(job.requestId, {
         kind: "already_recorded",
-        message: `#${job.orderNumber} already has framing work recorded. No extra credit. Check it on the classic station.`,
+        message: mode === "dispatch"
+          ? `#${job.orderNumber} was already dispatched. Nothing more was saved.`
+          : `#${job.orderNumber} already has framing work recorded. No extra credit. Check it on the classic station.`,
         pieces: 0,
         warnings: [res.reason],
       });
