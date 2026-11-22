@@ -701,54 +701,5 @@ export function stationRequiresPackages(stationDept: ProductionDeptKey): boolean
   return stationDept === "a0_framed" || stationDept === "dispatch";
 }
 
-// ---------------------------------------------------------------------------
-// KPI eligibility helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Items KPI eligibility (narrow). Frames + picture frames only.
- *   Includes: single_print / set_print with variant FN, FB, FW
- *             picture_frame (always PN, PB, PW)
- *   Excludes: UN variant (unframed prints - tracked via orders, not items)
- *             aux_other (hooks), aux_free_print, gift_card, SC variant
- */
-export function isKpiEligibleSku(sku: string | null | undefined): boolean {
-  if (!sku) return false;
-  const p = parseSku(sku);
-  if (!p) return false;
-  if (p.type === "gift_card" || p.type === "aux_other" || p.type === "aux_free_print") return false;
-  if (p.type === "picture_frame") return true;
-  // Items KPI excludes UN - unframed dept tracks orders, not items.
-  return p.variant === "FN" || p.variant === "FB" || p.variant === "FW";
-}
-
-/**
- * Orders KPI eligibility (broad). Items + unframed prints.
- * Hooks, gift cards, free prints still excluded.
- */
-export function isKpiOrderSku(sku: string | null | undefined): boolean {
-  if (!sku) return false;
-  const p = parseSku(sku);
-  // Fail OPEN for unparseable SKUs - legacy title-format strings baked
-  // into historical Shopify line items pre-v6 migration. They represent
-  // real production work and should count toward order throughput.
-  // isKpiEligibleSku stays strict so legacy SKUs do NOT inflate items.
-  if (!p) return true;
-  if (p.type === "gift_card" || p.type === "aux_other" || p.type === "aux_free_print") return false;
-  if (p.type === "picture_frame") return true;
-  return p.variant === "FN" || p.variant === "FB" || p.variant === "FW" || p.variant === "UN";
-}
-
-/**
- * For set prints, return the piece count (2, 3, 5, or 6) so one verified
- * line counts as N production units. Returns 1 for non-set SKUs.
- */
-export function kpiUnitMultiplier(sku: string | null | undefined): number {
-  if (!sku) return 1;
-  const p = parseSku(sku);
-  if (!p) return 1;
-  if (p.type === "set_print" && typeof p.setCount === "number" && p.setCount > 0) {
-    return p.setCount;
-  }
-  return 1;
-}
+// KPI eligibility helpers were removed in F1 (item-counting): counting lives in
+// productionItems.ts and frame timing keeps its own predicates in productionFrameTiming.ts.

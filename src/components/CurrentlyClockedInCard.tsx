@@ -4,13 +4,16 @@ import { Card, CardBody } from "@/components/ui/Card";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
 import { formatShiftDuration } from "@/lib/domain/shifts";
+import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
 
 /**
  * Live tile on the Welcome page showing who is currently clocked in at
  * this location. Refreshes every 30 seconds.
  *
  * Algorithm: pull all clock_in/clock_out events from the last 16 hours
- * (max shift length), group by staff_id, take the latest per staff. If
+ * (max shift length) - every page, in a total (created_at, id) order, so
+ * the latest per worker is never a first-page truncation - group by
+ * staff_id, take the latest per staff. If
  * the latest is a clock_in, the worker is currently signed in - show
  * them with their since-time and elapsed duration.
  *
@@ -41,21 +44,25 @@ function CurrentlyClockedInCardInner() {
     const fetchOnce = async () => {
       try {
         const sixteenHoursAgo = new Date(Date.now() - 16 * 3600 * 1000).toISOString();
-        const [evRes, barcodesRes] = await Promise.all([
-          supabase
-            .from("production_events")
-            .select("staff_id, event_type, created_at")
-            .eq("location", location)
-            .in("event_type", ["clock_in", "clock_out"])
-            .gte("created_at", sixteenHoursAgo)
-            .order("created_at", { ascending: true }),
+        const [clockEvents, barcodesRes] = await Promise.all([
+          // A page error or the safety cap throws (caught below): never a partial "who is in" list.
+          fetchAllRows<{ staff_id: string; event_type: string; created_at: string }>((from, to) =>
+            supabase
+              .from("production_events")
+              .select("staff_id, event_type, created_at")
+              .eq("location", location)
+              .in("event_type", ["clock_in", "clock_out"])
+              .gte("created_at", sixteenHoursAgo)
+              .order("created_at", { ascending: true })
+              .order("id", { ascending: true })
+              .range(from, to),
+          ),
           supabase
             .from("staff_barcodes")
             .select("user_id, display_name")
             .eq("location", location),
         ]);
         if (cancelled) return;
-        if (evRes.error) { setErr(evRes.error.message); setLoading(false); return; }
         if (barcodesRes.error) { setErr(barcodesRes.error.message); setLoading(false); return; }
 
         // Build name map (one row per (location, barcode) but display_name is
@@ -68,7 +75,7 @@ function CurrentlyClockedInCardInner() {
         // Walk events in chronological order; for each staff, track latest
         // clock event.
         const latestByStaff = new Map<string, { event_type: string; created_at: string }>();
-        for (const e of (evRes.data ?? [])) {
+        for (const e of clockEvents) {
           latestByStaff.set(e.staff_id, { event_type: e.event_type, created_at: e.created_at });
         }
 

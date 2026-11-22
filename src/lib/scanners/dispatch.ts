@@ -13,12 +13,13 @@
  * module only decides, from the server's answer, which lines still need a
  * person chosen, and applies the dispatcher's choice to an unsent payload.
  */
-import { kpiUnitMultiplier, parseSku, routeShopifyLineToCatalogueLines, shouldDeductAtDept } from "@/lib/domain/skuRouting";
+import { parseSku, routeShopifyLineToCatalogueLines, shouldDeductAtDept } from "@/lib/domain/skuRouting";
 import { packagingContents, packagingLinesFromOrder, totalPieces } from "@/lib/domain/packaging/contents";
 import { buildApplyPayload, predictPackaging } from "@/lib/domain/packaging/session";
 import {
   MAX_LINE_QUANTITY,
   no,
+  framingPieceMultiplier,
   orderHeaderProblem,
   type CatalogueProduct,
   type FramingPackaging,
@@ -118,7 +119,7 @@ export function prepareDispatchOrder(
     const hit = bySku.get(sku);
     const quantity = (hit?.quantity ?? 0) + q;
     if (quantity > MAX_LINE_QUANTITY) return refuse(no("invalid_quantity", `Line ${sku} has quantity ${quantity}.`));
-    bySku.set(sku, { sku, quantity, workType: p.size === "A0" ? "a0_framed" : "framed", pieces: quantity * kpiUnitMultiplier(sku) });
+    bySku.set(sku, { sku, quantity, workType: p.size === "A0" ? "a0_framed" : "framed", pieces: quantity * framingPieceMultiplier(sku) });
   }
   if (allLines.length === 0) return refuse(no("not_found", `Order #${n} has no lines.`));
 

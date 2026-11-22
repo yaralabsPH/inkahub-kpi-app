@@ -17,9 +17,20 @@
  *       .range(from, to),
  *   );
  *
- * Each call is independent, so the caller MUST include .order(...) in
- * the builder to get stable ordering across pages.
+ * Each call is independent, so the caller MUST include a TOTAL order
+ * (e.g. .order("created_at").order("id")) in the builder for stable pages.
+ *
+ * The result is complete or an error: a page error rejects, and reaching
+ * the safety cap with a full final page throws PageThroughIncompleteError
+ * (more rows may exist), never a silently truncated array.
  */
+export class PageThroughIncompleteError extends Error {
+  constructor(readonly maxPages: number, readonly pageSize: number) {
+    super(`Read stopped at the safety cap of ${maxPages} pages (${maxPages * pageSize} rows); the result would be incomplete`);
+    this.name = "PageThroughIncompleteError";
+  }
+}
+
 export async function fetchAllRows<T>(
   buildQuery: (
     from: number,
@@ -29,6 +40,8 @@ export async function fetchAllRows<T>(
 ): Promise<T[]> {
   const pageSize = opts?.pageSize ?? 1000;
   const maxPages = opts?.maxPages ?? 100; // hard safety: 100k rows
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1) throw new RangeError("pageSize must be a positive integer");
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1) throw new RangeError("maxPages must be a positive integer");
   const all: T[] = [];
   for (let page = 0; page < maxPages; page++) {
     const from = page * pageSize;
@@ -42,9 +55,10 @@ export async function fetchAllRows<T>(
           : String(error);
       throw new Error(msg);
     }
-    if (!data || data.length === 0) break;
+    if (!data || data.length === 0) return all;
     all.push(...data);
-    if (data.length < pageSize) break;
+    if (data.length < pageSize) return all;
   }
-  return all;
+  // Every page was full up to the cap: more rows may exist, so the result is not complete.
+  throw new PageThroughIncompleteError(maxPages, pageSize);
 }

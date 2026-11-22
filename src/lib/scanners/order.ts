@@ -8,7 +8,6 @@
  * classify with certainty sends the whole order to the classic station.
  */
 import {
-  kpiUnitMultiplier,
   parseSku,
   routeShopifyLineToCatalogueLines,
   shouldDeductAtDept,
@@ -18,6 +17,16 @@ import { buildApplyPayload, predictPackaging } from "@/lib/domain/packaging/sess
 import type { Quantities } from "@/lib/domain/packaging/reconcile";
 
 export type FramingWorkType = "a0_framed" | "framed";
+
+/**
+ * Pieces one framed line stands for: a set print is its set count, anything
+ * else is one. The local preview only; the server returns the saved pieces.
+ * (F1 removed the old skuRouting KPI helpers; this keeps F6's exact rule.)
+ */
+export function framingPieceMultiplier(sku: string): number {
+  const p = parseSku(sku);
+  return p && p.type === "set_print" && typeof p.setCount === "number" && p.setCount > 0 ? p.setCount : 1;
+}
 
 /** The subset of the /api/shopify/order answer this module reads. */
 export interface OrderLookup {
@@ -169,7 +178,7 @@ export function prepareFramingOrder(
     const hit = bySku.get(sku);
     const quantity = (hit?.quantity ?? 0) + q;
     if (quantity > MAX_LINE_QUANTITY) return no("invalid_quantity", `Line ${sku} has quantity ${quantity}.`);
-    bySku.set(sku, { sku, quantity, workType, pieces: quantity * kpiUnitMultiplier(sku) });
+    bySku.set(sku, { sku, quantity, workType, pieces: quantity * framingPieceMultiplier(sku) });
   }
 
   const lines = [...bySku.values()].sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0));
