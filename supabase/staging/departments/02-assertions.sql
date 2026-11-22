@@ -1095,6 +1095,34 @@ BEGIN
 END $$;
 
 -- ===========================================================================
+-- N. Health counts (the same aggregate as 08-health.sql, limited to this
+--    script's own events)
+-- ===========================================================================
+DO $$
+DECLARE
+  h record;
+BEGIN
+  SELECT
+    count(*) FILTER (WHERE department_time_status = 'future_clamped')                                     AS future_clamped,
+    count(*) FILTER (WHERE department_time_status = 'reported_old')                                       AS reported_old,
+    count(*) FILTER (WHERE department_time_status = 'invalid_time')                                       AS invalid_time,
+    count(*) FILTER (WHERE department_time_status = 'future_clamped' AND business_department_status = 'assigned') AS clamped_assigned,
+    count(*) FILTER (WHERE department_time_status = 'reported_old'   AND business_department_status = 'assigned') AS old_assigned,
+    count(*) FILTER (WHERE business_department_status IS NULL)                                            AS legacy
+  INTO h
+  FROM public.production_events
+  WHERE location = 'staging' AND id LIKE 'f5t-%' AND department_received_at >= now() - interval '24 hours';
+
+  -- future_clamped: f5t-plus2s, f5t-clamp-pre
+  PERFORM pg_temp.f5_ok('N01 future_clamped count matches the inserted cases', h.future_clamped = 2 AND h.clamped_assigned = 2, row_to_json(h)::text);
+  -- reported_old: f5t-2h, f5t-4h, f5t-at-r, f5t-before-r, f5t-at-t, f5t-before-t, f5t-15d, f5t-40d, f5t-p3-before
+  PERFORM pg_temp.f5_ok('N02 reported_old count matches, including assigned events', h.reported_old = 9 AND h.old_assigned = 7, row_to_json(h)::text);
+  -- invalid_time: f5t-plus30s
+  PERFORM pg_temp.f5_ok('N03 invalid_time count matches', h.invalid_time = 1, row_to_json(h)::text);
+  PERFORM pg_temp.f5_ok('N04 legacy rows are not counted as recent (no receipt time)', h.legacy = 0, row_to_json(h)::text);
+END $$;
+
+-- ===========================================================================
 -- M. Emergency mode: resolver trigger disabled, sanitize still protects
 -- (This holds a lock on production_events until the ROLLBACK below.)
 -- ===========================================================================
