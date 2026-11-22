@@ -54,7 +54,7 @@ Each task is one commit and ends with `npx tsc -b` and
 `npm run test -- --run` passing. All test data is synthetic (made-up product
 ids, rule sets and order numbers).
 
-### [ ] Task 1: Packaging contents model
+### [x] Task 1: Packaging contents model
 
 - Files: `src/lib/domain/packaging/contents.ts`,
   `src/lib/domain/packaging/__tests__/contents.test.ts`
@@ -393,4 +393,4 @@ CJ answers inline.
 
 Coder adds one line per task.
 
--
+- Task 1: contents.ts + 14 tests. Order-aware packing points per CJ Q4: travellers (unframed, free print, accessory, unclassified) ride the dispatch parcel, else A0, else unframed if any flat print, else dispatch.
