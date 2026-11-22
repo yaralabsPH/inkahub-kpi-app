@@ -7,6 +7,7 @@ import { isKpiEligibleSku, kpiUnitMultiplier } from "@/lib/domain/skuRouting";
 import { useAppStore } from "@/lib/state/appStore";
 import { Card, CardBody } from "@/components/ui/Card";
 import { CurrentlyClockedInCard } from "@/components/CurrentlyClockedInCard";
+import { ScannerHealthCard } from "@/components/production/scanners/ScannerHealthCard";
 import {
   PRODUCTION_DEPARTMENT_LABELS,
   type ProductionDepartment,
@@ -486,6 +487,7 @@ export function Welcome() {
       ) : null}
 
       <CurrentlyClockedInCard />
+      <ScannerHealthCard />
     </div>
   );
 }

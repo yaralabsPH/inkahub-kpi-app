@@ -1,0 +1,88 @@
+import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { SharedScannerWall, type SharedScannerWallProps } from "../SharedScannerWall";
+import { ScannerHealthView } from "../ScannerHealthCard";
+import { emptySlots } from "@/lib/scanners/session";
+import type { WallState } from "@/lib/scanners/station";
+import type { ScannerJob } from "@/lib/scanners/outbox";
+import type { DeviceStatus } from "../useSharedScannerStation";
+
+const noop = () => {};
+const device = (over: Partial<DeviceStatus> = {}): DeviceStatus => ({
+  started: true, online: true, focused: true, visible: true, capturePaused: false, wakeLock: "on", audio: "on", ...over,
+});
+const state = (over: Partial<WallState> = {}): WallState => ({
+  slots: emptySlots(["S1", "S2", "S3"]), last: null, view: { jobs: [], corrupt: [], waiting: 0, blocked: 0, uncertain: 0 },
+  storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null, ...over,
+});
+function render(over: Partial<SharedScannerWallProps> = {}) {
+  const props: SharedScannerWallProps = {
+    siteLabel: "Australia", receiverLabel: "Framing wall", scannerIds: ["S1", "S2", "S3"], state: state(), device: device(),
+    roleAllowed: true, signedIn: true, now: 1_000_000, onStart: noop, onRetry: noop, onDismiss: noop, onSignOutAll: noop, onExit: noop, ...over,
+  };
+  return renderToStaticMarkup(<SharedScannerWall {...props} />);
+}
+
+describe("SharedScannerWall", () => {
+  it("asks for the one start gesture until started", () => {
+    expect(render({ device: device({ started: false }) })).toContain('data-testid="start-station"');
+    expect(render()).not.toContain('data-testid="start-station"');
+  });
+
+  it("shows each scanner's person and expiry", () => {
+    const slots = emptySlots(["S1", "S2", "S3"]);
+    slots.S1 = { ...slots.S1, identity: { personId: "p", displayName: "Alice", badge: "B", activatedAt: 1_000_000, lastFramingAt: 1_000_000 - 60_000 } };
+    slots.S2 = { ...slots.S2, pending: { requestId: "r", badge: "X", startedAt: 0, orderFallback: null } };
+    const html = render({ state: state({ slots }) });
+    expect(html).toContain("Alice");
+    expect(html).toContain("Signs out in 9:00");
+    expect(html).toContain("Signing in");
+    expect(html).toContain("Scan badge");
+  });
+
+  it("green saved with person, order and pieces; amber queued; red not saved", () => {
+    const saved = render({ state: state({ last: { kind: "saved", title: "Saved #10190203", scannerId: "S1", person: "Alice", order: "10190203", pieces: 3, at: 1 } }) });
+    expect(saved).toContain('data-kind="saved"');
+    expect(saved).toContain("bg-emerald-600");
+    expect(saved).toContain("Alice · #10190203 · 3 pieces");
+    const queued = render({ state: state({ last: { kind: "queued", title: "Queued #10190203 for Alice", scannerId: "S1", at: 1 } }) });
+    expect(queued).toContain("QUEUED");
+    expect(queued).not.toContain("bg-emerald-600");
+    const red = render({ state: state({ last: { kind: "rejected", title: "NOT SAVED: #1", scannerId: "S2", at: 1 } }) });
+    expect(red).toContain("bg-red-600");
+  });
+
+  it("is loud about offline, storage, focus, paused capture, auth and role", () => {
+    const html = render({
+      device: device({ online: false, focused: false, capturePaused: true }),
+      state: state({ storageError: "QuotaExceededError", authProblem: true, deliveryWaiting: "timeout" }),
+      roleAllowed: false,
+    });
+    for (const text of ["Offline", "Device storage problem", "not focused", "capture is paused", "session has expired", "cannot run shared scanners", "Waiting to save: timeout"]) {
+      expect(html).toContain(text);
+    }
+  });
+
+  it("lists blocked scans with their reason and recovery buttons", () => {
+    const job = { requestId: "r1", orderNumber: "10190203", displayName: "Alice", scannerId: "S1", status: "blocked",
+      blocked: { code: "cancelled", message: "Order #10190203 is cancelled. Use the classic station for this order.", stage: "prepare" } } as ScannerJob;
+    const html = render({ state: state({ view: { jobs: [job], corrupt: [{ key: "k", raw: 1 }], waiting: 0, blocked: 1, uncertain: 0 } }) });
+    expect(html).toContain('data-testid="blocked-jobs"');
+    expect(html).toContain("is cancelled");
+    expect(html).toContain("Retry");
+    expect(html).toContain("Recorded on classic");
+    expect(html).toContain("cannot be read");
+  });
+});
+
+describe("ScannerHealthView", () => {
+  it("shows stale receivers in red", () => {
+    const html = renderToStaticMarkup(
+      <ScannerHealthView zone="Australia/Sydney" now={new Date("2026-11-23T23:00:00Z")} rows={[
+        { receiver_id: "rcv-1", label: "Wall", heartbeat_at: "2026-11-23T22:50:00Z", last_scan_at: null, queue_count: 0, blocked_count: 0 },
+      ]} />,
+    );
+    expect(html).toContain('data-level="bad"');
+    expect(html).toContain("No heartbeat");
+  });
+});

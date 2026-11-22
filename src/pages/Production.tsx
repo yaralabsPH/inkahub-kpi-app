@@ -52,6 +52,13 @@ import {
 import { cn } from "@/lib/utils/cn";
 import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { Modal } from "@/components/ui/Modal";
+import { SharedScannerSetup, SharedScannerStation } from "@/components/production/scanners/SharedScannerStation";
+import {
+  browserStorage,
+  loadSharedScannerConfig,
+  saveSharedScannerConfig,
+  type SharedScannerConfig,
+} from "@/lib/scanners/config";
 
 /**
  * Production / Order Submission tablet page.
@@ -224,10 +231,42 @@ export function Production() {
   const [scanError, setScanError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
+  // F6: opt-in Shared scanners mode, saved on this device. Off = the
+  // classic station below, unchanged. Turning it off keeps its queue.
+  const [shared, setShared] = useState<SharedScannerConfig | null>(() => loadSharedScannerConfig(browserStorage()));
+  const [sharedSetup, setSharedSetup] = useState(false);
+
   const handlePickStation = (cfg: StationConfig) => {
     saveStationConfig(cfg);
     setStation(cfg);
   };
+
+  if (sharedSetup) {
+    return (
+      <SharedScannerSetup
+        current={shared}
+        onCancel={() => setSharedSetup(false)}
+        onSave={(cfg) => {
+          saveSharedScannerConfig(browserStorage(), cfg);
+          setShared(cfg);
+          setSharedSetup(false);
+          setShowSettings(false);
+        }}
+      />
+    );
+  }
+  if (shared?.enabled) {
+    return (
+      <SharedScannerStation
+        config={shared}
+        onExit={() => {
+          const off = { ...shared, enabled: false };
+          saveSharedScannerConfig(browserStorage(), off);
+          setShared(off);
+        }}
+      />
+    );
+  }
 
   // Department wasn't set, or operator clicked the gear → show the picker.
   if (!station || showSettings) {
@@ -236,6 +275,7 @@ export function Production() {
         current={station}
         onPick={(cfg) => { handlePickStation(cfg); setShowSettings(false); }}
         onClose={station ? () => setShowSettings(false) : undefined}
+        onSharedScanners={() => setSharedSetup(true)}
         onReset={station ? () => {
           clearStationConfig();
           setStation(null);
@@ -2494,12 +2534,14 @@ null
 // ============================================================
 
 function DepartmentPicker({
-  current, onPick, onClose, onReset,
+  current, onPick, onClose, onReset, onSharedScanners,
 }: {
   current: StationConfig | null;
   onPick: (cfg: StationConfig) => void;
   onClose?: () => void;
   onReset?: () => void;
+  /** F6: open the Shared scanners setup instead of a single bench. */
+  onSharedScanners?: () => void;
 }) {
   const [dept, setDept] = useState<ProductionDepartment>(current?.department ?? "framed");
 
@@ -2537,6 +2579,17 @@ function DepartmentPicker({
             ))}
           </div>
         </div>
+
+        {onSharedScanners ? (
+          <button
+            type="button"
+            onClick={onSharedScanners}
+            className="w-full px-4 py-3 rounded-lg ring-1 ring-sky-300 dark:ring-sky-800 text-left hover:bg-sky-50 dark:hover:bg-sky-950"
+          >
+            <div className="font-semibold">Shared scanners (wall receiver)</div>
+            <div className="text-xs opacity-70 mt-0.5">Up to three cordless scanners; badge, then order, saved without taps</div>
+          </button>
+        ) : null}
 
         <div className="flex items-center justify-between pt-2">
 
