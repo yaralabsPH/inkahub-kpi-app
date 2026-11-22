@@ -46,7 +46,7 @@ Things to know when applying:
 
 - `0054` briefly locks `production_events` (add columns, build an index). Pick a quiet time.
 - The extension `btree_gist` stays installed on rollback.
-- `0054` hands one function to the role `departments_resolver`. Those ownership statements have only been run locally as a superuser; the first staging apply is their real test under the Supabase `postgres` role.
+- `0054` hands one function to the role `departments_resolver`. The first candidate of `0054` failed on staging at that point (see "Review r1" below) and was corrected before anything was applied. The corrected file must be re-run rollback-only on staging, unchanged, before it is applied for real.
 - No existing event row is updated or backfilled, by the migrations or by switching on. (This also means F1's capture trigger records nothing for old rows.)
 - New behaviour on updates: once an event has a snapshot, its `staff_id`, `created_at`, `location` and `id` cannot be changed (error 23514). Other edits and deletes work as before. Rows from before F5 are not affected. No app code changes those four fields today.
 - New behaviour on profile deletion: it now waits up to 2 seconds if an owner is saving a department change at that instant, and fails with a retryable error rather than waiting longer.
@@ -75,12 +75,12 @@ worth knowing here:
 
 ## Checks run by the coder
 
-On 2026-11-22, on the task 10 commit plus the final log commit:
+On 2026-11-22, after the review r1 fixes (commit `a8ca3a3`):
 
 | Check | Result |
 |---|---|
 | `npx tsc -b` | passed |
-| `npm run test -- --run` | 819 tests in 29 files passed (183 new for F5) |
+| `npm run test -- --run` | 836 tests in 30 files passed (200 new for F5) |
 | `npm run typecheck:digest` | passed |
 | `npm run build` | passed (existing chunk-size warning only) |
 
@@ -88,7 +88,7 @@ Migration SHA-256 as committed (LF line endings):
 
 - `0052_departments.sql` `fb86f6628f27191dce303a88d212a4f2b7a721e386a2346c5a2655d586c16b02`
 - `0053_departments_admin.sql` `cc7301877a146f7a62dad8cd93b066f88799a239275f73d254f91a5f754e89c3`
-- `0054_departments_snapshots.sql` `b1960ef35833cc89b35903f8acb63b342accb26ec37bf2d81f243b5363dec890`
+- `0054_departments_snapshots.sql` `541a7822ae18c9177bca3187a44fde256dcc1037a61c831b40d69d28a5b4a116` (corrected in review r1; the first candidate was `b1960ef3...`, never applied)
 
 A Windows checkout with line-ending conversion changes these bytes: hash the
 file as stored in git (`git show <commit>:<path> | sha256sum`).
@@ -99,6 +99,50 @@ migrations applied twice, `02-assertions.sql` all cases passing,
 `06-composition.sql` against a stand-in for F1's trigger, `07-performance.sql`
 at the default size, `01`/`08`/`09`, and `05-session-a.sql` in one session.
 **That is not staging evidence** and none of the rows below are filled from it.
+
+## Review r1 (2026-11-22)
+
+Review: [`docs/reviews/departments-r1.md`](../reviews/departments-r1.md). Three fixes, each with regression tests.
+
+1. **`0054` failed on staging; corrected before anything was applied.** Evidence
+   supplied by root (Codex), from an actual rollback-only run on the staging
+   project under the Supabase `postgres` role (not a superuser): `0052` and
+   `0053` executed; `0054` failed with SQLSTATE 42501 "permission denied for
+   function departments_private.resolve_event". Cause: the migration gave up
+   its temporary membership of `departments_resolver` before `CREATE TRIGGER`,
+   which needs EXECUTE on that function. Root then ran a diagnostic with only
+   that one `REVOKE` moved after the triggers: all three migrations executed,
+   the operator could no longer execute the function afterwards, and an
+   authenticated synthetic kiosk insert of a clock event saved with status
+   `disabled` and snapshot version 1. Everything was rolled back; root
+   confirmed no F5 object remains on staging and the event count is unchanged.
+   The fix in the repo is exactly that move. No grant was added or widened.
+   Coder local reproduction (not staging evidence): under a non-superuser
+   CREATEROLE role the old file fails with the same error; the corrected file
+   applies, re-applies, and `02-assertions.sql` passes 321 cases under that
+   role. **Still to do on staging:** run the committed files, unchanged, in
+   rollback-only mode once more before the persistent apply.
+2. **The owner panel now belongs to the live session.** It is shown only when
+   the session user id equals the loaded profile user id and that profile is
+   an owner, and it is keyed by that id. Changing account (to a non-owner, or
+   to another owner) unmounts the first owner panel immediately: lists, open
+   forms, a pending or unconfirmed request and its Retry all go, the cached
+   lists are cleared, and a late answer is discarded.
+3. **The switch confirmation keeps the action it was opened with.** Target
+   and expected version are captured when "Turn on..." / "Turn off..." is
+   clicked. The confirmation closes only when the server confirms. If the
+   switch is already in the requested state, or someone else changed it, the
+   confirmation can only be closed; it never becomes the opposite action. An
+   unconfirmed change is retried with the original request.
+
+Also: People and Members now load a page at a time with "Load more" (the
+department picker still loads every active department). A partial People list
+says "Showing the first N accounts" instead of a team-wide count.
+
+Accepted by the ruling as documented, no change: roles and failure cases as
+sections of `02-assertions.sql`; a platform-granted membership of
+`departments_resolver` for the role that created it (case A14 reports it),
+provided no client role gains membership or EXECUTE.
 
 ## Gate A — staging database acceptance
 
@@ -147,7 +191,8 @@ Steps: runbook section 3.
 | B15 lost response, retry, applied once | pending | | |
 | B16 remove and re-add a person | pending | | |
 | B17 keyboard and focus | pending | | |
-| B18 sign-out clears lists | pending | | |
+| B18 sign-out and direct account switch (owner to non-owner, owner to owner) hide the first owner panel at once | pending | | |
+| B18b open switch confirmation never becomes the opposite action | pending | | |
 | B19 Dexie notice | pending | | |
 | B20 RELEASING smoke test, stock deducts once, F4 packaging | pending | | |
 | B21 rollback rehearsal (old app on new schema; 6a; 6b and recovery) | pending | | |

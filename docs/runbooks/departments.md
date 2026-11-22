@@ -70,11 +70,29 @@ Scripts: [`supabase/staging/departments/`](../../supabase/staging/departments/RE
 | A12 | Run `09-cleanup.sql` | `no synthetic F5X rows remain`; switch as you left it; four triggers `O` | Output |
 | A13 | Run `08-health.sql` | Query 9 all zeros | Output |
 
-If A3 fails on the ownership statements near the end of `0054`
-(`GRANT departments_resolver TO CURRENT_USER`, `ALTER FUNCTION ... OWNER TO`),
-stop and report the exact error. Those statements were only ever executed
-locally as a superuser; staging is their first run under the Supabase
-`postgres` role. Nothing is half-applied: each migration is one transaction.
+Before A3, run the three committed files once in rollback-only mode on
+staging (one `BEGIN` ... `ROLLBACK` around them, with their own outer
+`BEGIN;` / `COMMIT;` removed) and confirm they execute. The first candidate of
+`0054` failed exactly here with SQLSTATE 42501 (`permission denied for
+function departments_private.resolve_event`); it was corrected in review r1 by
+giving up the temporary `departments_resolver` membership only after the
+triggers are created. If any migration fails, stop and report the exact
+error. Nothing is half-applied: each migration is one transaction.
+
+After A3, check the privileges really are narrow (also cases A09-A15 of
+`02-assertions.sql`):
+
+```sql
+SELECT r.rolname,
+       has_function_privilege(r.rolname, 'departments_private.resolve_event()', 'EXECUTE') AS can_execute_resolver,
+       pg_has_role(r.rolname, 'departments_resolver', 'MEMBER') AS is_member
+  FROM pg_roles r WHERE r.rolname IN ('anon', 'authenticated', 'service_role');
+-- Expect: false, false for all three.
+```
+
+The role that created `departments_resolver` (the Supabase `postgres` role)
+may keep an administrative membership the platform gives it; that is
+accepted. No client role may have one.
 
 ### What the scripts do not prove (keep these marked pending)
 
@@ -102,7 +120,7 @@ accounts. Use only synthetic names ("Department A", "Department B",
 | B6 | owner | Same person → Move → Department B → Confirm | History shows A ending and B starting at the same time |
 | B7 | owner | Archive "Department B" while the person is in it | Refused: "Move everyone out…", and the member list opens showing the person |
 | B8 | owner | Same person → tick "This fixes a mistake" → leave reason empty | Confirm is disabled; with a reason it saves; Change log shows "Corrected a home department" with the reason |
-| B9 | owner | Turn the switch ON (reason required) | Status ON. Change log shows it |
+| B9 | owner | Turn the switch ON (reason required) | Status ON, and the confirmation closes by itself (it must NOT turn into a ready "Turn OFF?" form). Change log shows it |
 | B10 | kiosk | Production page: scan the test person's badge, clock in, record an order event, verify a line, complete; dispatch at a dispatch station | Everything works exactly as before. In SQL the new rows have `business_department_status = 'assigned'`, the department from B6/B8, and `department` (work type) as before |
 | B11 | owner | Turn the switch OFF, kiosk records one event, owner turns it ON, kiosk records another | First row `disabled` with no department; second `assigned` |
 | B12 | manager, staff, kiosk, cs | Open Team (where the role can) | No Departments card at all. Browser network tab: no request to `department_owner_page` or the department tables |
@@ -111,7 +129,8 @@ accounts. Use only synthetic names ("Department A", "Department B",
 | B15 | owner | DevTools → Network → Offline, click Create, go back Online, click Retry | Banner "Not confirmed… Retry"; after Retry exactly one department; Change log shows one "Created department" |
 | B16 | owner | Team → remove the test person (the existing flow), then add them back (same account) | After removal: Change log "Left the team (home closed)"; history kept. After re-adding: "No home assigned" until assigned again |
 | B17 | owner | Keyboard only: Tab through the card, create and rename with Enter, Cancel with the Cancel button | Every control reachable and labelled; errors announced; focus is not lost |
-| B18 | owner | Sign out, sign in as a different owner | No list from the first owner flashes up |
+| B18 | owner | (a) Sign out, sign in as a different owner. (b) With a department form open and, if you can, an unconfirmed change showing Retry (B15), switch account without a full reload: once to a non-owner, once to another owner | The first owner card disappears at once in every case. Nothing of theirs (lists, history, open form, Retry banner) is shown to the next account. The second owner starts with a clean card |
+| B18b | two owners | Owner 1 opens "Turn on..." and waits; owner 2 turns the switch on (and, in a second run, on then off) in another browser; owner 1 refocuses the window so the page refreshes | Owner 1 sees "already ON" (or "changed by someone else") with only Close. The open confirmation never offers the opposite action |
 | B19 | — | Build with `VITE_BACKEND=dexie` (local `npm run dev` without Supabase) → Team | "Department management requires Supabase."; no network request |
 | B20 | all | `docs/RELEASING.md` smoke test: each role's pages; kiosk clock in/out; record and verify; **stock deducts exactly once** on completion and on retry; packaging (F4) pick as before; Shopify lookup; shipments, CS cases and returns save; Dashboard and Reports load with a clean console; digest groups by work type | Unchanged |
 | B21 | — | Rollback rehearsal: see section 6 | Old app works on the new schema |
