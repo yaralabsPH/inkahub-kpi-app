@@ -8,6 +8,10 @@
 --   scanner_activate_badge   owner/manager/kiosk: badge -> person, clock in once per site workday
 --   scanner_commit_framing   owner/manager/kiosk: one atomic framing save for one order
 --   scanner_heartbeat        owner/manager/kiosk: upsert the receiver's health row
+--   production_events_c6_scanner_guard  BEFORE INSERT trigger: classic framing
+--                            credit for an order the shared scanners already
+--                            saved is refused (same per-order lock)
+--   ledger_prod_order_idx    finds an order's earlier deductions by product
 --   private helpers (no client grants)
 --
 -- And replaces deduct_inventory_for_event (same signature, same JSON result
@@ -172,10 +176,16 @@ AS $$
   SELECT pg_advisory_xact_lock(hashtextextended('prod-order|' || p_location || '|' || p_order, 0));
 $$;
 
+-- Prior order deductions by product identity, whatever spelling 0031 stored.
+-- Takes a short write lock on ledger while it builds: apply at a quiet time.
+CREATE INDEX IF NOT EXISTS ledger_prod_order_idx
+  ON public.ledger (location, (split_part(source_id, ':', 2)), product_id)
+  WHERE source_id LIKE 'prod:%';
+
 -- Deduct order components for one terminal event. Caller holds the order
 -- lock and has authorized the event. Same rules as 0031 except:
---   * aliases (code in any case, or id) of one product are charged once per
---     order: prior "prod:order_<n>:<alias>" rows for ANY alias count;
+--   * a product is charged once per order: any prior "prod:order_<n>:..."
+--     row for the same product id counts, whatever alias it was keyed by;
 --   * products are aggregated and updated in id order.
 -- New rows are keyed by the product's code (its id if it has no code), which
 -- is also the key F4's legacy-packaging adoption looks for.
@@ -240,13 +250,16 @@ BEGIN
     GROUP BY r.product_id
     ORDER BY r.product_id
   LOOP
+    -- Any earlier "prod:order_<n>:<anything>" row for this PRODUCT counts,
+    -- whatever spelling (any case, code or id) it was written with.
+    -- Indexed by ledger_prod_order_idx (site, order part of the key, product).
     IF EXISTS (
       SELECT 1 FROM ledger lg
       WHERE lg.location = p_location
-        AND lg.source_id = ANY (
-          ARRAY(SELECT v_prefix || a FROM unnest(v_rec.aliases || ARRAY[v_rec.product_id, v_rec.code, upper(v_rec.code), lower(v_rec.code)]) a
-                WHERE a IS NOT NULL AND a <> '')
-        )
+        AND lg.source_id LIKE 'prod:%'
+        AND split_part(lg.source_id, ':', 2) = 'order_' || p_order_number
+        AND left(lg.source_id, length(v_prefix)) = v_prefix
+        AND lg.product_id = v_rec.product_id
     ) THEN
       v_skipped := v_skipped + 1;
       CONTINUE;
@@ -305,7 +318,11 @@ BEGIN
     RAISE EXCEPTION 'deduct_inventory_for_event: not_authenticated' USING ERRCODE = '42501';
   END IF;
 
-  -- Only events at a site the caller belongs to are visible here.
+  -- Only events at a site the caller belongs to are visible here. The id is
+  -- unique only per site: refuse to guess between two sites.
+  IF (SELECT count(*) FROM production_events WHERE id = p_event_id AND can_access_location(location)) > 1 THEN
+    RAISE EXCEPTION 'deduct_inventory_for_event: ambiguous_event %', p_event_id USING ERRCODE = 'P0001';
+  END IF;
   SELECT * INTO v_event
   FROM   production_events
   WHERE  id = p_event_id AND can_access_location(location)
@@ -353,13 +370,18 @@ $$;
 -- ---------------------------------------------------------------------------
 
 -- Returns {status:"activated", person_id, display_name, clocked_in} or
--- {status:"unknown_badge"}. Only the person's id and name are returned.
+-- {status:"unknown_badge"} (no badge with this value anywhere) or
+-- {status:"unusable_badge"} (exists but inactive here, or only at another
+-- site; nothing about it is disclosed). Only the person's id and name are
+-- returned. p_expected_caller must be the signed-in account (checked before
+-- replay or any write), so a queued request can never run as another account.
 CREATE OR REPLACE FUNCTION public.scanner_activate_badge(
   p_location    TEXT,
   p_request_id  UUID,
   p_receiver_id TEXT,
   p_scanner_id  TEXT,
-  p_badge       TEXT
+  p_badge       TEXT,
+  p_expected_caller UUID
 ) RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -385,6 +407,9 @@ BEGIN
        false) THEN
     RAISE EXCEPTION 'scanner: invalid_input' USING ERRCODE = 'P0001';
   END IF;
+  IF p_expected_caller IS DISTINCT FROM v_uid THEN
+    RAISE EXCEPTION 'scanner: caller_mismatch' USING ERRCODE = 'P0001';
+  END IF;
 
   v_hash := scanner_hash_(jsonb_build_object('v', 1, 'kind', 'activate', 'location', p_location,
               'receiver', p_receiver_id, 'scanner', p_scanner_id, 'badge', v_badge));
@@ -401,7 +426,11 @@ BEGIN
   FROM   staff_barcodes b
   WHERE  b.location = p_location AND b.barcode = v_badge AND b.active;
   IF NOT FOUND THEN
-    -- Not a badge here. No side effect, so nothing is stored.
+    -- No side effect, so nothing is stored. A known badge that cannot be
+    -- used here must never be read as an order for the previous person.
+    IF EXISTS (SELECT 1 FROM staff_barcodes b WHERE b.barcode = v_badge) THEN
+      RETURN jsonb_build_object('status', 'unusable_badge');
+    END IF;
     RETURN jsonb_build_object('status', 'unknown_badge');
   END IF;
 
@@ -468,7 +497,8 @@ CREATE OR REPLACE FUNCTION public.scanner_commit_framing(
   p_scanned_at   TIMESTAMPTZ,
   p_lines        JSONB,
   p_components   JSONB,
-  p_packaging    JSONB
+  p_packaging    JSONB,
+  p_expected_caller UUID
 ) RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -500,6 +530,12 @@ DECLARE
 BEGIN
   -- 1. Bounded input. Lines are re-checked against the SKU grammar: only
   --    framed single/set prints, A0 -> a0_framed, A1-A4/GW sets -> framed.
+  -- The request belongs to the account that scanned it: never run it as
+  -- another one (checked before replay and before any write).
+  IF p_expected_caller IS DISTINCT FROM v_uid THEN
+    RAISE EXCEPTION 'scanner: caller_mismatch' USING ERRCODE = 'P0001';
+  END IF;
+
   -- Each check is ONE null-safe expression evaluated left to right: a
   -- missing key or NULL makes it fail (COALESCE ... false), never pass.
   IF NOT COALESCE(
@@ -729,6 +765,48 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Classic credit guard
+-- ---------------------------------------------------------------------------
+
+-- Classic Production inserts framing credit (line_verified / completed at
+-- Framed or A0 Framed) straight into production_events. This BEFORE INSERT
+-- trigger takes the same per-order lock as scanner_commit_framing, so the two
+-- paths are serialized, and refuses the classic row when a saved shared
+-- commit already credited that work type for the order. Narrow on purpose:
+-- dispatch, unframed, started/cancelled/clock rows, CS-case replacement rows
+-- (cs_case_id set) and orders the shared scanners never saved are untouched.
+-- The shared commit's own rows pass: its receipt is written after them.
+-- Named "c6" so it runs before the F5 triggers ("f5_..."): a waiting classic
+-- insert never holds F5's resolver lock while it waits for the order lock.
+CREATE OR REPLACE FUNCTION public.scanner_guard_classic_credit_()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.event_type IN ('line_verified', 'completed')
+     AND NEW.department IN ('framed', 'a0_framed')
+     AND NEW.cs_case_id IS NULL
+     AND NEW.order_number IS NOT NULL THEN
+    PERFORM production_order_lock_(NEW.location, NEW.order_number);
+    IF EXISTS (SELECT 1 FROM scanner_requests r
+               WHERE r.location = NEW.location AND r.order_number = NEW.order_number
+                 AND r.kind = 'commit' AND r.outcome = 'saved'
+                 AND r.result -> 'work_types' ? NEW.department) THEN
+      RAISE EXCEPTION 'scanner: already_saved_by_shared_scanner: % work on order #% was already saved by the shared scanners; nothing more is credited',
+        NEW.department, NEW.order_number USING ERRCODE = 'P0001';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER production_events_c6_scanner_guard
+  BEFORE INSERT ON public.production_events
+  FOR EACH ROW EXECUTE FUNCTION public.scanner_guard_classic_credit_();
+
+-- ---------------------------------------------------------------------------
 -- Receiver heartbeat
 -- ---------------------------------------------------------------------------
 
@@ -778,17 +856,18 @@ REVOKE ALL ON FUNCTION public.scanner_require_operator_(TEXT)                   
 REVOKE ALL ON FUNCTION public.scanner_site_zone_(TEXT)                              FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.scanner_workday_start_(TEXT, TIMESTAMPTZ)             FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.scanner_hash_(JSONB)                                  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.scanner_guard_classic_credit_()                      FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.production_order_lock_(TEXT, TEXT)                    FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.production_deduct_locked_(TEXT, TEXT, TEXT, TEXT, TEXT, JSONB) FROM PUBLIC, anon, authenticated;
 
-REVOKE ALL ON FUNCTION public.scanner_activate_badge(TEXT, UUID, TEXT, TEXT, TEXT) FROM PUBLIC, anon;
-REVOKE ALL ON FUNCTION public.scanner_commit_framing(TEXT, UUID, TEXT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ, JSONB, JSONB, JSONB) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.scanner_activate_badge(TEXT, UUID, TEXT, TEXT, TEXT, UUID) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.scanner_commit_framing(TEXT, UUID, TEXT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ, JSONB, JSONB, JSONB, UUID) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.scanner_heartbeat(TEXT, TEXT, TEXT, TIMESTAMPTZ, INTEGER, INTEGER) FROM PUBLIC, anon;
 -- The replaced deduction keeps the old callers (signed-in station accounts) and loses anon.
 REVOKE ALL ON FUNCTION public.deduct_inventory_for_event(TEXT, JSONB)               FROM PUBLIC, anon;
 
-GRANT EXECUTE ON FUNCTION public.scanner_activate_badge(TEXT, UUID, TEXT, TEXT, TEXT) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.scanner_commit_framing(TEXT, UUID, TEXT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ, JSONB, JSONB, JSONB) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.scanner_activate_badge(TEXT, UUID, TEXT, TEXT, TEXT, UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.scanner_commit_framing(TEXT, UUID, TEXT, TEXT, UUID, TEXT, TEXT, TIMESTAMPTZ, JSONB, JSONB, JSONB, UUID) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.scanner_heartbeat(TEXT, TEXT, TEXT, TIMESTAMPTZ, INTEGER, INTEGER) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.deduct_inventory_for_event(TEXT, JSONB)               TO authenticated;
 

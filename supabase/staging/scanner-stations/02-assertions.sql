@@ -76,15 +76,19 @@ BEGIN
     format('expected %s %s, got %s %s (value %s)', p_state, coalesce(p_message, ''), r ->> 'state', r ->> 'message', r ->> 'value'));
 END $$;
 
-CREATE FUNCTION pg_temp.f6_activate_sql(p_req uuid, p_badge text, p_scanner text DEFAULT 'S1') RETURNS text LANGUAGE sql AS $$
-  SELECT format('SELECT public.scanner_activate_badge(%L, %L, %L, %L, %L)::text', 'staging', p_req, 'f6t-wall', p_scanner, p_badge)
+-- The expected caller defaults to whoever runs the statement (auth.uid());
+-- the caller_mismatch cases pass someone else explicitly.
+CREATE FUNCTION pg_temp.f6_activate_sql(p_req uuid, p_badge text, p_scanner text DEFAULT 'S1', p_expect uuid DEFAULT NULL) RETURNS text LANGUAGE sql AS $$
+  SELECT format('SELECT public.scanner_activate_badge(%L, %L, %L, %L, %L, %s)::text', 'staging', p_req, 'f6t-wall', p_scanner, p_badge,
+                CASE WHEN p_expect IS NULL THEN 'auth.uid()' ELSE quote_literal(p_expect) || '::uuid' END)
 $$;
 
 CREATE FUNCTION pg_temp.f6_commit_sql(p_req uuid, p_staff uuid, p_badge text, p_order text, p_at timestamptz,
-                                      p_lines jsonb, p_comps jsonb DEFAULT '[]', p_pack jsonb DEFAULT NULL)
+                                      p_lines jsonb, p_comps jsonb DEFAULT '[]', p_pack jsonb DEFAULT NULL, p_expect uuid DEFAULT NULL)
 RETURNS text LANGUAGE sql AS $$
-  SELECT format('SELECT public.scanner_commit_framing(%L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L)::text',
-                'staging', p_req, 'f6t-wall', 'S1', p_staff, p_badge, p_order, p_at, p_lines, p_comps, p_pack)
+  SELECT format('SELECT public.scanner_commit_framing(%L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %L, %s)::text',
+                'staging', p_req, 'f6t-wall', 'S1', p_staff, p_badge, p_order, p_at, p_lines, p_comps, p_pack,
+                CASE WHEN p_expect IS NULL THEN 'auth.uid()' ELSE quote_literal(p_expect) || '::uuid' END)
 $$;
 
 CREATE FUNCTION pg_temp.f6_deduct_sql(p_event text, p_lines jsonb) RETURNS text LANGUAGE sql AS $$
@@ -120,7 +124,7 @@ DECLARE
   v_version int;
 BEGIN
   IF v_other IS NULL THEN RAISE EXCEPTION 'F6 verify: needs a second location besides staging'; END IF;
-  IF EXISTS (SELECT 1 FROM public.staff_barcodes WHERE location = 'staging' AND barcode LIKE 'F67E000_')
+  IF EXISTS (SELECT 1 FROM public.staff_barcodes WHERE barcode LIKE 'F67E000_' OR barcode LIKE '1096799_')
      OR EXISTS (SELECT 1 FROM public.production_events WHERE location = 'staging' AND order_number LIKE '109670__')
      OR EXISTS (SELECT 1 FROM public.ledger WHERE location = 'staging' AND source_id LIKE 'prod:order_109670%')
      OR EXISTS (SELECT 1 FROM public.products WHERE location = 'staging' AND id LIKE 'f6t-%') THEN
@@ -142,7 +146,14 @@ BEGIN
     ('staging', 'F67E0001', v_ids[7], 'F6T Person 1', true),
     ('staging', 'F67E0002', v_ids[8], 'F6T Person 2', true),
     ('staging', 'F67E0003', v_ids[9], 'F6T Person 3', true),
-    ('staging', 'F67E0004', v_ids[10], 'F6T Person 4', false);
+    ('staging', 'F67E0004', v_ids[10], 'F6T Person 4', false),
+    ('staging', '10967991', v_ids[10], 'F6T Person 4', false);
+  -- A badge that exists only at another site (numeric, order-shaped).
+  INSERT INTO public.staff_barcodes (location, barcode, user_id, display_name, active) VALUES
+    (v_other, '10967992', v_ids[9], 'F6T Person 3', true),
+    (v_other, 'F67E0005', v_ids[9], 'F6T Person 3', true);
+  -- Manager can see both sites (for the ambiguous-event case).
+  INSERT INTO public.user_locations (user_id, location) VALUES (v_ids[2], v_other) ON CONFLICT DO NOTHING;
 
   INSERT INTO public.products (location, id, code, supplier, product_type, current_on_hand) VALUES
     ('staging', 'f6t-a0b',  'F6T-A0B',  'F6T', 'product', 10),
@@ -203,7 +214,7 @@ BEGIN
                 WHERE n.nspname = 'public'
                   AND p.proname IN ('scanner_activate_badge','scanner_commit_framing','scanner_heartbeat','deduct_inventory_for_event',
                                     'scanner_require_operator_','production_order_lock_','production_deduct_locked_','scanner_workday_start_',
-                                    'scanner_site_zone_','scanner_hash_')
+                                    'scanner_site_zone_','scanner_hash_','scanner_guard_classic_credit_')
                   AND NOT EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%'))
     AND (SELECT bool_and(prosecdef) FROM pg_proc WHERE proname IN ('scanner_activate_badge','scanner_commit_framing','scanner_heartbeat','deduct_inventory_for_event')));
 END $$;
@@ -223,7 +234,16 @@ BEGIN
   r := pg_temp.f6_must('B01 unknown badge', i.kiosk, pg_temp.f6_activate_sql(gen_random_uuid(), 'F67E00FF'));
   PERFORM pg_temp.f6_ok('B01 unknown badge answers unknown_badge', r = '{"status":"unknown_badge"}'::jsonb, r::text);
   r := pg_temp.f6_must('B02 inactive badge', i.kiosk, pg_temp.f6_activate_sql(gen_random_uuid(), 'F67E0004'));
-  PERFORM pg_temp.f6_ok('B02 revoked badge is not a badge', r ->> 'status' = 'unknown_badge', r::text);
+  PERFORM pg_temp.f6_ok('B02 a revoked badge is known but unusable', r = '{"status":"unusable_badge"}'::jsonb, r::text);
+  r := pg_temp.f6_must('B02b numeric inactive badge', i.kiosk, pg_temp.f6_activate_sql(gen_random_uuid(), '10967991'));
+  PERFORM pg_temp.f6_ok('B02b an order-shaped inactive badge is unusable, never unknown (no order fallback)', r = '{"status":"unusable_badge"}'::jsonb, r::text);
+  r := pg_temp.f6_must('B02c other-site badge', i.kiosk, pg_temp.f6_activate_sql(gen_random_uuid(), '10967992'));
+  PERFORM pg_temp.f6_ok('B02c an order-shaped badge of another site is unusable and discloses nothing', r = '{"status":"unusable_badge"}'::jsonb, r::text);
+  r := pg_temp.f6_must('B02d other-site hex badge', i.kiosk, pg_temp.f6_activate_sql(gen_random_uuid(), 'F67E0005'));
+  PERFORM pg_temp.f6_ok('B02d a hex badge of another site is unusable', r = '{"status":"unusable_badge"}'::jsonb, r::text);
+  PERFORM pg_temp.f6_refused('B02e activation for another account', i.kiosk, 'authenticated',
+    pg_temp.f6_activate_sql(gen_random_uuid(), 'F67E0001', 'S1', i.manager), 'P0001', 'scanner: caller_mismatch');
+  PERFORM pg_temp.f6_ok('B02e ...wrote nothing', NOT EXISTS (SELECT 1 FROM public.production_events WHERE location = 'staging' AND staff_id = i.p1));
   PERFORM pg_temp.f6_refused('B03 person not at this site', i.kiosk, 'authenticated', pg_temp.f6_activate_sql(gen_random_uuid(), 'F67E0003'), 'P0001', 'scanner: person_not_at_site');
 
   r := pg_temp.f6_must('B04 activate person 1', i.kiosk, pg_temp.f6_activate_sql(q, 'f67e0001'));
@@ -306,6 +326,11 @@ BEGIN
   PERFORM pg_temp.f6_refused('C07 changed payload under the same request', i.kiosk, 'authenticated',
     pg_temp.f6_commit_sql(q, i.p1, 'F67E0001', '10967001', t, '[{"sku":"INKA-ABC0001-A2-FB","quantity":3,"work_type":"framed"}]'),
     'P0001', 'scanner: request_conflict');
+  PERFORM pg_temp.f6_refused('C07b the same request replayed by another account for the original', i.manager, 'authenticated',
+    pg_temp.f6_commit_sql(q, i.p1, 'F67E0001', '10967001', t, v_lines, '[]', NULL, i.kiosk), 'P0001', 'scanner: caller_mismatch');
+  PERFORM pg_temp.f6_refused('C07c a queued job of one account sent under another', i.manager, 'authenticated',
+    pg_temp.f6_commit_sql(gen_random_uuid(), i.p1, 'F67E0001', '10967017', now(), v_lines, '[]', NULL, i.kiosk), 'P0001', 'scanner: caller_mismatch');
+  PERFORM pg_temp.f6_ok('C07c ...wrote nothing', pg_temp.f6_events('10967017') = 0);
   PERFORM pg_temp.f6_refused('C08 changed person under the same request', i.kiosk, 'authenticated',
     pg_temp.f6_commit_sql(q, i.p2, 'F67E0002', '10967001', t, v_lines), 'P0001', 'scanner: request_conflict');
   PERFORM pg_temp.f6_refused('C09 changed scan time under the same request', i.kiosk, 'authenticated',
@@ -582,6 +607,80 @@ BEGIN
   PERFORM pg_temp.f6_ok('J10 two spellings of one product in one call: one row, summed',
     (r ->> 'deducted')::int = 1
     AND (SELECT delta FROM public.ledger WHERE location = 'staging' AND source_id = 'prod:order_10967012:F6T-A0B') = -3, r::text);
+END $$;
+
+DO $$
+DECLARE
+  i f6t_ids%ROWTYPE;
+  r jsonb;
+  v_other text := (SELECT key FROM public.locations WHERE key <> 'staging' ORDER BY key LIMIT 1);
+  v_a0b numeric;
+  v_hook numeric;
+BEGIN
+  SELECT * INTO i FROM f6t_ids;
+  INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type, created_at) VALUES
+    ('staging', 'f6t-amb', i.p1, 'a0_framed', '10967018', 'completed', now()),
+    (v_other,   'f6t-amb', i.p1, 'a0_framed', '10967018', 'completed', now()),
+    ('staging', 'f6t-j-19', i.p1, 'a0_framed', '10967019', 'completed', now());
+  v_a0b := pg_temp.f6_on_hand('f6t-a0b');
+  PERFORM pg_temp.f6_refused('J11 the same event id at two visible sites is refused, not guessed', i.manager, 'authenticated',
+    pg_temp.f6_deduct_sql('f6t-amb', '[{"code":"F6T-A0B","qty":1}]'), 'P0001', 'ambiguous_event');
+  r := pg_temp.f6_must('J12 one visible site', i.kiosk, pg_temp.f6_deduct_sql('f6t-amb', '[{"code":"F6T-A0B","qty":1}]'));
+  PERFORM pg_temp.f6_ok('J12 a caller who sees only one of them is unaffected', (r ->> 'deducted')::int = 1
+    AND pg_temp.f6_on_hand('f6t-a0b') = v_a0b - 1, r::text);
+  -- 0031 stored whatever spelling it was given.
+  INSERT INTO public.ledger (location, id, product_id, delta, reason, source_id, note) VALUES
+    ('staging', 'f6t-led-19a', 'f6t-a0b',  -1, 'sale', 'prod:order_10967019:f6T-a0B', 'f6t'),
+    ('staging', 'f6t-led-19b', 'f6t-hook', -1, 'sale', 'prod:order_10967019:Some-Old-Hook-Alias', 'f6t');
+  v_a0b := pg_temp.f6_on_hand('f6t-a0b');
+  v_hook := pg_temp.f6_on_hand('f6t-hook');
+  r := pg_temp.f6_must('J13 mixed-case and foreign aliases', i.kiosk, pg_temp.f6_deduct_sql('f6t-j-19',
+    '[{"code":"F6T-A0B","qty":1},{"code":"f6t-hook","qty":1}]'));
+  PERFORM pg_temp.f6_ok('J13 earlier rows in any spelling block a second charge (product identity)',
+    (r ->> 'skipped_idempotent')::int = 2 AND (r ->> 'deducted')::int = 0
+    AND pg_temp.f6_on_hand('f6t-a0b') = v_a0b AND pg_temp.f6_on_hand('f6t-hook') = v_hook, r::text);
+  PERFORM pg_temp.f6_ok('J14 the order-source lookup is indexed by site, order and product',
+    EXISTS (SELECT 1 FROM pg_indexes WHERE tablename = 'ledger' AND indexname = 'ledger_prod_order_idx'));
+END $$;
+
+-- ===========================================================================
+-- M. Classic credit guard (same per-order lock as the shared commit)
+-- ===========================================================================
+DO $$
+DECLARE
+  i f6t_ids%ROWTYPE;
+  v_before bigint := pg_temp.f6_events('10967001');
+  v_n bigint;
+BEGIN
+  SELECT * INTO i FROM f6t_ids;
+  -- 10967001: Framed work saved by the shared scanners in section C.
+  PERFORM pg_temp.f6_refused('M01 classic verification after a shared save is refused', i.kiosk, 'authenticated',
+    $q$INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type)
+       VALUES ('staging', 'f6t-m-1', 'f6700000-0000-4000-8000-000000000002', 'framed', '10967001', 'INKA-ABC0001-A2-FB', 2, 'line_verified') RETURNING 'x'$q$,
+    'P0001', 'scanner: already_saved_by_shared_scanner');
+  PERFORM pg_temp.f6_refused('M02 classic completion after a shared save is refused', i.kiosk, 'authenticated',
+    $q$INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type)
+       VALUES ('staging', 'f6t-m-2', 'f6700000-0000-4000-8000-000000000002', 'framed', '10967001', 'completed') RETURNING 'x'$q$,
+    'P0001', 'scanner: already_saved_by_shared_scanner');
+  PERFORM pg_temp.f6_ok('M03 no extra credit row', pg_temp.f6_events('10967001') = v_before);
+  -- Still allowed on that order: dispatch after framing, CS replacement, brackets, undo, other work types.
+  PERFORM pg_temp.f6_must('M04 dispatch after framing', i.kiosk,
+    $q$WITH x AS (INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type)
+       VALUES ('staging', 'f6t-m-4', 'f6700000-0000-4000-8000-000000000002', 'dispatch', '10967001', 'dispatched') RETURNING 1) SELECT '{}' FROM x$q$);
+  PERFORM pg_temp.f6_must('M05 explicit CS replacement credit', i.kiosk,
+    $q$WITH x AS (INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, cs_case_id)
+       VALUES ('staging', 'f6t-m-5', 'f6700000-0000-4000-8000-000000000002', 'framed', '10967001', 'INKA-ABC0001-A2-FB', 1, 'line_verified', 'f6t-case-r') RETURNING 1) SELECT '{}' FROM x$q$);
+  PERFORM pg_temp.f6_must('M06 started bracket', i.kiosk,
+    $q$WITH x AS (INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type)
+       VALUES ('staging', 'f6t-m-6', 'f6700000-0000-4000-8000-000000000002', 'framed', '10967001', 'started') RETURNING 1) SELECT '{}' FROM x$q$);
+  PERFORM pg_temp.f6_must('M07 A0 work type the shared save did not credit', i.kiosk,
+    $q$WITH x AS (INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type)
+       VALUES ('staging', 'f6t-m-7', 'f6700000-0000-4000-8000-000000000002', 'a0_framed', '10967001', 'completed') RETURNING 1) SELECT '{}' FROM x$q$);
+  PERFORM pg_temp.f6_must('M08 an order the shared scanners never saved', i.kiosk,
+    $q$WITH x AS (INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type)
+       VALUES ('staging', 'f6t-m-8', 'f6700000-0000-4000-8000-000000000002', 'framed', '10967020', 'completed') RETURNING 1) SELECT '{}' FROM x$q$);
+  SELECT count(*) INTO v_n FROM public.production_events WHERE location = 'staging' AND id LIKE 'f6t-m-%';
+  PERFORM pg_temp.f6_ok('M09 exactly the five allowed rows exist', v_n = 5, v_n::text);
 END $$;
 
 -- ===========================================================================

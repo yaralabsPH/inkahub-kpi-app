@@ -29,7 +29,7 @@ describe("0055 migration", () => {
     const fns = [...m55.matchAll(/CREATE OR REPLACE FUNCTION public\.([a-z_]+)\(/g)].map((x) => x[1]);
     expect(fns.sort()).toEqual([
       "deduct_inventory_for_event", "production_deduct_locked_", "production_order_lock_", "scanner_activate_badge",
-      "scanner_commit_framing", "scanner_hash_", "scanner_heartbeat", "scanner_require_operator_", "scanner_site_zone_",
+      "scanner_commit_framing", "scanner_guard_classic_credit_", "scanner_hash_", "scanner_heartbeat", "scanner_require_operator_", "scanner_site_zone_",
       "scanner_workday_start_",
     ]);
     const bodies = m55.split("CREATE OR REPLACE FUNCTION").slice(1);
