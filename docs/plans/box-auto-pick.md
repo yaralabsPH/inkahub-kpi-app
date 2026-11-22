@@ -239,7 +239,7 @@ ids, rule sets and order numbers).
 - Done when: component tests cover auto, overridden, unresolved, pending
   and scan-mode rendering, and the one-tap swap.
 
-### [ ] Task 10: Correct a pick after completion
+### [x] Task 10: Correct a pick after completion
 
 - Files: `src/lib/hooks/useOrderPackaging.ts`,
   `src/components/production/PackagingPanel.tsx`, tests
@@ -402,3 +402,4 @@ Coder adds one line per task.
 - Task 7: orderPackaging.ts (typed outcomes, config load that falls back to scan), packagingOutbox.ts, 25 tests. Queue caps size by refusing new entries; it does not drop by age (dropping would lose a deduction silently; the attention list covers aged entries).
 - Task 8: stationScreenModel gets a packaging mode (auto never blocks); useOrderPackaging hook; pure session.ts and packagingSubmit.ts carry the logic because the test setup has no React renderer for hooks (tests cover them instead of the hook). handleCompleteOrder changes are one guarded branch plus one call. completeBlockReason left alone: it has no packaging rule. Replacement work predicts nothing (spec Q2 default: the station has no case lines), worker chooses or it is flagged. Not in the plan: src/lib/domain/packaging/session.ts, src/lib/state/packagingSubmit.ts. Finding for CJ, not changed: in scan mode the scanned-box list is never cleared after Complete, so boxes carry to the next order unless the worker taps Clear all.
 - Task 9: PackagingPanel (station and classic looks, saved-pick views ready for Task 10), slot on StationOrderScreen and the classic ActiveScreen, legacy box barcodes become a manual pick in auto mode (first scan replaces the prediction, later scans add one). Scan mode renders the old panels untouched. 15 new component tests. Also touched: station.css (three small classes).
+- Task 10: Rescanning a completed order shows its saved pick with Change box; one tap on a reason saves through packaging_override with the seen revision. packagingCorrection.ts holds the transitions (success, replay, conflict, no connection keeps the request id, refusal), 7 tests. A stray box scan never changes a saved pick. Not in the plan: src/lib/state/packagingCorrection.ts.

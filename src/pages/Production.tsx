@@ -367,6 +367,7 @@ function ProductionStation({
     department: station.department,
     order: currentOrder,
     csCaseId: activeCase?.caseId ?? null,
+    staffId: activeStaff?.user_id ?? null,
     onError: onScanError,
   });
   const packagingMode = packaging.mode;
@@ -390,6 +391,7 @@ function ProductionStation({
         onTap={packaging.tap}
         onAdjust={packaging.adjust}
         onReset={packaging.reset}
+        saved={packaging.saved}
       />
     );
   };
