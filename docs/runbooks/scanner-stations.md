@@ -3,6 +3,8 @@
 Spec `docs/specs/scanner-stations.md`, plan `docs/plans/scanner-stations.md`.
 Staging only until the bulk release. The classic station is always the fallback.
 
+Status (2026-11-22): migration 0055 is installed on STAGING only and frozen; staging SQL assertions, separate-connection races and PostgREST role checks passed (see docs/releases/scanner-stations.md). Browser/Preview flows, real scanners and production are not yet verified.
+
 ## What it does
 
 One wall device ("receiver") on `/production` accepts up to three cordless

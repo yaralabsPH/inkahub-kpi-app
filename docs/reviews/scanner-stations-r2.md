@@ -12,3 +12,13 @@ Reviewed90937acf471df79cef7a81a4d0dc9bb090e723b1. All scoped R1 SQL/session/pack
 Actual separate-connection races passed R1shared/classic, R2classic/shared, R3exactretry, R3boriginalrollback, R4twoscanners, R5clockin, plusR6classicline_verifiedheldopenWITHOUTdeduction provesinserttriggerlocking. All finalcredit/stock totals true. Actual PostgRESTowner/manager/kiosk allow andstaff/CS/anon denial, capturedcallermismatch, realkiosksave/exactreplay/noextraevents anddirectreceiptwrite denial passed. Syntheticfixturescleaned. Root evidence under overnight-20261122: f6-staging-rollback-schema.json, f6-concurrency.json, f6-postgrest-roles.json. Browser/hardware/finalPreview stillpending; don't claimthem.
 
 Make these two narrow corrections, focused regressions and the normal final gate, commit and return writer slot. Update release/runbook/plan to reflectactualstaging evidence and finalcontracts. NoSQLchange, no deploy/push/F7.
+
+## Coder response
+
+Both fixed in `2ac85bd`, client only (no SQL change; 0055 untouched).
+
+1. `markBlocked` and `retryLater` now return `false` when the lease is stale; every caller in `processNext` (preparation refusal, commit refusal, commit network error, other waits) then returns `superseded` instead of a blocked/waiting report, and the controller shows nothing for it. `LeaseLostError` is re-thrown by both store wrappers (Dexie and memory) so it stays `superseded`. Regressions: the existing stale-lease test now asserts A's report is `superseded`; new cases for a stale late network error and a stale late preparation refusal; a stale `markAttempt`/`setPrepared` rejects with `LeaseLostError`; a two-controller test shows the stale tab's wall never says NOT SAVED while the other tab saved.
+2. `processNext` re-checks `active()` right after `markAttempt` and before `commit`. If the station stopped, new `ScannerOutbox.releaseUnsent` restores `attempts`, `uncertain` and `priorUnknown` to their pre-attempt values, keeps the prepared payload and clears the lease. Regression: a delayed `markAttempt` during which the station closes -> `superseded`, no commit sent, job `prepared` with attempts 0 and not uncertain, then the same payload saves when reopened.
+
+Checks: tsc, typecheck:digest, typecheck:api, 957/957 tests (40 files), build.
+

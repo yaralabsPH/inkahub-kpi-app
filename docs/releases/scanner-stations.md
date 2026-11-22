@@ -18,25 +18,29 @@ Migrations: adds `0055_scanner_stations.sql` only (`git diff --name-status 25c4c
 
 (A Windows checkout may have CRLF; hash `git show HEAD:<path>` to compare.)
 
-## Checks run by the coder after R1 fixes (2026-11-22)
+## Checks run by the coder after R1 and R2 fixes (2026-11-22)
 
 | Check | Result |
 |---|---|
 | `npx tsc -b` | pass |
 | `npm run typecheck:digest` | pass |
 | `npm run typecheck:api` (new: Shopify order endpoint + test) | pass |
-| `npm run test -- --run` | 40 files, 953 tests pass |
+| `npm run test -- --run` | 40 files, 957 tests pass (after R2 client fixes) |
 | `npm run build` | pass (existing chunk-size warning only) |
 | Local PGlite: 0031, 0047, 0052–0055, 0055 again, then `02-assertions.sql` | `F6 verify: ALL CHECKS PASSED (160 cases)` (0055 applied twice first) — local, **not staging evidence** |
 | Local PGlite: 01-fixtures → session B R1-B1 → session A → session B from R1-B2 (sequential) → 09-cleanup | SQL valid; sequentially the c6 guard refuses the classic credit insert as expected. One connection cannot block — **not race evidence** |
 
-## Staging evidence (Codex)
+## Staging evidence (Codex, recorded in docs/reviews/scanner-stations-r2.md)
+
+0055 is **installed on STAGING** at sha256 `3e5981954ad37c992b78d2765d4329162efb1c69b606afe11f9dd95b177b2620` and is now immutable (later fixes are client-only). Evidence files (Codex root, `overnight-20261122/`): `f6-staging-rollback-schema.json`, `f6-concurrency.json`, `f6-postgrest-roles.json`.
 
 | Step | Result |
 |---|---|
-| Apply 0055 to staging (hash above) | _pending_ |
-| `02-assertions.sql` | _pending_ |
-| `01` → `05-session-a/b` R1–R5 → A-END all `true` → `09` | _pending_ |
+| `02-assertions.sql` on actual staging, inside a rollback transaction, before install | **pass** — 160 cases |
+| Apply 0055 to staging (hash above), `apply_migration` | **done** — persistent, success |
+| Separate-connection races R1 shared/classic, R2 classic/shared, R3 exact retry, R3b original rollback, R4 two scanners, R5 clock-in, plus R6 classic `line_verified` held open without deduction (proves the insert-trigger lock) | **pass** — all final credit and stock totals true |
+| Real PostgREST roles: owner/manager/kiosk allowed; staff/CS/anon denied; captured-caller mismatch refused; real kiosk save, exact replay with no extra events; direct receipt write denied | **pass** |
+| Existing products/ledger/events full hashes before vs after | **unchanged**; synthetic fixtures cleaned; F1 and F5 tracking OFF |
 | Combined Preview, staging env, receiver opt-in: badge → order → green (regular framed) | _pending_ |
 | Preview: A0 order with auto rules → green, pick visible on Packaging attention/history | _pending_ |
 | Preview: offline order → amber → back online → green; offline 8-digit → red + signed out | _pending_ |
