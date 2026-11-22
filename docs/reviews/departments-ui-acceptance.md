@@ -15,3 +15,5 @@ Operator cleanup removed exactly the two F5UI departments, two synthetic assignm
 Minor nonblocking UI observation: a successful rename leaves its form open, including when switching to the archived list. This does not save anything by itself and server rules still govern changes; no extra redesign requested. Browser automation occasionally needed a fresh locator or keyboard/coordinate fallback during rerenders; the underlying operations succeeded.
 
 CI passed for `25c4c80` (PR 11, run 45025621621). Final combined hosted Preview, old-app rollback smoke and physical scanner commissioning remain separately recorded. No production changes.
+
+Previous hosted F4 Preview smoke also passed after the schema expansion: synthetic kiosk signed in, selected the Framed station at AU, scanned the existing Staging Staff badge and reached the ready-for-order screen with counts loaded. This verifies startup/badge compatibility; it does not claim a full old stock/Shopify dispatch flow. The previous Preview URL is recorded in the deployment notes.
