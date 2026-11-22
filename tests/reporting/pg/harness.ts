@@ -79,3 +79,15 @@ export async function reportingDb(opts: { through?: string } = {}): Promise<PGli
   }
   return db;
 }
+
+/**
+ * F8: the three F5 (0054) snapshot columns the Reports overview reads from
+ * event images, added to the bootstrap table on request (nullable, as in
+ * 0054). Opt-in so the F1 fixtures and their recorded images stay unchanged.
+ */
+export async function addDepartmentSnapshotColumns(db: PGlite): Promise<void> {
+  await db.exec(`ALTER TABLE public.production_events
+    ADD COLUMN business_department_id uuid,
+    ADD COLUMN business_department_name text,
+    ADD COLUMN business_department_status text;`);
+}
