@@ -10,6 +10,14 @@ import { MAX_PACKAGE_LINES, MAX_PACKAGE_QTY, type CatalogueItem, type RuleSetBod
 
 export const REPLACEMENT_REASON = "Replacement: choose the packaging used.";
 
+/** One-tap reasons for changing a saved pick (stored on the audit row). */
+export const OVERRIDE_REASONS = [
+  "Used a different box",
+  "Needed an extra box",
+  "Box was damaged",
+  "Recorded by mistake",
+] as const;
+
 /** The packing point a station works at, or null (Framed packs nothing). */
 export function stationPackingPoint(department: string): PackingPoint | null {
   return department === "a0_framed" || department === "dispatch" || department === "unframed" ? department : null;

@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useOrderPackaging } from "@/lib/hooks/useOrderPackaging";
+import { PackagingPanel, PackagingPendingNotice } from "@/components/production/PackagingPanel";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
@@ -369,6 +370,29 @@ function ProductionStation({
     onError: onScanError,
   });
   const packagingMode = packaging.mode;
+  const scanLegacyBarcode = packaging.scanLegacyBarcode;
+  const currentOrderRef = useRef(currentOrder);
+  currentOrderRef.current = currentOrder;
+  /** The auto-pick panel for either station screen; null in scan mode. */
+  const renderPackagingSlot = (variant: "station" | "classic") => {
+    if (packagingMode !== "auto") return null;
+    const v = packaging.view;
+    if (!v) return <PackagingPendingNotice variant={variant} count={packaging.pendingCount} />;
+    return (
+      <PackagingPanel
+        variant={variant}
+        status={v.status}
+        chosen={v.chosen}
+        predicted={v.prediction.evaluation.packages}
+        reason={v.prediction.evaluation.reason}
+        alternatives={v.alternatives}
+        pendingCount={packaging.pendingCount}
+        onTap={packaging.tap}
+        onAdjust={packaging.adjust}
+        onReset={packaging.reset}
+      />
+    );
+  };
 
   // Auto-assign mail tube at unframed station based on order contents.
   // Runs whenever the current order changes. Cleared when order clears.
@@ -1300,6 +1324,17 @@ function ProductionStation({
       const pkgMatch = value.match(/\+\d+=/);
       if (pkgMatch) {
         const pkgBarcode = pkgMatch[0];
+        // F4 auto mode: a printed box barcode is a manual pick for the
+        // current order. It is never required and never pre-staged.
+        if (packagingMode === "auto") {
+          if (scanLegacyBarcode(pkgBarcode)) return;
+          onScanError(
+            currentOrderRef.current
+              ? `Box barcode "${pkgBarcode}" is not in this site's packaging list. Tap the packaging you used instead.`
+              : "Scan the order first. The packaging is picked automatically.",
+          );
+          return;
+        }
         const pkg = packageFromBarcode(pkgBarcode, station.department);
         // eslint-disable-next-line no-console
         console.log("[package] match?", pkgBarcode, "(from value", JSON.stringify(value) + ")", station.department, "->", pkg ? pkg.key : "NO MATCH");
@@ -1411,7 +1446,7 @@ function ProductionStation({
     } finally {
       setBusy(false);
     }
-  }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location]);
+  }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location, packagingMode, scanLegacyBarcode]);
 
   /**
    * Global keystroke capture. USB barcode scanners type the value as
@@ -1594,6 +1629,7 @@ function ProductionStation({
                 }
               : null
           }
+          packagingSlot={renderPackagingSlot("station")}
           onVerify={(key) => { const l = findLineByKey(key); if (l) void handleVerifyLine(l); }}
           onUnverify={(key) => { const l = findLineByKey(key); if (l) void handleUnverifyLine(l); }}
           onCompleteOrder={() => void handleCompleteOrder()}
@@ -1714,7 +1750,7 @@ function ProductionStation({
             }
             onClearPackages={() => setPackages(new Map())}
             packagingMode={packagingMode}
-            packagingSlot={null}
+            packagingSlot={renderPackagingSlot("classic")}
             verifiedLines={verifiedLines}
             onVerifyLine={(line) => void handleVerifyLine(line)}
             onUnverifyLine={(line) => void handleUnverifyLine(line)}

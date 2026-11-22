@@ -87,7 +87,10 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
   useEffect(() => {
     let cancelled = false;
     void loadPackagingConfig(client, location).then((c) => {
-      if (!cancelled) setConfig(c);
+      if (cancelled) return;
+      // eslint-disable-next-line no-console
+      if (c.warning) console.warn("[packaging] falling back to box scanning:", c.warning);
+      setConfig(c);
     });
     return () => {
       cancelled = true;

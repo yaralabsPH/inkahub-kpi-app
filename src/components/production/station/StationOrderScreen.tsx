@@ -62,6 +62,8 @@ export interface StationOrderScreenProps {
   activeCase: { caseId: string; issueType: string; urgency: string; customerName: string | null } | null;
   /** Box panel: null when this station doesn't scan boxes. */
   packages: { rows: StationPackageRow[]; required: boolean; auto: boolean } | null;
+  /** F4 auto mode: shown in place of the box panel (pass packages = null with it). */
+  packagingSlot?: ReactNode;
   onVerify: (key: string) => void;
   onUnverify: (key: string) => void;
   onCompleteOrder: () => void;
@@ -448,7 +450,7 @@ function WorkingView(props: StationOrderScreenProps & { order: StationScreenOrde
           </div>
         </div>
 
-        <PackagesPanel packages={props.packages} onRemovePackage={props.onRemovePackage} onClearPackages={props.onClearPackages} />
+        {props.packagingSlot ?? <PackagesPanel packages={props.packages} onRemovePackage={props.onRemovePackage} onClearPackages={props.onClearPackages} />}
         </div>
 
         <div className="st-actions">
@@ -676,7 +678,7 @@ function IdleView(props: StationOrderScreenProps) {
         <div className="st-done-wrap">
           <div className="st-done-empty">Scan a packing slip to start an order, or swipe another lanyard to switch worker.</div>
         </div>
-        <PackagesPanel packages={props.packages} onRemovePackage={props.onRemovePackage} onClearPackages={props.onClearPackages} />
+        {props.packagingSlot ?? <PackagesPanel packages={props.packages} onRemovePackage={props.onRemovePackage} onClearPackages={props.onClearPackages} />}
         <div className="st-actions">
           <button type="button" className="st-btn-clockout" onClick={props.onClockOut} title="Writes a clock-out event and idles the station">
             <LogOut size={18} aria-hidden="true" /> Clock out

@@ -127,6 +127,13 @@
 .st-panel.case { border: 2px solid #FDBA74; background: #FFF7ED; color: #7C2D12; }
 .dark .st-panel.case { border-color: #7C3A12; background: #2B1A0C; color: #FDBA74; }
 .st-panel.warn { border-color: #F5D0A9; background: var(--amber-tint); color: var(--amber-ink); }
+/* F4 box-auto-pick: packaging panel (auto mode). */
+.st-pk-chip { font-size: 10px; font-weight: 700; letter-spacing: .12em; border-radius: 999px; padding: 2px 8px; border: 1px solid currentColor; color: var(--green-ink); }
+.st-pk-chip[data-status="changed"], .st-pk-chip[data-status="saved"] { color: var(--blue-ink); }
+.st-pk-chip[data-status="flagged"] { color: var(--amber-ink); }
+.st-pk-alts { display: flex; flex-wrap: wrap; gap: 6px; }
+.st-pk-note { font-size: 12px; color: var(--ink-2); line-height: 1.35; }
+.st-panel.warn .st-pk-note { color: inherit; }
 .st-error { border-radius: 12px; border: 1px solid var(--red-line); background: var(--red-tint); color: var(--red-ink); font-size: 14px; padding: 10px 14px; }
 
 /* ---------- Item list (own scroll) ---------- */

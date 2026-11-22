@@ -217,3 +217,34 @@ describe("StationOrderScreen - working on an order", () => {
     expect(html).toContain("Verify failed");
   });
 });
+
+describe("StationOrderScreen - packaging in auto mode (F4 box-auto-pick)", () => {
+  const one = [line("INKA-DIV0147-A0-FN")];
+  const verified = new Map([[one[0].key, { staff_id: "u1", time: "2026-11-22T01:00:00Z" }]]);
+  const slot = <div data-testid="auto-packaging">AUTO PICK PANEL</div>;
+
+  it("shows the auto-pick panel instead of the box-scan panel and never asks for a scan", () => {
+    const html = renderToStaticMarkup(
+      <StationOrderScreen {...props({ order: order(one), verified, packages: null, packagingSlot: slot })} />,
+    );
+    expect(html).toContain("AUTO PICK PANEL");
+    expect(html).not.toContain("BOXES FOR THIS SHIPMENT");
+    expect(html).not.toContain("Scan a box to finish");
+    expect(html).toContain("st-btn-complete ready");
+    expect(html).not.toMatch(/st-btn-complete[^"]*" disabled/);
+  });
+
+  it("still needs every line checked", () => {
+    const html = renderToStaticMarkup(
+      <StationOrderScreen {...props({ order: order(one), packages: null, packagingSlot: slot })} />,
+    );
+    expect(html).toMatch(/st-btn-complete locked" disabled/);
+    expect(html).toContain("1 item left to check");
+  });
+
+  it("shows the slot while waiting for an order (pending saves notice)", () => {
+    const html = renderToStaticMarkup(<StationOrderScreen {...props({ packagingSlot: slot })} />);
+    expect(html).toContain("AUTO PICK PANEL");
+  });
+});
+
