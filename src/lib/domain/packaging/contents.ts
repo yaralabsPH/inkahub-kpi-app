@@ -35,6 +35,17 @@ export interface PackagingLineInput {
   quantity: number | null | undefined;
 }
 
+/**
+ * Every line of a fetched order, as packaging input. Unlike the station's
+ * display/routing list this keeps blank-SKU lines: they are physical items
+ * the rules cannot classify, so the pick must stay unresolved, not guessed.
+ */
+export function packagingLinesFromOrder(
+  items: ReadonlyArray<{ sku?: string | null; quantity?: number | null }>,
+): PackagingLineInput[] {
+  return items.map((it) => ({ sku: it.sku ?? null, quantity: typeof it.quantity === "number" && it.quantity > 0 ? it.quantity : 1 }));
+}
+
 export function isPackingPoint(value: string): value is PackingPoint {
   return (PACKING_POINTS as string[]).includes(value);
 }

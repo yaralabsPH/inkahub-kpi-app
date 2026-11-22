@@ -10,9 +10,12 @@ import {
   pickStatus,
   predictPackaging,
   REPLACEMENT_REASON,
+  scanPackage,
   stationPackingPoint,
   tapPackage,
 } from "../session";
+import { packagingLinesFromOrder } from "../contents";
+import type { PickedPackage } from "../evaluate";
 
 // Synthetic rule set; not real box rules.
 const ruleSet: RuleSetBody = {
@@ -136,5 +139,69 @@ describe("buildApplyPayload", () => {
     const payload = buildApplyPayload({ ruleSet: { id: "prs-1", version: 4 }, prediction, chosen: [] });
     expect(payload).toMatchObject({ resolved: false, predicted: {}, target: {} });
     expect(payload.snapshot.reason).toMatch(/No box rule/);
+  });
+});
+
+// Review r1 regressions: the station's real tap/add/scan sequences.
+describe("review r1: a known frame plus a blank-SKU item", () => {
+  it("stays unresolved with no guessed packaging", () => {
+    const lines = packagingLinesFromOrder([{ sku: A1, quantity: 1 }, { sku: "", quantity: 1 }, { sku: null, quantity: 0 }]);
+    expect(lines).toEqual([{ sku: A1, quantity: 1 }, { sku: "", quantity: 1 }, { sku: null, quantity: 1 }]);
+    const p = predictPackaging(ruleSet, "dispatch", lines, { replacement: false });
+    expect(p.evaluation).toMatchObject({ status: "unresolved", packages: [] });
+    expect(p.contents.unclassified).toEqual(["(no SKU)", "(no SKU)"]);
+    expect(buildApplyPayload({ ruleSet: { id: "prs-1", version: 4 }, prediction: p, chosen: p.evaluation.packages })).toMatchObject({ resolved: false, target: {} });
+    // Without the blank line the same frame resolves, so the blank line is what blocks the guess.
+    expect(predictPackaging(ruleSet, "dispatch", [{ sku: A1, quantity: 1 }], { replacement: false }).evaluation.status).toBe("resolved");
+  });
+});
+
+describe("review r1: building a pick without scanning", () => {
+  const keys = (p: PickedPackage[]) => p.map((x) => [x.key, x.qty]);
+
+  it("one tap still replaces; the add action builds A + B", () => {
+    const predicted = predictPackaging(ruleSet, "dispatch", [{ sku: A1, quantity: 1 }], { replacement: false }).evaluation.packages;
+    const replaced = tapPackage(predicted, L);
+    expect(keys(replaced)).toEqual([["BOX-L", 1]]);
+    const both = addPackage(replaced, S);
+    expect(keys(both)).toEqual([["BOX-L", 1], ["BOX-S", 1]]);
+    expect(keys(addPackage(both, S))).toEqual([["BOX-L", 1], ["BOX-S", 2]]);
+  });
+
+  it("replacement work: worker taps one item then adds a second type", () => {
+    const p = predictPackaging(ruleSet, "dispatch", [{ sku: A1, quantity: 1 }], { replacement: true });
+    let chosen = tapPackage(p.evaluation.packages, S);
+    chosen = addPackage(chosen, T);
+    expect(keys(chosen)).toEqual([["BOX-S", 1], ["TUBE", 1]]);
+    expect(pickStatus(p, chosen)).toBe("changed");
+  });
+
+  it("correcting a saved single-item pick can add a second type", () => {
+    const savedDraft = pickedFromQuantities(ruleSet, { "p-s": 1 });
+    expect(keys(addPackage(tapPackage(savedDraft, L), S))).toEqual([["BOX-L", 1], ["BOX-S", 1]]);
+  });
+});
+
+describe("review r1: legacy scans", () => {
+  const keys = (p: PickedPackage[]) => p.map((x) => [x.key, x.qty]);
+
+  it("scanning the predicted box is a first explicit scan; the second scan adds one", () => {
+    const predicted = predictPackaging(ruleSet, "dispatch", [{ sku: A1, quantity: 1 }], { replacement: false }).evaluation.packages;
+    expect(keys(predicted)).toEqual([["BOX-S", 1]]);
+    // null = the panel still shows the prediction.
+    const first = scanPackage(null, S);
+    expect(keys(first)).toEqual([["BOX-S", 1]]);
+    const second = scanPackage(first, S);
+    expect(keys(second)).toEqual([["BOX-S", 2]]);
+    expect(keys(scanPackage(second, L))).toEqual([["BOX-S", 2], ["BOX-L", 1]]);
+  });
+
+  it("the first scan replaces a different prediction; replacement work counts scans from one", () => {
+    expect(keys(scanPackage(null, L))).toEqual([["BOX-L", 1]]);
+    expect(keys(scanPackage(scanPackage(null, S), S))).toEqual([["BOX-S", 2]]);
+  });
+
+  it("a scan after a tap adds to the worker's choice", () => {
+    expect(keys(scanPackage(tapPackage([], L), S))).toEqual([["BOX-L", 1], ["BOX-S", 1]]);
   });
 });

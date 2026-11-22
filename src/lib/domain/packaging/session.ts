@@ -79,6 +79,15 @@ export function tapPackage(current: PickedPackage[], item: CatalogueItem): Picke
   return addPackage(current, item);
 }
 
+/**
+ * A legacy box scan before Complete. `explicit` is the worker's own choice so
+ * far, or null while the panel still shows the prediction. The first scan
+ * replaces the prediction, even with the same box; every later scan adds one.
+ */
+export function scanPackage(explicit: PickedPackage[] | null, item: CatalogueItem): PickedPackage[] {
+  return explicit === null ? [asPicked(item, 1)] : addPackage(explicit, item);
+}
+
 /** Add one of an item (each legacy box scan adds one, like the old flow). */
 export function addPackage(current: PickedPackage[], item: CatalogueItem): PickedPackage[] {
   const hit = current.find((p) => p.key === item.key);
@@ -125,6 +134,27 @@ export interface ApplyPayload {
   predicted: Quantities;
   target: Quantities;
   snapshot: Record<string, unknown>;
+}
+
+/**
+ * The packaging for one completion, taken when the worker taps Complete and
+ * before anything is awaited, so loading or clearing an order while the
+ * event saves cannot change which order's box is recorded.
+ */
+export interface PackagingCapture {
+  readonly orderNumber: string;
+  readonly payload: Readonly<ApplyPayload>;
+}
+
+export function capturePackaging(args: {
+  orderNumber: string;
+  ruleSet: { id: string; version: number };
+  prediction: PackagingPrediction;
+  chosen: PickedPackage[];
+}): PackagingCapture {
+  const payload = buildApplyPayload(args);
+  // Deep copy through JSON: the payload is plain data and must not share arrays with the live view.
+  return Object.freeze({ orderNumber: args.orderNumber, payload: Object.freeze(JSON.parse(JSON.stringify(payload)) as ApplyPayload) });
 }
 
 /** Everything packaging_apply needs besides the site, request and event ids. */

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { ApplyArgs } from "@/lib/repository/supabase/orderPackaging";
+import type { RuleSetBody } from "@/lib/domain/packaging/ruleSet";
+import { capturePackaging, predictPackaging, tapPackage, type PackagingCapture } from "@/lib/domain/packaging/session";
 import { createPackagingOutbox } from "../packagingOutbox";
 import { drainPackagingOutbox, submitPackagingApply } from "../packagingSubmit";
 
@@ -91,5 +93,74 @@ describe("drainPackagingOutbox", () => {
     expect(await drainPackagingOutbox(up.client, outbox)).toBe(2);
     expect(outbox.pendingCount()).toBe(0);
     expect(up.calls.map((c) => c.p_request_id)).toEqual(["apply:ev-1", "apply:ev-2"]);
+  });
+});
+
+// Review r1: Complete captures the packaging before any await, then submits
+// that capture with the saved event id, whatever the station shows by then.
+describe("review r1: completion while the order on screen changes", () => {
+  const rules: RuleSetBody = {
+    schema_version: 1,
+    catalogue: [
+      { key: "BOX-S", product_id: "p-s", label: "Small", packing_points: ["dispatch"] },
+      { key: "BOX-L", product_id: "p-l", label: "Large", packing_points: ["dispatch"] },
+    ],
+    rules: [
+      { id: "a1", packing_point: "dispatch", kinds: ["framed"], sizes: ["A1"], max_pieces: 1, output: { mode: "fixed", packages: [{ key: "BOX-S", qty: 1 }] } },
+      { id: "a2", packing_point: "dispatch", kinds: ["framed"], sizes: ["A2"], max_pieces: 1, output: { mode: "fixed", packages: [{ key: "BOX-L", qty: 1 }] } },
+    ],
+    examples: [],
+  };
+  const ruleSet = { id: "prs-1", version: 2 };
+  const view = (sku: string) => {
+    const prediction = predictPackaging(rules, "dispatch", [{ sku, quantity: 1 }], { replacement: false });
+    return { prediction, chosen: prediction.evaluation.packages };
+  };
+  const later = <T,>(value: T) => new Promise<T>((r) => setTimeout(() => r(value), 5));
+
+  /** The Complete flow's order of operations, with the live view read through a ref. */
+  async function complete(live: { current: ReturnType<typeof view> | null; order: string | null }, onAwait: () => void) {
+    const captured: PackagingCapture | null =
+      live.current && live.order ? capturePackaging({ orderNumber: live.order, ruleSet, ...live.current }) : null;
+    const eventId = await later("ev-A"); // insertEvent
+    onAwait();
+    await later(null); // component deduction
+    return { captured, eventId };
+  }
+
+  it("records A's box when B is loaded during A's save", async () => {
+    const live = { current: view("INKA-ABC0001-A1-FB"), order: "A" as string | null };
+    const { captured, eventId } = await complete(live, () => {
+      live.current!.chosen.push({ key: "BOX-L", product_id: "p-l", label: "Large", qty: 9 }); // same arrays mutated
+      live.current = view("INKA-ABC0002-A2-FB");
+      live.order = "B";
+    });
+    expect(captured).not.toBeNull();
+    const { client, calls } = fakeClient(() => applied);
+    const outbox = createPackagingOutbox(null);
+    await submitPackagingApply(client, outbox, { location: "au", requestId: `apply:${eventId}`, eventId, ...captured!.payload }, captured!.orderNumber);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ p_event_id: "ev-A", p_target: { "p-s": 1 } });
+    expect(captured!.orderNumber).toBe("A");
+  });
+
+  it("still records A when the screen is cleared during A's save, and keeps A's manual change", async () => {
+    const a = view("INKA-ABC0001-A1-FB");
+    const live = { current: { ...a, chosen: tapPackage(a.chosen, rules.catalogue[1]) }, order: "A" as string | null };
+    const { captured } = await complete(live as { current: ReturnType<typeof view> | null; order: string | null }, () => {
+      (live as { current: unknown }).current = null;
+      live.order = null;
+    });
+    expect(captured?.payload).toMatchObject({ resolved: true, predicted: { "p-s": 1 }, target: { "p-l": 1 } });
+    // Offline: the queued entry is A's, under A's event id.
+    const outbox = createPackagingOutbox(null);
+    await submitPackagingApply(fakeClient(() => offline).client, outbox, { location: "au", requestId: "apply:ev-A", eventId: "ev-A", ...captured!.payload }, captured!.orderNumber);
+    expect(outbox.list().map((e) => [e.orderNumber, e.args.target])).toEqual([["A", { "p-l": 1 }]]);
+  });
+
+  it("a capture cannot be changed afterwards", () => {
+    const captured = capturePackaging({ orderNumber: "A", ruleSet, ...view("INKA-ABC0001-A1-FB") });
+    expect(Object.isFrozen(captured)).toBe(true);
+    expect(Object.isFrozen(captured.payload)).toBe(true);
   });
 });

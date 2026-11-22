@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useOrderPackaging } from "@/lib/hooks/useOrderPackaging";
+import { packagingLinesFromOrder, type PackagingLineInput } from "@/lib/domain/packaging/contents";
 import { PackagingPanel, PackagingPendingNotice } from "@/components/production/PackagingPanel";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
@@ -106,6 +107,8 @@ interface CurrentOrder {
   lines: OrderLine[];
   /** Total lines on the order across all departments — to show "3 of 5 lines for your department". */
   total_lines: number;
+  /** F4: every line as packaging input, including blank-SKU lines that `lines` drops. */
+  packaging_lines: PackagingLineInput[];
   /** Shopify cancelledAt (ISO) when the order is cancelled; null otherwise. */
   cancelled_at: string | null;
   /** Cancellation reason if cancelled; null otherwise. */
@@ -361,11 +364,15 @@ function ProductionStation({
 
   // F4 box-auto-pick. In scan mode (default) this only reads the site
   // setting; every packaging path below behaves exactly as before.
+  const packagingOrder = useMemo(
+    () => (currentOrder ? { number: currentOrder.number, lines: currentOrder.packaging_lines } : null),
+    [currentOrder],
+  );
   const packaging = useOrderPackaging({
     client: supabase,
     location,
     department: station.department,
-    order: currentOrder,
+    order: packagingOrder,
     csCaseId: activeCase?.caseId ?? null,
     staffId: activeStaff?.user_id ?? null,
     onError: onScanError,
@@ -389,6 +396,7 @@ function ProductionStation({
         alternatives={v.alternatives}
         pendingCount={packaging.pendingCount}
         onTap={packaging.tap}
+        onAdd={packaging.add}
         onAdjust={packaging.adjust}
         onReset={packaging.reset}
         saved={packaging.saved}
@@ -682,6 +690,7 @@ function ProductionStation({
         display_name: body.order_name ?? `#${orderNumber}`,
         lines: matched,
         total_lines: allLines.length,
+        packaging_lines: packagingLinesFromOrder(allLines),
         cancelled_at: body.cancelled_at ?? null,
         cancel_reason: body.cancel_reason ?? null,
       };
@@ -1049,6 +1058,10 @@ function ProductionStation({
         return;
       }
     }
+    // F4: take this order's packaging now, before any await, so loading or
+    // clearing an order while the event saves cannot change what is recorded.
+    const packagingCapture = packagingMode === "auto" ? packaging.capture() : null;
+    const completedOrder = currentOrder;
     const totalItems = currentOrder.lines.reduce(
       (s, l) => s + (typeof l.quantity === "number" ? l.quantity : 1),
       0,
@@ -1113,12 +1126,15 @@ function ProductionStation({
     // F4: record and deduct the packaging for this completion. A no-op in
     // scan mode. Not awaited: a slow or failed save queues on the device and
     // never holds up the bench.
-    if (packagingMode === "auto") void packaging.applyAfterEvent(inserted, currentOrder.number);
+    if (packagingCapture) void packaging.applyAfterEvent(inserted, packagingCapture);
+    // Only clear the order that was completed: another order may have been
+    // scanned while this one saved.
     window.setTimeout(() => {
-      setCurrentOrder(null);
+      if (currentOrderRef.current !== completedOrder) return;
+      setCurrentOrder((now) => (now === completedOrder ? null : now));
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.applyAfterEvent]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on

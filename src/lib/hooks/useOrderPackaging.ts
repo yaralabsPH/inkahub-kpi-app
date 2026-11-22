@@ -7,17 +7,18 @@ import {
   addPackage,
   adjustPackage,
   alternativesFor,
-  buildApplyPayload,
+  capturePackaging,
   packageFromLegacyBarcode,
   pickedFromQuantities,
   pickStatus,
   predictPackaging,
+  scanPackage,
   stationPackingPoint,
   tapPackage,
+  type PackagingCapture,
   type PackagingPrediction,
   type PickStatus,
 } from "@/lib/domain/packaging/session";
-import { toQuantities } from "@/lib/domain/packaging/reconcile";
 import {
   applyRequestId,
   findPick,
@@ -30,7 +31,14 @@ import {
   type PackagingMode,
 } from "@/lib/repository/supabase/orderPackaging";
 import type { SavedPickView } from "@/components/production/PackagingPanel";
-import { afterOverride, startCorrection, type CorrectionState } from "@/lib/state/packagingCorrection";
+import {
+  afterOverride,
+  beginCorrectionSubmit,
+  cancelCorrection,
+  editCorrectionDraft,
+  startCorrection,
+  type CorrectionState,
+} from "@/lib/state/packagingCorrection";
 import { getPackagingOutbox } from "@/lib/state/packagingOutbox";
 import { drainPackagingOutbox, submitPackagingApply } from "@/lib/state/packagingSubmit";
 
@@ -67,13 +75,20 @@ export interface OrderPackaging {
   /** Packaging saves waiting on this device for the network. */
   pendingCount: number;
   tap: (item: CatalogueItem) => void;
+  /** Add one of an item without replacing the rest (a second packaging type). */
+  add: (item: CatalogueItem) => void;
   adjust: (key: string, delta: number) => void;
   /** Back to what the rules predicted. */
   reset: () => void;
   /** A scanned legacy box barcode. Returns true when it was used as a manual pick. */
   scanLegacyBarcode: (barcode: string) => boolean;
-  /** Call once after the completion event is saved. Never throws. */
-  applyAfterEvent: (eventId: string, orderNumber: string) => Promise<void>;
+  /**
+   * Take the packaging for the loaded order. Call when Complete is tapped,
+   * before any await; null when there is nothing to record.
+   */
+  capture: () => PackagingCapture | null;
+  /** Record a capture once its completion event is saved. Never throws. */
+  applyAfterEvent: (eventId: string, capture: PackagingCapture) => Promise<void>;
 }
 
 interface Options {
@@ -184,21 +199,24 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
   const confirmCorrection = useCallback(
     async (reason: string) => {
       const c = correctionRef.current;
-      if (!c?.editing || c.editing.busy) return;
-      const editing = c.editing;
-      setCorrection({ pick: c.pick, editing: { ...editing, busy: true, message: null } });
+      if (!c) return;
+      const started = beginCorrectionSubmit(c, reason, staffId);
+      if (!started) return;
+      const { request } = started;
+      correctionRef.current = started.state;
+      setCorrection(started.state);
       const outcome = await overridePackaging(client, {
         location,
-        requestId: editing.requestId,
+        requestId: request.requestId,
         pickId: c.pick.id,
-        expectedRevision: c.pick.revision,
-        target: toQuantities(editing.draft),
-        reason,
-        staffId,
+        expectedRevision: request.expectedRevision,
+        target: request.target,
+        reason: request.reason,
+        staffId: request.staffId,
       });
       setCorrection((now) =>
         now && now.pick.id === c.pick.id
-          ? afterOverride({ pick: now.pick, editing: now.editing ?? editing }, outcome, ruleSetRef.current?.body ?? null, newRequestId("override"))
+          ? afterOverride({ pick: now.pick, editing: now.editing ?? started.state.editing }, outcome, ruleSetRef.current?.body ?? null, newRequestId("override"))
           : now,
       );
     },
@@ -213,11 +231,20 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
       state: correction.pick.state,
       stockState: correction.pick.stock_state,
       editing: correction.editing
-        ? { draft: correction.editing.draft, busy: correction.editing.busy, message: correction.editing.message }
+        ? {
+            draft: correction.editing.draft,
+            busy: correction.editing.busy,
+            message: correction.editing.message,
+            uncertain: correction.editing.uncertain,
+          }
         : null,
       onStartChange: () => setCorrection((c) => (c ? startCorrection(c.pick, body, newRequestId("override")) : c)),
-      onCancelChange: () => setCorrection((c) => (c ? { pick: c.pick, editing: null } : c)),
+      onCancelChange: () => setCorrection((c) => (c ? cancelCorrection(c) : c)),
       onConfirm: (reason) => void confirmCorrection(reason),
+      // The reason is ignored on a retry: the frozen request is resent as it was.
+      onRetry: () => {
+        if (correctionRef.current?.editing?.uncertain) void confirmCorrection("");
+      },
     };
   }, [correction, ruleSet, confirmCorrection]);
 
@@ -225,7 +252,8 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
   const editDraft = useCallback((change: (draft: PickedPackage[]) => PickedPackage[]): boolean => {
     const c = correctionRef.current;
     if (!c?.editing) return false;
-    if (!c.editing.busy) setCorrection({ pick: c.pick, editing: { ...c.editing, draft: change(c.editing.draft), message: null } });
+    const next = editCorrectionDraft(c, change);
+    if (next !== c) setCorrection(next);
     return true;
   }, []);
 
@@ -233,6 +261,12 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
     if (editDraft((d) => tapPackage(d, item))) return;
     const v = viewRef.current;
     if (v) setChosen(tapPackage(v.chosen, item));
+  }, [editDraft]);
+
+  const add = useCallback((item: CatalogueItem) => {
+    if (editDraft((d) => addPackage(d, item))) return;
+    const v = viewRef.current;
+    if (v) setChosen(addPackage(v.chosen, item));
   }, [editDraft]);
 
   const adjust = useCallback((key: string, delta: number) => {
@@ -252,22 +286,30 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
     if (editDraft((d) => addPackage(d, item))) return true;
     // A saved pick is only changed through "Change box", never by a stray scan.
     if (correctionRef.current) return true;
-    // The first scan replaces the prediction; later scans add a box each.
-    setChosen(v.status === "changed" ? addPackage(v.chosen, item) : [{ key: item.key, product_id: item.product_id, label: item.label, qty: 1 }]);
+    // The first scan replaces the prediction (even with the same box); later scans add one each.
+    setChosen((explicit) => scanPackage(explicit, item));
     return true;
   }, [editDraft]);
 
+  const orderNumberRef = useRef(orderNumber);
+  orderNumberRef.current = orderNumber;
+
+  const capture = useCallback((): PackagingCapture | null => {
+    const v = viewRef.current;
+    const rs = ruleSetRef.current;
+    const forOrder = orderNumberRef.current;
+    if (!v || !rs || !forOrder) return null;
+    return capturePackaging({ orderNumber: forOrder, ruleSet: rs, prediction: v.prediction, chosen: v.chosen });
+  }, []);
+
   const applyAfterEvent = useCallback(
-    async (eventId: string, forOrder: string): Promise<void> => {
-      const v = viewRef.current;
-      const rs = ruleSetRef.current;
-      if (!v || !rs) return;
+    async (eventId: string, captured: PackagingCapture): Promise<void> => {
+      const forOrder = captured.orderNumber;
       try {
-        const payload = buildApplyPayload({ ruleSet: rs, prediction: v.prediction, chosen: v.chosen });
         const result = await submitPackagingApply(
           client,
           outbox,
-          { location, requestId: applyRequestId(eventId), eventId, ...payload },
+          { location, requestId: applyRequestId(eventId), eventId, ...captured.payload },
           forOrder,
         );
         if (result.kind === "failed") onError(result.message);
@@ -287,9 +329,11 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
     saved,
     pendingCount,
     tap,
+    add,
     adjust,
     reset,
     scanLegacyBarcode,
+    capture,
     applyAfterEvent,
   };
 }

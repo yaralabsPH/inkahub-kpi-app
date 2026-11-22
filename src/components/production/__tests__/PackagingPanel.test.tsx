@@ -19,6 +19,7 @@ function html(over: Partial<PackagingPanelProps> = {}): string {
       alternatives={[small, large]}
       pendingCount={0}
       onTap={noop}
+      onAdd={noop}
       onAdjust={noop}
       onReset={noop}
       {...over}
@@ -34,6 +35,7 @@ const saved = (over: Partial<SavedPickView> = {}): SavedPickView => ({
   onStartChange: noop,
   onCancelChange: noop,
   onConfirm: noop,
+  onRetry: noop,
   ...over,
 });
 
@@ -112,8 +114,9 @@ describe("PackagingPanel for a saved pick", () => {
   });
 
   it("while changing: editable rows, alternatives, reasons and cancel", () => {
-    const out = html({ saved: saved({ editing: { draft: [picked(large)], busy: false, message: null } }) });
+    const out = html({ saved: saved({ editing: { draft: [picked(large)], busy: false, message: null, uncertain: false } }) });
     expect(out).toContain(">CHANGING<");
+    expect(out).toContain('aria-label="Add one Small box"');
     expect(out).toContain("Large box");
     expect(out).toContain('aria-label="One more Large box"');
     expect(out).toContain('aria-label="Use Small box"');
@@ -124,10 +127,31 @@ describe("PackagingPanel for a saved pick", () => {
   });
 
   it("disables inputs while saving and shows a message such as a conflict", () => {
-    const out = html({ saved: saved({ editing: { draft: [picked(large)], busy: true, message: "Changed on another device. Showing the latest." } }) });
+    const out = html({ saved: saved({ editing: { draft: [picked(large)], busy: true, message: "Changed on another device. Showing the latest.", uncertain: false } }) });
     expect(out).toContain("disabled");
     expect(out).toContain('role="alert"');
     expect(out).toContain("Changed on another device.");
+  });
+
+  it("review r1: after a lost answer offers only Retry, with editing and Cancel removed", () => {
+    const out = html({ saved: saved({ editing: { draft: [picked(large)], busy: false, message: "No connection. The change may already be saved.", uncertain: true } }) });
+    expect(out).toContain(">Retry<");
+    expect(out).not.toContain("Used a different box");
+    expect(out).not.toContain(">Cancel<");
+    expect(out).not.toContain("Nothing was changed");
+    // Every row/alternative button is disabled; only Retry is live.
+    const enabled = out.match(/<button(?![^>]*disabled)[^>]*>/g) ?? [];
+    expect(enabled).toHaveLength(1);
+    expect(enabled[0]).not.toContain("aria-label");
+  });
+});
+
+describe("review r1: adding a second packaging type", () => {
+  it("offers an add action beside each one-tap alternative", () => {
+    const out = html();
+    expect(out).toContain('aria-label="Use Large box"');
+    expect(out).toContain('aria-label="Add one Large box"');
+    expect(out).toContain('aria-label="Add one Small box"');
   });
 });
 

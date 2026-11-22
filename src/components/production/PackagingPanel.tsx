@@ -17,12 +17,17 @@ export interface SavedPickView {
   packages: PickedPackage[];
   state: "auto" | "overridden" | "unresolved" | "legacy_scan";
   stockState: "posted" | "short" | "unposted";
-  /** Non-null while the worker is changing the saved pick. */
-  editing: { draft: PickedPackage[]; busy: boolean; message: string | null } | null;
+  /**
+   * Non-null while the worker is changing the saved pick. `uncertain`: the
+   * last save got no answer, so only Retry is offered until it does.
+   */
+  editing: { draft: PickedPackage[]; busy: boolean; message: string | null; uncertain: boolean } | null;
   onStartChange: () => void;
   onCancelChange: () => void;
   /** Save the draft with this reason. */
   onConfirm: (reason: string) => void;
+  /** Resend the save whose outcome is unknown, unchanged. */
+  onRetry: () => void;
 }
 
 export interface PackagingPanelProps {
@@ -36,6 +41,8 @@ export interface PackagingPanelProps {
   alternatives: CatalogueItem[];
   pendingCount: number;
   onTap: (item: CatalogueItem) => void;
+  /** Add one of an item alongside the current pick. */
+  onAdd: (item: CatalogueItem) => void;
   onAdjust: (key: string, delta: number) => void;
   onReset: () => void;
   saved?: SavedPickView | null;
@@ -111,14 +118,20 @@ function Alternatives(props: {
   items: CatalogueItem[];
   disabled?: boolean;
   onTap: (item: CatalogueItem) => void;
+  onAdd: (item: CatalogueItem) => void;
 }) {
   if (props.items.length === 0) return null;
   return (
     <div className={props.look.alts} role="group" aria-label="Use a different packaging item">
       {props.items.map((item) => (
-        <button key={item.key} type="button" className={props.look.button} disabled={props.disabled} aria-label={`Use ${item.label}`} onClick={() => props.onTap(item)}>
-          {item.label}
-        </button>
+        <span key={item.key} style={{ display: "inline-flex", gap: 4 }}>
+          <button type="button" className={props.look.button} disabled={props.disabled} aria-label={`Use ${item.label}`} onClick={() => props.onTap(item)}>
+            {item.label}
+          </button>
+          <button type="button" className={props.look.button} disabled={props.disabled} aria-label={`Add one ${item.label}`} onClick={() => props.onAdd(item)}>
+            +
+          </button>
+        </span>
       ))}
     </div>
   );
@@ -159,18 +172,26 @@ export function PackagingPanel(props: PackagingPanelProps) {
         {editing ? (
           <>
             {editing.draft.length === 0 ? <div className={look.note}>No packaging. Tap what was used.</div> : null}
-            <Rows look={look} packages={editing.draft} editable disabled={editing.busy} onAdjust={props.onAdjust} />
-            <Alternatives look={look} items={props.alternatives} disabled={editing.busy} onTap={props.onTap} />
-            <div className={look.note}>Why is it changing? Tap a reason to save.</div>
-            <div className={look.alts} role="group" aria-label="Reason for the change">
-              {OVERRIDE_REASONS.map((r) => (
-                <button key={r} type="button" className={look.button} disabled={editing.busy} onClick={() => saved.onConfirm(r)}>
-                  {r}
-                </button>
-              ))}
-            </div>
+            <Rows look={look} packages={editing.draft} editable disabled={editing.busy || editing.uncertain} onAdjust={props.onAdjust} />
+            <Alternatives look={look} items={props.alternatives} disabled={editing.busy || editing.uncertain} onTap={props.onTap} onAdd={props.onAdd} />
+            {editing.uncertain ? (
+              <button type="button" className={look.button} disabled={editing.busy} onClick={saved.onRetry}>Retry</button>
+            ) : (
+              <>
+                <div className={look.note}>Why is it changing? Tap a reason to save.</div>
+                <div className={look.alts} role="group" aria-label="Reason for the change">
+                  {OVERRIDE_REASONS.map((r) => (
+                    <button key={r} type="button" className={look.button} disabled={editing.busy} onClick={() => saved.onConfirm(r)}>
+                      {r}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
             {editing.message ? <div className={look.note} role="alert">{editing.message}</div> : null}
-            <button type="button" className={look.link} disabled={editing.busy} onClick={saved.onCancelChange}>Cancel</button>
+            {editing.uncertain ? null : (
+              <button type="button" className={look.link} disabled={editing.busy} onClick={saved.onCancelChange}>Cancel</button>
+            )}
           </>
         ) : (
           <>
@@ -205,7 +226,7 @@ export function PackagingPanel(props: PackagingPanelProps) {
         </div>
       ) : null}
       <Rows look={look} packages={props.chosen} editable onAdjust={props.onAdjust} />
-      <Alternatives look={look} items={props.alternatives} onTap={props.onTap} />
+      <Alternatives look={look} items={props.alternatives} onTap={props.onTap} onAdd={props.onAdd} />
       {props.status === "changed" ? (
         <button type="button" className={look.link} onClick={props.onReset}>
           {props.predicted.length > 0
