@@ -19,12 +19,14 @@ async function settle(n = 20) {
   for (let i = 0; i < n; i++) await tick();
 }
 
-function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId: string) => Promise<CommitOutcome>; failWrites?: () => boolean } = {}) {
-  const outbox = createScannerOutbox(memoryJobStore({ failWrites: over.failWrites }));
+function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId: string) => Promise<CommitOutcome>; failWrites?: () => boolean; clock?: () => number } = {}) {
+  const outbox = createScannerOutbox(memoryJobStore({ failWrites: over.failWrites }), over.clock);
   const sounds: SoundKind[] = [];
   const committedFor: string[] = [];
   const people: Record<string, { id: string; name: string }> = { AAAA0001: { id: ALICE, name: "Alice" }, BBBB0002: { id: BOB, name: "Bob" } };
-  const c = new SharedScannerController({
+  const make = () => {
+  let self: SharedScannerController | null = null;
+  self = new SharedScannerController({
     scannerIds: ["S1", "S2", "S3"],
     scope,
     outbox,
@@ -32,6 +34,7 @@ function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId
       people[badge] ? { outcome: "activated", personId: people[badge].id, displayName: people[badge].name, clockedIn: true } : { outcome: "unknown_badge" }),
     deliver: () => processNext({
       outbox, scope, owner: "tab",
+      active: () => self !== null && !self.isDisposed,
       lookupOrder: async (n) => ({ kind: "ok", lookup: order(n) }),
       openCase: async () => false,
       products: () => [],
@@ -46,7 +49,10 @@ function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId
     newRequestId: uuid,
     sound: (k) => sounds.push(k),
   });
-  return { c, outbox, sounds, committedFor };
+  return self;
+  };
+  const c = make();
+  return { c, outbox, sounds, committedFor, make };
 }
 
 describe("SharedScannerController", () => {
@@ -143,5 +149,57 @@ describe("SharedScannerController", () => {
     expect(c.state.last).toMatchObject({ kind: "queued" });
     expect(c.state.deliveryWaiting).toBe("timeout");
     expect(c.state.view?.uncertain).toBe(1);
+  });
+
+  it("R1-11: StrictMode setup -> cleanup -> setup gives a live controller: badge -> order -> saved", async () => {
+    const { c: first, make, committedFor } = setup();
+    first.dispose(); // StrictMode's immediate cleanup
+    const second = make(); // ...and setup again
+    first.onFrame("S1", "AAAA0001"); // the disposed one starts nothing
+    await settle();
+    expect(first.state.slots.S1.identity).toBeNull();
+    second.onFrame("S1", "AAAA0001");
+    await settle();
+    second.onFrame("S1", "190203");
+    await settle();
+    expect(second.state.last).toMatchObject({ kind: "saved", person: "Alice", order: "10190203" });
+    expect(committedFor).toEqual(["10190203:Alice"]);
+  });
+
+  it("R1-1: a known but unusable 8-digit badge signs the scanner out and saves nothing for the old person", async () => {
+    const { c, committedFor } = setup({
+      activate: async ({ badge }) => (badge === "AAAA0001"
+        ? { outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: false }
+        : { outcome: "unusable_badge" }),
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "10190203");
+    await settle();
+    expect(committedFor).toEqual([]);
+    expect(c.state.slots.S1.identity).toBeNull();
+    expect(c.state.last).toMatchObject({ kind: "rejected", detail: expect.stringMatching(/cannot be used here/) });
+  });
+
+  it("R1-2: a refusal after an unanswered save says 'not confirmed', never 'not saved — use classic'", async () => {
+    let n = 0;
+    let clock = 1_000_000;
+    const { c } = setup({
+      clock: () => clock,
+      commit: async () => (++n === 1 ? { outcome: "network_error", message: "timeout" } : { outcome: "rejected", code: "unavailable", message: "RPC missing" }),
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(n).toBe(1);
+    clock += 120_000; // past the back-off
+    c.pump();
+    await settle();
+    expect(n).toBe(2);
+    expect(c.state.last?.kind).not.toBe("rejected");
+    expect(c.state.last?.title).toMatch(/not confirmed/);
+    expect(c.state.last?.detail).toMatch(/Do NOT record it on the classic station/);
+    expect(c.state.view?.jobs[0]).toMatchObject({ status: "blocked", uncertain: true });
   });
 });

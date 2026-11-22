@@ -169,19 +169,26 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
 
       {blocked.length > 0 ? (
         <section className="px-6 pb-4" data-testid="blocked-jobs">
-          <div className="text-sm uppercase tracking-widest text-red-300 mb-2">Not saved — needs you ({blocked.length})</div>
+          <div className="text-sm uppercase tracking-widest text-red-300 mb-2">Needs you ({blocked.length})</div>
           <div className="space-y-2">
             {blocked.map((j: ScannerJob) => (
               <div key={j.requestId} className="rounded-lg bg-slate-900 ring-1 ring-red-700 px-4 py-2 flex items-center justify-between gap-4">
                 <div>
                   <div className="font-semibold">#{j.orderNumber} · {j.displayName} · {j.scannerId}</div>
                   <div className="text-sm text-slate-300">{j.blocked?.message}</div>
+                  {j.uncertain ? (
+                    <div className="text-sm font-semibold text-amber-300">
+                      An earlier send may already have saved this. Do NOT record it on the classic station; tap Retry once fixed.
+                    </div>
+                  ) : null}
                 </div>
                 <div className="flex gap-2 shrink-0">
                   <button type="button" onClick={() => p.onRetry(j.requestId)} className="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600">Retry</button>
-                  <button type="button" onClick={() => arm(j.requestId, () => p.onDismiss(j.requestId))} className="px-3 py-1 rounded bg-red-800 hover:bg-red-700">
-                    {armed === j.requestId ? "Tap again: I recorded it on classic" : "Recorded on classic"}
-                  </button>
+                  {j.uncertain ? null : (
+                    <button type="button" onClick={() => arm(j.requestId, () => p.onDismiss(j.requestId))} className="px-3 py-1 rounded bg-red-800 hover:bg-red-700">
+                      {armed === j.requestId ? "Tap again: I recorded it on classic" : "Recorded on classic"}
+                    </button>
+                  )}
                 </div>
               </div>
             ))}

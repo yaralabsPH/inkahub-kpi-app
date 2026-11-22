@@ -91,6 +91,10 @@ export class SharedScannerController {
     return () => this.listeners.delete(fn);
   }
 
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
   dispose(): void {
     this.disposed = true;
     this.listeners.clear();
@@ -121,6 +125,7 @@ export class SharedScannerController {
 
   /** Call for every whole frame. Synchronous decision; effects run after. */
   onFrame(scannerId: string, payload: string): void {
+    if (this.disposed) return; // a closed station starts nothing
     const { slots, decision } = decideFrame(this.s.slots, { scannerId, payload }, {
       online: this.d.isOnline(),
       now: this.d.now(),
@@ -147,13 +152,22 @@ export class SharedScannerController {
     } catch (e) {
       res = { outcome: "network_error", message: e instanceof Error ? e.message : String(e) };
     }
+    if (this.disposed) return;
     const result =
       res.outcome === "activated"
         ? ({ outcome: "activated", personId: res.personId, displayName: res.displayName } as const)
         : res.outcome === "unknown_badge"
           ? ({ outcome: "unknown_badge" } as const)
-          : ({ outcome: "failed", message: res.message } as const);
+          : res.outcome === "unusable_badge"
+            ? ({ outcome: "unusable_badge" } as const)
+            : ({ outcome: "failed", message: res.message } as const);
     const r = resolveActivation(this.s.slots, scannerId, epoch, requestId, result, this.d.now());
+    if (r.timedOut) {
+      // Too late: ignored, scanner cleared, and the operator is told how to recover.
+      this.set({ slots: r.slots });
+      this.show({ kind: "rejected", scannerId, title: `${scannerId}: badge check timed out`, detail: REJECT_TEXT.pending_timeout }, "error");
+      return;
+    }
     if (r.stale) return; // the scanner moved on; never bind an old answer
     this.set({ slots: r.slots });
     if (res.outcome === "activated") {
@@ -171,6 +185,8 @@ export class SharedScannerController {
     const detail =
       res.outcome === "unknown_badge"
         ? "Badge not recognised at this site. Scanner signed out."
+        : res.outcome === "unusable_badge"
+          ? "This badge cannot be used here (inactive, or issued at another site). Scanner signed out. For an order with this number, scan its packing slip or #number."
         : res.outcome === "rejected"
           ? `${res.message} Scanner signed out.`
           : `Couldn't reach the server to sign in (${res.message}). Scanner signed out; scan the badge again.`;
@@ -210,9 +226,14 @@ export class SharedScannerController {
 
   /** Periodic: expire idle identities. */
   tick(): void {
-    const { slots, expired } = expireIdle(this.s.slots, this.d.now());
-    if (expired.length === 0) return;
+    if (this.disposed) return;
+    const { slots, expired, timedOut } = expireIdle(this.s.slots, this.d.now());
+    if (expired.length === 0 && timedOut.length === 0) return;
     this.set({ slots });
+    if (timedOut.length > 0) {
+      this.show({ kind: "rejected", scannerId: timedOut[0], title: `${timedOut.join(", ")}: badge check timed out`, detail: REJECT_TEXT.pending_timeout }, "error");
+      return;
+    }
     this.show({ kind: "info", scannerId: expired[0], title: `${expired.join(", ")} signed out after 10 minutes without a scan`, detail: "Scan your badge again." }, null);
   }
 
@@ -235,6 +256,7 @@ export class SharedScannerController {
 
   /** Start (or re-check) the single delivery loop. */
   pump(): void {
+    if (this.disposed) return;
     if (this.pumping) {
       this.pumpAgain = true;
       return;
@@ -256,7 +278,7 @@ export class SharedScannerController {
             if (!report) break;
             this.onReport(report);
             await this.refreshView();
-            if (report.kind === "waiting") break;
+            if (report.kind === "waiting" || report.kind === "superseded") break;
           }
         } while (this.pumpAgain && !this.disposed);
       } finally {
@@ -285,10 +307,21 @@ export class SharedScannerController {
         }, "error");
         return;
       case "blocked":
+        if (r.uncertain) {
+          // An earlier attempt may have saved it: never claim "not saved" or send people to classic.
+          this.show({
+            kind: "queued", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
+            title: `#${j.orderNumber}: outcome not confirmed yet`,
+            detail: `It may already be saved. Do NOT record it on the classic station. Tap Retry when this is fixed: ${r.message}`,
+          }, "error");
+          return;
+        }
         this.show({
           kind: "rejected", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
           title: `#${j.orderNumber} not saved — use the classic station`, detail: r.message,
         }, "error");
+        return;
+      case "superseded":
         return;
       case "waiting":
         this.set({ deliveryWaiting: r.message, authProblem: r.auth });

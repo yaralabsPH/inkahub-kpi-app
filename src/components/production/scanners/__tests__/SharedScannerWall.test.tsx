@@ -73,6 +73,15 @@ describe("SharedScannerWall", () => {
     expect(html).toContain("Recorded on classic");
     expect(html).toContain("cannot be read");
   });
+
+  it("R1-2: an uncertain blocked scan never offers classic re-recording", () => {
+    const job = { requestId: "r2", orderNumber: "10190204", displayName: "Bob", scannerId: "S2", status: "blocked", uncertain: true,
+      blocked: { code: "forbidden_role", message: "Only an owner, manager or kiosk account can run shared scanners.", stage: "commit" } } as ScannerJob;
+    const html = render({ state: state({ view: { jobs: [job], corrupt: [], waiting: 0, blocked: 1, uncertain: 1 } }) });
+    expect(html).toContain("may already have saved this");
+    expect(html).toContain("Retry");
+    expect(html).not.toContain("Recorded on classic");
+  });
 });
 
 describe("ScannerHealthView", () => {

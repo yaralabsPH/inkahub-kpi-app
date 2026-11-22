@@ -67,8 +67,15 @@ export interface ScannerJob extends JobScope {
   prepared: PreparedFraming | null;
   /** Commit requests sent. */
   attempts: number;
-  /** A commit was sent and no definite answer has come back. */
+  /**
+   * A commit may have been saved and that is not yet settled. Set when a
+   * commit is sent; cleared only by a saved/already-recorded answer, or by a
+   * refusal of the FIRST attempt. A refusal after an earlier unanswered
+   * attempt does not settle it (that earlier attempt may have saved).
+   */
   uncertain: boolean;
+  /** An earlier commit attempt never got a definite answer. */
+  priorUnknown?: boolean;
   /** Failed attempts of any kind, for back-off. */
   tries: number;
   nextAttemptAt: number;
@@ -98,6 +105,7 @@ const JobSchema = z.object({
   prepared: z.unknown().nullable(),
   attempts: z.number().int().min(0),
   uncertain: z.boolean(),
+  priorUnknown: z.boolean().optional(),
   tries: z.number().int().min(0),
   nextAttemptAt: z.number(),
   lastError: z.string().nullable(),
@@ -135,6 +143,14 @@ export class OutboxStorageError extends Error {
   constructor(message: string, readonly cause?: unknown) {
     super(message);
     this.name = "OutboxStorageError";
+  }
+}
+
+/** Another tab (or a later claim by this tab) owns the job now. */
+export class LeaseLostError extends Error {
+  constructor() {
+    super("Another tab took over this queued scan.");
+    this.name = "LeaseLostError";
   }
 }
 
@@ -245,12 +261,20 @@ export interface ScopeView {
 
 export interface ScannerOutbox {
   enqueue(order: CapturedOrder, scope: JobScope, requestId: string): Promise<ScannerJob>;
+  /**
+   * Claim the next ready job. The returned job's `leaseOwner` is a fresh
+   * per-claim lease token: pass it to every later step. Steps with a stale
+   * token are refused (setPrepared/markAttempt throw LeaseLostError) or
+   * ignored (markBlocked/retryLater), so a late answer from an expired claim
+   * can never change a job another claim has moved on.
+   */
   claimNext(scope: JobScope, owner: string): Promise<ScannerJob | null>;
-  setPrepared(requestId: string, owner: string, prepared: PreparedFraming): Promise<ScannerJob>;
-  markAttempt(requestId: string, owner: string): Promise<ScannerJob>;
+  setPrepared(requestId: string, lease: string, prepared: PreparedFraming): Promise<ScannerJob>;
+  markAttempt(requestId: string, lease: string): Promise<ScannerJob>;
+  /** Saved / already recorded: the server's truth, accepted from any claim; never undone. */
   markDone(requestId: string, outcome: JobOutcome): Promise<void>;
-  markBlocked(requestId: string, block: JobBlock): Promise<void>;
-  retryLater(requestId: string, error: string): Promise<void>;
+  markBlocked(requestId: string, lease: string, block: JobBlock): Promise<void>;
+  retryLater(requestId: string, lease: string, error: string): Promise<void>;
   /** Operator: try a blocked job again (same request id, same payload once prepared). */
   retryBlocked(requestId: string, scope: JobScope): Promise<void>;
   /** Operator: give up on a blocked job and record it on the classic station instead. */
@@ -266,6 +290,10 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
     if (!job) throw new OutboxStorageError(`Queued scan ${requestId} is missing or unreadable.`);
     return job;
   };
+
+  let claims = 0;
+  const live = (job: ScannerJob, lease: string) =>
+    job.leaseOwner === lease && (job.status === "queued" || job.status === "prepared");
 
   const backoff = (tries: number) => Math.min(60_000, 2_000 * 2 ** Math.min(tries, 5));
 
@@ -294,6 +322,7 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
           prepared: null,
           attempts: 0,
           uncertain: false,
+          priorUnknown: false,
           tries: 0,
           nextAttemptAt: 0,
           lastError: null,
@@ -319,20 +348,21 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
           .map((r) => readJob(r.value))
           .filter((j): j is ScannerJob =>
             !!j && j.scope === key && (j.status === "queued" || j.status === "prepared") &&
-            j.nextAttemptAt <= at && (j.leaseOwner === null || j.leaseOwner === owner || j.leaseUntil <= at))
+            j.nextAttemptAt <= at && (j.leaseOwner === null || j.leaseUntil <= at))
           .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
         const job = ready[0];
         if (!job) return null;
-        const claimed: ScannerJob = { ...job, leaseOwner: owner, leaseUntil: at + LEASE_MS, updatedAt: iso() };
+        const lease = `${owner}#${++claims}-${Math.random().toString(36).slice(2, 10)}`;
+        const claimed: ScannerJob = { ...job, leaseOwner: lease, leaseUntil: at + LEASE_MS, updatedAt: iso() };
         await t.put(claimed);
         return claimed;
       });
     },
 
-    async setPrepared(requestId, owner, prepared) {
+    async setPrepared(requestId, lease, prepared) {
       return store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        if (job.leaseOwner !== owner) throw new OutboxStorageError("Lost the lease on a queued scan.");
+        if (!live(job, lease)) throw new LeaseLostError();
         if (job.prepared !== null || job.status !== "queued") {
           // Immutable: never replace a payload that may already have been sent.
           return job;
@@ -344,12 +374,20 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
       });
     },
 
-    async markAttempt(requestId, owner) {
+    async markAttempt(requestId, lease) {
       return store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        if (job.leaseOwner !== owner) throw new OutboxStorageError("Lost the lease on a queued scan.");
+        if (!live(job, lease)) throw new LeaseLostError();
         if (job.status !== "prepared" || !job.prepared) throw new OutboxStorageError("Scan is not ready to send.");
-        const next: ScannerJob = { ...job, attempts: job.attempts + 1, uncertain: true, leaseUntil: now() + LEASE_MS, updatedAt: iso() };
+        const next: ScannerJob = {
+          ...job,
+          attempts: job.attempts + 1,
+          // Still uncertain from an earlier send that never got an answer?
+          priorUnknown: (job.priorUnknown ?? false) || job.uncertain,
+          uncertain: true,
+          leaseUntil: now() + LEASE_MS,
+          updatedAt: iso(),
+        };
         await t.put(next);
         return next;
       });
@@ -358,7 +396,8 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
     async markDone(requestId, outcome) {
       await store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        await t.put({ ...job, status: "done", uncertain: false, outcome, blocked: null, lastError: null, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
+        if (job.status === "done" || job.status === "dismissed") return; // never rewrite a finished job
+        await t.put({ ...job, status: "done", uncertain: false, priorUnknown: false, outcome, blocked: null, lastError: null, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
         // Keep the finished history bounded per scope (oldest first out).
         const finished = (await t.all())
           .map((r) => readJob(r.value))
@@ -368,17 +407,22 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
       });
     },
 
-    async markBlocked(requestId, block) {
+    async markBlocked(requestId, lease, block) {
       await store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        // A definite refusal settles any uncertainty: the server did not save it.
-        await t.put({ ...job, status: "blocked", uncertain: false, blocked: block, lastError: block.message, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
+        if (!live(job, lease)) return; // a stale claim's answer: ignored
+        // A refusal proves only that THIS attempt saved nothing. If an earlier
+        // attempt went unanswered it may have saved: stay uncertain until a
+        // retry gets the receipt's answer.
+        const uncertain = block.stage === "commit" ? (job.priorUnknown ?? false) : job.uncertain;
+        await t.put({ ...job, status: "blocked", uncertain, blocked: block, lastError: block.message, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
       });
     },
 
-    async retryLater(requestId, error) {
+    async retryLater(requestId, lease, error) {
       await store.tx(async (t) => {
         const job = await mustGet(t, requestId);
+        if (!live(job, lease)) return;
         const tries = job.tries + 1;
         await t.put({ ...job, tries, nextAttemptAt: now() + backoff(tries), lastError: error, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
       });

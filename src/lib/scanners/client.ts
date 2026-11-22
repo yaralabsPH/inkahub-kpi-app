@@ -12,7 +12,8 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { prepareFramingOrder, type CatalogueProduct, type OrderLookup, type PackagingSetup, type PreparedFraming } from "./order";
-import type { JobScope, ScannerJob, ScannerOutbox } from "./outbox";
+import { LeaseLostError, type JobScope, type ScannerJob, type ScannerOutbox } from "./outbox";
+import { parseRuleSetBody } from "@/lib/domain/packaging/ruleSet";
 
 export interface Rejected {
   outcome: "rejected";
@@ -49,6 +50,11 @@ export function classifyRpcError(error: { message?: string; code?: string; statu
   const message = error.message ?? "";
   const code = error.code ?? "";
   const m = /scanner: ([a-z_]+)/.exec(message);
+  // A request sent under a different account than the one that scanned it:
+  // nothing ran. Keep the job for its own account; never block or drop it.
+  if (m && m[1] === "caller_mismatch") {
+    return { outcome: "network_error", message: "Signed in as a different account than the one that scanned this. Kept for that account.", auth: true };
+  }
   if (m) return { outcome: "rejected", code: m[1], message: REJECTION_TEXT[m[1]] ?? message };
   const pkg = /packaging: ([a-z_]+)/.exec(message);
   if (pkg) return { outcome: "rejected", code: "packaging_invalid", message: `${REJECTION_TEXT.packaging_invalid} (${pkg[1]})` };
@@ -88,17 +94,19 @@ export function newRequestId(): string {
 export type ActivateOutcome =
   | { outcome: "activated"; personId: string; displayName: string; clockedIn: boolean }
   | { outcome: "unknown_badge" }
+  | { outcome: "unusable_badge" }
   | Rejected
   | NetworkError;
 
 const ActivateSchema = z.union([
   z.object({ status: z.literal("activated"), person_id: z.string().uuid(), display_name: z.string(), clocked_in: z.boolean() }),
   z.object({ status: z.literal("unknown_badge") }),
+  z.object({ status: z.literal("unusable_badge") }),
 ]);
 
 export async function activateBadge(
   client: SupabaseClient,
-  a: { location: string; requestId: string; receiverId: string; scannerId: string; badge: string },
+  a: { location: string; requestId: string; receiverId: string; scannerId: string; badge: string; expectedCaller: string },
 ): Promise<ActivateOutcome> {
   const res = await rpc(client, "scanner_activate_badge", {
     p_location: a.location,
@@ -106,12 +114,14 @@ export async function activateBadge(
     p_receiver_id: a.receiverId,
     p_scanner_id: a.scannerId,
     p_badge: a.badge,
+    p_expected_caller: a.expectedCaller,
   });
   if ("outcome" in res) return res;
   const parsed = ActivateSchema.safeParse(res.data);
   if (!parsed.success) return malformed("activation");
   const d = parsed.data;
   if (d.status === "unknown_badge") return { outcome: "unknown_badge" };
+  if (d.status === "unusable_badge") return { outcome: "unusable_badge" };
   return { outcome: "activated", personId: d.person_id, displayName: d.display_name, clockedIn: d.clocked_in };
 }
 
@@ -154,6 +164,7 @@ export function commitParams(job: ScannerJob, prepared: PreparedFraming): Record
     p_badge: job.badge,
     p_order_number: prepared.orderNumber,
     p_scanned_at: job.scannedAt,
+    p_expected_caller: job.callerId,
     p_lines: prepared.lines.map((l) => ({ sku: l.sku, quantity: l.quantity, work_type: l.workType })),
     p_components: prepared.components,
     p_packaging: prepared.packaging
@@ -243,6 +254,39 @@ export async function hasOpenCase(client: SupabaseClient, location: string, orde
 }
 
 // ---------------------------------------------------------------------------
+// Box rules for A0 jobs (scanner-specific; F4's loadPackagingConfig is unchanged)
+// ---------------------------------------------------------------------------
+
+/**
+ * Only A0 jobs need this. Transport failures are "network" (the job waits);
+ * a definite answer is returned as a setup: scan mode, no active rule set or
+ * unreadable rules all come back as "no usable rules", so the A0 order is
+ * blocked with a classic-station reason instead of stalling the queue.
+ */
+export async function loadScannerPackaging(client: SupabaseClient, location: string): Promise<PackagingSetup | "network"> {
+  const missingTable = (code?: string) => code === "PGRST205" || code === "42P01";
+  try {
+    const settings = await client.from("packaging_settings").select("mode").eq("location", location).maybeSingle();
+    if (settings.error) return missingTable(settings.error.code) ? { mode: "scan", ruleSet: null } : "network";
+    if ((settings.data as { mode?: string } | null)?.mode !== "auto") return { mode: "scan", ruleSet: null };
+    const active = await client
+      .from("packaging_rule_sets")
+      .select("id, version, body")
+      .eq("location", location)
+      .eq("status", "active")
+      .maybeSingle();
+    if (active.error) return "network";
+    if (!active.data) return { mode: "auto", ruleSet: null };
+    const rs = active.data as { id: string; version: number; body: unknown };
+    const parsed = parseRuleSetBody(rs.body);
+    if (!parsed.ok) return { mode: "auto", ruleSet: null };
+    return { mode: "auto", ruleSet: { id: rs.id, version: rs.version, body: parsed.body } };
+  } catch {
+    return "network";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Delivery: one job at a time
 // ---------------------------------------------------------------------------
 
@@ -254,15 +298,21 @@ export interface DeliveryDeps {
   openCase(orderNumber: string): Promise<boolean | "network">;
   /** null while the catalogue is still loading. */
   products(): readonly CatalogueProduct[] | null;
+  /** Called only for orders with A0 framed lines. */
   packaging(): Promise<PackagingSetup | "network">;
   commit(job: ScannerJob, prepared: PreparedFraming): Promise<CommitOutcome>;
+  /** False once the station was closed or its account/site changed: start nothing new. */
+  active?(): boolean;
 }
 
 export type DeliveryReport =
   | { kind: "saved"; job: ScannerJob; result: SavedResult }
   | { kind: "already_recorded"; job: ScannerJob; reason: string }
-  | { kind: "blocked"; job: ScannerJob; code: string; message: string }
-  | { kind: "waiting"; job: ScannerJob; message: string; auth: boolean };
+  /** `uncertain`: an earlier attempt may still have saved it (do not re-record). */
+  | { kind: "blocked"; job: ScannerJob; code: string; message: string; uncertain: boolean }
+  | { kind: "waiting"; job: ScannerJob; message: string; auth: boolean }
+  /** Another claim owns the job now, or the station stopped: nothing changed. */
+  | { kind: "superseded"; job: ScannerJob };
 
 /**
  * Take the next job in this exact scope and move it one step as far as it
@@ -270,33 +320,56 @@ export type DeliveryReport =
  * server problems (they become reports); storage failures do throw.
  */
 export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | null> {
-  let job = await d.outbox.claimNext(d.scope, d.owner);
-  if (!job) return null;
+  const active = () => d.active?.() ?? true;
+  if (!active()) return null;
+  const claimed = await d.outbox.claimNext(d.scope, d.owner);
+  if (!claimed) return null;
+  let job: ScannerJob = claimed;
+  const lease = claimed.leaseOwner ?? "";
 
   const wait = async (message: string, auth = false): Promise<DeliveryReport> => {
-    await d.outbox.retryLater(job!.requestId, message);
-    return { kind: "waiting", job: job!, message, auth };
+    await d.outbox.retryLater(job.requestId, lease, message);
+    return { kind: "waiting", job, message, auth };
+  };
+  const stopped = async (): Promise<DeliveryReport> => {
+    await d.outbox.retryLater(job.requestId, lease, "Station closed or account changed.");
+    return { kind: "superseded", job };
   };
 
-  if (job.status === "queued") {
-    const products = d.products();
-    if (!products) return wait("Product catalogue still loading.");
-    const [lookup, openCase, packaging] = await Promise.all([d.lookupOrder(job.orderNumber), d.openCase(job.orderNumber), d.packaging()]);
-    if (lookup.kind === "network") return wait(lookup.message, lookup.auth ?? false);
-    if (openCase === "network") return wait("Couldn't check replacement cases.");
-    if (packaging === "network") return wait("Couldn't load the box rules.");
-    const prep = prepareFramingOrder(lookup.lookup, { orderNumber: job.orderNumber, openCase, products, packaging });
-    if (!prep.ok) {
-      await d.outbox.markBlocked(job.requestId, { code: prep.code, message: prep.message, stage: "prepare" });
-      return { kind: "blocked", job, code: prep.code, message: prep.message };
+  try {
+    if (job.status === "queued") {
+      const products = d.products();
+      if (!products) return wait("Product catalogue still loading.");
+      const [lookup, openCase] = await Promise.all([d.lookupOrder(job.orderNumber), d.openCase(job.orderNumber)]);
+      if (!active()) return stopped();
+      if (lookup.kind === "network") return wait(lookup.message, lookup.auth ?? false);
+      if (openCase === "network") return wait("Couldn't check replacement cases.");
+      const ctx = { orderNumber: job.orderNumber, openCase, products, packaging: null as PackagingSetup | null };
+      let prep = prepareFramingOrder(lookup.lookup, ctx);
+      // Box rules matter only for A0 framed work (the only reason for this code).
+      if (!prep.ok && prep.code === "packaging_not_auto") {
+        const packaging = await d.packaging();
+        if (!active()) return stopped();
+        if (packaging === "network") return wait("Couldn't load the box rules.");
+        prep = prepareFramingOrder(lookup.lookup, { ...ctx, packaging });
+      }
+      if (!prep.ok) {
+        await d.outbox.markBlocked(job.requestId, lease, { code: prep.code, message: prep.message, stage: "prepare" });
+        return { kind: "blocked", job, code: prep.code, message: prep.message, uncertain: job.uncertain };
+      }
+      // Persist the exact payload BEFORE anything is sent.
+      job = await d.outbox.setPrepared(job.requestId, lease, prep.prepared);
     }
-    // Persist the exact payload BEFORE anything is sent.
-    job = await d.outbox.setPrepared(job.requestId, d.owner, prep.prepared);
-  }
 
-  const prepared = job.prepared;
-  if (!prepared) return wait("Scan has no prepared payload.");
-  job = await d.outbox.markAttempt(job.requestId, d.owner);
+    const prepared = job.prepared;
+    if (!prepared) return wait("Scan has no prepared payload.");
+    if (!active()) return stopped();
+    job = await d.outbox.markAttempt(job.requestId, lease);
+  } catch (e) {
+    if (e instanceof LeaseLostError) return { kind: "superseded", job };
+    throw e;
+  }
+  const prepared = job.prepared!;
   const res = await d.commit(job, prepared);
   switch (res.outcome) {
     case "saved":
@@ -315,9 +388,11 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
         warnings: [res.reason],
       });
       return { kind: "already_recorded", job, reason: res.reason };
-    case "rejected":
-      await d.outbox.markBlocked(job.requestId, { code: res.code, message: res.message, stage: "commit" });
-      return { kind: "blocked", job, code: res.code, message: res.message };
+    case "rejected": {
+      await d.outbox.markBlocked(job.requestId, lease, { code: res.code, message: res.message, stage: "commit" });
+      // An earlier unanswered attempt may have saved it: say so, don't invite re-recording.
+      return { kind: "blocked", job, code: res.code, message: res.message, uncertain: job.priorUnknown ?? false };
+    }
     case "network_error":
       // Unknown outcome: keep the job exactly as is and ask again later.
       return wait(res.message, res.auth ?? false);

@@ -6,6 +6,7 @@ import {
   emptySlots,
   expireIdle,
   IDENTITY_IDLE_MS,
+  PENDING_MAX_MS,
   resolveActivation,
   type ScannerSlot,
 } from "../session";
@@ -135,16 +136,62 @@ describe("resolveActivation", () => {
     expect(r.slots.S1.identity).toBeNull();
   });
 
-  it("ignores the first answer when the scanner scanned a second badge", () => {
+  it("a second badge while the first is still checking is refused loudly; the first is kept", () => {
     const first = decideFrame(emptySlots(["S1"]), { scannerId: "S1", payload: "AAAA0001" }, ctx());
+    if (first.decision.action !== "activate") throw new Error("x");
     const second = decideFrame(first.slots, { scannerId: "S1", payload: "BBBB0002" }, ctx());
-    if (first.decision.action !== "activate" || second.decision.action !== "activate") throw new Error("x");
+    expect(second.decision).toMatchObject({ action: "reject", code: "badge_pending", clearedIdentity: false });
     const r1 = resolveActivation(second.slots, "S1", first.decision.epoch, first.decision.pending.requestId,
-      { outcome: "activated", personId: "alice", displayName: "Alice" }, 2);
-    expect(r1.stale).toBe(true);
-    const r2 = resolveActivation(r1.slots, "S1", second.decision.epoch, second.decision.pending.requestId,
-      { outcome: "activated", personId: "bob", displayName: "Bob" }, 3);
-    expect(r2.slots.S1.identity?.personId).toBe("bob");
+      { outcome: "activated", personId: "alice", displayName: "Alice" }, 1_000_002);
+    expect(r1.slots.S1.identity?.personId).toBe("alice");
+  });
+
+  it("R1-7: two rapid 8-digit order scans: the first stays an order for Alice, the second is refused (never silent)", () => {
+    const t = 5_000_000;
+    const slots = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice", t);
+    const a = decideFrame(slots, { scannerId: "S1", payload: "10190203" }, ctx({ now: t + 100 }));
+    if (a.decision.action !== "activate") throw new Error("x");
+    const b = decideFrame(a.slots, { scannerId: "S1", payload: "10190204" }, ctx({ now: t + 200 }));
+    expect(b.decision).toMatchObject({ action: "reject", scannerId: "S1", code: "badge_pending" });
+    const r = resolveActivation(b.slots, "S1", a.decision.epoch, a.decision.pending.requestId, { outcome: "unknown_badge" }, t + 300);
+    expect(r.order).toMatchObject({ orderNumber: "10190203", person: { personId: "alice" } });
+  });
+
+  it("R1-1: an order-shaped badge that exists but is unusable never becomes an order for the old person", () => {
+    const slots = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice");
+    const d = decideFrame(slots, { scannerId: "S1", payload: "10190203" }, ctx());
+    if (d.decision.action !== "activate") throw new Error("x");
+    const r = resolveActivation(d.slots, "S1", d.decision.epoch, d.decision.pending.requestId, { outcome: "unusable_badge" }, 1_000_001);
+    expect(r.order).toBeNull();
+    expect(r.slots.S1.identity).toBeNull();
+  });
+
+  it("R1-9: a late lookup reply cannot revive an expired person; a reply past the bound is ignored", () => {
+    const t0 = 10_000_000;
+    let slots = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice", t0);
+    // Scan 10190203 just before Alice's 10 minutes run out; the answer comes 15 s later.
+    const scanAt = t0 + IDENTITY_IDLE_MS - 5_000;
+    const d = decideFrame(slots, { scannerId: "S1", payload: "10190203" }, ctx({ now: scanAt }));
+    if (d.decision.action !== "activate") throw new Error("x");
+    const r = resolveActivation(d.slots, "S1", d.decision.epoch, d.decision.pending.requestId, { outcome: "unknown_badge" }, scanAt + 15_000);
+    expect(r.order).toMatchObject({ orderNumber: "10190203", scannedAt: scanAt }); // the scan was valid: it queues
+    slots = r.slots;
+    // Inactivity counts from the scan, not the reply: a later unbadged order 10 minutes after the scan is refused.
+    const late = decideFrame(slots, { scannerId: "S1", payload: "190205" }, ctx({ now: scanAt + IDENTITY_IDLE_MS + 1 }));
+    expect(late.decision).toMatchObject({ action: "reject", code: "identity_expired" });
+
+    // Past the pending bound: ignored with a recovery message, scanner cleared, no order.
+    const s2 = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice", t0);
+    const d2 = decideFrame(s2, { scannerId: "S1", payload: "10190206" }, ctx({ now: t0 + 1_000 }));
+    if (d2.decision.action !== "activate") throw new Error("x");
+    const r2 = resolveActivation(d2.slots, "S1", d2.decision.epoch, d2.decision.pending.requestId, { outcome: "unknown_badge" }, t0 + 1_000 + PENDING_MAX_MS + 1);
+    expect(r2).toMatchObject({ stale: true, timedOut: true, order: null, rejected: "pending_timeout" });
+    expect(r2.slots.S1.identity).toBeNull();
+    expect(r2.slots.S1.pending).toBeNull();
+    // ...and the periodic sweep clears a pending check that never answers.
+    const swept = expireIdle(d2.slots, t0 + 1_000 + PENDING_MAX_MS + 1);
+    expect(swept.timedOut).toEqual(["S1"]);
+    expect(swept.slots.S1.pending).toBeNull();
   });
 
   it("an 8-digit scan that is not a badge becomes an order for the person captured at scan time", () => {

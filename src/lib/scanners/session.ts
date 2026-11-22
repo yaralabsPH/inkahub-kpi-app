@@ -10,6 +10,8 @@
 
 /** Ten minutes without a framing scan ends a scanner's identity. */
 export const IDENTITY_IDLE_MS = 10 * 60 * 1000;
+/** A badge sign-in/lookup answer later than this is ignored and the scanner cleared. */
+export const PENDING_MAX_MS = 20 * 1000;
 
 export interface ScannerPerson {
   personId: string;
@@ -91,13 +93,15 @@ export type RejectCode =
   | "badge_pending"
   | "no_person"
   | "identity_expired"
+  | "pending_timeout"
   | "unknown_scanner";
 
 export const REJECT_TEXT: Record<RejectCode, string> = {
   invalid_payload: "Not a badge or a supported order barcode.",
   badge_offline: "Badge scanned while offline. Badges sign in online only. Scanner cleared.",
   ambiguous_offline: "Offline: this 8-digit scan could be a badge or an order. Not saved. Scanner cleared; scan the packing-slip barcode, or wait for the network.",
-  badge_pending: "Still signing in the badge on this scanner. Scan the order again in a moment.",
+  badge_pending: "Still checking the previous scan on this scanner. This scan was NOT saved: scan it again in a moment.",
+  pending_timeout: "Checking the badge took too long. Scanner signed out: scan the badge again, then any order not shown as queued.",
   no_person: "Scan your badge on this scanner first.",
   identity_expired: "Signed out after 10 minutes without a scan. Scan your badge again.",
   unknown_scanner: "This scanner is not configured on this station.",
@@ -152,6 +156,11 @@ export function decideFrame(
       const code: RejectCode = shape.orderCandidate ? "ambiguous_offline" : "badge_offline";
       return { slots: next, decision: { action: "reject", scannerId: slot.scannerId, code, clearedIdentity: slot.identity !== null } };
     }
+    // One check at a time per scanner: a second badge/8-digit scan while the
+    // first is still being looked up is refused loudly and the first is kept.
+    if (slot.pending) {
+      return { slots: next, decision: { action: "reject", scannerId: slot.scannerId, code: "badge_pending", clearedIdentity: false } };
+    }
     // Online: badge first. The old person is cleared immediately; an
     // order-shaped value keeps the captured person only as a fallback.
     const fallbackPerson = slot.identity && !isExpired(slot.identity, ctx.now) ? slot.identity : null;
@@ -192,6 +201,8 @@ export function decideFrame(
 export type ActivationResult =
   | { outcome: "activated"; personId: string; displayName: string }
   | { outcome: "unknown_badge" }
+  /** A badge that exists but cannot be used here: never an order fallback. */
+  | { outcome: "unusable_badge" }
   | { outcome: "failed"; message: string };
 
 /**
@@ -209,6 +220,8 @@ export function resolveActivation(
 ): {
   slots: Record<string, ScannerSlot>;
   stale: boolean;
+  /** The answer came after PENDING_MAX_MS: ignored, scanner cleared. */
+  timedOut?: boolean;
   /** An order-shaped scan that turned out not to be a badge. */
   order: CapturedOrder | null;
   rejected: RejectCode | null;
@@ -219,6 +232,10 @@ export function resolveActivation(
     return { slots: next, stale: true, order: null, rejected: null };
   }
   const pending = slot.pending;
+  if (now - pending.startedAt > PENDING_MAX_MS) {
+    next[scannerId] = cleared(slot);
+    return { slots: next, stale: true, timedOut: true, order: null, rejected: "pending_timeout" };
+  }
   if (result.outcome === "activated") {
     next[scannerId] = {
       ...slot,
@@ -234,7 +251,10 @@ export function resolveActivation(
       return { slots: next, stale: false, order: null, rejected: "no_person" };
     }
     // Not a badge: it was an order for the person captured at scan time.
-    next[scannerId] = { ...slot, pending: null, identity: { ...fb.person, lastFramingAt: now } };
+    // Inactivity counts from that scan, never from the slower answer, so a
+    // late reply cannot revive an expired person.
+    const restored: ActiveIdentity = { ...fb.person, lastFramingAt: pending.startedAt };
+    next[scannerId] = { ...slot, pending: null, identity: isExpired(restored, now) ? null : restored };
     const order: CapturedOrder = Object.freeze({
       scannerId,
       orderNumber: fb.orderNumber,
@@ -249,17 +269,24 @@ export function resolveActivation(
   return { slots: next, stale: false, order: null, rejected: null };
 }
 
-/** Expire idle identities. Returns the ids that were cleared. */
-export function expireIdle(slots: Slots, now: number): { slots: Record<string, ScannerSlot>; expired: string[] } {
+/** Expire idle identities and over-long badge checks. Returns the ids cleared. */
+export function expireIdle(
+  slots: Slots,
+  now: number,
+): { slots: Record<string, ScannerSlot>; expired: string[]; timedOut: string[] } {
   const next: Record<string, ScannerSlot> = { ...slots };
   const expired: string[] = [];
+  const timedOut: string[] = [];
   for (const [id, slot] of Object.entries(slots)) {
-    if (slot.identity && isExpired(slot.identity, now)) {
+    if (slot.pending && now - slot.pending.startedAt > PENDING_MAX_MS) {
+      next[id] = cleared(slot);
+      timedOut.push(id);
+    } else if (slot.identity && isExpired(slot.identity, now)) {
       next[id] = cleared(slot);
       expired.push(id);
     }
   }
-  return { slots: next, expired };
+  return { slots: next, expired, timedOut };
 }
 
 /** Clear every scanner (corrupt stream, reload, account/site/mode change). */

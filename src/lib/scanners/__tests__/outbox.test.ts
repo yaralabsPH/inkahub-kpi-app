@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   createScannerOutbox,
+  LEASE_MS,
   MAX_ACTIVE_JOBS,
   memoryJobStore,
   OutboxFullError,
   OutboxStorageError,
   type JobScope,
 } from "../outbox";
-import { commitParams, processNext, type CommitOutcome, type DeliveryDeps, type LookupOutcome } from "../client";
+import { classifyRpcError, commitParams, processNext, type CommitOutcome, type DeliveryDeps, type LookupOutcome } from "../client";
 import type { CapturedOrder } from "../session";
 import type { OrderLookup } from "../order";
 
@@ -103,7 +104,8 @@ describe("scanner outbox", () => {
     const ob = createScannerOutbox(store);
     const job = await ob.enqueue(captured(), scope, uuid());
     await expect(ob.dismiss(job.requestId, scope)).rejects.toThrow(/Only a blocked/);
-    await ob.markBlocked(job.requestId, { code: "cancelled", message: "x", stage: "prepare" });
+    const claimed = await ob.claimNext(scope, "tab-1");
+    await ob.markBlocked(job.requestId, claimed!.leaseOwner!, { code: "cancelled", message: "x", stage: "prepare" });
     await expect(ob.dismiss(job.requestId, otherCaller)).rejects.toThrow(/another account/);
     await ob.dismiss(job.requestId, scope);
     expect((await ob.view(scope)).jobs[0].status).toBe("dismissed");
@@ -223,5 +225,119 @@ describe("delivery", () => {
     await running;
     await processNext(d);
     expect(order).toEqual(["10190203", "10190204"]);
+  });
+});
+
+describe("R1 corrections", () => {
+  const savedResult: CommitOutcome = { outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: true } };
+
+  it("R1-2: an unanswered save then a refusal stays uncertain, cannot be dismissed, and an exact replay resolves it", async () => {
+    let clock = 1_000;
+    const ob = createScannerOutbox(memoryJobStore(), () => clock);
+    const job = await ob.enqueue(captured(), scope, uuid());
+    const answers: CommitOutcome[] = [
+      { outcome: "network_error", message: "timeout" }, // may have saved
+      { outcome: "rejected", code: "forbidden_role", message: "role revoked" }, // refused before the receipt check
+      savedResult, // retry: the receipt says it was saved by attempt 1
+    ];
+    const d = deps({ outbox: ob });
+    const realCommit = d.commit;
+    d.commit = async (j, p) => { await realCommit(j, p); return answers.shift()!; };
+    expect(await processNext(d)).toMatchObject({ kind: "waiting" });
+    clock += 120_000;
+    expect(await processNext(d)).toMatchObject({ kind: "blocked", code: "forbidden_role", uncertain: true });
+    let v = await ob.view(scope);
+    expect(v.jobs[0]).toMatchObject({ status: "blocked", uncertain: true });
+    await expect(ob.dismiss(job.requestId, scope)).rejects.toThrow(/Only a blocked/);
+    await ob.retryBlocked(job.requestId, scope);
+    expect(await processNext(d)).toMatchObject({ kind: "saved" });
+    v = await ob.view(scope);
+    expect(v.jobs[0]).toMatchObject({ status: "done", uncertain: false, outcome: { kind: "saved" } });
+    expect(new Set(d.commits.map((c) => JSON.stringify(c))).size).toBe(1); // the identical request every time
+  });
+
+  it("R1-2: a refusal of the first and only attempt is definite and may be dismissed", async () => {
+    const ob = createScannerOutbox(memoryJobStore());
+    const job = await ob.enqueue(captured(), scope, uuid());
+    const d = deps({ outbox: ob, commit: async () => ({ outcome: "rejected", code: "badge_inactive", message: "revoked" }) });
+    expect(await processNext(d)).toMatchObject({ kind: "blocked", uncertain: false });
+    await ob.dismiss(job.requestId, scope);
+  });
+
+  it("R1-4: a stale claim's late refusal cannot downgrade a job another claim saved", async () => {
+    let clock = 1_000;
+    const ob = createScannerOutbox(memoryJobStore(), () => clock);
+    await ob.enqueue(captured(), scope, uuid());
+    let releaseA!: (o: CommitOutcome) => void;
+    const dA = deps({ outbox: ob, owner: "tab-A", commit: () => new Promise<CommitOutcome>((r) => (releaseA = r)) });
+    const runA = processNext(dA); // A sends and hangs
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    clock += LEASE_MS + 1; // A's lease expires
+    const dB = deps({ outbox: ob, owner: "tab-B", commit: async () => savedResult });
+    expect(await processNext(dB)).toMatchObject({ kind: "saved" });
+    releaseA({ outcome: "rejected", code: "forbidden_role", message: "late" });
+    await runA;
+    const v = await ob.view(scope);
+    expect(v.jobs[0]).toMatchObject({ status: "done", uncertain: false, outcome: { kind: "saved" } });
+    // A late retry-later from the old claim is ignored too.
+    await ob.retryLater(v.jobs[0].requestId, "tab-A#1-stale", "late");
+    expect((await ob.view(scope)).jobs[0].status).toBe("done");
+  });
+
+  it("R1-8: account A's job is never sent as B; a disposed station starts nothing; the job waits for A", async () => {
+    let clock = 1_000;
+    const ob = createScannerOutbox(memoryJobStore(), () => clock);
+    await ob.enqueue(captured(), scope, uuid()); // scanned by kiosk-1 (scope.callerId)
+    let signedIn = "kiosk-1";
+    let releaseLookup!: () => void;
+    const lookupGate = new Promise<void>((r) => (releaseLookup = r));
+    let stationOpen = true;
+    // Server stand-in: refuses a request whose expected caller is not the signed-in account.
+    const d = deps({
+      outbox: ob,
+      active: () => stationOpen,
+      lookupOrder: async (n) => { await lookupGate; return { kind: "ok", lookup: framedOrder(n) }; },
+      commit: async (j, p) => (commitParams(j, p).p_expected_caller === signedIn
+        ? savedResult : classifyRpcError({ message: "scanner: caller_mismatch", code: "P0001" }) as CommitOutcome),
+    });
+    const run = processNext(d);
+    signedIn = "kiosk-2"; // B signs in while A's preparation is delayed
+    stationOpen = false; // ...and A's station is torn down
+    releaseLookup();
+    expect(await run).toMatchObject({ kind: "superseded" });
+    let v = await ob.view(scope);
+    expect(v.jobs[0]).toMatchObject({ status: "queued", attempts: 0, prepared: null });
+    // Even if a station did send it under B, the expected caller makes the server refuse: kept for A, not blocked.
+    stationOpen = true;
+    clock += 120_000;
+    expect(await processNext(d)).toMatchObject({ kind: "waiting", auth: true });
+    v = await ob.view(scope);
+    expect(v.jobs[0]).toMatchObject({ status: "prepared" });
+    // A signs back in: the identical request saves.
+    signedIn = "kiosk-1";
+    clock += 120_000;
+    expect(await processNext(d)).toMatchObject({ kind: "saved" });
+  });
+
+  it("R1-10: regular-only orders never need box rules; A0 with missing rules gets a classic reason; transport failure waits", async () => {
+    const ob = createScannerOutbox(memoryJobStore());
+    await ob.enqueue(captured("10190203"), scope, uuid());
+    let packagingCalls = 0;
+    const d = deps({ outbox: ob, packaging: async () => { packagingCalls++; return "network"; } });
+    expect(await processNext(d)).toMatchObject({ kind: "saved" });
+    expect(packagingCalls).toBe(0);
+
+    const ob2 = createScannerOutbox(memoryJobStore());
+    await ob2.enqueue(captured("10190204"), scope, uuid());
+    const a0 = (n: string): OrderLookup => ({ ...framedOrder(n), line_items: [{ sku: "INKA-ABC0001-A0-FB", quantity: 1 }] });
+    const products = [{ id: "p-a0b", code: "A0-Black" }];
+    const transport = deps({ outbox: ob2, products: () => products, lookupOrder: async (n) => ({ kind: "ok", lookup: a0(n) }), packaging: async () => "network" });
+    expect(await processNext(transport)).toMatchObject({ kind: "waiting", message: "Couldn't load the box rules." });
+    const ob3 = createScannerOutbox(memoryJobStore());
+    await ob3.enqueue(captured("10190205"), scope, uuid());
+    const missing = deps({ outbox: ob3, products: () => products, lookupOrder: async (n) => ({ kind: "ok", lookup: a0(n) }),
+      packaging: async () => ({ mode: "auto", ruleSet: null }) });
+    expect(await processNext(missing)).toMatchObject({ kind: "blocked", code: "packaging_not_auto", uncertain: false });
   });
 });

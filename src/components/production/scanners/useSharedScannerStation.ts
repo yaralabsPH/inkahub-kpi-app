@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { activateBadge, commitFraming, fetchOrderLookup, hasOpenCase, newRequestId, processNext, sendHeartbeat } from "@/lib/scanners/client";
+import { activateBadge, commitFraming, fetchOrderLookup, hasOpenCase, loadScannerPackaging, newRequestId, processNext, sendHeartbeat } from "@/lib/scanners/client";
 import { createFrameParser, DEFAULT_PROTOCOL } from "@/lib/scanners/protocol";
 import { createScannerOutbox, dexieJobStore, type JobScope } from "@/lib/scanners/outbox";
+import { emptySlots } from "@/lib/scanners/session";
 import { SharedScannerController, type SoundKind, type WallState } from "@/lib/scanners/station";
 import { HEARTBEAT_EVERY_MS } from "@/lib/scanners/config";
-import type { CatalogueProduct, PackagingSetup } from "@/lib/scanners/order";
-import { loadPackagingConfig } from "@/lib/repository/supabase/orderPackaging";
+import type { CatalogueProduct } from "@/lib/scanners/order";
 
 /**
  * F6: browser wiring for the shared scanner wall. All decisions live in
@@ -86,30 +86,38 @@ export function useSharedScannerStation(opts: {
     }
   }, []);
 
-  const controller = useMemo(() => {
+  const idsKey = scannerIds.join(",");
+  // A fresh controller per effect run: React StrictMode's setup -> cleanup ->
+  // setup gets a live second controller instead of reusing a disposed one.
+  // Every request carries the captured caller (the server refuses any other
+  // signed-in account), and a disposed controller starts nothing new.
+  const [controller, setController] = useState<SharedScannerController | null>(null);
+  const [state, setState] = useState<WallState>(() => ({
+    slots: emptySlots(scannerIds), last: null, view: null, storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null,
+  }));
+  useEffect(() => {
+    const ids = idsKey.split(",");
     const outbox = createScannerOutbox(dexieJobStore());
-    const packaging = async (): Promise<PackagingSetup | "network"> => {
-      const cfg = await loadPackagingConfig(client, location);
-      if (cfg.warning) return "network"; // auto requested but rules unreadable: wait, never guess
-      return { mode: cfg.mode, ruleSet: cfg.ruleSet };
-    };
-    return new SharedScannerController({
-      scannerIds,
+    let c: SharedScannerController | null = null;
+    const active = () => c !== null && !c.isDisposed;
+    c = new SharedScannerController({
+      scannerIds: ids,
       scope,
       outbox,
-      activate: (a) => activateBadge(client, { location, receiverId, ...a }),
+      activate: (a) => activateBadge(client, { location, receiverId, expectedCaller: callerId, ...a }),
       deliver: () =>
         processNext({
           outbox,
           scope,
           owner,
+          active,
           lookupOrder: async (n) => {
             const { data } = await client.auth.getSession();
             return fetchOrderLookup(fetch, data.session?.access_token ?? null, n);
           },
           openCase: (n) => hasOpenCase(client, location, n),
           products: () => productsRef.current,
-          packaging,
+          packaging: () => loadScannerPackaging(client, location),
           commit: (job, prepared) => commitFraming(client, job, prepared),
         }),
       isOnline: () => navigator.onLine,
@@ -117,26 +125,23 @@ export function useSharedScannerStation(opts: {
       newRequestId,
       sound,
     });
-    // scannerIds is compared by value through the mount key.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, location, receiverId, scope, owner, sound]);
-
-  const [state, setState] = useState<WallState>(controller.state);
-  useEffect(() => {
-    setState(controller.state);
-    const off = controller.subscribe(setState);
-    void controller.refreshView().then(() => controller.pump());
+    const mine = c;
+    setController(mine);
+    setState(mine.state);
+    const off = mine.subscribe(setState);
+    void mine.refreshView().then(() => mine.pump());
     return () => {
       off();
-      controller.dispose();
+      mine.dispose();
+      setController((cur) => (cur === mine ? null : cur));
     };
-  }, [controller]);
+  }, [client, location, callerId, receiverId, scope, owner, sound, idsKey]);
 
   // ---- key capture ---------------------------------------------------------
-  const idsKey = scannerIds.join(",");
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const parser = useMemo(() => createFrameParser({ ...DEFAULT_PROTOCOL, scannerIds: idsKey.split(",") }), [idsKey]);
   useEffect(() => {
+    if (!controller) return;
     const onKey = (e: KeyboardEvent) => {
       if (isEditable(e.target as Element | null) || isEditable(document.activeElement)) {
         parser.reset();
@@ -167,6 +172,7 @@ export function useSharedScannerStation(opts: {
   const stateRef = useRef(state);
   stateRef.current = state;
   useEffect(() => {
+    if (!controller) return;
     const expiry = window.setInterval(() => controller.tick(), 5_000);
     const retry = window.setInterval(() => controller.pump(), 5_000);
     const beat = async () => {
@@ -206,6 +212,7 @@ export function useSharedScannerStation(opts: {
   }, []);
 
   useEffect(() => {
+    if (!controller) return;
     const update = () =>
       setDevice((d) => ({ ...d, online: navigator.onLine, focused: document.hasFocus(), visible: document.visibilityState === "visible" }));
     const onOnline = () => {
@@ -254,8 +261,8 @@ export function useSharedScannerStation(opts: {
     state,
     device,
     start,
-    retry: (id: string) => void controller.retry(id),
-    dismiss: (id: string) => void controller.dismiss(id),
-    signOutAll: () => controller.resetAll("Signed out by the operator."),
+    retry: (id: string) => void controller?.retry(id),
+    dismiss: (id: string) => void controller?.dismiss(id),
+    signOutAll: () => controller?.resetAll("Signed out by the operator."),
   };
 }
