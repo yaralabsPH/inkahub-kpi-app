@@ -647,14 +647,8 @@ function LineCard({
               </span>
             </div>
           </div>
-          {line.setCount ? (
-            <div className="st-spec">
-              <div className="st-spec-txt" style={{ paddingLeft: 10 }}>
-                <span className="st-spec-label">SET</span>
-                <span className="st-spec-val">{line.setCount} prints</span>
-              </div>
-            </div>
-          ) : null}
+          {/* Set prints: the "SET (n)" tag in the title row carries the
+              piece count, so the row stays at three chips and never clips. */}
         </div>
       </div>
       <div className="st-action">{action}</div>

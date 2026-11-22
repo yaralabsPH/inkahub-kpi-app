@@ -181,6 +181,13 @@ describe("StationOrderScreen - working on an order", () => {
     expect(html.slice(actions)).toContain("Scrap order");
   });
 
+  it("shows a set print's piece count as a title tag and keeps three spec chips", () => {
+    const set = [line("INKA-S2BON0064-A0-FN", { quantity: 2, variantTitle: "A0 / Framed Print (Natural) / Portrait" })];
+    const html = renderToStaticMarkup(<StationOrderScreen {...props({ order: order(set) })} />);
+    expect(html).toContain("SET (2)");
+    expect(count(html, 'class="st-spec ') + count(html, 'class="st-spec"')).toBe(3);
+  });
+
   it("shows other-department and gift lines without check buttons", () => {
     const lines = [
       line("INKA-DIV0147-A2-FN"),

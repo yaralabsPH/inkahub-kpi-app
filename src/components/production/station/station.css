@@ -142,7 +142,7 @@
 
 /* Card: identical height in every state */
 @keyframes st-glow { 0%,100% { box-shadow: 0 0 0 4px rgba(29,111,234,.12), 0 12px 30px rgba(29,111,234,.18); } 50% { box-shadow: 0 0 0 7px rgba(29,111,234,.06), 0 16px 40px rgba(29,111,234,.30); } }
-.st-card { display: flex; align-items: center; gap: 24px; height: 156px; padding: 0 28px; background: var(--surface); border: 2px solid var(--card-border); border-radius: var(--r-card); transition: background .25s, border-color .25s; flex: 0 0 auto; }
+.st-card { display: flex; align-items: center; gap: 24px; min-height: 156px; padding: 14px 28px; background: var(--surface); border: 2px solid var(--card-border); border-radius: var(--r-card); transition: background .25s, border-color .25s; flex: 0 0 auto; }
 .st-card.is-current { background: var(--blue-wash); border-color: var(--blue); animation: st-glow 2.4s ease-in-out infinite; }
 .st-card.is-done { background: var(--green-solid); border-color: var(--green-solid); }
 .st-card.is-muted { background: var(--surface-2); }
@@ -158,7 +158,9 @@
 .st-tag.dept { color: var(--amber-ink); background: var(--amber-tint); }
 .st-title { margin: 0; font-size: 20px; font-weight: 700; line-height: 1.3; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .st-sku { font: 11px var(--mono); color: var(--muted); letter-spacing: .03em; margin-top: 4px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.st-specs { display: flex; flex-wrap: nowrap; gap: 10px; min-width: 0; overflow: hidden; }
+/* Chips wrap (and the card grows) only when they truly do not fit, so frame,
+   quantity and set details are never clipped at in-between widths. */
+.st-specs { display: flex; flex-wrap: wrap; gap: 10px; min-width: 0; }
 .st-spec { display: flex; align-items: center; gap: 10px; padding: 6px 16px 6px 6px; border-radius: 12px; background: var(--surface-2); flex: 0 0 auto; }
 .is-current .st-spec { background: var(--surface); box-shadow: 0 1px 2px rgba(16,24,40,.06); }
 .st-spec-ico { width: 40px; height: 40px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
@@ -229,7 +231,7 @@
   .st-topbar { padding: 0 24px; gap: 16px; }
   .st-layout { padding: 24px 28px; gap: 24px; }
   .st-sidebar { flex-basis: 316px; padding: 22px; gap: 18px; }
-  .st-card { gap: 18px; padding: 0 22px; }
+  .st-card { gap: 18px; padding: 14px 22px; }
   .st-specs { gap: 8px; }
   .st-spec { gap: 8px; padding-right: 12px; }
   .st-spec-val { font-size: 17px; }
