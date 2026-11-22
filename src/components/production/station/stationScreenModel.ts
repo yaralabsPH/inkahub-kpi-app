@@ -60,7 +60,8 @@ export function getStationLineView(line: StationLineInput): StationLineView {
     ...line,
     group,
     size,
-    frameLabel: pres.colourTone === "unknown" ? "Unknown style" : pres.colourLabel,
+    // Gift cards / AUX have no frame at all; legacy SKUs are genuinely unknown.
+    frameLabel: pres.kind === "other" ? "—" : pres.colourTone === "unknown" ? "Unknown style" : pres.colourLabel,
     frameColor,
     needsCheck: line.belongsToThisDept && verifiable,
     verifiable,
