@@ -11,6 +11,6 @@ Approved for autonomous implementation by Codex under CJ delegation. Branch `fea
 
 ## Implementation log
 
-Pending.
+- [x] 1. Pure contracts: `protocol.ts` (whole-frame parser; any structural error has no source and clears every identity; a whole frame with a bad payload names its scanner; 400 ms quiet gap after errors; Shift ignored, other in-frame keys rejected), `session.ts` (pinned shapes: 8-hex badge first, 6-digit slip -> "10"+digits always, "#10xxxxxx"; an online 8-digit 10xxxxxx clears the slot while the badge lookup runs and becomes an order for the person captured at scan time only on a definite "not a badge"), `order.ts` (strict framed-only credit; whole order rejected for blank/legacy/canvas/odd-quantity/GW single; A0 components = classic `shouldDeductAtDept(a0_framed, completed)` incl. accessories; A0 needs F4 auto + resolved prediction, target = prediction). Routine: open CS statuses are new/query/approved (0008 renamed approved->query; classic still checks new/approved).
 
 Execution base: 25c4c808c1cca8b8bad891d0fbcbca00def93711 (reviewed F5, real staging SQL/roles/concurrency passed; final combined Preview UI pending). Reuses the existing isolated worktree; no changes in the user's primary checkout. 0052-0054 are installed on staging and must not be edited.
