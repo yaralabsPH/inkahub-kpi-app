@@ -28,3 +28,15 @@ The initial Retry/awaitChoice finding is fixed by40b3e75: a known-rollback refus
 - Supported current SKU routes and conservative manual fallback are sufficient. No new dependency, broad rework engine, redesign or extra feature.
 
 After fixes: focused regressions, one final required gate, fresh focused review; then Codex runs actual staging rollback/roles/concurrency/replay checks before installing exact reviewed0056. Combined hosted Preview/browser checks follow. Real scanners and real box-rule commissioning remain separate deployment setup.
+
+## Coder response
+
+All five required fixes done; nothing declined.
+
+1. Current-attempt evidence + serialization — `cdb0af2`: reader uses the first same-person completion at/after the verification; a later parentless whole-order/same-SKU cancel or a post-completion `started` (reopen) ends the attempt; new attempts need their own pair. New c7 trigger locks the order on framing `started`/`cancelled` inserts. Cases C16 (scrap after completion, new attempt), C17 (same vs other SKU cancel), C18 (reopen, later completion without re-verify, new pair), G05/G06 (lock taken / not for other work); race R7.
+2. Classic/shared duplicate dispatch — `cdb0af2`: `production_events_c7_dispatch_guard` refuses a non-CS classic `dispatched` row after a saved shared receipt, same order lock; CS and never-shared orders unchanged. Cases G01-G04; races R5 (shared first, classic insert waits then refused) and R8 (classic insert held open without deduction, shared waits then already recorded); R4 kept. Initial ruling withdrawn.
+3. Completion SKU — `cdb0af2`: `c.sku IS NULL OR c.sku = r.sku`. Case C19.
+4. Required Dispatch parcel — `cdb0af2`: `packaging_required` for SQL/JSON null when any `framed` line. Cases D15a-e (A0-only still saves); client message added.
+5. CSV paging — `98d84a5`: range pages inside each id batch, ordered by (dispatch_event_id, sku). Regression: 5000 rows in one batch with a 1000-row cap all read.
+
+Checks: tsc, digest, API, 1016/1016 tests (46 files), build; local PGlite F7 167 cases + F6 160 cases, each fix mutation fails its case; races sequential only (not concurrency evidence).

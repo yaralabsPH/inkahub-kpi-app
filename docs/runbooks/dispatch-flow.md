@@ -46,17 +46,25 @@ stock, an accessory shipped from the A0 bench — is skipped, never charged
 twice); the F4 Dispatch box (the A0 box is a separate pick, never touched);
 one immutable attribution row per framed SKU; a receipt so a retry gets the
 same answer. A framing save never blocks the later dispatch; duplicate
-framing credit stays blocked.
+framing credit stays blocked. Once the shared scanners dispatched an order,
+the classic dispatch station refuses to dispatch it again ("already
+dispatched by the shared scanners"); replacement (CS case) dispatches still
+work. Framed prints always need their Dispatch box in the save.
 
 ## Measured "Framed by"
 
-Same site, same order, same SKU: an uncancelled framing verification AND a
-completion by the same person for that work type, completion at or after
-the verification, no scrap or cancel of that line in between, enough
-quantity, not replacement work. Two different framers = needs a choice.
-A verification alone, someone else's completion, or another site's records
-never count. Measured records that arrive before the save win over a
-manual choice.
+Same site, same order, same SKU, the CURRENT framing attempt only: an
+uncancelled framing verification AND the next completion by the same
+person for that work type, for the whole order or that SKU, at or after the
+verification, enough quantity, not replacement work. A scrap or cancel of
+the order or that line at any time after the verification, or the order
+being reopened at framing after the completion, ends that attempt; a new
+attempt counts through its own verification and completion. Two different
+framers = needs a choice. A verification alone, someone else's completion,
+a completion for another SKU or another site's records never count.
+Measured records that arrive before the save win over a manual choice; a
+scrap that arrives first makes the save ask for a framer instead.
+
 
 ## Unknown outcome
 
