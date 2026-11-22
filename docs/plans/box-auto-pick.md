@@ -172,7 +172,7 @@ ids, rule sets and order numbers).
   migrations, every function has the three guards and the grants), and CI's
   append-only check passes. Not applied anywhere by the coder.
 
-### [ ] Task 6: Staging verification scripts
+### [x] Task 6: Staging verification scripts
 
 - Files: `supabase/staging/box-auto-pick/README.md`,
   `supabase/staging/box-auto-pick/01-verify.sql` (`/supabase/` is already
@@ -398,3 +398,4 @@ Coder adds one line per task.
 - Task 3: 512-combination parity with autoMailTubeForUnframedOrder for orders without a framed parcel; no differences. Documented the one deliberate difference (CJ Q4: prints go in the box when a framed parcel exists).
 - Task 4: reconcile.ts + 11 tests (deltas, convergence, partial posting).
 - Task 5: 0047_packaging_auto_pick.sql (number provisional, not confirmed with CJ yet; see Open questions). Additive only: the only DROP/ALTER statements are DROP POLICY IF EXISTS / ENABLE RLS on the four new tables. Differences from the plan text: apply derives order, packing point, shipment key and staff from the event instead of taking them as arguments; state is derived server-side from p_resolved/predicted/target; ledger key uses a per-pick posting counter (post_seq) rather than revision so a retry can never reuse a key; added mode_changed_at. Ran migration twice + verify script in a local in-memory Postgres (PGlite, scratch dir, not a project dependency) against both on-hand floor variants: all checks pass. Not applied to any real database.
+- Task 6: 01-verify.sql (single transaction, ROLLBACK, synthetic f4t-/F4T- data) + README with the two-session race check and the old-app check. Verified locally in PGlite; running on staging is CJ's release step.
