@@ -1,9 +1,11 @@
 # Plan: Remove box scan, app picks the box
 
 - Slug: `box-auto-pick` · Spec: `docs/specs/box-auto-pick.md`
-- Branch: `feature/box-auto-pick` (to be created at implementation; this
-  draft lives on `claude/f4-box-auto-pick-spec-3b9382`)
-- Status: draft (awaiting CJ review; spec not yet approved)
+- Branch: `feature/box-auto-pick` (created 2026-11-22 from
+  `origin/feature/station-screen-redesign` at `7b05828`; PR #10 still open)
+- Status: approved by CJ on 2026-11-22 (with the spec's recorded decisions:
+  managers edit rules, unframed-in-framed goes in the box, no destination
+  rules so Task 14 is dropped)
 - Author: Claude Fable 5.2 at CJ's request (2026-11-22); Astra review
   recommended before approval.
 
@@ -56,8 +58,9 @@ ids, rule sets and order numbers).
 
 - Files: `src/lib/domain/packaging/contents.ts`,
   `src/lib/domain/packaging/__tests__/contents.test.ts`
-- Do: `packingPointForLine(sku)` → `a0_framed | dispatch | unframed | null`
-  (mirror `shouldDeductAtDept`; gift card → null) and
+- Do: `packingPointsForOrder(lines)` assigning each line a packing point
+  per the spec's Terms (order-aware: unframed, free prints and accessories
+  travel with the framed parcel; gift card → none) and
   `packagingContents(lines, packingPoint)` → pieces grouped by
   `{ kind, size }` with counts using the existing set multiplier, plus a
   list of lines it could not classify (unparseable, canvas).
@@ -72,7 +75,7 @@ ids, rule sets and order numbers).
   `src/lib/domain/packaging/__tests__/evaluate.test.ts`
 - Do: zod schema for `{ schema_version: 1, catalogue[], rules[], examples[] }`
   as in the spec (rule: `id`, `packing_point`, `kinds`, `sizes`, optional
-  `min_pieces`, `max_pieces`, `contains_sizes`, `countries`, and output
+  `min_pieces`, `max_pieces`, `contains_sizes`, and output
   `{ mode: "fixed", packages[] } | { mode: "per_capacity", capacity, package }`).
   `evaluatePackaging(ruleSet, contents, ctx)` → `{ status: "resolved" |
   "unresolved", packages, firedRuleIds, unassigned }`. Deterministic,
@@ -80,7 +83,7 @@ ids, rule sets and order numbers).
   `runExamples(ruleSet)` → pass/fail per example. Structural validation:
   duplicate ids, package keys missing from the catalogue, capacity < 1.
 - Done when: table-driven tests cover fixed and capacity outputs, priority
-  order, contains-size, country present/absent, remainder → unresolved,
+  order, contains-size, remainder → unresolved,
   empty contents, unclassified lines → unresolved, invalid rule sets
   rejected.
 
@@ -135,11 +138,11 @@ ids, rule sets and order numbers).
   - Functions (`SECURITY DEFINER`, `SET search_path = public`; each starts
     with `auth.uid() IS NOT NULL` and `can_access_location(p_location)`;
     `REVOKE ALL … FROM PUBLIC, anon; GRANT EXECUTE … TO authenticated`):
-    - `packaging_save_rule_set(p_location, p_id, p_body, p_note)` — owner
-      only; draft only; validates catalogue product ids exist at the site.
-    - `packaging_activate_rule_set(p_location, p_id)` — owner only; retires
+    - `packaging_save_rule_set(p_location, p_id, p_body, p_note)` — manager
+      or higher; draft only; validates catalogue product ids exist at the site.
+    - `packaging_activate_rule_set(p_location, p_id)` — manager or higher; retires
       the current active one in the same transaction.
-    - `packaging_set_mode(p_location, p_mode)` — owner only; `auto` needs
+    - `packaging_set_mode(p_location, p_mode)` — manager or higher; `auto` needs
       an active rule set.
     - `packaging_apply(p_location, p_request_id, p_order_number,
       p_packing_point, p_shipment_key, p_event_id, p_staff_id, p_state,
@@ -250,7 +253,7 @@ ids, rule sets and order numbers).
 ### [ ] Task 11: Settings — mode, versions and catalogue
 
 - Files: `src/components/PackagingRulesCard.tsx`, `src/pages/Settings.tsx`
-- Do: owner-only card (hidden for other roles; managers get read-only),
+- Do: owner/manager card (hidden for other roles),
   Supabase-only like `ProductionBenchmarksCard`: site mode switch with a
   confirmation naming the site; list of versions with status, who, when;
   "New draft from this version"; catalogue editor choosing from the site's
@@ -289,7 +292,10 @@ ids, rule sets and order numbers).
 - Done when: tests cover netting (swap, quantity change, no corrections)
   and the missing-pick derivation.
 
-### [ ] Task 14 (only if CJ approves spec Q5): destination country
+### Task 14: dropped (CJ, 2026-11-22: no rule depends on destination)
+
+Original text kept for the record; not to be implemented.
+
 
 - Files: `api/shopify/order.ts`, `src/pages/Production.tsx` (order mapping),
   `src/lib/hooks/useOrderPackaging.ts`
@@ -378,9 +384,10 @@ ids, rule sets and order numbers).
 Coder writes here when it hits something the plan didn't foresee. Planner or
 CJ answers inline.
 
-- (pre-implementation) Spec Q1–Q7 and R1–R2 need CJ's answers before the
-  spec can be marked approved. Tasks 1–10 and 13 do not depend on Max's
-  rules; Task 12 and any `auto` activation do.
+- (pre-implementation) Answered by CJ on 2026-11-22 except spec Q2
+  (replacement contents; proposed default in force) and R1 (Max's rules).
+  Tasks 1–10 and 13 do not depend on Max's rules; any `auto` activation
+  does.
 
 ## Implementation log
 

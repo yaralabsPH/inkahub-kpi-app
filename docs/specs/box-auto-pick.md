@@ -1,7 +1,7 @@
 # Spec: Remove box scan, app picks the box
 
 - Slug: `box-auto-pick` · Roadmap ID: `F4` (see `docs/ROADMAP.md`)
-- Status: draft (awaiting CJ review; not approved)
+- Status: approved by CJ on 2026-11-22 (decisions recorded below)
 - Author: Claude Fable 5.2, in a dedicated discovery session CJ requested on
   2026-11-22. This is an exception to the usual "planner writes specs" rule;
   an Astra review of this spec and its plan is recommended before approval.
@@ -9,6 +9,28 @@
   `origin/feature/station-screen-redesign` (`7b05828`, PR #10),
   `feature/item-counting` (`3fd8b49`, PR #7 draft) and the staging schema
   (catalogue metadata only, no rows changed).
+
+## CJ decisions (2026-11-22)
+
+CJ approved this spec in chat with these answers. Where older wording below
+differed, it has been updated to match.
+
+- Q1: **managers and owners** edit rules and switch the site mode.
+- Q3: mixed A0 + smaller framed orders ship as **two parcels**: one pick at
+  A0 Framed, one at Dispatch.
+- Q4: unframed prints inside a framed order go **in the box**. They join the
+  Dispatch pick (or the A0 Framed pick when the order's only framed lines
+  are A0). A tube is used only when the order has no framed or picture-frame
+  lines.
+- Q5: **no rule depends on destination.** No country condition, no Shopify
+  lookup change.
+- Q6: a partial match deducts **nothing** and flags the order.
+- Q7: any station account at the site (kiosk or higher) may override after
+  completion, with an audit row.
+- R2: the unguarded `deduct_inventory_for_event` is fixed in a **separate**
+  `production-write-safety` spec, not here.
+- Q2 (replacement contents) was not answered. The proposed default applies
+  until CJ says otherwise: see Q2 below.
 
 ## Problem
 
@@ -67,9 +89,13 @@ Workers feel the blocked button; Max and managers feel wrong box stock.
 ## Terms
 
 - **Packing point**: the station where a shipment is physically packed.
-  Unframed prints → `unframed`; A0 framed → `a0_framed`; everything else →
-  `dispatch`. This mirrors `shouldDeductAtDept` today. A mixed order (for
-  example A0 framed + A1 framed) has two packing points and two picks.
+  A0 framed → `a0_framed`; other framed prints and picture frames →
+  `dispatch`. Unframed prints, free prints and accessories travel with the
+  framed parcel: `dispatch` if the order has one, else `a0_framed`; with no
+  framed lines, unframed and free prints → `unframed` (tube) and
+  accessories-only → `dispatch`. A mixed order (A0 framed + A1 framed) has
+  two packing points and two picks. A packing-point station with nothing to
+  pack for an order records an empty pick.
 - **Shipment key**: `orig` for the original order, `cs:<case id>` for a
   replacement packed under a CS case.
 - **Pick**: the packaging record for one (site, order, packing point,
@@ -86,7 +112,7 @@ Workers feel the blocked button; Max and managers feel wrong box stock.
   notice after completing, I scan the slip again and change it.
 - As a worker on an order no rule covers, I see "No box rule — flagged" and
   Complete still works.
-- As an owner, I edit rules in Settings as a draft, run Max's examples and my
+- As an owner or manager, I edit rules in Settings as a draft, run Max's examples and my
   own in a simulator, and activate the draft. I can go back to an earlier
   version or switch the site back to scanning.
 - As a manager, I see packaging used (net of corrections) and a short list
@@ -107,8 +133,7 @@ A rule set belongs to one site (stock is per site) and holds:
   - `packing_point`,
   - which pieces it takes: `kinds` (framed, unframed, picture frame, free
     print, accessory) and `sizes` (A0–A4),
-  - optional conditions: piece-count range, "contains size", destination
-    country list,
+  - optional conditions: piece-count range, "contains size",
   - output: packages, either a fixed list for all matched pieces, or one
     package per N pieces (capacity).
   A rule that fires removes its pieces; evaluation continues on what is
@@ -133,8 +158,8 @@ any activation (Risk R1).
 ### Site mode
 
 `packaging_settings.mode` per site: `scan` (default, today's behaviour
-exactly) or `auto`. Stations read it when an order loads, so an owner can
-switch a site without a deploy. `auto` cannot be selected without an active
+exactly) or `auto`. Stations read it when an order loads, so an owner or manager
+can switch a site without a deploy. `auto` cannot be selected without an active
 rule set.
 
 ### At the station (auto mode)
@@ -210,7 +235,7 @@ Site mode and rollback
 - [ ] With no settings row, or mode `scan`, every station behaves exactly as
       before this feature (box scan required where it was, same deduction
       call, same ledger keys).
-- [ ] An owner can switch a site between `scan` and `auto` in Settings;
+- [ ] An owner or manager can switch a site between `scan` and `auto` in Settings;
       stations pick it up on the next order load without a deploy.
 - [ ] `auto` cannot be selected while the site has no active rule set.
 - [ ] The previous app version runs unchanged against the new schema.
@@ -227,9 +252,9 @@ Stations (auto mode)
 
 Rules
 
-- [ ] Only an owner with access to the site can create, edit, activate or
-      retire rule sets and change the mode. Managers can view. Kiosk, staff
-      and cs cannot change them (enforced in the database, not only the UI).
+- [ ] Only an owner or manager with access to the site can create, edit,
+      activate or retire rule sets and change the mode. Kiosk, staff and cs
+      cannot change them (enforced in the database, not only the UI).
 - [ ] An active or retired rule set cannot be edited or deleted.
 - [ ] Activation is refused while any stored example fails.
 - [ ] The simulator shows, for typed-in contents, the packages, the rules
@@ -288,11 +313,8 @@ Reports
   remove packaging audit rows; the link to the event lives on the pick).
 - Repository interface changes: none (Supabase-only production path, stated
   out of scope for Dexie).
-- `api/` endpoints touched: none required. Only if Max's rules depend on
-  destination (the "NZ" box suggests they may): `api/shopify/order.ts`
-  additionally returns the shipping **country code** (no other address
-  data). `api/reports/daily-digest.ts` is not changed in this feature
-  (see Dependencies, F1).
+- `api/` endpoints touched: none. `api/reports/daily-digest.ts` is not
+  changed in this feature (see Dependencies, F1).
 - RLS / role access: all four tables are site-scoped with
   `can_access_location`. Read: any role with site access (stations need the
   mode, active rule set and their picks). Direct writes: none; all writes go
@@ -316,11 +338,11 @@ Before the preview test (CJ or delegated to Astra, staging only):
 
 On the Vercel preview:
 
-- Owner: create packaging products and a draft rule set; add examples; see
+- Owner or manager: create packaging products and a draft rule set; add examples; see
   activation refused with a failing example, then succeed; switch the site
   to `auto`; switch back to `scan` and confirm stations revert; edit rules
   after picks exist and confirm old picks and totals do not move.
-- Manager: can view rules, cannot edit; sees packages used (net) and the
+- Manager: same rule rights as owner; sees packages used (net) and the
   attention list; "Retry" on a short pick.
 - Kiosk at A0 Framed, Unframed (new screen and `?ui=classic`) and Dispatch:
   complete without scanning; unmatched order completes with a flag; scan a
@@ -380,7 +402,7 @@ verify" and "Stock: an order deducts inventory exactly once".
    adjusted in the existing stock screens. To maintain: rules when box types
    change; nothing expires.
 7. **Tests.** Table-driven unit tests for the rule evaluator (set
-   multipliers, mixed sizes, capacity, contains-size, country, unassigned
+   multipliers, mixed sizes, capacity, contains-size, unassigned
    remainder, gift cards, unparseable SKUs), parity tests proving a
    synthetic rule set reproduces today's tube choice, reconcile delta tests,
    Complete-blocking rule tests for old and new behaviour, queue tests, and
@@ -394,7 +416,7 @@ verify" and "Stock: an order deducts inventory exactly once".
 - *The app picks the box and deducts it, like mail tubes today.* Rules cover
   boxes and tubes; the tube choice becomes two rules.
 - *Rules editable by an admin in Settings, not hard-coded; Max supplies the
-  initial rules.* Owner-edited, versioned rule sets with a simulator; no
+  initial rules.* Owner- and manager-edited, versioned rule sets with a simulator; no
   rules are shipped in code or invented.
 - *Dispatch can override with one tap.* Tap another catalogue item before or
   after completion; audited deltas.
@@ -447,38 +469,28 @@ Business inputs still missing (not invented here):
   tested with synthetic rules, but no site can be switched to `auto`.
   Questions the table must answer: which box per size and count; mixed
   sizes; when a second box is needed; sets; picture frames; accessories;
-  what the "NZ" box depends on; whether UK and US use the same boxes.
+  what the "NZ" box is used for; whether UK and US use the same boxes.
 
 Decisions for CJ:
 
-- **Q1. Who edits rules?** Proposed: owner only (the roadmap says "admin";
-  the roadmap review said owner-managed). Alternative: managers too.
-- **Q2. Replacement contents.** For a replacement under a CS case, should
+- **Q1. Who edits rules?** Decided: owners and managers.
+- **Q2. Replacement contents (still open; default in force).** For a replacement under a CS case, should
   the pick be evaluated on the case's replacement lines (proposed, if the
   station has them) or on what the worker verified in that session? If
   neither is reliable the pick is unresolved and the worker taps the box.
-- **Q3. Mixed A0 + smaller framed orders.** Proposed: two picks, one at A0
-  Framed and one at Dispatch, because they are packed at two benches today.
-  Confirm they really ship as separate parcels.
-- **Q4. Unframed lines inside a framed order.** `isLineMyDept` says Framed
-  handles these end to end, but stock for them deducts at Unframed. Proposed
-  packing point: wherever the tube is actually used; Max to confirm whether
-  such prints go in the box (no tube) or in a tube at Unframed.
-- **Q5. Destination.** If any rule depends on destination, approve adding
-  the shipping country code to the Shopify order lookup.
-- **Q6. Partial matches.** Proposed: if any piece is unassigned, deduct
-  nothing and flag the order. Alternative: deduct the matched part and flag
-  the rest.
-- **Q7. Post-completion override rights.** Proposed: any signed-in station
-  account at that site (kiosk or higher), with the audit row; managers can
-  also correct from Reports.
+- **Q3. Mixed A0 + smaller framed orders.** Decided: two parcels, two
+  picks.
+- **Q4. Unframed lines inside a framed order.** Decided: in the box.
+- **Q5. Destination.** Decided: no rule uses it.
+- **Q6. Partial matches.** Decided: deduct nothing and flag.
+- **Q7. Post-completion override rights.** Decided: any station account at
+  the site (kiosk or higher), audited.
 
 Technical risks:
 
 - **R2. The existing deduction function stays unguarded.** It is shared with
-  component stock on every station and with F6/F7. Recommended: a separate
-  small `production-write-safety` spec. Alternative: add a caller/site guard
-  in this feature (old clients would still pass). CJ to choose.
+  component stock on every station and with F6/F7. Decided: a separate
+  small `production-write-safety` spec.
 - **R3. Old and new clients on the same order.** New code adopts earlier
   scan deductions. The reverse (an old client completing an order again
   after auto mode already deducted) can deduct a second box. It needs the
