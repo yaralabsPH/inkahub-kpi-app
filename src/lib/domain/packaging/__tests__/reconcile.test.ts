@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyDeltas, isOverride, packagingDeltas, sameQuantities, toQuantities } from "../reconcile";
+import { applyDeltas, isOverride, packagingDeltas, sameQuantities, toQuantities, type Quantities } from "../reconcile";
 
 describe("packagingDeltas", () => {
   it("first apply consumes the whole target", () => {
@@ -34,7 +34,7 @@ describe("packagingDeltas", () => {
 
   it("converges: applying the deltas leaves nothing more to post, however often it is repeated", () => {
     const target = { boxA: 2, tube: 1 };
-    let posted = { boxA: 1, boxB: 4 };
+    let posted: Quantities = { boxA: 1, boxB: 4 };
     for (let i = 0; i < 3; i++) {
       posted = applyDeltas(posted, packagingDeltas(target, posted));
       expect(posted).toEqual(target);
