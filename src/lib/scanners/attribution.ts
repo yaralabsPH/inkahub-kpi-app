@@ -18,6 +18,8 @@ export interface FramerAttribution {
 
 const COLUMNS = "dispatch_event_id, order_number, sku, source, display_name, person_id, recorded_at, dispatcher_id";
 export const ATTRIBUTION_BATCH = 200;
+/** Rows per response page; at or below Supabase's default max-rows (1000). */
+export const ATTRIBUTION_PAGE = 1000;
 
 /** Only shared-scanner dispatches (event ids "dsp-...-d") can have attributions. */
 export function attributableEventIds(events: ReadonlyArray<{ id: string; event_type: string }>): string[] {
@@ -28,20 +30,32 @@ export type AttributionLoad = { ok: true; rows: FramerAttribution[] } | { ok: fa
 
 const missingTable = (code?: string) => code === "PGRST205" || code === "42P01";
 
-/** Batched by event id within the caller's site. A database without 0056 answers "none". */
+/**
+ * Batched by event id within the caller's site, and paged inside each batch
+ * in a stable order (dispatch_event_id, sku; unique per site) until a short
+ * page, so a capped response can never silently drop rows. A database
+ * without 0056 answers "none".
+ */
 export async function fetchAttributionsForEvents(client: SupabaseClient, location: string, eventIds: readonly string[]): Promise<AttributionLoad> {
   const rows: FramerAttribution[] = [];
   for (let i = 0; i < eventIds.length; i += ATTRIBUTION_BATCH) {
     const ids = eventIds.slice(i, i + ATTRIBUTION_BATCH);
-    try {
-      const { data, error } = await client.from("dispatch_framer_attributions").select(COLUMNS).eq("location", location).in("dispatch_event_id", ids);
-      if (error) {
-        if (missingTable(error.code)) return { ok: true, rows: [] };
-        return { ok: false, message: error.message };
+    for (let from = 0; ; from += ATTRIBUTION_PAGE) {
+      try {
+        const { data, error } = await client.from("dispatch_framer_attributions").select(COLUMNS)
+          .eq("location", location).in("dispatch_event_id", ids)
+          .order("dispatch_event_id", { ascending: true }).order("sku", { ascending: true })
+          .range(from, from + ATTRIBUTION_PAGE - 1);
+        if (error) {
+          if (missingTable(error.code)) return { ok: true, rows: [] };
+          return { ok: false, message: error.message };
+        }
+        const page = (data ?? []) as FramerAttribution[];
+        rows.push(...page);
+        if (page.length < ATTRIBUTION_PAGE) break;
+      } catch (e) {
+        return { ok: false, message: e instanceof Error ? e.message : String(e) };
       }
-      rows.push(...((data ?? []) as FramerAttribution[]));
-    } catch (e) {
-      return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
   }
   return { ok: true, rows };

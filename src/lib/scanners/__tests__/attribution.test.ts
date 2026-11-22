@@ -16,17 +16,35 @@ const row = (over: Partial<FramerAttribution>): FramerAttribution => ({
   display_name: "Alice", person_id: "p1", recorded_at: "2026-11-22T09:00:00Z", dispatcher_id: "d1", ...over,
 });
 
-/** A fake PostgREST builder that records each .in() batch. */
-function fakeClient(answer: (ids: string[]) => { data: unknown; error: { code?: string; message: string } | null }) {
-  const calls: Array<{ location: string; ids: string[] }> = [];
+/**
+ * A fake PostgREST builder: records each .in() batch, its ordering and the
+ * requested .range(); answers like PostgREST (slice of the ordered rows),
+ * but never more than `cap` rows per response (Supabase's max-rows).
+ */
+function fakeClient(
+  answer: (ids: string[]) => { data: unknown; error: { code?: string; message: string } | null },
+  cap = Number.POSITIVE_INFINITY,
+) {
+  const calls: Array<{ location: string; ids: string[]; order: string[]; from: number; to: number }> = [];
   const client = {
     from: (table: string) => {
       expect(table).toBe("dispatch_framer_attributions");
       let location = "";
+      let ids: string[] = [];
+      const order: string[] = [];
       const b = {
         select: () => b,
         eq: (_c: string, v: string) => { location = v; return b; },
-        in: async (_c: string, ids: string[]) => { calls.push({ location, ids }); return answer(ids); },
+        in: (_c: string, v: string[]) => { ids = v; return b; },
+        order: (c: string) => { order.push(c); return b; },
+        range: async (from: number, to: number) => {
+          calls.push({ location, ids, order: [...order], from, to });
+          const a = answer(ids);
+          if (a.error || !Array.isArray(a.data)) return a;
+          const sorted = [...(a.data as FramerAttribution[])].sort((x, y) =>
+            x.dispatch_event_id < y.dispatch_event_id ? -1 : x.dispatch_event_id > y.dispatch_event_id ? 1 : x.sku < y.sku ? -1 : x.sku > y.sku ? 1 : 0);
+          return { data: sorted.slice(from, Math.min(to + 1, from + cap)), error: null };
+        },
       };
       return b;
     },
@@ -53,7 +71,22 @@ describe("framer attribution for Reports", () => {
     expect(r.ok && r.rows.length).toBe(2);
   });
 
+  it("pages deterministically within a batch: more rows than one response returns are all read", async () => {
+    // 200 dispatches x 25 framed SKUs = 5000 rows in ONE id batch; the server caps a response at 1000.
+    const ids = Array.from({ length: ATTRIBUTION_BATCH }, (_, i) => `dsp-${String(i).padStart(3, "0")}-d`);
+    const all = ids.flatMap((id) => Array.from({ length: 25 }, (_, k) => row({ dispatch_event_id: id, sku: `INKA-ABC${String(k).padStart(4, "0")}-A2-FB` })));
+    const { client, calls } = fakeClient(() => ({ data: all, error: null }), 1000);
+    const r = await fetchAttributionsForEvents(client, "au", ids);
+    expect(r.ok && r.rows.length).toBe(5000);
+    expect(r.ok && new Set(r.rows.map((x) => `${x.dispatch_event_id}|${x.sku}`)).size).toBe(5000);
+    expect(calls.every((c) => c.order.join(",") === "dispatch_event_id,sku")).toBe(true);
+    expect(calls.map((c) => c.from)).toEqual([0, 1000, 2000, 3000, 4000, 5000]);
+    // Every row of a dispatch event lands in its CSV cell.
+    expect(attributionCsvCells("dsp-199-d", groupByEvent(r.ok ? r.rows : []))[1].split("; ")).toHaveLength(25);
+  });
+
   it("a database without 0056 answers none; any other error is reported, not hidden", async () => {
+
     expect(await fetchAttributionsForEvents(fakeClient(() => ({ data: null, error: { code: "PGRST205", message: "no table" } })).client, "au", ["dsp-1-d"]))
       .toEqual({ ok: true, rows: [] });
     expect(await fetchAttributionsForEvents(fakeClient(() => ({ data: null, error: { code: "57014", message: "timeout" } })).client, "au", ["dsp-1-d"]))
