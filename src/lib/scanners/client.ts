@@ -327,13 +327,17 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
   let job: ScannerJob = claimed;
   const lease = claimed.leaseOwner ?? "";
 
+  // Every finalizer is fenced by the lease: when the outbox ignored a stale
+  // claim, report "superseded" (another claim owns the truth), never the
+  // stale claim's own failure.
+  const superseded = (): DeliveryReport => ({ kind: "superseded", job });
   const wait = async (message: string, auth = false): Promise<DeliveryReport> => {
-    await d.outbox.retryLater(job.requestId, lease, message);
+    if (!(await d.outbox.retryLater(job.requestId, lease, message))) return superseded();
     return { kind: "waiting", job, message, auth };
   };
   const stopped = async (): Promise<DeliveryReport> => {
     await d.outbox.retryLater(job.requestId, lease, "Station closed or account changed.");
-    return { kind: "superseded", job };
+    return superseded();
   };
 
   try {
@@ -354,7 +358,7 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
         prep = prepareFramingOrder(lookup.lookup, { ...ctx, packaging });
       }
       if (!prep.ok) {
-        await d.outbox.markBlocked(job.requestId, lease, { code: prep.code, message: prep.message, stage: "prepare" });
+        if (!(await d.outbox.markBlocked(job.requestId, lease, { code: prep.code, message: prep.message, stage: "prepare" }))) return superseded();
         return { kind: "blocked", job, code: prep.code, message: prep.message, uncertain: job.uncertain };
       }
       // Persist the exact payload BEFORE anything is sent.
@@ -364,9 +368,17 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
     const prepared = job.prepared;
     if (!prepared) return wait("Scan has no prepared payload.");
     if (!active()) return stopped();
+    const before = { attempts: job.attempts, uncertain: job.uncertain, priorUnknown: job.priorUnknown ?? false };
     job = await d.outbox.markAttempt(job.requestId, lease);
+    // The station may have stopped while the attempt was being recorded.
+    // Nothing was sent: undo the attempt (no invented unknown outcome), keep
+    // the exact payload and earlier uncertainty, release the claim.
+    if (!active()) {
+      await d.outbox.releaseUnsent(job.requestId, lease, before);
+      return superseded();
+    }
   } catch (e) {
-    if (e instanceof LeaseLostError) return { kind: "superseded", job };
+    if (e instanceof LeaseLostError) return superseded();
     throw e;
   }
   const prepared = job.prepared!;
@@ -389,7 +401,7 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
       });
       return { kind: "already_recorded", job, reason: res.reason };
     case "rejected": {
-      await d.outbox.markBlocked(job.requestId, lease, { code: res.code, message: res.message, stage: "commit" });
+      if (!(await d.outbox.markBlocked(job.requestId, lease, { code: res.code, message: res.message, stage: "commit" }))) return superseded();
       // An earlier unanswered attempt may have saved it: say so, don't invite re-recording.
       return { kind: "blocked", job, code: res.code, message: res.message, uncertain: job.priorUnknown ?? false };
     }

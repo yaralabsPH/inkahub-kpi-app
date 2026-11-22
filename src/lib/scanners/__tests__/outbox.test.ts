@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createScannerOutbox,
   LEASE_MS,
+  LeaseLostError,
   MAX_ACTIVE_JOBS,
   memoryJobStore,
   OutboxFullError,
@@ -277,7 +278,8 @@ describe("R1 corrections", () => {
     const dB = deps({ outbox: ob, owner: "tab-B", commit: async () => savedResult });
     expect(await processNext(dB)).toMatchObject({ kind: "saved" });
     releaseA({ outcome: "rejected", code: "forbidden_role", message: "late" });
-    await runA;
+    // R2-1: the stale claim reports "superseded", never its own false "not saved".
+    expect(await runA).toMatchObject({ kind: "superseded" });
     const v = await ob.view(scope);
     expect(v.jobs[0]).toMatchObject({ status: "done", uncertain: false, outcome: { kind: "saved" } });
     // A late retry-later from the old claim is ignored too.
@@ -340,4 +342,79 @@ describe("R1 corrections", () => {
       packaging: async () => ({ mode: "auto", ruleSet: null }) });
     expect(await processNext(missing)).toMatchObject({ kind: "blocked", code: "packaging_not_auto", uncertain: false });
   });
+
+  it("R2-1: a stale claim's late network error and late preparation refusal are superseded too", async () => {
+    let clock = 1_000;
+    const ob = createScannerOutbox(memoryJobStore(), () => clock);
+    await ob.enqueue(captured("10190203"), scope, uuid());
+    let releaseA!: (o: CommitOutcome) => void;
+    const dA = deps({ outbox: ob, owner: "tab-A", commit: () => new Promise<CommitOutcome>((r) => (releaseA = r)) });
+    const runA = processNext(dA);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    clock += LEASE_MS + 1;
+    expect(await processNext(deps({ outbox: ob, owner: "tab-B", commit: async () => savedResult }))).toMatchObject({ kind: "saved" });
+    releaseA({ outcome: "network_error", message: "late timeout" });
+    expect(await runA).toMatchObject({ kind: "superseded" });
+    expect((await ob.view(scope)).jobs[0]).toMatchObject({ status: "done", outcome: { kind: "saved" } });
+
+    // Preparation: A's lookup outlives its lease; B saves; A's "cancelled" verdict is ignored.
+    const ob2 = createScannerOutbox(memoryJobStore(), () => clock);
+    await ob2.enqueue(captured("10190204"), scope, uuid());
+    let releaseLookup!: () => void;
+    const gate = new Promise<void>((r) => (releaseLookup = r));
+    const slowA = deps({ outbox: ob2, owner: "tab-A",
+      lookupOrder: async (n) => { await gate; return { kind: "ok", lookup: { ...framedOrder(n), cancelled_at: "2026-01-01" } }; } });
+    const runA2 = processNext(slowA);
+    await new Promise((r) => setImmediate(r));
+    clock += LEASE_MS + 1;
+    expect(await processNext(deps({ outbox: ob2, owner: "tab-B", lookupOrder: async (n) => ({ kind: "ok", lookup: framedOrder(n) }), commit: async () => savedResult }))).toMatchObject({ kind: "saved" });
+    releaseLookup();
+    expect(await runA2).toMatchObject({ kind: "superseded" });
+    expect((await ob2.view(scope)).jobs[0]).toMatchObject({ status: "done" });
+  });
+
+  it("R2-1: a stale lease surfaces as LeaseLostError through the store, not a storage failure", async () => {
+    let clock = 1_000;
+    const ob = createScannerOutbox(memoryJobStore(), () => clock);
+    await ob.enqueue(captured(), scope, uuid());
+    const a = await ob.claimNext(scope, "tab-A");
+    clock += LEASE_MS + 1;
+    await ob.claimNext(scope, "tab-B");
+    await expect(ob.markAttempt(a!.requestId, a!.leaseOwner!)).rejects.toBeInstanceOf(LeaseLostError);
+    await expect(ob.setPrepared(a!.requestId, a!.leaseOwner!, {} as never)).rejects.toBeInstanceOf(LeaseLostError);
+  });
+
+  it("R2-2: the station stopping while the attempt is recorded sends nothing and invents no unknown outcome", async () => {
+    const base = createScannerOutbox(memoryJobStore());
+    let stationOpen = true;
+    let releaseAttempt!: () => void;
+    const attemptGate = new Promise<void>((r) => (releaseAttempt = r));
+    const ob = {
+      ...base,
+      markAttempt: async (id: string, lease: string) => {
+        const j = await base.markAttempt(id, lease);
+        await attemptGate; // the IndexedDB write is slow; the station closes meanwhile
+        return j;
+      },
+    };
+    const job = await ob.enqueue(captured(), scope, uuid());
+    const d = deps({ outbox: ob, active: () => stationOpen });
+    const run = processNext(d);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    stationOpen = false;
+    releaseAttempt();
+    expect(await run).toMatchObject({ kind: "superseded" });
+    expect(d.commits).toHaveLength(0);
+    const v = await base.view(scope);
+    expect(v.jobs[0]).toMatchObject({ requestId: job.requestId, status: "prepared", attempts: 0, uncertain: false, leaseOwner: null });
+    const payload = v.jobs[0].prepared;
+    // Reopened: the same job, same payload, is claimable at once and saves.
+    stationOpen = true;
+    const d2 = deps({ outbox: base });
+    expect(await processNext(d2)).toMatchObject({ kind: "saved" });
+    expect(d2.commits[0].p_lines).toEqual(payload!.lines.map((l) => ({ sku: l.sku, quantity: l.quantity, work_type: l.workType })));
+  });
 });
+

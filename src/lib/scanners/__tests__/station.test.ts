@@ -202,4 +202,35 @@ describe("SharedScannerController", () => {
     expect(c.state.last?.detail).toMatch(/Do NOT record it on the classic station/);
     expect(c.state.view?.jobs[0]).toMatchObject({ status: "blocked", uncertain: true });
   });
+
+  it("R2-1: a stale tab's late refusal leaves its wall without a false NOT SAVED", async () => {
+    let clock = 1_000_000;
+    const outbox = createScannerOutbox(memoryJobStore(), () => clock);
+    let releaseA!: (o: CommitOutcome) => void;
+    const mk = (owner: string, commit: () => Promise<CommitOutcome>) => new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox,
+      activate: async () => ({ outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: false }),
+      deliver: () => processNext({
+        outbox, scope, owner,
+        lookupOrder: async (n) => ({ kind: "ok", lookup: order(n) }),
+        openCase: async () => false, products: () => [], packaging: async () => ({ mode: "scan", ruleSet: null }), commit,
+      }),
+      isOnline: () => true, now: () => clock, newRequestId: uuid, sound: () => {},
+    });
+    const a = mk("tab-A", () => new Promise<CommitOutcome>((r) => (releaseA = r)));
+    const b = mk("tab-B", async () => ({ outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: true } }));
+    a.onFrame("S1", "AAAA0001");
+    await settle();
+    a.onFrame("S1", "190203");
+    await settle(); // A sends and hangs
+    clock += 61_000; // A's lease expires
+    b.pump();
+    await settle();
+    expect(b.state.last).toMatchObject({ kind: "saved" });
+    releaseA({ outcome: "rejected", code: "forbidden_role", message: "late" });
+    await settle();
+    expect(a.state.last?.kind).not.toBe("rejected");
+    expect(a.state.last?.title ?? "").not.toMatch(/not saved/i);
+  });
 });
+

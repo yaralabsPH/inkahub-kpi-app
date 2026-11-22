@@ -195,7 +195,7 @@ export function dexieJobStore(): JobStore {
           }),
         );
       } catch (e) {
-        if (e instanceof OutboxFullError || e instanceof OutboxStorageError) throw e;
+        if (e instanceof OutboxFullError || e instanceof OutboxStorageError || e instanceof LeaseLostError) throw e;
         throw new OutboxStorageError(`Device storage failed: ${e instanceof Error ? e.message : String(e)}`, e);
       }
     },
@@ -229,7 +229,7 @@ export function memoryJobStore(opts: { failWrites?: () => boolean } = {}): JobSt
           for (const [k, v] of draft) rows.set(k, v);
           return out;
         } catch (e) {
-          if (e instanceof OutboxFullError || e instanceof OutboxStorageError) throw e;
+          if (e instanceof OutboxFullError || e instanceof OutboxStorageError || e instanceof LeaseLostError) throw e;
           throw new OutboxStorageError(`Device storage failed: ${e instanceof Error ? e.message : String(e)}`, e);
         }
       };
@@ -273,8 +273,16 @@ export interface ScannerOutbox {
   markAttempt(requestId: string, lease: string): Promise<ScannerJob>;
   /** Saved / already recorded: the server's truth, accepted from any claim; never undone. */
   markDone(requestId: string, outcome: JobOutcome): Promise<void>;
-  markBlocked(requestId: string, lease: string, block: JobBlock): Promise<void>;
-  retryLater(requestId: string, lease: string, error: string): Promise<void>;
+  /** Returns false (and changes nothing) when the lease is stale. */
+  markBlocked(requestId: string, lease: string, block: JobBlock): Promise<boolean>;
+  /** Returns false (and changes nothing) when the lease is stale. */
+  retryLater(requestId: string, lease: string, error: string): Promise<boolean>;
+  /**
+   * Undo a markAttempt whose request was never sent (the station stopped in
+   * between): restores the attempt count and uncertainty exactly as before
+   * and releases the claim. The prepared payload is kept. False when stale.
+   */
+  releaseUnsent(requestId: string, lease: string, before: Pick<ScannerJob, "attempts" | "uncertain" | "priorUnknown">): Promise<boolean>;
   /** Operator: try a blocked job again (same request id, same payload once prepared). */
   retryBlocked(requestId: string, scope: JobScope): Promise<void>;
   /** Operator: give up on a blocked job and record it on the classic station instead. */
@@ -408,23 +416,42 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
     },
 
     async markBlocked(requestId, lease, block) {
-      await store.tx(async (t) => {
+      return store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        if (!live(job, lease)) return; // a stale claim's answer: ignored
+        if (!live(job, lease)) return false; // a stale claim's answer: ignored
         // A refusal proves only that THIS attempt saved nothing. If an earlier
         // attempt went unanswered it may have saved: stay uncertain until a
         // retry gets the receipt's answer.
         const uncertain = block.stage === "commit" ? (job.priorUnknown ?? false) : job.uncertain;
         await t.put({ ...job, status: "blocked", uncertain, blocked: block, lastError: block.message, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
+        return true;
+      });
+    },
+
+    async releaseUnsent(requestId, lease, before) {
+      return store.tx(async (t) => {
+        const job = await mustGet(t, requestId);
+        if (!live(job, lease)) return false;
+        await t.put({
+          ...job,
+          attempts: before.attempts,
+          uncertain: before.uncertain,
+          priorUnknown: before.priorUnknown ?? false,
+          leaseOwner: null,
+          leaseUntil: 0,
+          updatedAt: iso(),
+        });
+        return true;
       });
     },
 
     async retryLater(requestId, lease, error) {
-      await store.tx(async (t) => {
+      return store.tx(async (t) => {
         const job = await mustGet(t, requestId);
-        if (!live(job, lease)) return;
+        if (!live(job, lease)) return false;
         const tries = job.tries + 1;
         await t.put({ ...job, tries, nextAttemptAt: now() + backoff(tries), lastError: error, leaseOwner: null, leaseUntil: 0, updatedAt: iso() });
+        return true;
       });
     },
 
