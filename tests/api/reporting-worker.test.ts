@@ -2121,17 +2121,27 @@ describe("Task 15 handlers: reporting-admin", () => {
 // ---------------------------------------------------------------------------
 
 describe("Task 15 schedule and migration", () => {
-  it("adds exactly the three site-staggered refresh schedules; the digest entries are unchanged; 300 s functions", () => {
+  // Integration staging exception (docs/specs/item-counting-integration.md): the Vercel project is Hobby,
+  // which refuses sub-daily crons at deploy time. The three refresh schedules stay DORMANT in the release
+  // doc (exact definitions below); vercel.json keeps only the unchanged daily digests and the 300 s functions.
+  const DORMANT = [
+    { path: "/api/reports/refresh-summaries?site=au", schedule: "0,15,30,45 * * * *" },
+    { path: "/api/reports/refresh-summaries?site=uk", schedule: "1,16,31,46 * * * *" },
+    { path: "/api/reports/refresh-summaries?site=us", schedule: "2,17,32,47 * * * *" },
+  ];
+  it("active crons are exactly the three unchanged daily digests (Hobby-deployable); 300 s functions kept", () => {
     const v = JSON.parse(read("vercel.json")) as { crons: Array<{ path: string; schedule: string }>; functions: Record<string, { maxDuration: number }> };
     expect(v.crons).toEqual([
       { path: "/api/reports/daily-digest?location=au", schedule: "55 13 * * *" },
       { path: "/api/reports/daily-digest?location=uk", schedule: "55 22 * * *" },
       { path: "/api/reports/daily-digest?location=us", schedule: "55 4 * * *" },
-      { path: "/api/reports/refresh-summaries?site=au", schedule: "0,15,30,45 * * * *" },
-      { path: "/api/reports/refresh-summaries?site=uk", schedule: "1,16,31,46 * * * *" },
-      { path: "/api/reports/refresh-summaries?site=us", schedule: "2,17,32,47 * * * *" },
     ]);
+    for (const c of v.crons) expect(c.schedule).toMatch(/^\d{1,2} \d{1,2} \* \* \*$/); // at most once a day
     expect(v.functions).toEqual({ "api/reports/refresh-summaries.ts": { maxDuration: 300 }, "api/reports/reporting-admin.ts": { maxDuration: 300 } });
+  });
+  it("the dormant refresh schedules are recorded verbatim in the release doc for a later plan that allows them", () => {
+    const doc = read("docs/releases/item-counting.md");
+    for (const c of DORMANT) expect(doc).toContain(JSON.stringify(c));
   });
   const sql = read("supabase/migrations/0043_reporting_worker_state.sql");
   const fns = ["save_reporting_enumeration(uuid, bigint, jsonb, jsonb, jsonb, boolean)", "read_reporting_worker_progress(uuid, bigint)", "list_reporting_worker_owners(uuid, bigint, boolean, text, text, integer)", "plan_reporting_owner(uuid, bigint, text, text, jsonb)", "verify_reporting_plan(uuid, bigint)", "list_reporting_work_descriptors(uuid, bigint, jsonb, integer)", "set_reporting_site_mode(text, text, boolean)", "record_reporting_run(text, text, text, text, uuid, uuid, timestamptz, integer, jsonb, text)", "cleanup_reporting_history(text, integer)", "save_reporting_walk(uuid, bigint, jsonb, jsonb, jsonb, text, integer, text[], jsonb, boolean)", "read_reporting_walk_line(uuid, bigint, text, integer, text)"];

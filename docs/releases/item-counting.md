@@ -172,6 +172,33 @@ processor is off.
    and US `2,17,32,47` minutes past each hour. The three digest schedules are
    unchanged.
 
+#### Integration amendment (2026-11-23): refresh schedules are dormant
+
+The integrated F1 + F4–F7 build (`feature/item-counting-integration`) is
+deployed to a **Vercel Hobby** project. Hobby refuses sub-daily cron
+definitions at deploy time, so `vercel.json` keeps only the three unchanged
+daily digest crons and the two `maxDuration: 300` functions (300 s needs
+Fluid Compute; verify the project's actual runtime before relying on a full
+240 s worker budget). **No refresh runs on its own** in this Preview.
+
+- Staging publication is exercised by the operator workflow above
+  (`reporting-admin` `rebuild`, or an authorized manual
+  `GET /api/reports/refresh-summaries?site=…`), and Reports/Welcome show the
+  published cutoff and staleness. This is a staging scheduling exception, not
+  autonomous refresh.
+- Before production relies on published reads, a hosting plan that allows
+  15-minute crons must exist (CJ decision; nothing is purchased here). Then add
+  these three entries back to `vercel.json` `crons`, exactly:
+
+```json
+{"path":"/api/reports/refresh-summaries?site=au","schedule":"0,15,30,45 * * * *"}
+{"path":"/api/reports/refresh-summaries?site=uk","schedule":"1,16,31,46 * * * *"}
+{"path":"/api/reports/refresh-summaries?site=us","schedule":"2,17,32,47 * * * *"}
+```
+
+- Until then keep every site's `readMode` `legacy` for real staff, or accept
+  that published reads only advance when an operator refreshes.
+
 Operator commands are `POST /api/reports/reporting-admin` with
 `Authorization: Bearer <REPORTING_OPERATOR_SECRET>` and a JSON body:
 `status`, `rebuild`, `cleanup`, `set-mode`, `abandon`, `disable-capture`,
