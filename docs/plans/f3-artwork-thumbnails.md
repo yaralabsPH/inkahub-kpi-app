@@ -36,7 +36,7 @@ Recommended defaults are a complete ordered set composite, a private final bucke
 
 ## Tasks
 
-### [ ] Task 1: Add the dedicated F3 API type-check gate
+### [x] Task 1: Add the dedicated F3 API type-check gate
 
 - Files: new `tsconfig.artwork-api.json`; modify `.gitignore`, `package.json`, `.github/workflows/ci.yml`; API tests under `tests/api/artwork/` as they arrive.
 - Do:
@@ -369,3 +369,4 @@ Provider links in the draft spec remain the implementation reference for OAuth, 
 ## Implementation log
 
 - Planning only, 2026-11-22: draft written from the template/spec; supplied discovery notes reconciled. No implementation task, staging benchmark, database test or CI run has been completed by this planning pass. No app code, provider configuration or migration was changed.
+- Task 1, 2026-11-22: added `tsconfig.artwork-api.json` + `npm run typecheck:artwork` (strict, Node types, allowJs/checkJs for .mjs) and a CI step; whitelisted the config. It immediately caught a type-only error in `api/dropbox/artwork-image.ts` (file not listed in the plan): `.catch` on a PromiseLike query builder; wrapped in `Promise.resolve`, same runtime behaviour. Negative check (deliberate error in `tests/api/artwork/`) failed as expected, then removed.

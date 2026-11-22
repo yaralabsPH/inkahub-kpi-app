@@ -11,6 +11,7 @@
 !/tailwind.config.js
 !/tsconfig.json
 !/tsconfig.node.json
+!/tsconfig.artwork-api.json
 !/vite.config.ts
 !/vercel.json
 !/src/
