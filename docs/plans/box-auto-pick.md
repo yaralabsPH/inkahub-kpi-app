@@ -68,7 +68,7 @@ ids, rule sets and order numbers).
   print, accessory, gift card, unparseable, canvas, and a mixed A0 + A1
   order producing two packing points.
 
-### [ ] Task 2: Rule-set schema and evaluator
+### [x] Task 2: Rule-set schema and evaluator
 
 - Files: `src/lib/domain/packaging/ruleSet.ts`,
   `src/lib/domain/packaging/evaluate.ts`,
@@ -394,3 +394,4 @@ CJ answers inline.
 Coder adds one line per task.
 
 - Task 1: contents.ts + 14 tests. Order-aware packing points per CJ Q4: travellers (unframed, free print, accessory, unclassified) ride the dispatch parcel, else A0, else unframed if any flat print, else dispatch.
+- Task 2: ruleSet.ts (zod + structural checks), evaluate.ts, 20 tests. Country condition omitted per CJ Q5. Added per-pick bounds (20 per item, 10 items) shared with the SQL.
