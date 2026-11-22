@@ -1,0 +1,28 @@
+{
+  "//": "F3 artwork-thumbnails server graph. api/ is outside tsc -b (tsconfig.json includes only src), so this project type-checks the artwork endpoints, their server helpers, the converter child and their tests. Shared domain modules are pulled in through relative imports.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true
+  },
+  "include": [
+    "api/dropbox/artwork-image.ts",
+    "api/shopify/install-start.ts",
+    "api/artwork/**/*.ts",
+    "api/_lib/artwork/**/*.ts",
+    "api/_lib/artwork/**/*.mjs",
+    "api/dropbox/artwork-webhook.ts",
+    "api/shopify/artwork-webhook.ts",
+    "tests/api/artwork/**/*.ts"
+  ]
+}

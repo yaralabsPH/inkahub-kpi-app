@@ -315,13 +315,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
   const newExpires = new Date(Date.now() + URL_TTL_MS).toISOString();
   // Best-effort cache write; don't fail the request if it doesn't persist.
-  await supabase
-    .rpc("upsert_artwork_image_cache", {
+  // Promise.resolve: the query builder is typed as PromiseLike (no .catch).
+  await Promise.resolve(
+    supabase.rpc("upsert_artwork_image_cache", {
       p_artwork_code: artworkCode,
       p_dropbox_path: searchRes.path,
       p_cached_url: linkRes.link,
       p_expires_at: newExpires,
-    })
+    }),
+  )
     .then(() => null)
     .catch(() => null);
 

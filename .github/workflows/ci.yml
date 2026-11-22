@@ -28,6 +28,9 @@ jobs:
       - name: Type-check digest endpoint (api/ is outside tsc -b)
         run: npm run typecheck:digest
 
+      - name: Type-check artwork thumbnail server code (api/ is outside tsc -b)
+        run: npm run typecheck:artwork
+
       - name: Tests
         run: npm run test -- --run
 
