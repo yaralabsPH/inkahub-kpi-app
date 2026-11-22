@@ -96,7 +96,7 @@ ids, rule sets and order numbers).
 - Done when: the parity test passes and documents any case that differs
   (stop and write an Open question if one does).
 
-### [ ] Task 4: Reconcile maths
+### [x] Task 4: Reconcile maths
 
 - Files: `src/lib/domain/packaging/reconcile.ts`,
   `src/lib/domain/packaging/__tests__/reconcile.test.ts`
@@ -396,3 +396,4 @@ Coder adds one line per task.
 - Task 1: contents.ts + 14 tests. Order-aware packing points per CJ Q4: travellers (unframed, free print, accessory, unclassified) ride the dispatch parcel, else A0, else unframed if any flat print, else dispatch.
 - Task 2: ruleSet.ts (zod + structural checks), evaluate.ts, 20 tests. Country condition omitted per CJ Q5. Added per-pick bounds (20 per item, 10 items) shared with the SQL.
 - Task 3: 512-combination parity with autoMailTubeForUnframedOrder for orders without a framed parcel; no differences. Documented the one deliberate difference (CJ Q4: prints go in the box when a framed parcel exists).
+- Task 4: reconcile.ts + 11 tests (deltas, convergence, partial posting).
