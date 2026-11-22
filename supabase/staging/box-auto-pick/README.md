@@ -104,3 +104,35 @@ Settings, or leave the site in `scan` mode.
 After applying the migration and before deploying the new preview, open the
 **previous** preview build and complete one order with a box scan. It must
 behave exactly as before (same deduction, `prod:order_…` ledger key).
+
+## 5. Synthetic rules for testing the preview
+
+Until the rule editor is built (plan Task 12), a rule set with rules has to
+be saved with SQL. On **staging**, as an owner or manager of the site, with
+two made-up packaging products created first (replace the ids):
+
+```sql
+SELECT set_config('request.jwt.claims', '{"sub":"<owner-uuid>","role":"authenticated"}', false);
+SELECT packaging_save_rule_set('<site>', NULL, '{
+  "schema_version": 1,
+  "catalogue": [
+    {"key": "TEST-S", "product_id": "<small box product id>", "label": "Test small box", "legacy_barcode": "+90="},
+    {"key": "TEST-L", "product_id": "<large box product id>", "label": "Test large box", "legacy_barcode": "+91="}
+  ],
+  "rules": [
+    {"id": "t1", "label": "TEST ONLY: one framed piece", "packing_point": "dispatch", "kinds": ["framed"], "max_pieces": 1,
+     "output": {"mode": "fixed", "packages": [{"key": "TEST-S", "qty": 1}]}},
+    {"id": "t2", "label": "TEST ONLY: two framed pieces", "packing_point": "dispatch", "kinds": ["framed"], "min_pieces": 2, "max_pieces": 2,
+     "output": {"mode": "fixed", "packages": [{"key": "TEST-L", "qty": 1}]}}
+  ],
+  "examples": [
+    {"id": "x1", "packing_point": "dispatch", "contents": [{"kind": "framed", "size": "A1", "pieces": 1}], "expect": [{"key": "TEST-S", "qty": 1}]},
+    {"id": "x2", "packing_point": "dispatch", "contents": [{"kind": "framed", "size": "A1", "pieces": 3}], "expect": "unresolved"}
+  ]
+}', 'TEST ONLY - synthetic rules, not Inka box rules');
+```
+
+These rules are deliberately meaningless (one piece = small, two = large,
+anything else = flagged). They exist to exercise the screens, not to
+describe how Inka packs. Open the draft in Settings, activate it there, and
+switch the site to automatic. Never copy them to production.

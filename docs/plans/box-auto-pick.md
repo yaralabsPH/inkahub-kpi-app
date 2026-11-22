@@ -306,7 +306,7 @@ Original text kept for the record; not to be implemented.
   (note: `tsc -b` does not cover `api/`; check it the way `typecheck:digest`
   does).
 
-### [ ] Task 15: Release notes and full check
+### [x] Task 15: Release notes and full check
 
 - Files: `docs/RELEASING.md` (short "Packaging auto-pick" section: mode
   switch, verification scripts, rollback), this plan's log
@@ -434,3 +434,4 @@ Coder adds one line per task.
 - Task 10: Rescanning a completed order shows its saved pick with Change box; one tap on a reason saves through packaging_override with the seen revision. packagingCorrection.ts holds the transitions (success, replay, conflict, no connection keeps the request id, refusal), 7 tests. A stray box scan never changes a saved pick. Not in the plan: src/lib/state/packagingCorrection.ts.
 - Task 11: PackagingRulesCard (owner/manager, Supabase only) + PackagingRulesView + editing.ts helpers, 14 tests. Includes Save draft and Activate (activation gate: saved, valid, at least one example, all pass) so a draft whose rules came from elsewhere can be activated; the rule and example editors themselves are Task 12. Not in the plan: src/components/packaging/PackagingRulesView.tsx, src/lib/domain/packaging/editing.ts.
 - Task 13: usage.ts (netting, catalogue products, completions without a pick) + 13 tests; both package cards now read correction rows and catalogue items; PackagingAttentionCard (owner/manager) lists flagged, short/unposted (with Retry) and missing picks, bounded by the date range and row caps, with a 2-minute grace so in-flight saves are not reported. The digest is untouched. Not verified here: the PostgREST or-filter (delta.lt.0,source_id.like."pkg:%") needs a look on the staging preview. Not in the plan: src/lib/hooks/usePackagingCatalogue.ts.
+- Task 15: RELEASING.md section (modes, release order, rollback, what to watch) and a TEST-ONLY synthetic rule set snippet in the staging README. npx tsc -b clean, 578/578 tests, npm run build passes (same chunk-size warning as before). Task 12 is still open (see Open questions), so the feature is not ready for Astra's review yet. Nothing was run against a real database and no screen was exercised against Supabase; that needs the migration on staging (CJ).
