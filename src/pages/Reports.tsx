@@ -17,6 +17,7 @@ import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { DailyTimesheetCard } from "@/components/DailyTimesheetCard";
 import { PackageUsageCard } from "@/components/PackageUsageCard";
 import { PackageHistoryCard } from "@/components/PackageHistoryCard";
+import { PackagingAttentionCard } from "@/components/PackagingAttentionCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
 
 /**
@@ -1086,6 +1087,8 @@ export function Reports() {
         toIso={range.to.toISOString()}
         rangeLabel={subtitleSuffix || "current range"}
       />
+
+      <PackagingAttentionCard fromIso={range.from.toISOString()} toIso={range.to.toISOString()} />
 
       <PackageHistoryCard />
 

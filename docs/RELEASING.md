@@ -174,3 +174,62 @@ A rejected override never falls back to the default address.
 
 Full staging checklist: [digest-auth spec, Staging test plan](specs/digest-auth.md#staging-test-plan).
 CI also runs `npm run typecheck:digest`, because `npx tsc -b` does not cover `api/`.
+
+## Packaging auto-pick (`box-auto-pick`, F4)
+
+Each site is in one of two packaging modes, set by an owner or manager in
+Settings → "Packaging (boxes and tubes)":
+
+- **Scan the box** (default, and what every site starts in): the old
+  behaviour. Nothing about this release changes it.
+- **Pick automatically**: the app picks the packaging from the site's active
+  rule set; no box scan. Needs an active rule set first.
+
+Stations read the mode when an order loads, so a switch takes effect on the
+next order without a deploy.
+
+### Release order
+
+1. **Before production:** check (read-only) that each site's box and tube
+   stock items exist, and what `products.current_on_hand`'s check constraint
+   allows. Both stock rules are handled; knowing which one production has
+   tells you whether a shortage shows as "stock went below zero" or "not
+   deducted yet".
+2. **Staging:** apply `0047_packaging_auto_pick.sql` (renumber first if
+   another feature took `0047`; only one feature's migration on shared
+   staging at a time). Then follow
+   `supabase/staging/box-auto-pick/README.md`: the old preview still
+   completes with a box scan, `01-verify.sql` passes, the two-session race
+   check passes.
+3. **Preview:** run the spec's staging test plan with synthetic rules.
+4. **Production (with the batch release):** back up, apply the migration at
+   a quiet time (it builds one small index on `ledger`), then merge and
+   deploy. Every site is still in scan mode; staff see no change.
+5. **Per site, later:** enter Max's rules and examples as a draft, make
+   every example pass, activate, then switch that one site to automatic.
+   Watch Reports → "Packaging needing attention" and box stock for a few
+   days before the next site.
+
+### Rolling back
+
+- **Fastest, no deploy:** switch the site back to "Scan the box". Stations
+  ask for a box scan again from their next order.
+- **App rollback (Vercel):** safe. The old build ignores the new tables and
+  uses the scan path. Packaging already recorded stays valid.
+- **Known edge:** if an order was completed in automatic mode and is then
+  completed again by an old build, the old build can deduct a box a second
+  time. It is visible in the ledger (`prod:order_…` and `pkg:…` rows for the
+  same order) and corrected with a normal stock adjustment.
+- The migration is additive only; there is nothing to undo in the database.
+
+### What to watch
+
+- Reports → **Packaging needing attention**: orders flagged because no rule
+  matched, packaging used with short stock (with Retry), and orders
+  completed in automatic mode with no packaging record.
+- A station showing "Packaging not saved yet for n orders" has saves waiting
+  for the network; they retry on their own with the same request, so they
+  cannot deduct twice.
+- The daily digest counts boxes gross until its follow-up change: a box
+  corrected *after* an order was completed shows twice there. The Reports
+  cards are already net.

@@ -11,6 +11,8 @@ import {
   MAIL_TUBE_LABELS,
 } from "@/lib/domain/skuRouting";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
+import { usePackagingCatalogue } from "@/lib/hooks/usePackagingCatalogue";
+import { netUsageByProduct, PACKAGE_USAGE_ROWS_FILTER } from "@/lib/domain/packaging/usage";
 
 interface LedgerRow {
   product_id: string;
@@ -38,6 +40,8 @@ export function PackageUsageCard({
   const [rows, setRows] = useState<LedgerRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // F4: packaging items from the site's rule sets (empty when there are none).
+  const catalogue = usePackagingCatalogue();
 
   // Which product IDs are packages? Match PACKAGE_TYPES.key against
   // product.code (dispatch scan flow) + the two known mail tube IDs
@@ -51,8 +55,9 @@ export function PackageUsageCard({
     }
     ids.add(MAIL_TUBE_LARGE_PRODUCT_ID);
     ids.add(MAIL_TUBE_SMALL_PRODUCT_ID);
+    for (const id of catalogue.keys()) ids.add(id);
     return ids;
-  }, [data]);
+  }, [data, catalogue]);
 
   // Fetch ledger rows for package products in the range.
   useEffect(() => {
@@ -73,7 +78,9 @@ export function PackageUsageCard({
             .select("product_id, delta, ts")
             .eq("location", location)
             .in("product_id", idsArray)
-            .lt("delta", 0)
+            // F4: also read the rows a packaging correction writes back, so
+            // a corrected box is not counted twice.
+            .or(PACKAGE_USAGE_ROWS_FILTER)
             .gte("ts", fromIso)
             .lte("ts", toIso)
             .order("ts", { ascending: true })
@@ -92,10 +99,7 @@ export function PackageUsageCard({
 
   const summary = useMemo(() => {
     if (!data) return { rows: [], totalQty: 0, totalCost: 0, hasCost: false };
-    const perProduct = new Map<string, number>();
-    for (const r of rows) {
-      perProduct.set(r.product_id, (perProduct.get(r.product_id) ?? 0) + Math.abs(r.delta));
-    }
+    const perProduct = netUsageByProduct(rows);
     const productById = new Map(data.products.map((p) => [p.id, p]));
     const currency = data.settings?.currency_symbol ?? "$";
     let totalQty = 0;
@@ -106,6 +110,7 @@ export function PackageUsageCard({
       const label =
         product?.code ??
         MAIL_TUBE_LABELS[productId] ??
+        catalogue.get(productId) ??
         "Unknown package";
       const unitCost = product?.unit_cost ?? null;
       const cost = unitCost != null ? qty * unitCost : null;
@@ -114,7 +119,7 @@ export function PackageUsageCard({
       return { productId, label, qty, unitCost, cost };
     }).sort((a, b) => b.qty - a.qty);
     return { rows: summaryRows, totalQty, totalCost, hasCost, currency };
-  }, [rows, data]);
+  }, [rows, data, catalogue]);
 
   return (
     <Card>
