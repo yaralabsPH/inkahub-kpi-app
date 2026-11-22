@@ -276,7 +276,7 @@ ids, rule sets and order numbers).
 - Done when: tests cover validation errors, example failure blocking
   activation, and simulator output for a synthetic set.
 
-### [ ] Task 13: Reports — net usage and attention list
+### [x] Task 13: Reports — net usage and attention list
 
 - Files: `src/components/PackageUsageCard.tsx`,
   `src/components/PackageHistoryCard.tsx`,
@@ -433,3 +433,4 @@ Coder adds one line per task.
 - Task 9: PackagingPanel (station and classic looks, saved-pick views ready for Task 10), slot on StationOrderScreen and the classic ActiveScreen, legacy box barcodes become a manual pick in auto mode (first scan replaces the prediction, later scans add one). Scan mode renders the old panels untouched. 15 new component tests. Also touched: station.css (three small classes).
 - Task 10: Rescanning a completed order shows its saved pick with Change box; one tap on a reason saves through packaging_override with the seen revision. packagingCorrection.ts holds the transitions (success, replay, conflict, no connection keeps the request id, refusal), 7 tests. A stray box scan never changes a saved pick. Not in the plan: src/lib/state/packagingCorrection.ts.
 - Task 11: PackagingRulesCard (owner/manager, Supabase only) + PackagingRulesView + editing.ts helpers, 14 tests. Includes Save draft and Activate (activation gate: saved, valid, at least one example, all pass) so a draft whose rules came from elsewhere can be activated; the rule and example editors themselves are Task 12. Not in the plan: src/components/packaging/PackagingRulesView.tsx, src/lib/domain/packaging/editing.ts.
+- Task 13: usage.ts (netting, catalogue products, completions without a pick) + 13 tests; both package cards now read correction rows and catalogue items; PackagingAttentionCard (owner/manager) lists flagged, short/unposted (with Retry) and missing picks, bounded by the date range and row caps, with a 2-minute grace so in-flight saves are not reported. The digest is untouched. Not verified here: the PostgREST or-filter (delta.lt.0,source_id.like."pkg:%") needs a look on the staging preview. Not in the plan: src/lib/hooks/usePackagingCatalogue.ts.

@@ -12,6 +12,8 @@ import {
   MAIL_TUBE_LABELS,
 } from "@/lib/domain/skuRouting";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
+import { usePackagingCatalogue } from "@/lib/hooks/usePackagingCatalogue";
+import { PACKAGE_USAGE_ROWS_FILTER, usageOf } from "@/lib/domain/packaging/usage";
 
 interface LedgerRow {
   product_id: string;
@@ -99,6 +101,7 @@ export function PackageHistoryCard() {
   const supabase = getSupabase();
   const location = useAppStore((s) => s.location);
   const { data } = useDataset();
+  const catalogue = usePackagingCatalogue();
   const [periodKey, setPeriodKey] = useState<PeriodKey>("12w");
   const period = PERIODS.find((p) => p.key === periodKey) ?? PERIODS[3];
 
@@ -162,8 +165,23 @@ export function PackageHistoryCard() {
           : null,
       });
     }
+    // F4: packaging items from the site's rule sets that are not in the
+    // hard-coded list above.
+    const listed = new Set(slots.map((s) => s.product?.id).filter(Boolean));
+    for (const [productId, label] of catalogue) {
+      if (listed.has(productId)) continue;
+      const product = byId.get(productId) ?? null;
+      slots.push({
+        key: productId,
+        label,
+        kind: "box",
+        product: product
+          ? { id: product.id, supplier: product.supplier ?? "", current_on_hand: product.current_on_hand ?? 0 }
+          : null,
+      });
+    }
     return slots;
-  }, [data]);
+  }, [data, catalogue]);
 
   const packageProductIds = useMemo(() => {
     const s = new Set<string>();
@@ -192,7 +210,8 @@ export function PackageHistoryCard() {
                 .select("product_id, delta, ts")
                 .eq("location", location)
                 .in("product_id", idsArray)
-                .lt("delta", 0)
+                // F4: include rows written back by packaging corrections.
+                .or(PACKAGE_USAGE_ROWS_FILTER)
                 .gte("ts", fromIso)
                 .order("ts", { ascending: true })
                 .range(from, to),
@@ -260,7 +279,12 @@ export function PackageHistoryCard() {
       const idx = bucketKeys.indexOf(key);
       if (idx < 0) continue;
       const arr = perProduct.get(r.product_id);
-      if (arr) arr[idx] += Math.abs(r.delta);
+      if (arr) arr[idx] += usageOf(r);
+    }
+    // A correction can land in a later bucket than its deduction; never show
+    // negative usage for a bucket.
+    for (const arr of perProduct.values()) {
+      for (let i = 0; i < arr.length; i++) if (arr[i] < 0) arr[i] = 0;
     }
     return packageSlots.map((slot) => {
       const buckets = slot.product ? (perProduct.get(slot.product.id) ?? new Array(period.bucketCount).fill(0)) : new Array(period.bucketCount).fill(0);
