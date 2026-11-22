@@ -31,3 +31,21 @@ Status: changes requested before staging. Read-only review of 119d52a..0df84ec (
 API exact-match/completeness flags are sound. Server canonical receipts, atomic stock/packaging, frozen payload and direct receipt-write restrictions are useful existing foundations. Keep 0055 as the single unapplied migration if practical, reuse current structures, and maintain clean classic fallback. These are corrections to approved F6 behavior, not added features. F7 must reuse phase-aware guards/caller fencing and distinct dispatch receipts later.
 
 After fixes: focused regressions and updated SQL/race cases, one final full gate, fresh focused re-review; then Codex will run actual staging roles and two-connection races. Do not claim local PGlite establishes concurrent behavior or physical scanner commissioning.
+
+## Coder response
+
+All 11 fixed in `af2ab96` (0055 + staging SQL) and `90937ac` (client); docs and hashes in the next commit. 0055 edited in place (unapplied); nothing earlier touched.
+
+1. Activation returns `unusable_badge` when the value exists in `staff_barcodes` anywhere but is not active here (nothing disclosed); the client treats it as a refusal, never an order fallback. SQL B02-B02d (hex and numeric, inactive and other-site); session and controller tests.
+2. Outbox `priorUnknown` (set at `markAttempt` when the job was already uncertain); a commit-stage refusal keeps `uncertain` in that case; dismiss stays refused; the wall says "not confirmed / do NOT record on classic" and offers only Retry. Test: unknown -> refusal -> dismiss denied -> Retry replays the identical request -> saved.
+3. BEFORE INSERT trigger `production_events_c6_scanner_guard` (framed/a0_framed line_verified/completed with cs_case_id NULL) takes the same `prod-order` advisory lock and refuses after a saved shared receipt for that work type. SQL M01-M09; R1 race now expects the classic insert to wait then fail; A-END checks credit counts for both arrival orders (R1, R2).
+4. Per-claim lease token: `setPrepared`/`markAttempt` throw `LeaseLostError` (-> `superseded`), `markBlocked`/`retryLater` ignore stale tokens, `markDone` never rewrites done/dismissed. Test: expired lease, B saves, A's late refusal and retry-later leave it done/saved.
+5. Legacy deduction raises `ambiguous_event` when more than one visible site has the id. SQL J11/J12.
+6. Prior charge = any `prod:order_<n>:...` ledger row with the same product id (index `ledger_prod_order_idx` on site, `split_part(source_id, ':', 2)`, product; partial `LIKE 'prod:%'`). SQL J13/J14 (mixed case, foreign alias, id).
+7. A hex8 scan while that scanner's check is pending is refused loudly (`badge_pending`) and the first is kept. Test: Alice + 10190203 + 10190204 -> first queued for Alice, second refused.
+8. `p_expected_caller` on both RPCs, checked before replay and writes; client classifies `caller_mismatch` as wait (auth), never block; controller and `processNext` start nothing after disposal (`active()`). SQL B02e, C07b, C07c; test: delayed lookup, B signs in, station closed -> superseded, nothing sent; sent under B -> mismatch -> stays prepared; A again -> saved.
+9. `PENDING_MAX_MS` 20 s: late answers ignored with a recovery message, plus a periodic sweep; the fallback identity is restored with the scan time. Test: a reply 15 s after a scan made 5 s before expiry queues the order, but a later unbadged order is `identity_expired`; a reply past the bound -> timedOut, no order.
+10. `loadScannerPackaging` (scanner only; F4's loader unchanged) separates transport (wait) from scan/missing/invalid (classic reason); `processNext` asks for rules only when preparation says A0 needs them. Tests: regular-only never calls it; A0 transport waits; A0 missing -> blocked `packaging_not_auto`.
+11. Controller is created inside the effect (fresh per run) and disposed in cleanup; UI effects wait for it. There is no DOM test environment (none added), so the regression drives the same setup -> dispose -> setup order on the controller: the disposed one starts nothing and the second completes badge -> order -> saved.
+
+Checks: tsc, typecheck:digest, typecheck:api, 953/953 tests (40 files), build; local PGlite 02-assertions 160 cases pass (not staging evidence). Staging roles and two-connection races remain for Codex.

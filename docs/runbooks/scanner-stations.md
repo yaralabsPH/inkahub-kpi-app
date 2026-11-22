@@ -35,7 +35,7 @@ setup screen (1–4 capital letters/digits starting with a letter, max three).
 | An active 8-hex badge, e.g. `A1B2C3D4` | Sign in (online only); clocks in once per site workday (04:00 site-local) |
 | `190203` (6 digits) | Order `10190203` (legacy packing slip: "10" is always added) |
 | `#10190203` | Order `10190203`, explicitly not a badge |
-| `10190203` (8 digits) | Badge first. Online: if no active badge matches, it is that order. **Offline: rejected and the scanner is signed out** (could be either) |
+| `10190203` (8 digits) | Badge first. Online: if no badge with this value exists anywhere, it is that order; a badge that exists but is inactive or from another site is refused (scan the slip or `#number` instead). One such check per scanner at a time: a second scan meanwhile is refused loudly; a check over 20 s is dropped and the scanner signed out. **Offline: rejected and the scanner is signed out** (could be either) |
 | anything else | Rejected |
 
 Issue synthetic staging badges in Settings → Team members; use real staging orders.
@@ -63,6 +63,16 @@ approved), Shopify did not return the complete exact order, existing or
 partial framing/dispatch work, A0 without F4 auto mode or without a resolved
 box prediction, missing stock code, stock already charged, packaging that
 could not be posted, stock floor refusal. Nothing is written for any of them.
+Regular-only orders never need box rules; an A0 order at a site without
+usable automatic rules is blocked with that reason (a box-rule read that
+fails in transit just waits).
+
+## Classic station after a shared save
+
+Once the shared scanners saved an order's Framed or A0 Framed work, the
+classic station cannot add verification/completion credit for that work
+type ("already saved by the shared scanners"). Dispatch, CS-case
+replacement work and the other work type are unaffected.
 
 ## Packaging prerequisites (A0)
 
@@ -77,7 +87,11 @@ still does). Real rules are a commissioning task, not set by this feature.
   cannot sign in. Storage failure is red NOT SAVED, never accepted.
 - Unknown outcome (sent, no answer): the job keeps its request id and exact
   payload and is re-sent; the server answers from its receipt. Never enter
-  such an order on the classic station while it shows "awaiting answer".
+  such an order on the classic station while it shows "awaiting answer" or
+  "may already have saved" (even after a later refusal, e.g. lost access):
+  only Retry is offered until the server confirms.
+- Every request carries the account that scanned it; the server refuses it
+  under any other signed-in account and it waits for that account.
 - Blocked jobs list the reason. **Retry** re-sends the same request (or
   re-checks the order if nothing was sent yet). **Recorded on classic** (tap
   twice) removes it after you recorded it on the classic station.
