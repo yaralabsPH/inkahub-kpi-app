@@ -55,8 +55,11 @@ export interface ArtworkManifest {
 
 export interface ComponentConflict {
   ordinal: number;
-  /** distinct_contents: two or more different live contents match one component. */
-  reason: "distinct_contents";
+  /**
+   * distinct_contents: two or more different live contents match one component.
+   * shared_source: one file ID matches more than one component.
+   */
+  reason: "distinct_contents" | "shared_source";
   candidates: Array<{ fileId: string; path: string; contentHash: string }>;
 }
 
@@ -89,12 +92,23 @@ export function resolveManifest(
   const check = validateAliases(approvedAliases);
   if (!check.ok) throw new RangeError(`invalid artwork alias list: ${check.problems.join("; ")}`);
 
-  const live = currentFiles.filter((f) => !f.deleted);
-  const components: ManifestComponent[] = [];
-  const conflicts: ComponentConflict[] = [];
-  const missingOrdinals: number[] = [];
-
+  // An alias must not borrow another component's canonical name, or component
+  // 01's file could also "fill" component 02.
+  const canonicalOrdinal = new Map<string, number>();
   for (const expected of descriptor.components) {
+    for (const stem of expected.stems) canonicalOrdinal.set(stem.toUpperCase(), expected.ordinal);
+  }
+  for (const expected of descriptor.components) {
+    for (const a of approvedAliasesFor(descriptor.code, expected.ordinal, approvedAliases)) {
+      const owner = canonicalOrdinal.get(a.stem.toUpperCase());
+      if (owner !== undefined && owner !== expected.ordinal) {
+        throw new RangeError(`invalid artwork alias list: alias ${a.stem} → ${descriptor.code}#${expected.ordinal} is the canonical name of ordinal ${owner}`);
+      }
+    }
+  }
+
+  const live = currentFiles.filter((f) => !f.deleted);
+  const candidatesByOrdinal = descriptor.components.map((expected) => {
     const candidates: Candidate[] = [];
     for (const file of live) {
       const stem = expected.stems.find((s) => isCandidateName(file.name, s));
@@ -104,6 +118,36 @@ export function resolveManifest(
       }
       const alias = approvedAliasesFor(descriptor.code, expected.ordinal, approvedAliases).find((a) => isCandidateName(file.name, a.stem));
       if (alias) candidates.push({ file, stem: alias.stem.toUpperCase(), via: "alias", alias });
+    }
+    return candidates;
+  });
+
+  // One source file can never stand in for two components.
+  const ordinalsByFileId = new Map<string, Set<number>>();
+  descriptor.components.forEach((expected, i) => {
+    for (const c of candidatesByOrdinal[i]) {
+      const set = ordinalsByFileId.get(c.file.fileId) ?? new Set<number>();
+      set.add(expected.ordinal);
+      ordinalsByFileId.set(c.file.fileId, set);
+    }
+  });
+
+  const components: ManifestComponent[] = [];
+  const conflicts: ComponentConflict[] = [];
+  const missingOrdinals: number[] = [];
+
+  for (const [i, expected] of descriptor.components.entries()) {
+    const candidates = candidatesByOrdinal[i];
+    const shared = candidates.filter((c) => (ordinalsByFileId.get(c.file.fileId)?.size ?? 0) > 1);
+    if (shared.length > 0) {
+      conflicts.push({
+        ordinal: expected.ordinal,
+        reason: "shared_source",
+        candidates: shared
+          .map((c) => ({ fileId: c.file.fileId, path: c.file.path, contentHash: c.file.contentHash }))
+          .sort((a, b) => compareCodepoints(a.path, b.path)),
+      });
+      continue;
     }
 
     if (candidates.length === 0) {

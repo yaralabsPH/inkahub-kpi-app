@@ -199,6 +199,32 @@ describe("resolveManifest", () => {
     // validateAliases rejects one stem bound to two targets, so this cannot be configured.
     expect(() => resolveManifest(item("INKA-S2WIL0049-A2-FN"), [shared], aliases)).toThrow(/alias/i);
   });
+
+  it("rejects an alias that points one ordinal at another ordinal's canonical name (missing 02 stays missing)", () => {
+    const provenance = { source: "t", verifiedBy: "CJ", verifiedAt: "2026-11-22" };
+    const only01 = file("INKA-S2-WIL0049-01.jpg");
+    const sku = "INKA-S2WIL0049-A2-FN";
+    expect(resolveManifest(item(sku), [only01])).toMatchObject({ status: "missing", missingOrdinals: [2] });
+    for (const stem of ["INKA-S2-WIL0049-01", "inka-s2wil0049-01"]) {
+      const aliases: ArtworkAlias[] = [{ code: "S2WIL0049", ordinal: 2, stem, status: "approved", provenance }];
+      expect(() => resolveManifest(item(sku), [only01], aliases)).toThrow(/alias.*ordinal 1/i);
+    }
+    // An alias onto its own ordinal's canonical name is redundant but harmless.
+    const own: ArtworkAlias[] = [{ code: "S2WIL0049", ordinal: 2, stem: "INKA-S2-WIL0049-02", status: "approved", provenance }];
+    expect(resolveManifest(item(sku), [only01], own)).toMatchObject({ status: "missing", missingOrdinals: [2] });
+  });
+
+  it("never lets one file ID fill two ordinals, even from duplicate observation records", () => {
+    const one = file("INKA-S2-WIL0049-01.jpg");
+    const sameFileRenamed = { ...file("INKA-S2-WIL0049-02.jpg"), fileId: one.fileId, contentHash: one.contentHash };
+    const r = resolveManifest(item("INKA-S2WIL0049-A2-FN"), [one, sameFileRenamed]);
+    expect(r).toMatchObject({ status: "ambiguous", missingOrdinals: [] });
+    if (r.status !== "ambiguous") throw new Error("unreachable");
+    expect(r.conflicts.map((c) => [c.ordinal, c.reason])).toEqual([
+      [1, "shared_source"],
+      [2, "shared_source"],
+    ]);
+  });
 });
 
 describe("manifestPayload / revisionDigest", () => {

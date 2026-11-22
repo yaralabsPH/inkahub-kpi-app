@@ -18,4 +18,19 @@ Coder ran 90 Task 4 tests and the normal type checks/full tests; the independent
 
 ## Coder response
 
-(Record fix and actual validation here.)
+Must-fix fixed in `src/lib/domain/artworkManifest.ts` (`resolveManifest`):
+
+- An approved alias whose stem matches another ordinal's canonical name in either form (`INKA-S2-WIL0049-01` or `INKA-S2WIL0049-01`) is now rejected as invalid alias data. It throws a `RangeError` like the other alias-list errors. An alias onto its own ordinal's canonical name is still allowed, because it is redundant and harmless.
+- As a second guard, any file ID that matches more than one ordinal now gives an `ambiguous` result, with a `shared_source` conflict on each affected ordinal. It never gives a complete manifest. This also catches the case where duplicate observation records share one file ID under two names. `ComponentConflict.reason` now includes `"shared_source"`.
+- Regressions sit beside the existing two-component alias test in `src/lib/domain/__tests__/artworkManifest.test.ts`:
+  - The reviewer's scenario: only `-01` is present and an ordinal-2 alias points at `-01`. It now throws, and without the alias `-02` stays missing.
+  - One file ID across two ordinals now gives `shared_source` on ordinals 1 and 2.
+  - Both tests were run against the old code first and failed; they pass now.
+
+Validation, run on the fix in this checkout on 2026-11-22:
+
+- `npx vitest run src/lib/domain/__tests__/artworkManifest.test.ts`: 23/23 passed.
+- `npx tsc -b`: exit 0.
+- `npm run typecheck:artwork`: exit 0.
+- `npm run test -- --run`: 11 files, 561/561 passed.
+- `npm run build`: exit 0. The only output was Vite's existing chunk-size warning.
