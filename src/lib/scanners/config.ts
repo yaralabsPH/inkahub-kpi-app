@@ -3,6 +3,7 @@
  * receiver-health rule. Pure apart from the storage passed in.
  */
 import { DEFAULT_SCANNER_IDS, validateScannerIds } from "./protocol";
+import type { ScanMode } from "./dispatch";
 
 export const SHARED_SCANNER_KEY = "inkaar.production.sharedScanners";
 
@@ -13,6 +14,8 @@ export interface SharedScannerConfig {
   /** Free text shown on the health card, e.g. "Framing wall". */
   label: string;
   scannerIds: string[];
+  /** F7: what new scans on this receiver record. Absent (F6 configs) = framing. */
+  mode?: ScanMode;
 }
 
 type KV = Pick<Storage, "getItem" | "setItem">;
@@ -39,7 +42,9 @@ export function loadSharedScannerConfig(storage: KV | null): SharedScannerConfig
       receiverId: p.receiverId,
       label: typeof p.label === "string" ? p.label.slice(0, 60) : "",
       scannerIds: ids,
+      mode: p.mode === "dispatch" ? "dispatch" : "framing",
     };
+
   } catch {
     return null;
   }

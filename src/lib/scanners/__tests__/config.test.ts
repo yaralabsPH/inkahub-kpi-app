@@ -18,7 +18,12 @@ describe("device config", () => {
     const s = mem();
     expect(loadSharedScannerConfig(s)).toBeNull();
     saveSharedScannerConfig(s, { enabled: true, receiverId: "rcv-abc", label: "Wall", scannerIds: ["S1", "S2"] });
-    expect(loadSharedScannerConfig(s)).toEqual({ enabled: true, receiverId: "rcv-abc", label: "Wall", scannerIds: ["S1", "S2"] });
+    // An F6 config (no mode) reads as framing; F7 dispatch round-trips; anything else is framing.
+    expect(loadSharedScannerConfig(s)).toEqual({ enabled: true, receiverId: "rcv-abc", label: "Wall", scannerIds: ["S1", "S2"], mode: "framing" });
+    saveSharedScannerConfig(s, { enabled: true, receiverId: "rcv-abc", label: "Desk", scannerIds: ["S1"], mode: "dispatch" });
+    expect(loadSharedScannerConfig(s)?.mode).toBe("dispatch");
+    expect(loadSharedScannerConfig(mem({ [SHARED_SCANNER_KEY]: '{"enabled":true,"receiverId":"r","mode":"x"}' }))?.mode).toBe("framing");
+
     expect(loadSharedScannerConfig(mem({ [SHARED_SCANNER_KEY]: '{"enabled":true,"receiverId":"bad id"}' }))).toBeNull();
     expect(loadSharedScannerConfig(mem({ [SHARED_SCANNER_KEY]: '{"enabled":true,"receiverId":"r","scannerIds":["S1","S1"]}' }))).toBeNull();
     expect(loadSharedScannerConfig(mem({ [SHARED_SCANNER_KEY]: "not json" }))).toBeNull();

@@ -1,6 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { activateBadge, commitFraming, fetchOrderLookup, hasOpenCase, loadScannerPackaging, newRequestId, processNext, sendHeartbeat } from "@/lib/scanners/client";
+import {
+  activateBadge,
+  activateDispatchBadge,
+  commitDispatch,
+  commitFraming,
+  fetchDispatchPeople,
+  fetchFramerEvidence,
+  fetchOrderLookup,
+  hasOpenCase,
+  loadScannerPackaging,
+  newRequestId,
+  processNext,
+  sendHeartbeat,
+} from "@/lib/scanners/client";
+import type { FramerChoice, ScanMode } from "@/lib/scanners/dispatch";
 import { createFrameParser, DEFAULT_PROTOCOL } from "@/lib/scanners/protocol";
 import { createScannerOutbox, dexieJobStore, type JobScope } from "@/lib/scanners/outbox";
 import { emptySlots } from "@/lib/scanners/session";
@@ -42,8 +56,11 @@ export function useSharedScannerStation(opts: {
   label: string;
   scannerIds: string[];
   products: readonly CatalogueProduct[] | null;
+  /** F7: framing (F6) or dispatch. Mount with a key that includes it. */
+  mode?: ScanMode;
 }) {
   const { client, location, callerId, receiverId, label, scannerIds } = opts;
+  const mode: ScanMode = opts.mode ?? "framing";
   const productsRef = useRef(opts.products);
   productsRef.current = opts.products;
 
@@ -103,8 +120,12 @@ export function useSharedScannerStation(opts: {
     c = new SharedScannerController({
       scannerIds: ids,
       scope,
+      mode,
       outbox,
-      activate: (a) => activateBadge(client, { location, receiverId, expectedCaller: callerId, ...a }),
+      activate: (a) =>
+        mode === "dispatch"
+          ? activateDispatchBadge(client, { location, receiverId, expectedCaller: callerId, ...a })
+          : activateBadge(client, { location, receiverId, expectedCaller: callerId, ...a }),
       deliver: () =>
         processNext({
           outbox,
@@ -119,6 +140,9 @@ export function useSharedScannerStation(opts: {
           products: () => productsRef.current,
           packaging: () => loadScannerPackaging(client, location),
           commit: (job, prepared) => commitFraming(client, job, prepared),
+          // Every job is delivered by its own captured mode, whatever this screen shows.
+          evidence: (n, lines) => fetchFramerEvidence(client, { location, orderNumber: n, lines, expectedCaller: callerId }),
+          commitDispatch: (job, prepared) => commitDispatch(client, job, prepared),
         }),
       isOnline: () => navigator.onLine,
       now: () => Date.now(),
@@ -135,7 +159,7 @@ export function useSharedScannerStation(opts: {
       mine.dispose();
       setController((cur) => (cur === mine ? null : cur));
     };
-  }, [client, location, callerId, receiverId, scope, owner, sound, idsKey]);
+  }, [client, location, callerId, receiverId, scope, owner, sound, idsKey, mode]);
 
   // ---- key capture ---------------------------------------------------------
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -263,6 +287,9 @@ export function useSharedScannerStation(opts: {
     start,
     retry: (id: string) => void controller?.retry(id),
     dismiss: (id: string) => void controller?.dismiss(id),
+    chooseFramers: (id: string, choices: readonly FramerChoice[]) => void controller?.chooseFramers(id, choices),
+    loadPeople: () => fetchDispatchPeople(client, location),
+
     signOutAll: () => controller?.resetAll("Signed out by the operator."),
   };
 }

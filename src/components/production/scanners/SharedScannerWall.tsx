@@ -1,6 +1,8 @@
 import { useState } from "react";
-import type { ScannerJob } from "@/lib/scanners/outbox";
+import { firstWaitingChoice, type ScannerJob } from "@/lib/scanners/outbox";
 import { msUntilExpiry } from "@/lib/scanners/session";
+import type { FramerChoice, ScanMode } from "@/lib/scanners/dispatch";
+import { FramerPicker, type PeopleState } from "./FramerPicker";
 import type { WallResult, WallState } from "@/lib/scanners/station";
 import { cn } from "@/lib/utils/cn";
 import type { DeviceStatus } from "./useSharedScannerStation";
@@ -24,6 +26,13 @@ export interface SharedScannerWallProps {
   onDismiss(requestId: string): void;
   onSignOutAll(): void;
   onExit(): void;
+  /** F7. Absent = framing (F6). */
+  mode?: ScanMode;
+  /** F7: switch this receiver between framing and dispatch (tap twice). */
+  onSwitchMode?(): void;
+  onChooseFramers?(requestId: string, choices: FramerChoice[]): void;
+  /** F7: people for the framer chooser (loaded only while a choice is waiting). */
+  people?: PeopleState;
 }
 
 const RESULT_STYLE: Record<WallResult["kind"], string> = {
@@ -64,7 +73,9 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
     warnings.push(`${state.view.corrupt.length} stored scan(s) cannot be read. Do not clear browser data; ask a manager.`);
   }
 
+  const mode: ScanMode = p.mode ?? "framing";
   const blocked = state.view?.jobs.filter((j) => j.status === "blocked") ?? [];
+  const choice = firstWaitingChoice(state.view?.jobs ?? []);
   const waiting = state.view?.waiting ?? 0;
   const uncertain = state.view?.uncertain ?? 0;
   const last = state.last;
@@ -84,7 +95,9 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
     <div className="min-h-screen flex flex-col bg-slate-950 text-white select-none" data-testid="shared-scanner-wall">
       <header className="flex items-center justify-between px-6 py-3 border-b border-slate-800">
         <div>
-          <div className="text-xs uppercase tracking-widest text-slate-400">Shared scanners · {p.siteLabel}</div>
+          <div className="text-xs uppercase tracking-widest text-slate-400">
+            Shared scanners · {p.siteLabel} · <span data-testid="wall-mode" className={mode === "dispatch" ? "text-sky-300" : ""}>{mode === "dispatch" ? "Dispatch" : "Framing"}</span>
+          </div>
           <div className="text-lg font-semibold">{p.receiverLabel || "Receiver"}</div>
         </div>
         <div className="flex items-center gap-2 text-xs">
@@ -96,7 +109,17 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
             Screen {device.wakeLock === "on" ? "kept awake" : device.wakeLock === "unsupported" ? "lock unsupported" : device.wakeLock === "failed" ? "lock failed" : "may sleep"}
           </span>
           <span className="px-2 py-1 rounded bg-slate-800">Sound {device.audio === "on" ? "on" : device.audio === "unsupported" ? "unsupported" : "off"}</span>
-          <button type="button" onClick={p.onSignOutAll} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">Sign out all</button>
+          <button type="button" onClick={p.onSignOutAll} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700">
+            {mode === "dispatch" ? "Switch worker" : "Sign out all"}
+          </button>
+          {p.onSwitchMode ? (
+            <button type="button" onClick={() => arm("mode", p.onSwitchMode!)} data-testid="switch-mode"
+              className={cn("px-2 py-1 rounded", armed === "mode" ? "bg-amber-500 text-amber-950" : "bg-slate-800 hover:bg-slate-700")}>
+              {armed === "mode"
+                ? `Tap again: switch to ${mode === "dispatch" ? "framing" : "dispatch"} (everyone signs out; queued scans keep their own mode)`
+                : mode === "dispatch" ? "Framing mode" : "Dispatch mode"}
+            </button>
+          ) : null}
           <button type="button" onClick={() => arm("exit", p.onExit)} className={cn("px-2 py-1 rounded", armed === "exit" ? "bg-amber-500 text-amber-950" : "bg-slate-800 hover:bg-slate-700")}>
             {armed === "exit"
               ? (waiting + blocked.length > 0 ? `Tap again: ${waiting + blocked.length} scan(s) stay stored here` : "Tap again for classic")
@@ -136,7 +159,11 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
               ) : slot?.identity ? (
                 <>
                   <div className="text-3xl font-bold mt-1">{slot.identity.displayName}</div>
-                  <div className="text-sm text-slate-400 mt-1">Signs out in {mmss(left ?? 0)} without a scan</div>
+                  <div className="text-sm text-slate-400 mt-1">
+                    {slot.identity.expiresAt !== undefined
+                      ? `Dispatching until ${new Date(slot.identity.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+                      : `Signs out in ${mmss(left ?? 0)} without a scan`}
+                  </div>
                 </>
               ) : (
                 <div className="text-2xl text-slate-500 mt-1">Scan badge</div>
@@ -158,14 +185,35 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
                   .join(" · ")}
               </div>
             ) : null}
+            {last.framers && last.framers.length > 0 ? (
+              <ul className="text-2xl mt-4 space-y-1" data-testid="framed-by">
+                {last.framers.map((f) => (
+                  <li key={f.sku}>
+                    <span className="font-semibold">Framed by: {f.displayName}</span>{" "}
+                    {f.source === "scan" ? "✓" : <span className="text-base font-bold uppercase tracking-wide bg-black/30 rounded px-2 py-0.5">Manual</span>}
+                    <span className="text-base opacity-80 font-mono ml-3">{f.sku}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
             {last.detail ? <div className="text-xl mt-3 opacity-90">{last.detail}</div> : null}
           </div>
         ) : (
           <div className="rounded-2xl bg-slate-900 ring-1 ring-slate-800 h-full flex items-center justify-center text-3xl text-slate-500">
-            Scan badge, then order
+            {mode === "dispatch" ? "Scan your badge once for the shift, then order slips" : "Scan badge, then order"}
           </div>
         )}
       </section>
+
+      {choice && p.onChooseFramers ? (
+        <FramerPicker
+          job={choice}
+          people={p.people ?? { status: "loading" }}
+          onSave={(choices) => p.onChooseFramers!(choice.requestId, choices)}
+          onRecheck={() => p.onRetry(choice.requestId)}
+        />
+      ) : null}
+
 
       {blocked.length > 0 ? (
         <section className="px-6 pb-4" data-testid="blocked-jobs">

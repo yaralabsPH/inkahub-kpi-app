@@ -6,6 +6,9 @@ import { useAppStore } from "@/lib/state/appStore";
 import { LOCATION_LABELS, type LocationKey } from "@/lib/domain";
 import { DEFAULT_SCANNER_IDS, validateScannerIds } from "@/lib/scanners/protocol";
 import { newReceiverId, type SharedScannerConfig } from "@/lib/scanners/config";
+import { firstWaitingChoice } from "@/lib/scanners/outbox";
+import type { ScanMode } from "@/lib/scanners/dispatch";
+import type { PeopleState } from "./FramerPicker";
 import { SharedScannerWall } from "./SharedScannerWall";
 import { useSharedScannerStation } from "./useSharedScannerStation";
 
@@ -17,7 +20,12 @@ const OPERATOR_ROLES = new Set(["owner", "manager", "kiosk"]);
  * receiver or scanner list changes, because the inner station is keyed on
  * all four.
  */
-export function SharedScannerStation({ config, onExit }: { config: SharedScannerConfig; onExit(): void }) {
+export function SharedScannerStation({ config, onExit, onChangeConfig }: {
+  config: SharedScannerConfig;
+  onExit(): void;
+  /** F7: persist a changed config (mode switch). */
+  onChangeConfig?(cfg: SharedScannerConfig): void;
+}) {
   const auth = useAuthOptional();
   const location = useAppStore((s) => s.location);
   const callerId = auth?.user?.id ?? null;
@@ -28,28 +36,50 @@ export function SharedScannerStation({ config, onExit }: { config: SharedScanner
       </div>
     );
   }
-  const key = [callerId, location, config.receiverId, config.scannerIds.join(",")].join("|");
+  const mode: ScanMode = config.mode ?? "framing";
+  // Mode is part of the key: switching it starts from empty identities
+  // (queued jobs stay, each with the mode it was scanned in).
+  const key = [callerId, location, config.receiverId, config.scannerIds.join(","), mode].join("|");
   return (
     <Inner
       key={key}
       config={config}
+      mode={mode}
       callerId={callerId}
       location={location}
       roleAllowed={OPERATOR_ROLES.has(auth?.profile?.role ?? "")}
       onExit={onExit}
+      onSwitchMode={onChangeConfig ? () => onChangeConfig({ ...config, mode: mode === "dispatch" ? "framing" : "dispatch" }) : undefined}
     />
   );
 }
 
-function Inner({ config, callerId, location, roleAllowed, onExit }: {
-  config: SharedScannerConfig; callerId: string; location: string; roleAllowed: boolean; onExit(): void;
+function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitchMode }: {
+  config: SharedScannerConfig; mode: ScanMode; callerId: string; location: string; roleAllowed: boolean; onExit(): void; onSwitchMode?(): void;
 }) {
   const client = getSupabase();
   const { data: dataset } = useDataset();
   const products = useMemo(() => (dataset ? dataset.products.map((p) => ({ id: p.id, code: p.code })) : null), [dataset]);
   const st = useSharedScannerStation({
-    client, location, callerId, receiverId: config.receiverId, label: config.label, scannerIds: config.scannerIds, products,
+    client, location, callerId, receiverId: config.receiverId, label: config.label, scannerIds: config.scannerIds, products, mode,
   });
+  // People for the framer chooser: loaded when a choice is waiting, once per waiting job.
+  const waitingId = firstWaitingChoice(st.state.view?.jobs ?? [])?.requestId ?? null;
+  const [people, setPeople] = useState<PeopleState>({ status: "loading" });
+  const { loadPeople } = st;
+  useEffect(() => {
+    if (!waitingId) return;
+    let cancelled = false;
+    setPeople({ status: "loading" });
+    void loadPeople().then((r) => {
+      if (cancelled) return;
+      setPeople(r.outcome === "ok" ? { status: "ok", people: r.people } : { status: "error", message: r.message });
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waitingId]);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const t = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -70,6 +100,10 @@ function Inner({ config, callerId, location, roleAllowed, onExit }: {
       onDismiss={st.dismiss}
       onSignOutAll={st.signOutAll}
       onExit={onExit}
+      mode={mode}
+      onSwitchMode={onSwitchMode}
+      onChooseFramers={st.chooseFramers}
+      people={people}
     />
   );
 }
@@ -82,6 +116,7 @@ export function SharedScannerSetup({ current, onSave, onCancel }: {
 }) {
   const [label, setLabel] = useState(current?.label ?? "");
   const [ids, setIds] = useState((current?.scannerIds ?? [...DEFAULT_SCANNER_IDS]).join(", "));
+  const [mode, setMode] = useState<ScanMode>(current?.mode ?? "framing");
   const parsed = ids.split(",").map((s) => s.trim()).filter(Boolean);
   const problem = validateScannerIds(parsed);
   return (
@@ -103,11 +138,17 @@ export function SharedScannerSetup({ current, onSave, onCancel }: {
           <input value={ids} onChange={(e) => setIds(e.target.value)}
             className="mt-1 w-full rounded-md ring-1 ring-slate-300 dark:ring-slate-700 px-3 h-9 bg-transparent font-mono" />
         </label>
+        <fieldset className="text-sm">
+          <legend className="text-slate-600 dark:text-slate-300">What do the scanners record?</legend>
+          <label className="mr-4"><input type="radio" name="mode" checked={mode === "framing"} onChange={() => setMode("framing")} /> Framing (badge, then orders; 10 minutes)</label>
+          <label><input type="radio" name="mode" checked={mode === "dispatch"} onChange={() => setMode("dispatch")} /> Dispatch (badge once per shift, then order slips)</label>
+        </fieldset>
         {problem ? <div className="text-sm text-red-600">{problem}</div> : null}
         <div className="flex justify-end gap-2">
           <button type="button" onClick={onCancel} className="px-3 h-9 rounded-md ring-1 ring-slate-200 dark:ring-slate-700 text-sm">Cancel</button>
           <button type="button" disabled={!!problem}
-            onClick={() => onSave({ enabled: true, receiverId: current?.receiverId ?? newReceiverId(), label: label.trim(), scannerIds: parsed })}
+            onClick={() => onSave({ enabled: true, receiverId: current?.receiverId ?? newReceiverId(), label: label.trim(), scannerIds: parsed, mode })}
+
             className="px-4 h-9 rounded-md bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 text-sm font-medium disabled:opacity-40">
             Turn on shared scanners
           </button>

@@ -259,6 +259,10 @@ export function Production() {
     return (
       <SharedScannerStation
         config={shared}
+        onChangeConfig={(cfg) => {
+          saveSharedScannerConfig(browserStorage(), cfg);
+          setShared(cfg);
+        }}
         onExit={() => {
           const off = { ...shared, enabled: false };
           saveSharedScannerConfig(browserStorage(), off);

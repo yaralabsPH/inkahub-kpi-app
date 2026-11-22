@@ -12,7 +12,8 @@
  *   - Green only after the server saved it; amber while queued; red when
  *     refused or when the device could not store the scan.
  */
-import type { ActivateOutcome, DeliveryReport } from "./client";
+import type { ActivateOutcome, DeliveryReport, SavedAttribution } from "./client";
+import { CHOICE_CODES, dispatchShiftEnd, type FramerChoice, type ScanMode } from "./dispatch";
 import { OutboxFullError, type JobScope, type ScannerOutbox, type ScopeView } from "./outbox";
 import { PROTOCOL_ERROR_TEXT, type ProtocolErrorReason } from "./protocol";
 import {
@@ -36,6 +37,8 @@ export interface WallResult {
   person?: string;
   order?: string;
   pieces?: number;
+  /** F7 dispatch: who framed each framed SKU, as saved. */
+  framers?: SavedAttribution[];
   at: number;
 }
 
@@ -54,6 +57,8 @@ export type SoundKind = "ok" | "queued" | "error";
 export interface ControllerDeps {
   scannerIds: readonly string[];
   scope: JobScope;
+  /** F7: the receiver's mode. Captured into every new job; old jobs keep theirs. Default framing. */
+  mode?: ScanMode;
   outbox: ScannerOutbox;
   activate(a: { requestId: string; scannerId: string; badge: string }): Promise<ActivateOutcome>;
   deliver(): Promise<DeliveryReport | null>;
@@ -69,6 +74,10 @@ export class SharedScannerController {
   private pumping = false;
   private pumpAgain = false;
   private disposed = false;
+
+  get mode(): ScanMode {
+    return this.d.mode ?? "framing";
+  }
 
   constructor(private readonly d: ControllerDeps) {
     this.s = {
@@ -153,9 +162,13 @@ export class SharedScannerController {
       res = { outcome: "network_error", message: e instanceof Error ? e.message : String(e) };
     }
     if (this.disposed) return;
+    // Dispatch: one sign-in per shift (next site 04:00, at most 12 h), no idle timeout.
+    const expiresAt = this.mode === "dispatch" && res.outcome === "activated"
+      ? dispatchShiftEnd(this.d.now(), res.workdayEndsAt ?? null)
+      : undefined;
     const result =
       res.outcome === "activated"
-        ? ({ outcome: "activated", personId: res.personId, displayName: res.displayName } as const)
+        ? ({ outcome: "activated", personId: res.personId, displayName: res.displayName, expiresAt } as const)
         : res.outcome === "unknown_badge"
           ? ({ outcome: "unknown_badge" } as const)
           : res.outcome === "unusable_badge"
@@ -171,7 +184,8 @@ export class SharedScannerController {
     if (r.stale) return; // the scanner moved on; never bind an old answer
     this.set({ slots: r.slots });
     if (res.outcome === "activated") {
-      this.show({ kind: "signed_in", scannerId, person: res.displayName, title: `${scannerId}: ${res.displayName}`, detail: res.clockedIn ? "Signed in and clocked in." : "Signed in." }, "ok");
+      const shift = expiresAt !== undefined ? ` Dispatching until ${new Date(expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.` : "";
+      this.show({ kind: "signed_in", scannerId, person: res.displayName, title: `${scannerId}: ${res.displayName}`, detail: (res.clockedIn ? "Signed in and clocked in." : "Signed in.") + shift }, "ok");
       return;
     }
     if (r.order) {
@@ -196,7 +210,7 @@ export class SharedScannerController {
 
   private async enqueue(order: CapturedOrder): Promise<void> {
     try {
-      await this.d.outbox.enqueue(order, this.d.scope, this.d.newRequestId());
+      await this.d.outbox.enqueue(order, this.d.scope, this.d.newRequestId(), this.mode);
     } catch (e) {
       const full = e instanceof OutboxFullError;
       const message = e instanceof Error ? e.message : String(e);
@@ -234,7 +248,11 @@ export class SharedScannerController {
       this.show({ kind: "rejected", scannerId: timedOut[0], title: `${timedOut.join(", ")}: badge check timed out`, detail: REJECT_TEXT.pending_timeout }, "error");
       return;
     }
-    this.show({ kind: "info", scannerId: expired[0], title: `${expired.join(", ")} signed out after 10 minutes without a scan`, detail: "Scan your badge again." }, null);
+    this.show({
+      kind: "info", scannerId: expired[0],
+      title: this.mode === "dispatch" ? `${expired.join(", ")} signed out: dispatch shift ended` : `${expired.join(", ")} signed out after 10 minutes without a scan`,
+      detail: "Scan your badge again.",
+    }, null);
   }
 
   /** Clear every identity (auth/site/mode change, operator reset). */
@@ -294,7 +312,8 @@ export class SharedScannerController {
         this.set({ deliveryWaiting: null, authProblem: false });
         this.show({
           kind: "saved", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber, pieces: r.result.pieces,
-          title: `Saved #${j.orderNumber}`,
+          title: j.mode === "dispatch" ? `Dispatched #${j.orderNumber}` : `Saved #${j.orderNumber}`,
+          framers: r.result.attributions,
           detail: r.result.negativeCodes.length ? `Stock now below zero: ${r.result.negativeCodes.join(", ")}` : undefined,
         }, "ok");
         return;
@@ -302,8 +321,15 @@ export class SharedScannerController {
         this.set({ deliveryWaiting: null });
         this.show({
           kind: "already", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
-          title: `#${j.orderNumber} already recorded — no extra credit`,
+          title: j.mode === "dispatch" ? `#${j.orderNumber} already dispatched — nothing more saved` : `#${j.orderNumber} already recorded — no extra credit`,
           detail: `${r.reason}. Check the order on the classic station.`,
+        }, "error");
+        return;
+      case "needs_choice":
+        this.show({
+          kind: "queued", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
+          title: `#${j.orderNumber}: framing scan missing`,
+          detail: "Not saved yet. Choose who framed it below; other scans keep saving.",
         }, "error");
         return;
       case "blocked":
@@ -316,11 +342,20 @@ export class SharedScannerController {
           }, "error");
           return;
         }
+        if (CHOICE_CODES.has(r.code)) {
+          // Definitely not saved, and fixable here: the dispatcher chooses again.
+          this.show({
+            kind: "rejected", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
+            title: `#${j.orderNumber} not saved — choose who framed it`, detail: r.message,
+          }, "error");
+          return;
+        }
         this.show({
           kind: "rejected", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
           title: `#${j.orderNumber} not saved — use the classic station`, detail: r.message,
         }, "error");
         return;
+
       case "superseded":
         return;
       case "waiting":
@@ -335,7 +370,21 @@ export class SharedScannerController {
     this.pump();
   }
 
+  /** F7: the dispatcher's framer choice for one waiting dispatch job, then send it. */
+  async chooseFramers(requestId: string, choices: readonly FramerChoice[]): Promise<void> {
+    try {
+      await this.d.outbox.chooseFramers(requestId, this.d.scope, choices);
+    } catch (e) {
+      this.show({ kind: "rejected", scannerId: null, title: "Framer choice not saved", detail: e instanceof Error ? e.message : String(e) }, "error");
+      await this.refreshView();
+      return;
+    }
+    await this.refreshView();
+    this.pump();
+  }
+
   async dismiss(requestId: string): Promise<void> {
+
     await this.d.outbox.dismiss(requestId, this.d.scope);
     await this.refreshView();
   }

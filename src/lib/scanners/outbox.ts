@@ -56,6 +56,18 @@ function inScopeKey(jobScope: string, key: string): boolean {
   return jobScope === key || jobScope === key + DISPATCH_SCOPE_SUFFIX;
 }
 
+/**
+ * F7: the OLDEST dispatch job waiting for a framer choice that can still be
+ * changed (nothing possibly saved). One at a time; the rest stay queued.
+ */
+export function firstWaitingChoice(jobs: readonly ScannerJob[]): (ScannerJob & { prepared: PreparedDispatch }) | null {
+  const waiting = jobs
+    .filter((j) => jobMode(j) === "dispatch" && j.status === "blocked" && !!j.blocked && CHOICE_CODES.has(j.blocked.code)
+      && !j.uncertain && !(j.priorUnknown ?? false) && isPreparedDispatch(j.prepared))
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
+  return (waiting[0] as (ScannerJob & { prepared: PreparedDispatch }) | undefined) ?? null;
+}
+
 /** Jobs written before F7 have no mode: they are framing jobs. */
 export function jobMode(job: Pick<ScannerJob, "mode">): ScanMode {
   return job.mode === "dispatch" ? "dispatch" : "framing";

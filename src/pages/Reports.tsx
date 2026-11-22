@@ -19,6 +19,15 @@ import { PackageUsageCard } from "@/components/PackageUsageCard";
 import { PackageHistoryCard } from "@/components/PackageHistoryCard";
 import { PackagingAttentionCard } from "@/components/PackagingAttentionCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
+import {
+  ATTRIBUTION_CSV_HEADERS,
+  attributableEventIds,
+  attributionCsvCells,
+  fetchAttributionsForEvents,
+  fetchAttributionsForOrder,
+  groupByEvent,
+  type FramerAttribution,
+} from "@/lib/scanners/attribution";
 
 /**
  * Reports tab — production analytics for owners + managers.
@@ -533,11 +542,17 @@ export function Reports() {
   }, [completedLines]);
 
   // -------- CSV export (respects all filters) --------
-  const handleExport = useCallback(() => {
+  const handleExport = useCallback(async () => {
+    // F7: framer attributions for the shared-scanner dispatch rows in this
+    // exact export (same filter), appended as two columns. Event columns and
+    // row counts are unchanged.
+    const attrIds = attributableEventIds(filteredEvents);
+    const attr = attrIds.length > 0 ? await fetchAttributionsForEvents(supabase, location, attrIds) : { ok: true as const, rows: [] };
+    const byEvent = groupByEvent(attr.ok ? attr.rows : []);
     const headers = [
       "timestamp", "staff_name", "department",
       "order_number", "sku", "quantity", "event_type",
-      "station_id", "note",
+      "station_id", "note", ...ATTRIBUTION_CSV_HEADERS,
     ];
     const rows = filteredEvents.map((e) => {
       const info = staffLookup.get(e.staff_id);
@@ -551,6 +566,7 @@ export function Reports() {
         e.event_type,
         e.station_id ?? "",
         (e.note ?? "").replace(/[\r\n]+/g, " "),
+        ...attributionCsvCells(e.id, byEvent, !attr.ok),
       ];
     });
     const csv = [headers, ...rows]
@@ -576,7 +592,7 @@ export function Reports() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  }, [filteredEvents, staffLookup, selectedStaff, selectedDepartment, range.from, range.to]);
+  }, [filteredEvents, staffLookup, selectedStaff, selectedDepartment, range.from, range.to, supabase, location]);
 
   /* ------------------------------------------------------------
    * Render
@@ -646,7 +662,7 @@ export function Reports() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={handleExport}
+            onClick={() => void handleExport()}
             disabled={filteredEvents.length === 0}
             title="Download raw event log as CSV"
           >
@@ -1186,6 +1202,9 @@ function OrderLookupCard({
   const [input, setInput] = useState("");
   const [searched, setSearched] = useState<string | null>(null);
   const [events, setEvents] = useState<OrderEvent[] | null>(null);
+  // F7: stored "who framed it" rows for shared-scanner dispatches of this order.
+  const [framers, setFramers] = useState<FramerAttribution[] | null>(null);
+  const [framersError, setFramersError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1206,7 +1225,15 @@ function OrderLookupCard({
         .eq("order_number", normalized)
         .order("created_at", { ascending: false });
       if (err) throw err;
-      setEvents((data ?? []) as OrderEvent[]);
+      const found = (data ?? []) as OrderEvent[];
+      setEvents(found);
+      setFramers(null);
+      setFramersError(null);
+      if (attributableEventIds(found).length > 0) {
+        const a = await fetchAttributionsForOrder(supabase, location, normalized);
+        if (a.ok) setFramers(a.rows);
+        else setFramersError(a.message);
+      }
     } catch (e) {
       setError((e as Error).message);
       setEvents(null);
@@ -1255,6 +1282,8 @@ function OrderLookupCard({
     setInput("");
     setSearched(null);
     setEvents(null);
+    setFramers(null);
+    setFramersError(null);
     setError(null);
   };
 
@@ -1435,8 +1464,40 @@ function OrderLookupCard({
                 variant="compact"
               />
 
+              {/* F7: who framed it, as recorded at shared-scanner dispatch */}
+              {framersError ? (
+                <div className="text-xs text-rose-700 dark:text-rose-300">Couldn't load framer attribution: {framersError}</div>
+              ) : null}
+              {framers && framers.length > 0 ? (
+                <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2" data-testid="framer-attribution">
+                  <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Framed by (recorded at dispatch)</div>
+                  <ul className="space-y-0.5 text-sm">
+                    {framers.map((f) => (
+                      <li key={`${f.dispatch_event_id}|${f.sku}`} className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-xs">{f.sku}</span>
+                        <span className="font-medium">{f.display_name}</span>
+                        {f.source === "manual" ? (
+                          <span className="inline-flex items-center rounded-full bg-amber-100 text-amber-800 ring-1 ring-amber-200 text-[11px] font-semibold px-2 py-0.5 dark:bg-amber-900/30 dark:text-amber-200 dark:ring-amber-800"
+                            title="Chosen by the dispatcher; no framing scan exists, so it adds no framing time or credit">
+                            Manual
+                          </span>
+                        ) : (
+                          <span className="text-emerald-700 dark:text-emerald-300 text-xs" title="Measured: framing verification and completion scans">✓ scanned</span>
+                        )}
+                        {f.source === "manual" ? (
+                          <span className="text-[11px] text-slate-500">
+                            chosen by {staffLookup.get(f.dispatcher_id)?.display_name ?? `User ${f.dispatcher_id.slice(0, 8)}`}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
               {/* Timeline */}
               <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 overflow-hidden">
+
                 <table className="w-full text-sm">
                   <thead className="bg-slate-50 dark:bg-slate-900/60 text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400">
                     <tr>
