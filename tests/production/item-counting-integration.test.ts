@@ -165,6 +165,9 @@ describe("merged pages keep F4–F7 wiring (source seams)", () => {
     const legacy = reports.slice(reports.indexOf("const handleExport = useCallback("), reports.indexOf("const handlePublishedExport = useCallback("));
     expect(legacy).toMatch(/"station_id", "note", \.\.\.ATTRIBUTION_CSV_HEADERS,/);
     expect(legacy).toMatch(/\.\.\.attributionCsvCells\(e\.id, byEvent, !attr\.ok\)/);
+    // integration r1 #2: the published attribution read runs inside collectAll's beforeFinish guard.
+    const pub = reports.slice(reports.indexOf("const handlePublishedExport = useCallback("));
+    expect(pub).toMatch(/beforeFinish: async \(\) => \{[\s\S]*?fetchAttributionsForEvents\(supabase, location, attrIds\)[\s\S]*?\},\s*\}\);/);
     expect(reports).toMatch(/fetchAttributionsForOrder\(supabaseRef\.current, location, searched\)/);
   });
 
@@ -183,5 +186,9 @@ describe("merged pages keep F4–F7 wiring (source seams)", () => {
     expect(body).toMatch(/refreshCounter\(\);/);
     expect(production).not.toMatch(/setTodayCount|setTodayLineUnits/);
     expect(production).toMatch(/todayCount=\{counter \? counter\.normal\.orders : null\}/);
+    // integration r1 #1: the default station screen gets F1 status, retry and separate rework.
+    expect(production).toMatch(/todayState=\{counterEvidence\.status\}/);
+    expect(production).toMatch(/todayRework=\{counter \? counter\.rework : null\}/);
+    expect(production).toMatch(/onRetryCount=\{refreshCounter\}/);
   });
 });

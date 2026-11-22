@@ -450,6 +450,32 @@ describe("Task 17: collectAll - the published raw-export collector", () => {
     await h.ctrl.load(ID);
     await expect(h.ctrl.collectAll(ID, "raw-export")).rejects.toMatchObject({ code: "UNAVAILABLE", status: 503 });
   });
+  it("integration r1 #2: a view change during the beforeFinish step (F7 attribution read) rejects VIEW_CHANGED; unchanged resolves", async () => {
+    const a = harness(pages(1, 2));
+    await a.ctrl.load(ID);
+    let release!: () => void;
+    const p = a.ctrl.collectAll(ID, "raw-export", { onPage: () => {}, beforeFinish: () => new Promise<void>((r) => (release = r)) });
+    for (let i = 0; i < 5 && !release; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(typeof release).toBe("function");
+    await a.ctrl.load({ ...ID, site: "au" }); // the view moves while attributions load
+    release();
+    await expect(p).rejects.toMatchObject({ code: "VIEW_CHANGED" });
+
+    const b = harness(pages(1, 2));
+    await b.ctrl.load(ID);
+    let ran = false;
+    await expect(b.ctrl.collectAll(ID, "raw-export", { beforeFinish: async () => { ran = true; } })).resolves.toHaveLength(2);
+    expect(ran).toBe(true);
+
+    const c = harness(pages(1, 2));
+    await c.ctrl.load(ID);
+    let releaseC!: () => void;
+    const pc = c.ctrl.collectAll(ID, "raw-export", { beforeFinish: () => new Promise<void>((r) => (releaseC = r)) });
+    for (let i = 0; i < 5 && !releaseC; i++) await new Promise((r) => setTimeout(r, 0));
+    c.ctrl.reset(); // sign-out / cleared view
+    releaseC();
+    await expect(pc).rejects.toMatchObject({ code: "VIEW_CHANGED" });
+  });
   it("an identity change mid-export rejects; a generation change rejects; a same-generation refresh does not", async () => {
     let release!: (v: { status: number; body: unknown }) => void;
     const slow = (url: string): Reply => (param(url, "cursor") === "1" ? new Promise((r) => (release = r)) : pages(2, 2)(url));

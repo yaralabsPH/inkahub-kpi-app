@@ -248,3 +248,33 @@ describe("StationOrderScreen - packaging in auto mode (F4 box-auto-pick)", () =>
   });
 });
 
+
+describe("StationOrderScreen - F1 counter status (integration review r1 #1)", () => {
+  it("a failed refresh marks the shown figures stale with a retry, in idle and working views", () => {
+    for (const o of [null, order(SIX)]) {
+      const html = renderToStaticMarkup(
+        <StationOrderScreen {...props({ order: o, todayState: "stale", onRetryCount: noop, countStatus: <span>STATUS-LINE</span> })} />,
+      );
+      expect(html).toContain('data-count-state="stale"');
+      expect(html).toContain("Not current");
+      expect(html).toContain("Retry");
+    }
+  });
+  it("an error with no figures shows no numbers as current", () => {
+    const html = renderToStaticMarkup(<StationOrderScreen {...props({ todayCount: null, todayItems: null, todayState: "error", onRetryCount: noop })} />);
+    expect(html).toContain('data-count-state="error"');
+    expect(html).toContain("Orders today <b>–</b>");
+  });
+  it("current figures carry no stale marker; the status line renders in the idle sidebar", () => {
+    const html = renderToStaticMarkup(<StationOrderScreen {...props({ todayState: "current", countStatus: <span>STATUS-LINE</span> })} />);
+    expect(html).not.toContain("Not current");
+    expect(html).toContain("STATUS-LINE");
+  });
+  it("CS/rework stays separate from normal work", () => {
+    const html = renderToStaticMarkup(<StationOrderScreen {...props({ todayState: "current", todayRework: { orders: 1, items: 2 } })} />);
+    expect(html).toContain("Orders today <b>3</b>");
+    expect(html).toContain("CS/rework <b>2</b> items · <b>1</b> orders");
+    const none = renderToStaticMarkup(<StationOrderScreen {...props({ todayState: "current", todayRework: { orders: 0, items: 0 } })} />);
+    expect(none).not.toContain("CS/rework");
+  });
+});

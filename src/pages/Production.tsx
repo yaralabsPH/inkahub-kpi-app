@@ -1651,6 +1651,18 @@ function ProductionStation({
           staff={activeStaff}
           todayCount={counter ? counter.normal.orders : null}
           todayItems={counter ? counter.normal.items : null}
+          todayState={counterEvidence.status}
+          todayRework={counter ? counter.rework : null}
+          onRetryCount={refreshCounter}
+          countStatus={
+            <ProductionCountStatus
+              className="max-w-[16rem] text-left"
+              state={counterEvidence}
+              range={counter?.range ?? null}
+              coverage={counter?.coverage ?? null}
+              compact
+            />
+          }
           order={currentOrder ? {
             number: currentOrder.number,
             displayName: currentOrder.display_name,

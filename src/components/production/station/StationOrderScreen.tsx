@@ -52,6 +52,14 @@ export interface StationOrderScreenProps {
   staff: { user_id: string; display_name: string };
   todayCount: number | null;
   todayItems: number | null;
+  /** F1 counter load state; "stale"/"error" figures are marked not current. Omitted = current. */
+  todayState?: "unavailable" | "loading" | "current" | "stale" | "error";
+  /** F1 CS/rework counts, always separate from normal work. */
+  todayRework?: { orders: number; items: number | null } | null;
+  /** F1 status/coverage line (ProductionCountStatus), shown in the idle sidebar. */
+  countStatus?: ReactNode;
+  /** Re-read the counter after a failed refresh. */
+  onRetryCount?: () => void;
   order: StationScreenOrder | null;
   verified: ReadonlyMap<string, StationVerifiedRecord>;
   staffNames: ReadonlyMap<string, string>;
@@ -124,6 +132,32 @@ function useWindowFocus(): boolean {
   return focused;
 }
 
+function notCurrent(p: StationOrderScreenProps): boolean {
+  return p.todayState === "stale" || p.todayState === "error";
+}
+
+/** F1: a failed refresh never leaves old figures looking current. */
+function CountFlag(p: StationOrderScreenProps) {
+  if (!notCurrent(p)) return null;
+  return (
+    <div role="status" style={{ color: "var(--warn, #b45309)" }}>
+      Not current{p.todayState === "stale" ? " (refresh failed)" : ""}
+      {p.onRetryCount ? (
+        <>
+          {" "}
+          <button type="button" onClick={p.onRetryCount} style={{ textDecoration: "underline" }}>Retry</button>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function ReworkLine(p: StationOrderScreenProps) {
+  const r = p.todayRework;
+  if (!r || (r.orders === 0 && (r.items ?? 0) === 0)) return null;
+  return <div>CS/rework <b>{r.items ?? "–"}</b> items · <b>{r.orders}</b> orders</div>;
+}
+
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   return ((parts[0]?.[0] ?? "") + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase() || "?";
@@ -175,9 +209,11 @@ function TopBar(props: StationOrderScreenProps) {
         {focused ? "Scanner live" : "Click here to scan"}
       </button>
       <span className="st-vr" />
-      <div className="st-today">
+      <div className="st-today" data-count-state={props.todayState ?? "current"} style={notCurrent(props) ? { opacity: 0.7 } : undefined}>
         <div>Orders today <b>{props.todayCount ?? "–"}</b></div>
         <div>Items <b>{props.todayItems ?? "–"}</b></div>
+        <ReworkLine {...props} />
+        <CountFlag {...props} />
       </div>
       <span className="st-vr" />
       <div className="st-user">
@@ -674,6 +710,7 @@ function IdleView(props: StationOrderScreenProps) {
             <span className="st-big-count" style={{ color: "var(--ink)" }}>{props.todayCount ?? "–"}</span>
             <span className="st-of">{props.todayCount === 1 ? "order" : "orders"} · {props.todayItems ?? "–"} items</span>
           </div>
+          {props.countStatus ?? null}
         </div>
         <div className="st-done-wrap">
           <div className="st-done-empty">Scan a packing slip to start an order, or swipe another lanyard to switch worker.</div>

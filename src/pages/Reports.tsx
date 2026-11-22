@@ -26,6 +26,7 @@ import {
   fetchAttributionsForEvents,
   fetchAttributionsForOrder,
   groupByEvent,
+  type AttributionLoad,
   type FramerAttribution,
 } from "@/lib/scanners/attribution";
 import { ProductionCountStatus } from "@/components/ProductionCountStatus";
@@ -410,15 +411,20 @@ function SupabaseReports() {
       // every buffered chunk is discarded: never a partial file.
       // F7: the framer columns need the attributions of every shared-scanner dispatch row, so the
       // validated pages are kept until the collection resolves, then rendered one chunk per page.
+      // The attribution read runs inside the collector (beforeFinish), so a view change during it is
+      // VIEW_CHANGED and nothing downloads; only synchronous work follows until the download.
       const pages: PublishedDetailRow[][] = [];
+      let attr: AttributionLoad = { ok: true, rows: [] };
       await pub.collectAll("raw-export", {
         limit: 1000,
         onPage: (rows) => {
           if (rows.length) pages.push(rows);
         },
+        beforeFinish: async () => {
+          const attrIds = attributableEventIds(pages.flat().flatMap((r) => (r.kind === "raw-export" ? [{ id: r.row.id, event_type: r.row.eventType }] : [])));
+          if (attrIds.length > 0) attr = await fetchAttributionsForEvents(supabase, location, attrIds);
+        },
       });
-      const attrIds = attributableEventIds(pages.flat().flatMap((r) => (r.kind === "raw-export" ? [{ id: r.row.id, event_type: r.row.eventType }] : [])));
-      const attr = attrIds.length > 0 ? await fetchAttributionsForEvents(supabase, location, attrIds) : { ok: true as const, rows: [] };
       const byEvent = groupByEvent(attr.ok ? attr.rows : []);
       const extra = (eventId: string) => attributionCsvCells(eventId, byEvent, !attr.ok);
       const chunks: BlobPart[] = [publishedCsvHeader(ATTRIBUTION_CSV_HEADERS)];
