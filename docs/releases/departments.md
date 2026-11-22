@@ -75,9 +75,23 @@ worth knowing here:
 
 ## Checks run by the coder
 
-Recorded in the plan's Implementation log (Task 11) with exact numbers.
-`npx tsc -b`, `npm run test -- --run`, `npm run typecheck:digest`,
-`npm run build`.
+On 2026-11-22, on the task 10 commit plus the final log commit:
+
+| Check | Result |
+|---|---|
+| `npx tsc -b` | passed |
+| `npm run test -- --run` | 819 tests in 29 files passed (183 new for F5) |
+| `npm run typecheck:digest` | passed |
+| `npm run build` | passed (existing chunk-size warning only) |
+
+Migration SHA-256 as committed (LF line endings):
+
+- `0052_departments.sql` `fb86f6628f27191dce303a88d212a4f2b7a721e386a2346c5a2655d586c16b02`
+- `0053_departments_admin.sql` `cc7301877a146f7a62dad8cd93b066f88799a239275f73d254f91a5f754e89c3`
+- `0054_departments_snapshots.sql` `b1960ef35833cc89b35903f8acb63b342accb26ec37bf2d81f243b5363dec890`
+
+A Windows checkout with line-ending conversion changes these bytes: hash the
+file as stored in git (`git show <commit>:<path> | sha256sum`).
 
 All SQL was also executed on a throwaway local Postgres (PGlite, outside the
 repo) with stand-ins for Supabase's roles and the recovered tables:

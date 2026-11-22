@@ -241,10 +241,21 @@ BEGIN
     AND NOT has_table_privilege('departments_resolver', 'public.department_requests', 'SELECT')
     AND NOT has_table_privilege('departments_resolver', 'public.production_events', 'SELECT')
     AND (to_regclass('public.staff_rates') IS NULL OR NOT has_table_privilege('departments_resolver', 'public.staff_rates', 'SELECT')));
-  PERFORM pg_temp.f5_ok('A14 migration role is no longer a member of departments_resolver',
+  -- The migration granted itself this role for a moment and must have taken
+  -- that grant away again. (A membership the PLATFORM gives a role's creator
+  -- automatically has a different grantor; it is reported, not judged here.)
+  PERFORM pg_temp.f5_ok('A14 the migration''s own temporary membership of departments_resolver is gone',
     NOT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r2 ON r2.oid = m.roleid
-                 WHERE r2.rolname = 'departments_resolver' AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
-                   AND m.set_option));
+                 WHERE r2.rolname = 'departments_resolver'
+                   AND m.member = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                   AND m.grantor = m.member));
+  IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r2 ON r2.oid = m.roleid
+              WHERE r2.rolname = 'departments_resolver' AND (m.set_option OR m.inherit_option)) THEN
+    RAISE NOTICE 'F5 verify NOTE [A14]: some role holds a usable membership of departments_resolver (granted by the platform, not by the migration): %',
+      (SELECT string_agg(pg_get_userbyid(m.member) || ' via ' || pg_get_userbyid(m.grantor), ', ')
+         FROM pg_auth_members m JOIN pg_roles r2 ON r2.oid = m.roleid
+        WHERE r2.rolname = 'departments_resolver' AND (m.set_option OR m.inherit_option));
+  END IF;
   PERFORM pg_temp.f5_ok('A15 resolver role cannot create in the private schema',
     NOT has_schema_privilege('departments_resolver', 'departments_private', 'CREATE'));
 
