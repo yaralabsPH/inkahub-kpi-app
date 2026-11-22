@@ -111,7 +111,7 @@ describe("0052 storage and privileges", () => {
 
   it("does not touch production_events, existing tables or item-counting objects", () => {
     // (It is mentioned in comments on the new tables, but never read or written.)
-    expect(sql).not.toMatch(/(ON|TABLE|INTO|FROM|UPDATE|JOIN)\s+(public\.)?production_events/);
+    expect(sql).not.toMatch(/\b(ON|TABLE|INTO|FROM|UPDATE|JOIN)\s+(public\.)?production_events\b/);
     expect(sql).not.toMatch(/reporting_private|reporting_capture/);
     expect(sql).not.toMatch(/ALTER TABLE (public\.)?(profiles|user_locations|staff_barcodes|staff_rates)/);
     expect(sql).not.toMatch(/DROP (TABLE|COLUMN|SCHEMA|FUNCTION)/);
@@ -248,5 +248,138 @@ describe("0053 administration and profile lifecycle", () => {
     expect(sql).not.toMatch(/reporting_private|reporting_capture/);
     expect(sql).not.toMatch(/ALTER (TABLE|DEFAULT PRIVILEGES)/);
     expect(sql).not.toMatch(/DROP (TABLE|COLUMN|SCHEMA|FUNCTION|POLICY)/);
+  });
+});
+
+describe("0054 event snapshots", () => {
+  const sql = code(read("0054_departments_snapshots.sql"));
+  const COLUMNS = [
+    "business_department_id", "business_department_name", "business_department_assignment_id",
+    "business_department_name_version_id", "business_department_status", "department_snapshot_version",
+    "department_occurred_at", "department_received_at", "department_resolution_instant",
+    "department_time_status", "department_resolved_at",
+  ];
+  const body = (name: string) => {
+    const start = sql.indexOf(`CREATE OR REPLACE FUNCTION departments_private.${name}(`);
+    expect(start, name).toBeGreaterThan(-1);
+    return sql.slice(start, sql.indexOf("$fn$;", start));
+  };
+
+  it("adds eleven nullable columns with no default, constraint or foreign key", () => {
+    const alter = sql.slice(sql.indexOf("ALTER TABLE public.production_events"), sql.indexOf("COMMENT ON COLUMN"));
+    const added = alter.match(/ADD COLUMN IF NOT EXISTS (\w+)\s+(\w+)(.*)/g) ?? [];
+    expect(added).toHaveLength(11);
+    for (const c of COLUMNS) expect(alter).toMatch(new RegExp(`ADD COLUMN IF NOT EXISTS ${c}\\s`));
+    expect(alter).not.toMatch(/NOT NULL|DEFAULT|REFERENCES|CHECK/);
+    expect(sql).not.toMatch(/ADD CONSTRAINT|ALTER COLUMN|DROP COLUMN|DROP CONSTRAINT/);
+  });
+
+  it("never updates or backfills events and never touches item-counting objects", () => {
+    expect(sql).not.toMatch(/UPDATE\s+(public\.)?production_events/);
+    expect(sql).not.toMatch(/INSERT INTO\s+(public\.)?production_events/);
+    expect(sql).not.toMatch(/DELETE FROM/);
+    expect(sql).not.toMatch(/reporting_private|reporting_capture/);
+    expect(sql).not.toMatch(/ledger|deduct_inventory|packaging_/);
+    expect(sql).not.toMatch(/DISABLE TRIGGER|DROP POLICY|CREATE POLICY|ALTER POLICY/);
+  });
+
+  it("names the triggers so sanitize fires before resolve", () => {
+    const triggers = (sql.match(/CREATE TRIGGER (\w+)\s+BEFORE (INSERT|UPDATE) ON public\.production_events/g) ?? [])
+      .map((t) => t.replace(/\s+/g, " "));
+    expect(triggers).toEqual([
+      "CREATE TRIGGER production_events_f5_10_sanitize BEFORE INSERT ON public.production_events",
+      "CREATE TRIGGER production_events_f5_20_resolve BEFORE INSERT ON public.production_events",
+      "CREATE TRIGGER production_events_f5_10_freeze BEFORE UPDATE ON public.production_events",
+    ]);
+    expect("production_events_f5_10_sanitize" < "production_events_f5_20_resolve").toBe(true);
+    expect(sql).not.toMatch(/AFTER (INSERT|UPDATE|DELETE)/);
+  });
+
+  it("sanitize overwrites every F5 column and looks nothing up", () => {
+    const fn = body("sanitize_event");
+    for (const c of COLUMNS) expect(fn).toMatch(new RegExp(`NEW\\.${c}\\s+:=`));
+    expect(fn).toContain("'resolver_unavailable'");
+    expect(fn).toContain("NEW.department_occurred_at              := NEW.created_at;");
+    expect(fn).toContain("NEW.department_received_at              := clock_timestamp();");
+    const statements = fn.slice(fn.indexOf("AS $fn$"));
+    expect(statements).not.toMatch(/SELECT|FROM public\.|departments_private\.|PERFORM/);
+    expect(fn).not.toContain("SECURITY DEFINER");
+  });
+
+  it("freeze copies every F5 column back and protects who/when/where/which", () => {
+    const fn = body("freeze_event");
+    for (const c of COLUMNS) expect(fn).toMatch(new RegExp(`NEW\\.${c}\\s+:= OLD\\.${c};`));
+    for (const key of ["staff_id", "created_at", "location", "id"]) {
+      expect(fn).toMatch(new RegExp(`NEW\\.${key}\\s+IS DISTINCT FROM OLD\\.${key}`));
+    }
+    expect(fn).toContain("OLD.business_department_status IS NOT NULL");
+    expect(fn).not.toMatch(/SELECT|SECURITY DEFINER/);
+  });
+
+  it("classifies time with the approved bounds", () => {
+    const fn = body("classify_time");
+    expect(fn).toContain("p_occurred_at - p_received_at > interval '5 seconds'");
+    expect(fn).toContain("p_received_at - p_occurred_at > interval '5 minutes'");
+    expect(fn).toContain("resolution_instant := p_received_at;");
+    for (const s of ["invalid_time", "future_clamped", "reported_old", "reported"]) expect(fn).toContain(`'${s}'`);
+    expect(fn).toContain("isfinite(p_occurred_at)");
+  });
+
+  it("resolves by the credited worker, with a try-shared lock and a fresh lookup after it", () => {
+    const fn = body("resolve_event");
+    expect(fn).toContain("WHERE a.person_id = NEW.staff_id");
+    expect(fn).not.toContain("auth.uid()");
+    const lock = fn.indexOf("pg_try_advisory_xact_lock_shared(494749, 5)");
+    const lookup = fn.indexOf("FROM public.person_department_assignments a");
+    expect(lock).toBeGreaterThan(-1);
+    expect(lookup).toBeGreaterThan(lock);
+    // Never a waiting lock on the insert path.
+    expect(sql).not.toMatch(/pg_advisory_xact_lock\(|pg_advisory_lock\(|pg_advisory_xact_lock_shared\(/);
+    expect(fn).toContain("'read committed'");
+    for (const s of ["assigned", "unassigned", "before_tracking", "invalid_time", "resolution_busy", "resolution_error", "disabled", "control_missing"]) {
+      expect(fn).toContain(`'${s}'`);
+    }
+    // Off / missing configuration is decided before time or lookup problems.
+    expect(fn.indexOf("'control_missing'")).toBeLessThan(fn.indexOf("'before_tracking'"));
+    expect(fn.indexOf("'disabled'")).toBeLessThan(fn.indexOf("'before_tracking'"));
+    expect(fn).not.toMatch(/INSERT INTO|UPDATE |DELETE /);
+  });
+
+  it("turns a failed lookup into a status, not a rejected scan", () => {
+    const fn = body("resolve_event");
+    const handler = fn.slice(fn.indexOf("EXCEPTION WHEN OTHERS THEN"));
+    expect(handler).toContain("NEW.business_department_status          := 'resolution_error';");
+    expect(handler).toContain("NEW.business_department_id              := NULL;");
+    // The warning carries the event key only, and cannot itself fail the insert.
+    expect(handler).toContain("RAISE WARNING 'f5_departments resolution_error location=% id=% sqlstate=%', NEW.location, NEW.id, SQLSTATE;");
+    expect(handler).not.toMatch(/order_number|note|line_sku|staff_id/);
+    expect(handler.match(/EXCEPTION WHEN OTHERS THEN/g)).toHaveLength(2);
+    expect(fn.replace(/\s+/g, " ").trimEnd().endsWith("RETURN NEW; END;")).toBe(true);
+  });
+
+  it("runs the resolver as departments_resolver and removes the temporary grants", () => {
+    expect(sql).toContain("ALTER FUNCTION departments_private.resolve_event() OWNER TO departments_resolver;");
+    const commit = sql.lastIndexOf("COMMIT;");
+    const pairs = [
+      ["GRANT departments_resolver TO CURRENT_USER;", "REVOKE departments_resolver FROM CURRENT_USER;"],
+      ["GRANT CREATE ON SCHEMA departments_private TO departments_resolver;", "REVOKE CREATE ON SCHEMA departments_private FROM departments_resolver;"],
+    ];
+    for (const [grant, revoke] of pairs) {
+      expect(sql.indexOf(grant)).toBeGreaterThan(-1);
+      expect(sql.indexOf(revoke)).toBeGreaterThan(sql.indexOf(grant));
+      expect(sql.indexOf(revoke)).toBeLessThan(commit);
+    }
+    const revokes = sql.match(/REVOKE ALL ON FUNCTION[^;]+FROM PUBLIC, anon, authenticated, service_role;/g) ?? [];
+    expect(revokes).toHaveLength(4);
+    const grants = sql.match(/GRANT EXECUTE ON FUNCTION[^;]+;/g) ?? [];
+    expect(grants).toEqual(["GRANT EXECUTE ON FUNCTION departments_private.classify_time(timestamptz, timestamptz) TO departments_resolver;"]);
+  });
+
+  it("adds only the receipt-time index, for new rows only", () => {
+    const indexes = sql.match(/CREATE INDEX[^;]+;/g) ?? [];
+    expect(indexes).toHaveLength(1);
+    expect(indexes[0]).toContain("production_events_department_received_idx");
+    expect(indexes[0]).toContain("(department_received_at, location, id)");
+    expect(indexes[0]).toContain("WHERE department_received_at IS NOT NULL");
   });
 });
