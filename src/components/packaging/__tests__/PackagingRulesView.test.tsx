@@ -42,7 +42,7 @@ function html(over: Partial<PackagingRulesViewProps> = {}): string {
     <PackagingRulesView
       siteLabel="Australia" mode="scan" ruleSets={[]} products={products} draft={null} busy={false} message={null}
       onSetMode={noop} onNewDraft={noop} onOpenDraft={noop} onCloseDraft={noop} onChangeNote={noop}
-      onAddItem={noop} onUpdateItem={noop} onRemoveItem={noop} onSaveDraft={noop} onActivate={noop}
+      onAddItem={noop} onUpdateItem={noop} onRemoveItem={noop} onEditBody={noop} onSaveDraft={noop} onActivate={noop}
       {...over}
     />,
   );

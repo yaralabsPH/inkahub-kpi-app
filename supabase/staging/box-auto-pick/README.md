@@ -107,9 +107,11 @@ behave exactly as before (same deduction, `prod:order_…` ledger key).
 
 ## 5. Synthetic rules for testing the preview
 
-Until the rule editor is built (plan Task 12), a rule set with rules has to
-be saved with SQL. On **staging**, as an owner or manager of the site, with
-two made-up packaging products created first (replace the ids):
+Rules, examples and the simulator can be typed in Settings ("Packaging
+(boxes and tubes)" → New empty draft). The SQL below is a shortcut that
+saves the same kind of draft in one step. On **staging**, as an owner or
+manager of the site, with two made-up packaging products created first
+(replace the ids):
 
 ```sql
 SELECT set_config('request.jwt.claims', '{"sub":"<owner-uuid>","role":"authenticated"}', false);

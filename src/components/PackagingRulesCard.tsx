@@ -15,6 +15,7 @@ import {
   removeCatalogueItem,
   updateCatalogueItem,
 } from "@/lib/domain/packaging/editing";
+import { isEditableBody } from "@/lib/domain/packaging/ruleEditing";
 import { emptyRuleSetBody, parseRuleSetBody, type RuleSetBody } from "@/lib/domain/packaging/ruleSet";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { getBackendMode, getSupabase } from "@/lib/repository/supabase/client";
@@ -137,8 +138,13 @@ function PackagingRulesCardInner() {
   const onOpenDraft = (row: RuleSetRow) => {
     if (draft?.dirty && !window.confirm("Discard the unsaved changes in the open draft?")) return;
     const parsed = parseRuleSetBody(row.body);
-    // A stored draft that fails validation is still opened so it can be fixed.
-    const body = parsed.ok ? draftFrom(parsed.body) : (row.body as RuleSetBody);
+    // A stored draft that fails validation is still opened so it can be fixed,
+    // as long as it has the basic shape the editor needs to draw it.
+    if (!parsed.ok && !isEditableBody(row.body)) {
+      setMessage({ kind: "error", text: `Draft v${row.version} was not saved by this screen and cannot be opened here. Start a new draft instead.` });
+      return;
+    }
+    const body = parsed.ok ? draftFrom(parsed.body) : draftFrom(row.body as RuleSetBody);
     setDraft({ id: row.id, basedOnVersion: null, body, note: row.note, dirty: false });
   };
 
@@ -201,6 +207,7 @@ function PackagingRulesCardInner() {
             onAddItem={(product) => edit((b) => addCatalogueItem(b, product))}
             onUpdateItem={(index, patch) => edit((b) => updateCatalogueItem(b, index, patch))}
             onRemoveItem={(index) => edit((b) => removeCatalogueItem(b, index))}
+            onEditBody={edit}
             onSaveDraft={onSaveDraft}
             onActivate={onActivate}
           />

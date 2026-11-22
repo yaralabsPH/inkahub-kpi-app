@@ -3,13 +3,16 @@ import { Input, Select } from "@/components/ui/Input";
 import type { PackingPoint } from "@/lib/domain/packaging/contents";
 import { toggleCataloguePoint, type DraftCheck } from "@/lib/domain/packaging/editing";
 import { runExamples } from "@/lib/domain/packaging/evaluate";
+import { splitDraftProblems } from "@/lib/domain/packaging/ruleEditing";
 import type { CatalogueItem, RuleSetBody } from "@/lib/domain/packaging/ruleSet";
 import type { PackagingMode, RuleSetRow } from "@/lib/repository/supabase/orderPackaging";
+import { RuleEditor } from "./RuleEditor";
+import { ExamplesTable, RuleSimulator } from "./RuleSimulator";
 
 /**
  * F4 box-auto-pick: Settings view for the site's packaging mode, rule-set
- * versions and a draft's packaging catalogue. Presentational; state and
- * saving live in PackagingRulesCard.
+ * versions and a draft: its packaging catalogue, rules, examples and the
+ * simulator. Presentational; state and saving live in PackagingRulesCard.
  */
 
 export interface ProductOption {
@@ -43,6 +46,8 @@ export interface PackagingRulesViewProps {
   onAddItem: (product: ProductOption) => void;
   onUpdateItem: (index: number, patch: Partial<CatalogueItem>) => void;
   onRemoveItem: (index: number) => void;
+  /** Any other edit to the draft (rules, examples). */
+  onEditBody: (change: (body: RuleSetBody) => RuleSetBody) => void;
   onSaveDraft: () => void;
   onActivate: () => void;
 }
@@ -195,6 +200,8 @@ function DraftSection(props: PackagingRulesViewProps & { draft: DraftEditorState
   const { draft } = props;
   const results = draft.check.problems.length === 0 ? runExamples(draft.body) : [];
   const failing = results.filter((r) => !r.pass).length;
+  const ready = draft.check.problems.length === 0;
+  const { general, markedBelow } = splitDraftProblems(draft.check.problems);
   return (
     <section className="space-y-4 rounded-lg ring-1 ring-slate-200 dark:ring-slate-700 p-4" data-draft={draft.id ?? "new"}>
       <div className="flex items-center justify-between gap-2">
@@ -211,6 +218,10 @@ function DraftSection(props: PackagingRulesViewProps & { draft: DraftEditorState
       <CatalogueSection body={draft.body} products={props.products} busy={props.busy}
         onAddItem={props.onAddItem} onUpdateItem={props.onUpdateItem} onRemoveItem={props.onRemoveItem} />
 
+      <RuleEditor body={draft.body} busy={props.busy} onChange={props.onEditBody} />
+      <ExamplesTable body={draft.body} ready={ready} busy={props.busy} onChange={props.onEditBody} />
+      <RuleSimulator body={draft.body} ready={ready} busy={props.busy} onChange={props.onEditBody} />
+
       <div className="text-sm text-slate-600 dark:text-slate-300" data-summary="rules">
         {draft.body.rules.length} {draft.body.rules.length === 1 ? "rule" : "rules"} · {draft.body.examples.length}{" "}
         {draft.body.examples.length === 1 ? "example" : "examples"}
@@ -219,7 +230,8 @@ function DraftSection(props: PackagingRulesViewProps & { draft: DraftEditorState
 
       {draft.check.problems.length > 0 ? (
         <ul className="text-sm text-red-600 dark:text-red-400 list-disc pl-5" role="alert">
-          {draft.check.problems.map((p, i) => <li key={i}>{p}</li>)}
+          {general.map((p, i) => <li key={i}>{p}</li>)}
+          {markedBelow > 0 ? <li>Some rules or examples need fixing. They are marked in red above.</li> : null}
         </ul>
       ) : null}
 

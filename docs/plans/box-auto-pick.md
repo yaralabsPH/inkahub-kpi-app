@@ -261,7 +261,7 @@ ids, rule sets and order numbers).
 - Done when: component tests cover role gating, the `auto` guard without an
   active set, and draft creation.
 
-### [ ] Task 12: Settings — rule editor, examples and simulator
+### [x] Task 12: Settings — rule editor, examples and simulator
 
 - Files: `src/components/packaging/RuleEditor.tsx`,
   `src/components/packaging/RuleSimulator.tsx`,
@@ -399,6 +399,11 @@ CJ answers inline.
   table. For staging tests in the meantime a synthetic rule set can be
   saved with `packaging_save_rule_set` (see
   `supabase/staging/box-auto-pick/README.md`).
+  - **Answered by CJ, 2026-11-22: (a) "Build it now".** Task 12 is built
+    against the rule shape in the spec. Still open: Max's table has not
+    been checked against that shape. If his rules need a condition the
+    shape does not have, that is a spec change (schema, evaluator, editor),
+    not something the coder adds on its own.
 - **Migration number (coder, 2026-11-22).** Task 5 said to confirm the
   number with CJ before committing. The file is committed as `0047`
   (first free number after item-counting's `0046`) and has not been applied
@@ -435,3 +440,4 @@ Coder adds one line per task.
 - Task 11: PackagingRulesCard (owner/manager, Supabase only) + PackagingRulesView + editing.ts helpers, 14 tests. Includes Save draft and Activate (activation gate: saved, valid, at least one example, all pass) so a draft whose rules came from elsewhere can be activated; the rule and example editors themselves are Task 12. Not in the plan: src/components/packaging/PackagingRulesView.tsx, src/lib/domain/packaging/editing.ts.
 - Task 13: usage.ts (netting, catalogue products, completions without a pick) + 13 tests; both package cards now read correction rows and catalogue items; PackagingAttentionCard (owner/manager) lists flagged, short/unposted (with Retry) and missing picks, bounded by the date range and row caps, with a 2-minute grace so in-flight saves are not reported. The digest is untouched. Not verified here: the PostgREST or-filter (delta.lt.0,source_id.like."pkg:%") needs a look on the staging preview. Not in the plan: src/lib/hooks/usePackagingCatalogue.ts.
 - Task 15: RELEASING.md section (modes, release order, rollback, what to watch) and a TEST-ONLY synthetic rule set snippet in the staging README. npx tsc -b clean, 578/578 tests, npm run build passes (same chunk-size warning as before). Task 12 is still open (see Open questions), so the feature is not ready for Astra's review yet. Nothing was run against a real database and no screen was exercised against Supabase; that needs the migration on staging (CJ).
+- Task 12: Started on CJ's go-ahead without Max's table (see Open questions). RuleEditor (ordered list: add per station, edit, move, delete, problems shown next to the rule), ExamplesTable (pass/fail with what the rules gave), RuleSimulator (parcel in, packages, fired rules, uncovered items out; 'Keep this as an example'). ruleEditing.ts holds the logic, 24 tests; 16 component tests. Draft problem list now shows general problems and points at marked rules/examples instead of raw field paths. A stored draft the editor cannot draw is refused with a message rather than opened. Staging README updated. npx tsc -b clean, 618/618 tests, npm run build passes. Not exercised in a browser: the card needs Supabase with the migration applied. Not in the plan: src/lib/domain/packaging/ruleEditing.ts.
