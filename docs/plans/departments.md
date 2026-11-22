@@ -102,7 +102,7 @@ Catch optional control/lookup failures in a sub-block, clear references and save
 
 Each numbered task is one coder commit: `task N: <title>`. Write new-logic tests first, observe their failure, then implement and rerun. Every commit leaves `npx tsc -b` and `npm run test -- --run` green; record results in the Implementation log and tick its checkbox. `npm run typecheck:digest` and `npm run build` also pass before review. SQL text checks are structural evidence, never a claim of executed database behavior. The coder does not edit the spec or rewrite tasks; unforeseen requirements go under Open questions. No SQL application, merge or deployment by the coder.
 
-### [ ] Task 1: Pin domain validation, time and snapshot contracts
+### [x] Task 1: Pin domain validation, time and snapshot contracts
 
 - Files: new `src/lib/domain/departments.ts`, `src/lib/domain/__tests__/departments.test.ts`, `tests/fixtures/departments.ts`; modify `src/lib/domain/schemas.ts`.
 - Do: after verifying Gate 0, add Zod admin/result/page and snapshot types matching the contracts above. Export `previewDepartmentName(raw: string): string`, `classifyDepartmentTime(occurredUs: bigint | null, receivedUs: bigint): {timeStatus: DepartmentTimeStatus; resolutionUs: bigint | null}`, and `containsDepartmentInstant(fromUs: bigint,toUs: bigint | null,instantUs: bigint): boolean`. Use integer microseconds for boundary fixtures, not JS millisecond rounding. Helpers illustrate the contract; SQL remains authoritative. Add optional nullable snapshot fields without defaults on old rows. Align `ProductionEventSchema` with all seven SQL types (`started`, `completed`, `cancelled`, `dispatched`, `line_verified`, `clock_in`, `clock_out`), clock-only NULL order number, and optional nullable text `cs_case_id`/`parent_event_id`; retain old Dexie acceptance.
@@ -247,3 +247,7 @@ Each numbered task is one coder commit: `task N: <title>`. Write new-logic tests
 ## Open questions
 
 ## Implementation log
+
+Coder: Claude (Fable 5.2), under the Overnight execution ruling. Base: `feature/departments` at `bc8f2b8` (main + F4 box-auto-pick + #10 station; #8 Team not included, so the plain-main Team variation applies).
+
+- Task 1: added `src/lib/domain/departments.ts` (name/reason rules, microsecond time classifier, half-open interval helpers, snapshot/result/page Zod schemas, site-zone display) with 32 tests, and fixtures in `tests/fixtures/departments.ts`. `ProductionEventSchema` now accepts all seven SQL event types, a null order number on clock events only, `cs_case_id`/`parent_event_id` and the optional snapshot fields; old Dexie rows still parse. Routine choices: the collapsible "spaces" and the refused control characters are explicit character lists so the browser preview and the SQL agree exactly (tabs and line breaks are refused, not collapsed); length is counted in code points like Postgres `char_length`. Also exported `checkDepartmentName`, `checkDepartmentAdminArgs`, `resolveDepartmentInterval` and `departmentSnapshotProblem`, which the plan did not name.
