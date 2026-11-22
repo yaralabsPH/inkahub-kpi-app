@@ -1,7 +1,7 @@
 # Spec: Managed business departments
 
 - Slug: `departments` · Roadmap ID: `F5`
-- Status: draft — awaiting CJ approval
+- Status: approved for implementation by Codex under CJ's delegated approval, 2026-11-22; staging acceptance and release remain pending
 - Author: planner (GPT-6 Astra)
 - Basis: `feature/departments` at `8519ac9`, inspected 2026-11-22. The brief is approved; the detailed choices below are proposals for approval.
 
@@ -260,7 +260,9 @@ Persisted markers are the diagnostic record; sanitized database warnings contain
 
 ## Risks and open questions
 
-Only these material inputs/choices need CJ; other detailed choices above form this draft's proposed design, not previously approved facts.
+Approval record (2026-11-22): CJ asked Codex to continue the pending work and approvals without overengineering. Following planner review, Codex approves the existing design for implementation: global homes, effective-now changes, the inclusive five-second forward clamp and greater-than-five-minute past warning, archive blocked while assigned, and unchanged routing. Use the current `feature/departments` main-based checkout; integrate #8/#10 later before combined acceptance. F5 reserves 0052–0054; F1 owns 0034–0046, F4 owns committed 0047, and F3's uncreated files reserve 0048–0051. Recheck reservations before creating or applying files. Scheduling a staging window and supplying the real roster are execution/activation requirements, not reasons to block pure implementation. No SQL, deployment, paid service change or production access is approved here.
+
+The following records the original decisions and remaining release inputs; items 2–4 are settled for implementation by the approval above.
 
 1. **Initial departments/worker roster missing:** Max/CJ must supply actual names, Auth-person assignments and worker versus shared-login classification. Recommend staging validation then prospective enrollment, no historical inference; unassigned capture remains visible. No real names or assignments are invented.
 2. **Integration base/release sequence:** approve a base containing #8/#10. Recommend CJ's prepared integration branch until the batch is ready, separate Team component/server capture, no F1 stack. Reserve migration number/window with F1/F3/F4 at implementation. PR statuses, unpushed 0046, staging trigger installation and tighter live grants are supplied discovery evidence, not live verification in this task.

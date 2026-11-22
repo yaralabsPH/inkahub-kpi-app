@@ -2,16 +2,16 @@
 
 - Slug: `departments` · Roadmap ID: `F5` · Spec: `docs/specs/departments.md`
 - Branch: `feature/departments`
-- Status: draft — awaiting CJ approval of the spec and this plan
+- Status: approved for implementation by Codex under CJ's delegated approval, 2026-11-22; staging acceptance and release remain pending
 - Basis: local main baseline `8519ac9`, supplied discovery dated 2026-11-22 and read-only remote branch inspection. No database or network verification was performed for this plan.
 
 ## Gates before Task 1
 
-**Gate 0 — CJ records the approvals, integration base, migration reservations and shared-staging window before coding.** The coder verifies this record before Task 1; missing evidence stops implementation.
+**Gate 0 — implementation approval recorded, 2026-11-22.** CJ delegated continuation and pending approvals to Codex. Planner review found no design blocker. Use the existing main-based `feature/departments` checkout (plan commit `f39ce3a`), following the plain-main variation below. Global homes, effective-now changes, the inclusive five-second forward clamp, greater-than-five-minute past warning, and unchanged routing are approved. Reserve F5 migrations 0052–0054; F1 occupies 0034–0046, F4 owns committed 0047, and uncreated F3 files reserve 0048–0051. Recheck before creating files. A staging window is required before SQL execution, not before coding. Real roster and #8/#10 combined acceptance remain activation/release requirements. Do not reopen these decisions or wait for a fresh approval to implement.
 
 - CJ approves the draft spec and this plan together. Implementation is contingent on all four spec decisions: (1) Max/CJ supply the roster before activation, with prospective enrollment and no inferred workers; (2) choose integration base and batch sequence; (3) approve global homes, effective-now changes, inclusive five-second forward clamp and strictly greater than five-minute past warning; (4) defer framing-line scope to F6 and leave routing unchanged. A different decision requires planner revision, not coder interpretation.
 - Preferred base: CJ's prepared integration branch containing reviewed #8 Team and #10 Station, with their commit IDs recorded. Do not merge to main merely to obtain it, and do not stack F5 on unfinished F1. Plain main is an allowed explicit CJ choice only with the task variations below.
-- Confirm the **next three unclaimed migration numbers with CJ, and the shared-staging window**. Main ends at 0033; F1 reserves 0034–0046 and may grow (0046 supplied as local/unpushed); obtain F3/F4 reservations. `00NN` below is a different reserved number for each file, in listed order, never a proposed actual number. Reconfirm before application if the release batch changes.
+- Use reserved numbers **0052, 0053, 0054**, in the `00NN` placeholder order below, after a final local/ref collision check. The shared-staging window is still pending and blocks SQL execution only. Reconfirm before application if the release batch changes.
 - Roster data is **not required to build**. Max/CJ's approved real department names, Auth IDs and worker/shared-login classification are required before activation. Only synthetic Department A/B and Person 1/2 fixtures belong in tests or this plan.
 - CJ reserves a staging-only Preview, test identities and operator execution time. Production Auth/FK/grant parity and extension availability remain release gates, not permission for the coder to inspect production.
 
