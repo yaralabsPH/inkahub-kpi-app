@@ -87,7 +87,7 @@ ids, rule sets and order numbers).
   empty contents, unclassified lines → unresolved, invalid rule sets
   rejected.
 
-### [ ] Task 3: Parity with today's tube choice
+### [x] Task 3: Parity with today's tube choice
 
 - Files: `src/lib/domain/packaging/__tests__/tubeParity.test.ts`
 - Do: a synthetic two-rule set (any A0 unframed/free print → large tube,
@@ -395,3 +395,4 @@ Coder adds one line per task.
 
 - Task 1: contents.ts + 14 tests. Order-aware packing points per CJ Q4: travellers (unframed, free print, accessory, unclassified) ride the dispatch parcel, else A0, else unframed if any flat print, else dispatch.
 - Task 2: ruleSet.ts (zod + structural checks), evaluate.ts, 20 tests. Country condition omitted per CJ Q5. Added per-pick bounds (20 per item, 10 items) shared with the SQL.
+- Task 3: 512-combination parity with autoMailTubeForUnframedOrder for orders without a framed parcel; no differences. Documented the one deliberate difference (CJ Q4: prints go in the box when a framed parcel exists).
