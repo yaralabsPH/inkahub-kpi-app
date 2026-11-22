@@ -53,6 +53,7 @@ const ORDER_QUERY = `
             trackingInfo { company }
           }
           lineItems(first: 50) {
+            pageInfo { hasNextPage }
             edges {
               node {
                 sku
@@ -80,6 +81,7 @@ interface ShopifyOrderNode {
   customer: { firstName: string | null; lastName: string | null; email: string | null } | null;
   fulfillments: Array<{ trackingInfo: Array<{ company: string | null }> }>;
   lineItems: {
+    pageInfo?: { hasNextPage: boolean };
     edges: Array<{
       node: { sku: string | null; title: string | null; quantity: number; currentQuantity: number | null; variantTitle: string | null };
     }>;
@@ -199,6 +201,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
     let node = body.data?.orders?.edges?.[0]?.node;
+    // F6: where the order came from, for the completeness flags below.
+    let source: "graphql" | "rest" = "graphql";
 
     // ---- REST fallback for old / archived orders ----
     // Shopify's GraphQL search index doesn't reliably return orders
@@ -243,7 +247,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           // For the sweep strategy, filter client-side by order_number
           // matching the trimmed input. For name-based strategies,
           // Shopify already narrowed to <=1 result.
-          let rest = orders[0];
+          let rest: (typeof orders)[number] | undefined = orders[0];
           if (strat.label === "order_number") {
             const target = Number(trimmed);
             rest = orders.find((o) => Number((o as { order_number?: number }).order_number) === target);
@@ -275,6 +279,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 trackingInfo: [{ company: f.tracking_company ?? null }],
               })),
               lineItems: {
+                // REST order objects carry every line item; there is no paging.
+                pageInfo: { hasNextPage: false },
                 edges: (rest.line_items ?? []).map((l) => ({
                   node: {
                     sku: l.sku,
@@ -286,6 +292,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 })),
               },
             } as ShopifyOrderNode;
+            source = "rest";
           }
         } catch (restErr) {
           // eslint-disable-next-line no-console
@@ -334,8 +341,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       })
       .filter((l) => l.quantity > 0);
 
+    // F6 completeness guard. `truncated`: Shopify said more line items exist
+    // than were returned (GraphQL pageInfo), or did not say (no pageInfo).
+    // `complete`: every line item was returned AND the order found is
+    // exactly the one asked for. Strict callers (shared scanners) refuse
+    // anything else; existing callers ignore both fields.
+    const truncated = node.lineItems?.pageInfo?.hasNextPage !== false;
+    const exactMatch = node.name === `#${trimmed}`;
+
     res.status(200).json({
       found: true,
+      truncated,
+      complete: !truncated && exactMatch,
+      exact_match: exactMatch,
+      lookup_source: source,
       order_name: node.name,
       customer_name: customerName,
       customer_email: customerEmail,
