@@ -446,7 +446,8 @@ export function createScannerOutbox(store: JobStore, now: () => number = Date.no
       return store.tx(async (t) => {
         const job = await mustGet(t, requestId);
         if (!live(job, lease)) return false;
-        if (jobMode(job) !== "dispatch" || job.status !== "queued" || job.prepared !== null || job.uncertain || job.attempts > 0) {
+        // Nothing may have been saved for it: never sent, or every send was definitely refused.
+        if (jobMode(job) !== "dispatch" || job.status !== "queued" || job.prepared !== null || job.uncertain || (job.priorUnknown ?? false)) {
           throw new OutboxStorageError("Only an unsent dispatch scan can wait for a framer choice.");
         }
         if (draft.orderNumber !== job.orderNumber || !CHOICE_CODES.has(block.code)) throw new OutboxStorageError("Framer choice does not match the scan.");

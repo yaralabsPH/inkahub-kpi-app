@@ -218,6 +218,21 @@ describe("dispatch jobs in the shared outbox", () => {
     await expect(ob.chooseFramers(a.requestId, scope, [])).rejects.toThrow(/incomplete/);
   });
 
+  it("a definite commit refusal (framer_missing: the record was undone meanwhile) -> Retry re-reads and asks again, no storage error", async () => {
+    const ob = createScannerOutbox(memoryJobStore());
+    const a = await ob.enqueue(captured(), scope, uuid(), "dispatch");
+    const t = deps({ outbox: ob });
+    // Preview saw a measured record; the server, under the lock, no longer does.
+    t.answerNext({ outcome: "rejected", code: "framer_missing", message: "missing" });
+    expect(await processNext(t.d)).toMatchObject({ kind: "blocked", code: "framer_missing", uncertain: false });
+    t.setEvidence("missing");
+    await ob.retryBlocked(a.requestId, scope);
+    expect(await processNext(t.d)).toMatchObject({ kind: "needs_choice" });
+    await ob.chooseFramers(a.requestId, scope, [{ sku: "INKA-ABC0001-A2-FB", personId: P1, displayName: "Alice" }]);
+    expect(await processNext(t.d)).toMatchObject({ kind: "saved" });
+    expect(t.dispatch.at(-1)?.p_choices).toEqual([{ sku: "INKA-ABC0001-A2-FB", person_id: P1 }]);
+  });
+
   it("evidence overflow is a clear refusal, never treated as missing", async () => {
     const ob = createScannerOutbox(memoryJobStore());
     await ob.enqueue(captured(), scope, uuid(), "dispatch");
