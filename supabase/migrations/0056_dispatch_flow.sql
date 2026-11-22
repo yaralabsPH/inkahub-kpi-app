@@ -216,7 +216,10 @@ $$;
 --     without a parent at or after L (a scrap/cancel during OR after the
 --     work), and
 --     no started row of that work type for the whole order or that SKU
---     strictly after C (the order was reopened at framing).
+--     strictly after L (the order was loaded again at framing after the
+--     verification: a reload/reopen starts a new attempt, so L and any
+--     completion after it are not reused). A start at or before L belongs
+--     to L's own attempt.
 --   A later attempt is evidence only through its own verification and
 --   completion. Conservative: anything doubtful is "missing" (manual choice).
 -- status: measured (valid pairs of exactly one person; the latest L and its
@@ -273,7 +276,8 @@ BEGIN
       AND  NOT EXISTS (
              SELECT 1 FROM ev x
              WHERE  x.event_type = 'started' AND x.department = p.wt
-               AND  (x.sku IS NULL OR x.sku = p.sku) AND x.created_at > p.cat)
+               AND  (x.sku IS NULL OR x.sku = p.sku) AND x.created_at > p.vat)
+
   )
 
   SELECT COALESCE(jsonb_agg(jsonb_build_object(

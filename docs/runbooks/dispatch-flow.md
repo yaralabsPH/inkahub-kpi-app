@@ -58,7 +58,8 @@ uncancelled framing verification AND the next completion by the same
 person for that work type, for the whole order or that SKU, at or after the
 verification, enough quantity, not replacement work. A scrap or cancel of
 the order or that line at any time after the verification, or the order
-being reopened at framing after the completion, ends that attempt; a new
+being loaded again at framing after the verification (a reload or reopen),
+ends that attempt; a new
 attempt counts through its own verification and completion. Two different
 framers = needs a choice. A verification alone, someone else's completion,
 a completion for another SKU or another site's records never count.

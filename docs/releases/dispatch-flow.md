@@ -1,7 +1,7 @@
 # Release record: F7 dispatch flow
 
 Branch `feature/dispatch-flow`. Staging only; production and `main` untouched.
-Base: reviewed F6 `0c47ace` (plan commit `ab37988`). Review R1 fixes: `cdb0af2`, `98d84a5`.
+Base: reviewed F6 `0c47ace` (plan commit `ab37988`). Review R1 fixes: `cdb0af2`, `98d84a5`; R2 start boundary: see plan log.
 Migrations: adds `0056_dispatch_flow.sql` only (`git diff --name-status ab37988 HEAD -- supabase/migrations` = `A 0056`).
 0048–0051 stay reserved for F3; 0052–0055 (installed on staging) are byte-identical to `0c47ace`
 (0055 still `3e5981954ad37c992b78d2765d4329162efb1c69b606afe11f9dd95b177b2620`). 0056 is NOT installed anywhere.
@@ -10,9 +10,9 @@ Migrations: adds `0056_dispatch_flow.sql` only (`git diff --name-status ab37988 
 
 | File | sha256 |
 |---|---|
-| `supabase/migrations/0056_dispatch_flow.sql` | `583814909dd5ae1afecbcb094d37e5f2fee5139896b79ec121f562830da867c9` |
+| `supabase/migrations/0056_dispatch_flow.sql` | `b13cd1d2f7daea4b2d8b4b73e34b4571329beba85e45f6b97d062ab12d07fa2e` |
 | `supabase/staging/dispatch-flow/01-fixtures.sql` | `521f34fe5447ac1c27920aef025da617df41bc28463da9292ba23ae07cf5d19a` |
-| `supabase/staging/dispatch-flow/02-assertions.sql` | `f1170bf145b7f5d711a9849ee4239d6ed85943a2ac1b08f0219ba470900ffc94` |
+| `supabase/staging/dispatch-flow/02-assertions.sql` | `b648f16c9206b610d3f23c34ed88d78e63ccda964cd97c27b4bd9e90d09c805a` |
 | `supabase/staging/dispatch-flow/05-session-a.sql` | `e5be20d9837470c43ebd8afe5e2abf0466c84128d5eed10642cc0fc3c4944c20` |
 | `supabase/staging/dispatch-flow/05-session-b.sql` | `5cb21f90cac396056bd9f2773a11a07768d7055fef0feb27e450c3c4e32d36d6` |
 | `supabase/staging/dispatch-flow/09-cleanup.sql` | `b4d110b2502db981503ec81ce9315101e952d2cbf3e11e2104f5372655eeac27` |
@@ -28,7 +28,8 @@ Migrations: adds `0056_dispatch_flow.sql` only (`git diff --name-status ab37988 
 - Evidence (one SQL reader, preview and commit): only the CURRENT framing attempt counts. Uncancelled `line_verified`
   of the SKU/work type (not CS, enough quantity) + the FIRST `completed` at or after it by the same person for the
   whole order or that SKU; ended by any parentless whole-order/same-SKU `cancelled` of that work type at or after the
-  verification, or a `started` of that work type (whole order/SKU) after the completion. Equal-timestamp F6 pairs work.
+  verification, or a `started` of that work type (whole order/SKU) strictly after the verification (a reload/reopen starts
+  a new attempt; a start at or before the verification is its own). Equal-timestamp F6 pairs work.
   Several framers = conflict. Doubt = missing (manual choice). >1000 events = `evidence_overflow`.
 - Commit: regular framed lines (`work_type = 'framed'`) require a packaging object (`packaging_required` for SQL or
   JSON null); A0-only / no-framed orders may omit it.
@@ -50,7 +51,7 @@ Migrations: adds `0056_dispatch_flow.sql` only (`git diff --name-status ab37988 
 - Reports CSV: attribution read per 200 exported shared-dispatch event ids, each batch paged by `range` in
   (dispatch_event_id, sku) order, 1000 rows a page, until a short page.
 
-## Checks run by the coder (2026-11-22 UTC, after review R1 fixes)
+## Checks run by the coder (2026-11-22 UTC, after review R1 fixes; R2 re-ran SQL + manifest only, app code unchanged)
 
 | Check | Result |
 |---|---|
@@ -59,9 +60,9 @@ Migrations: adds `0056_dispatch_flow.sql` only (`git diff --name-status ab37988 
 | `npm run typecheck:api` | pass |
 | `npm run test -- --run` | 46 files, 1016 tests pass |
 | `npm run build` | pass |
-| Local PGlite: 0031, 0047, 0052–0055, 0056 twice, then F7 `02-assertions.sql` | `F7 verify: ALL CHECKS PASSED (167 cases)` — local, **not staging evidence** |
+| Local PGlite: 0031, 0047, 0052–0055, 0056 twice, then F7 `02-assertions.sql` | `F7 verify: ALL CHECKS PASSED (175 cases)` (after R2) — local, **not staging evidence** |
 | Local PGlite: F6 `02-assertions.sql` with 0056 applied | 160 cases pass — local |
-| Local PGlite: each R1 fix removed in turn / previous 0056 | fails C16b (previous 0056), C19a, D15a, G01, G06 respectively — the cases bite |
+| Local PGlite: each R1 fix removed in turn / previous 0056 | fails C16b (first 0056), C20 (R1 0056 start boundary), C19a, D15a, G01, G06 respectively — the cases bite |
 | Local PGlite: 01-fixtures → R1–R8 in documented order (sequential; waiting steps placed where they return) → totals | every step gave its expected answer; 16/16 totals `true`. One connection cannot block — **not concurrency evidence** |
 
 ## Staging (Codex / root)

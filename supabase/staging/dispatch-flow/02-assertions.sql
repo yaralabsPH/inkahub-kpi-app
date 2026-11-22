@@ -462,6 +462,30 @@ BEGIN
   PERFORM pg_temp.f7_event('f7c19-ca', i.f1, 'framed', '10977025', 'completed', 'INKA-ABC0001-A2-FB', 2, t + interval '2 minutes');
   e := pg_temp.f7_must('C19b', i.kiosk, pg_temp.f7_evidence_sql('10977025', L)) -> 'lines' -> 0;
   PERFORM pg_temp.f7_ok('C19b a same-SKU completion is measured', e ->> 'status' = 'measured' AND e ->> 'completed_event_id' = 'f7c19-ca', e::text);
+
+  -- C20: verification -> later start/reload -> completion: the verification
+  -- belongs to the earlier attempt, so it needs a manual choice.
+  PERFORM pg_temp.f7_event('f7c20-v', i.f1, 'framed', '10977026', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t);
+  PERFORM pg_temp.f7_event('f7c20-s', i.f1, 'framed', '10977026', 'started', NULL, NULL, t + interval '1 minute');
+  PERFORM pg_temp.f7_event('f7c20-c', i.f1, 'framed', '10977026', 'completed', NULL, 2, t + interval '2 minutes');
+  e := pg_temp.f7_must('C20', i.kiosk, pg_temp.f7_evidence_sql('10977026', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C20 V -> S -> C is missing (start after the verification)', e ->> 'status' = 'missing', e::text);
+  -- C21: start -> verification -> completion is one attempt; a start at the
+  -- same instant as the verification is also the same attempt.
+  PERFORM pg_temp.f7_event('f7c21-s', i.f1, 'framed', '10977027', 'started', NULL, NULL, t);
+  PERFORM pg_temp.f7_event('f7c21-v', i.f1, 'framed', '10977027', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t + interval '1 minute');
+  PERFORM pg_temp.f7_event('f7c21-c', i.f1, 'framed', '10977027', 'completed', NULL, 2, t + interval '2 minutes');
+  e := pg_temp.f7_must('C21a', i.kiosk, pg_temp.f7_evidence_sql('10977027', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C21a S -> V -> C is measured', e ->> 'status' = 'measured' AND e ->> 'verified_event_id' = 'f7c21-v', e::text);
+  PERFORM pg_temp.f7_event('f7c21-s2', i.f2, 'framed', '10977028', 'started', NULL, NULL, t);
+  PERFORM pg_temp.f7_event('f7c21-v2', i.f2, 'framed', '10977028', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t);
+  PERFORM pg_temp.f7_event('f7c21-c2', i.f2, 'framed', '10977028', 'completed', NULL, 2, t);
+  e := pg_temp.f7_must('C21b', i.kiosk, pg_temp.f7_evidence_sql('10977028', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C21b start, verification and completion at one instant are measured', e ->> 'status' = 'measured', e::text);
+  -- C01 (F6 same-instant V/C, no start) is re-checked after all of this.
+  e := pg_temp.f7_must('C21c', i.kiosk, pg_temp.f7_evidence_sql('10977001', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C21c F6 equal-time pair still measured', e ->> 'status' = 'measured' AND e ->> 'verified_event_id' = 'scn-f7c01-v01', e::text);
+
 END $$;
 
 -- ===========================================================================
