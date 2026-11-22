@@ -370,6 +370,24 @@ describe("0054 event snapshots", () => {
       expect(sql.indexOf(revoke)).toBeGreaterThan(sql.indexOf(grant));
       expect(sql.indexOf(revoke)).toBeLessThan(commit);
     }
+    // Review r1 (reproduced on staging, SQLSTATE 42501): once resolve_event
+    // belongs to departments_resolver, a non-superuser migration role can only
+    // attach it to a trigger while it is still a member of that role. So the
+    // membership must be held from before the function is created until after
+    // the LAST trigger is created, and be given up exactly once.
+    const membershipRevoke = sql.indexOf("REVOKE departments_resolver FROM CURRENT_USER;");
+    const lastTrigger = sql.lastIndexOf("CREATE TRIGGER");
+    const resolveTrigger = sql.indexOf("CREATE TRIGGER production_events_f5_20_resolve");
+    expect(sql.match(/REVOKE departments_resolver FROM CURRENT_USER;/g)).toHaveLength(1);
+    expect(sql.match(/GRANT departments_resolver TO CURRENT_USER;/g)).toHaveLength(1);
+    expect(sql.indexOf("GRANT departments_resolver TO CURRENT_USER;"))
+      .toBeLessThan(sql.indexOf("CREATE OR REPLACE FUNCTION departments_private.resolve_event("));
+    expect(resolveTrigger).toBeGreaterThan(sql.indexOf("ALTER FUNCTION departments_private.resolve_event() OWNER TO"));
+    expect(membershipRevoke).toBeGreaterThan(resolveTrigger);
+    expect(membershipRevoke).toBeGreaterThan(lastTrigger);
+    // The fix is the ordering, never a wider grant.
+    expect(sql).not.toMatch(/GRANT EXECUTE ON FUNCTION departments_private\.(resolve_event|sanitize_event|freeze_event)/);
+    expect(sql).not.toMatch(/GRANT[^;]*TO (PUBLIC|anon|authenticated|service_role)\b/);
     const revokes = sql.match(/REVOKE ALL ON FUNCTION[^;]+FROM PUBLIC, anon, authenticated, service_role;/g) ?? [];
     expect(revokes).toHaveLength(4);
     const grants = sql.match(/GRANT EXECUTE ON FUNCTION[^;]+;/g) ?? [];

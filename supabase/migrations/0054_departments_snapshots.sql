@@ -371,10 +371,14 @@ GRANT EXECUTE ON FUNCTION departments_private.classify_time(timestamptz, timesta
 -- needs the migration role to be able to act as the new owner (granted
 -- above), and the new owner to hold CREATE on the schema, for a moment. Both
 -- are taken away again before the migration commits.
+--
+-- The membership is NOT revoked here. Once the function belongs to
+-- departments_resolver and nobody else may execute it, the migration role can
+-- only attach it to a trigger through that membership (CREATE TRIGGER checks
+-- EXECUTE on the function). So the revoke comes after the triggers, below.
 GRANT CREATE ON SCHEMA departments_private TO departments_resolver;
 ALTER FUNCTION departments_private.resolve_event() OWNER TO departments_resolver;
 REVOKE CREATE ON SCHEMA departments_private FROM departments_resolver;
-REVOKE departments_resolver FROM CURRENT_USER;
 
 -- ---------------------------------------------------------------------------
 -- Triggers. Names fix the firing order: f5_10 before f5_20.
@@ -394,6 +398,11 @@ DROP TRIGGER IF EXISTS production_events_f5_10_freeze ON public.production_event
 CREATE TRIGGER production_events_f5_10_freeze
   BEFORE UPDATE ON public.production_events
   FOR EACH ROW EXECUTE FUNCTION departments_private.freeze_event();
+
+-- Last: give up the temporary membership taken before resolve_event was
+-- created. After this the migration role can no longer execute or replace
+-- that function, and no client role ever could.
+REVOKE departments_resolver FROM CURRENT_USER;
 
 COMMIT;
 
