@@ -79,3 +79,46 @@ to the git-ignored `.claude/settings.local.json`, which was refused.
 Still not verified: the F4 preview itself, its bundle refs, staging login and
 the station and Settings flows in a browser, and the two-session race. No box
 rules are activated.
+
+## Preview deployed (coder, 2026-11-22)
+
+**DEPLOYED to Preview.** This supersedes "NOT DEPLOYED YET" above.
+
+- URL: https://inka-arthouse-n6jn9ueyz-inka-arthouse-s-projects.vercel.app
+- Deployment: `dpl_94rdjt3M8VX3KqZE6QNfBPCpHQMX`, project `inka-arthouse-hub`
+  (`prj_1SQWDWZtxggASu59ZO0dkhAXMAzH`), target Preview (`target: null`), no
+  aliases. State READY after about 52 s of build.
+- Source: exact app files of commit `f9cb8a2` on `feature/box-auto-pick` (same
+  app code as reviewed `0e4e6d3`/`3a47b7d`; `f9cb8a2` and later `e6dacbd` are
+  docs-only). 124 deploy files (docs, tests and supabase/ excluded). The 28
+  files changed since station-redesign preview `7b05828` were uploaded; the
+  other 96 were referenced by SHA1 from that earlier deploy.
+- How: the temporary hook (`C:/Users/cjgom/dev/f4deploy-tmp/hook.py`,
+  registered in the git-ignored `.claude/settings.local.json`, approved by CJ)
+  filled each `upload_file` body and the `create_deployment` file list from the
+  clean checkout and re-checked every SHA1 and size. The hook log shows 28
+  uploads injected and one deployment with 124 verified refs; Vercel accepted
+  every upload under its SHA1 digest. No probe or incomplete deployment was
+  made this time. The hook is to be removed after verification.
+
+Checks:
+
+- Built JS `/assets/index-Dqy9t16Z.js`: `ybrzhrgfrnvtcwymjdrq.supabase.co` 1,
+  `lkboboagiikvozvbcpvg` 0. F4 code present (`packaging_apply`,
+  `packaging_save_rule_set`, "Try a parcel", "Packaging needing attention").
+- Production is unchanged: the current Production deployment is still
+  `dpl_4r1s2fBXEdhNdUzooNN4BNHaWyZf`.
+- The page is behind Vercel Authentication (team SSO protection), as for
+  earlier previews.
+
+Not verified yet (needs a person in the browser): staging login on the
+preview, the station flows in scan and auto mode, the Settings rule editor,
+the Reports cards and the PostgREST `or` filter, and the two-session race in
+the staging README. No box rules are activated; every site stays in scan mode
+until someone switches it on staging. Shopify and Dropbox calls from the
+preview use the shared tokens (read-only in app code); email cannot be sent
+from Preview.
+
+Clean-up still open: delete failed probe `dpl_5A5TpoXUq9UVZwqiMoPV8ehRcKbQ`
+from the dashboard (optional), and remove the temporary `hooks` key from
+`.claude/settings.local.json`.
