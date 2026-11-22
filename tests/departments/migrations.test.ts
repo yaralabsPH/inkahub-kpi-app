@@ -117,3 +117,136 @@ describe("0052 storage and privileges", () => {
     expect(sql).not.toMatch(/DROP (TABLE|COLUMN|SCHEMA|FUNCTION)/);
   });
 });
+
+describe("0053 administration and profile lifecycle", () => {
+  const sql = code(read("0053_departments_admin.sql"));
+  const PUBLIC_FUNCTIONS = [
+    "public.department_admin(text, uuid, uuid, uuid, text, bigint, uuid, text)",
+    "public.department_set_snapshot_enabled(uuid, boolean, bigint, text)",
+    "public.department_owner_page(text, uuid, jsonb, integer)",
+  ];
+  /** The body of one function, from its CREATE to the closing $fn$;. */
+  const body = (name: string) => {
+    const start = sql.indexOf(`CREATE OR REPLACE FUNCTION ${name}(`);
+    expect(start, name).toBeGreaterThan(-1);
+    return sql.slice(start, sql.indexOf("$fn$;", start));
+  };
+
+  it("exposes exactly three functions, with no overloads or defaults", () => {
+    const created = (sql.match(/CREATE OR REPLACE FUNCTION public\.\w+/g) ?? []).sort();
+    expect(created).toEqual([
+      "CREATE OR REPLACE FUNCTION public.department_admin",
+      "CREATE OR REPLACE FUNCTION public.department_owner_page",
+      "CREATE OR REPLACE FUNCTION public.department_set_snapshot_enabled",
+    ]);
+    expect(sql).not.toMatch(/\bDEFAULT\b/);
+  });
+
+  it("pins search_path on every function and uses no dynamic SQL", () => {
+    const functions = sql.match(/CREATE OR REPLACE FUNCTION/g) ?? [];
+    const pinned = sql.match(/SET search_path = pg_catalog/g) ?? [];
+    expect(pinned).toHaveLength(functions.length);
+    expect(sql).not.toMatch(/\bEXECUTE\s+(format|'|\w+\s*\|\|)/);
+  });
+
+  it("checks the owner role before anything else in each public function", () => {
+    for (const name of ["public.department_admin", "public.department_set_snapshot_enabled", "public.department_owner_page"]) {
+      const b = body(name);
+      const begin = b.indexOf("BEGIN");
+      const firstStatement = b.slice(begin + 5).trim();
+      expect(firstStatement.startsWith("v_actor := departments_private.require_owner();")
+        || firstStatement.startsWith("PERFORM departments_private.require_owner();"), name).toBe(true);
+      expect(b).toContain("SECURITY DEFINER");
+    }
+    const owner = body("departments_private.require_owner");
+    expect(owner).toContain("auth.uid()");
+    expect(owner).toContain("FROM public.profiles p WHERE p.user_id = v_actor");
+    expect(owner).toContain("IS DISTINCT FROM 'owner'");
+    expect(owner).not.toMatch(/user_metadata|allowed_nav/);
+  });
+
+  it("authorizes and locks before returning a stored receipt, then picks the time", () => {
+    for (const name of ["public.department_admin", "public.department_set_snapshot_enabled"]) {
+      const b = body(name);
+      const owner = b.indexOf("require_owner()");
+      const lock = b.indexOf("PERFORM departments_private.lock_exclusive();");
+      const receipt = b.indexOf("FROM public.department_requests r");
+      const now = b.indexOf("v_now := clock_timestamp();");
+      expect(owner).toBeGreaterThan(-1);
+      expect(lock).toBeGreaterThan(owner);
+      expect(receipt).toBeGreaterThan(lock);
+      expect(now).toBeGreaterThan(receipt);
+      expect(b).toContain("'request_id_reused'");
+      // The receipt is written last, in the same transaction as the change.
+      expect(b.lastIndexOf("INSERT INTO public.department_requests")).toBeGreaterThan(b.lastIndexOf("INSERT INTO public.department_audit"));
+    }
+  });
+
+  it("uses the one reserved exclusive lock with a two-second bound", () => {
+    const lock = body("departments_private.lock_exclusive");
+    expect(lock).toContain("pg_advisory_xact_lock(494749, 5)");
+    expect(lock).toContain("set_config('lock_timeout', '2s', true)");
+    expect(lock).toContain("set_config('lock_timeout', v_previous, true)");
+    expect(lock).toContain("'read committed'");
+    expect(sql.match(/pg_advisory_xact_lock\(/g)).toHaveLength(1);
+  });
+
+  it("never lets a caller choose the effective time", () => {
+    for (const fn of PUBLIC_FUNCTIONS) expect(fn).not.toMatch(/timestamptz/);
+    expect(body("public.department_admin")).not.toMatch(/p_(effective|valid|at)\w*/);
+  });
+
+  it("uses the agreed error codes", () => {
+    const admin = body("public.department_admin");
+    for (const state of ["'22023'", "'40001'", "'23505'", "'P0001'"]) expect(admin).toContain(state);
+    expect(admin).toContain("'department_has_members'");
+    expect(body("departments_private.require_owner")).toContain("'42501'");
+  });
+
+  it("requires a current profile to open an assignment and never deletes history", () => {
+    const admin = body("public.department_admin");
+    expect(admin).toContain("FROM public.profiles p WHERE p.user_id = p_person_id");
+    expect(sql).not.toMatch(/DELETE FROM/);
+    // Updates of history rows only ever close them.
+    for (const u of sql.match(/UPDATE public\.(person_department_assignments|business_department_names)[^;]+;/g) ?? []) {
+      expect(u).toMatch(/SET valid_to = v_now, closed_at = v_now/);
+    }
+  });
+
+  it("closes the open assignment when a profile is deleted, under the same lock", () => {
+    expect(sql).toMatch(/CREATE TRIGGER profiles_f5_10_close_assignment\s+BEFORE DELETE ON public\.profiles\s+FOR EACH ROW/);
+    const fn = body("departments_private.close_profile_assignment");
+    expect(fn).toContain("PERFORM departments_private.lock_exclusive();");
+    expect(fn).toContain("'profile_removed_actor_unavailable'");
+    expect(fn).toContain("'remove'");
+    // It does not touch the Auth user, barcodes or location grants.
+    expect(fn).not.toMatch(/auth\.users|staff_barcodes|user_locations/);
+  });
+
+  it("limits pages to 100 rows and validates the cursor", () => {
+    const page = body("public.department_owner_page");
+    expect(page).toContain("p_limit < 1 OR p_limit > 100");
+    expect(page).toContain("'invalid_cursor'");
+    expect(page).not.toMatch(/hourly_rate|email|allowed_nav|\brole\b/);
+  });
+
+  it("revokes every function from every client role, then grants exactly the three", () => {
+    const functions = sql.match(/CREATE OR REPLACE FUNCTION/g) ?? [];
+    const revokes = sql.match(/REVOKE ALL ON FUNCTION[^;]+FROM PUBLIC, anon, authenticated, service_role;/g) ?? [];
+    expect(revokes).toHaveLength(functions.length);
+    const grants = sql.match(/GRANT EXECUTE ON FUNCTION[^;]+;/g) ?? [];
+    expect(grants).toHaveLength(3);
+    for (const g of grants) {
+      expect(g).toMatch(/TO authenticated;$/);
+      expect(g).toMatch(/ON FUNCTION public\./);
+    }
+    for (const fn of PUBLIC_FUNCTIONS) expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${fn}`);
+  });
+
+  it("does not read or write events, and changes no existing object", () => {
+    expect(sql).not.toMatch(/production_events/);
+    expect(sql).not.toMatch(/reporting_private|reporting_capture/);
+    expect(sql).not.toMatch(/ALTER (TABLE|DEFAULT PRIVILEGES)/);
+    expect(sql).not.toMatch(/DROP (TABLE|COLUMN|SCHEMA|FUNCTION|POLICY)/);
+  });
+});
