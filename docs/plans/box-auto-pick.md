@@ -388,6 +388,35 @@ CJ answers inline.
   (replacement contents; proposed default in force) and R1 (Max's rules).
   Tasks 1–10 and 13 do not depend on Max's rules; any `auto` activation
   does.
+- **Task 12 is stopped (coder, 2026-11-22).** The plan says to start the
+  rule editor, examples table and simulator only after Max's table has been
+  checked against the rule shape. No table from Max exists yet, so that
+  check cannot be done. Until Task 12 is built, rules and examples cannot be
+  typed in Settings; the Settings card can still switch mode, edit the
+  packaging items of a draft, save it and activate it. CJ to choose:
+  (a) build Task 12 now against the rule shape in the spec, accepting some
+  rework if Max's rules need a different shape; or (b) wait for Max's
+  table. For staging tests in the meantime a synthetic rule set can be
+  saved with `packaging_save_rule_set` (see
+  `supabase/staging/box-auto-pick/README.md`).
+- **Migration number (coder, 2026-11-22).** Task 5 said to confirm the
+  number with CJ before committing. The file is committed as `0047`
+  (first free number after item-counting's `0046`) and has not been applied
+  anywhere. CJ to confirm or give another number before it goes to staging;
+  renaming the file is the only change needed.
+- **Spec Q2, replacement contents (coder, 2026-11-22).** The station only
+  knows the CS case id, urgency and customer name, not which lines are being
+  re-sent. So the "use the case's lines" option is not available without
+  loading case lines at the station. Implemented the fallback: nothing is
+  predicted for replacement work; the worker taps the packaging used, or
+  completes and the order is flagged. CJ to confirm, or ask for case lines
+  to be loaded (a new task).
+- **Found, not changed (coder, 2026-11-22).** In scan mode today the list
+  of scanned boxes is never cleared after Complete (`setPackages` is only
+  reset by "Clear all"), so a scanned box stays on screen for the next
+  order and is deducted again for it unless the worker clears it. Scan mode
+  was left exactly as it is, as the spec requires. Auto mode starts every
+  order from its own prediction.
 
 ## Implementation log
 
