@@ -9,18 +9,16 @@ import {
   type DepartmentPersonRow,
   type DepartmentRow,
 } from "@/lib/domain/departments";
-import type { ListState } from "./DepartmentEditor";
+import type { ListState, PagedState } from "./DepartmentEditor";
 import { HomeDepartmentEditor, type HomeChange } from "./HomeDepartmentEditor";
 
-/** A list read one page at a time. */
-export interface PagedState<T> extends ListState<T> {
-  hasMore: boolean;
-  loadingMore: boolean;
-}
+export type { PagedState } from "./DepartmentEditor";
 
 export interface DepartmentPeopleViewProps {
   location: string;
-  people: ListState<DepartmentPersonRow>;
+  /** Read a page at a time; "Load more" fetches the next one. */
+  people: PagedState<DepartmentPersonRow>;
+  onLoadMorePeople: () => void;
   /** Active departments, for the picker. */
   departments: ListState<DepartmentRow>;
   selectedPersonId: string | null;
@@ -61,9 +59,11 @@ export function DepartmentPeopleView(props: DepartmentPeopleViewProps) {
       {people.status === "ready" && people.rows.length > 0 && (
         <>
           <p className="text-xs text-slate-600 dark:text-slate-300">
-            {without === 0
-              ? "Every account has a home department."
-              : `${without} of ${people.rows.length} accounts have no home department. Their work is still recorded, without a department.`}
+            {people.hasMore
+              ? `Showing the first ${people.rows.length} accounts (${without} of them without a home department). Load more to see the rest.`
+              : without === 0
+                ? "Every account has a home department."
+                : `${without} of ${people.rows.length} accounts have no home department. Their work is still recorded, without a department.`}
           </p>
           <ul className="divide-y divide-slate-100 dark:divide-slate-800 rounded-md ring-1 ring-slate-200 dark:ring-slate-800">
             {people.rows.map((p) => {
@@ -103,6 +103,11 @@ export function DepartmentPeopleView(props: DepartmentPeopleViewProps) {
               );
             })}
           </ul>
+          {people.hasMore && (
+            <Button size="sm" variant="ghost" disabled={people.loadingMore} onClick={props.onLoadMorePeople}>
+              {people.loadingMore ? "Loading..." : "Load more people"}
+            </Button>
+          )}
         </>
       )}
     </section>

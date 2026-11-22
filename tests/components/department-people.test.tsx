@@ -32,7 +32,7 @@ const emptyHistory: PagedState<DepartmentHistoryRow> = { status: "ready", rows: 
 function people(over: Partial<DepartmentPeopleViewProps> = {}): string {
   return renderToStaticMarkup(
     <DepartmentPeopleView
-      location="au" people={{ status: "ready", rows: [person1, person2] }} departments={{ status: "ready", rows: departments }}
+      location="au" people={{ status: "ready", rows: [person1, person2], hasMore: false, loadingMore: false }} onLoadMorePeople={noop} departments={{ status: "ready", rows: departments }}
       selectedPersonId={null} history={emptyHistory} busy={false} onSelect={noop} onSubmit={noop} onLoadMoreHistory={noop} {...over}
     />,
   );
@@ -69,12 +69,12 @@ describe("people list", () => {
   });
 
   it("says when everyone has a home", () => {
-    expect(people({ people: { status: "ready", rows: [person1] } })).toContain("Every account has a home department");
+    expect(people({ people: { status: "ready", rows: [person1], hasMore: false, loadingMore: false } })).toContain("Every account has a home department");
   });
 
   it("shows loading, and an error without pretending the list is empty", () => {
-    expect(people({ people: { status: "loading", rows: [] } })).toContain("Loading people");
-    const html = people({ people: { status: "error", rows: [], message: "timeout" } });
+    expect(people({ people: { status: "loading", rows: [], hasMore: false, loadingMore: false } })).toContain("Loading people");
+    const html = people({ people: { status: "error", rows: [], message: "timeout", hasMore: false, loadingMore: false } });
     expect(html).toContain("load people: timeout");
     expect(html).not.toContain("No team members");
   });
@@ -95,7 +95,7 @@ describe("people list", () => {
 
   it("shows nothing stale when the list changes to another account's data", () => {
     const other: DepartmentPersonRow = { ...person2, person_id: OWNER_1, display_name: "Someone Else" };
-    const html = people({ people: { status: "ready", rows: [other] }, selectedPersonId: PERSON_1 });
+    const html = people({ people: { status: "ready", rows: [other], hasMore: false, loadingMore: false }, selectedPersonId: PERSON_1 });
     expect(html).not.toContain("Person 1");
     expect(html).not.toContain('aria-label="Home department for');
   });

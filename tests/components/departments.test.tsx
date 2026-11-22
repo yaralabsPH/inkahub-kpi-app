@@ -11,7 +11,7 @@ import {
 } from "@/components/departments/DepartmentEditor";
 import { DepartmentsGate } from "@/components/departments/DepartmentsCard";
 import type { DepartmentRow } from "@/lib/domain/departments";
-import { ASSIGN_A, DEPT_A, DEPT_B, PERSON_1 } from "../fixtures/departments";
+import { ASSIGN_A, DEPT_A, DEPT_B, OWNER_1, PERSON_1 } from "../fixtures/departments";
 
 // Rendered to static HTML (as the packaging tests do): this checks what is
 // shown for each state. Clicks, focus and keyboard use are checked by hand
@@ -27,7 +27,7 @@ function view(over: Partial<DepartmentsViewProps> = {}): string {
   return renderToStaticMarkup(
     <DepartmentsView
       location="au" showArchived={false} departments={{ status: "ready", rows: [] }} membersOf={null}
-      members={{ status: "ready", rows: [] }} busy={false} onToggleArchived={noop} onCreate={noop} onRename={noop}
+      members={{ status: "ready", rows: [], hasMore: false, loadingMore: false }} onLoadMoreMembers={noop} busy={false} onToggleArchived={noop} onCreate={noop} onRename={noop}
       onArchive={noop} onRestore={noop} onShowMembers={noop} {...over}
     />,
   );
@@ -35,19 +35,24 @@ function view(over: Partial<DepartmentsViewProps> = {}): string {
 
 describe("backend and owner gates", () => {
   it("shows the Supabase notice in Dexie mode and never renders the data panel", () => {
-    const html = renderToStaticMarkup(<DepartmentsGate backend="dexie" role="owner"><p>DATA PANEL</p></DepartmentsGate>);
+    const html = renderToStaticMarkup(<DepartmentsGate backend="dexie" sessionUserId={OWNER_1} profile={{ user_id: OWNER_1, role: "owner" }}>{() => <p>DATA PANEL</p>}</DepartmentsGate>);
     expect(html).toContain("Department management requires Supabase");
     expect(html).not.toContain("DATA PANEL");
   });
 
   it("renders nothing at all for every non-owner role", () => {
-    for (const role of ["manager", "staff", "kiosk", "cs", null]) {
-      expect(renderToStaticMarkup(<DepartmentsGate backend="supabase" role={role}><p>DATA PANEL</p></DepartmentsGate>)).toBe("");
+    for (const role of ["manager", "staff", "kiosk", "cs"]) {
+      expect(renderToStaticMarkup(
+        <DepartmentsGate backend="supabase" sessionUserId={PERSON_1} profile={{ user_id: PERSON_1, role }}>{() => <p>DATA PANEL</p>}</DepartmentsGate>,
+      )).toBe("");
     }
+    expect(renderToStaticMarkup(
+      <DepartmentsGate backend="supabase" sessionUserId={null} profile={null}>{() => <p>DATA PANEL</p>}</DepartmentsGate>,
+    )).toBe("");
   });
 
   it("renders the data panel only for an owner on Supabase", () => {
-    expect(renderToStaticMarkup(<DepartmentsGate backend="supabase" role="owner"><p>DATA PANEL</p></DepartmentsGate>)).toContain("DATA PANEL");
+    expect(renderToStaticMarkup(<DepartmentsGate backend="supabase" sessionUserId={OWNER_1} profile={{ user_id: OWNER_1, role: "owner" }}>{(id) => <p>DATA PANEL {id}</p>}</DepartmentsGate>)).toContain(`DATA PANEL ${OWNER_1}`);
   });
 
   it("does not load the Supabase client or any query when the gate is closed", async () => {
@@ -69,7 +74,10 @@ describe("backend and owner gates", () => {
     const getSupabase = vi.fn(() => { throw new Error("getSupabase must not be called"); });
     vi.doMock("@/lib/repository/supabase/client", () => ({ getBackendMode: () => "supabase", getSupabase }));
     vi.doMock("@/lib/auth/AuthProvider", () => ({
-      useAuthOptional: () => ({ profile: { user_id: PERSON_1, display_name: "Manager", role: "manager", allowed_nav: null } }),
+      useAuthOptional: () => ({
+        session: { user: { id: PERSON_1 } },
+        profile: { user_id: PERSON_1, display_name: "Manager", role: "manager", allowed_nav: null },
+      }),
     }));
     const { DepartmentsCard } = await import("@/components/departments/DepartmentsCard");
     expect(renderToStaticMarkup(<DepartmentsCard />)).toBe("");
@@ -165,21 +173,21 @@ describe("members of a department (archive refused)", () => {
   const member = { person_id: PERSON_1, display_name: "Person 1", assignment_id: ASSIGN_A, department_id: DEPT_A, department_name: "Department A", valid_from: "2026-11-22T10:00:00+00:00" };
 
   it("lists who must be moved first", () => {
-    const html = view({ departments: { status: "ready", rows: [dept()] }, membersOf: DEPT_A, members: { status: "ready", rows: [member] } });
+    const html = view({ departments: { status: "ready", rows: [dept()] }, membersOf: DEPT_A, members: { status: "ready", rows: [member], hasMore: false, loadingMore: false } });
     expect(html).toContain("Person 1");
     expect(html).toContain("Move these people to another department before archiving");
   });
 
   it("shows a removed person by a fixed label, never an id or a guess", () => {
-    const html = renderToStaticMarkup(<MembersList location="au" members={{ status: "ready", rows: [{ ...member, display_name: null }] }} />);
+    const html = renderToStaticMarkup(<MembersList location="au" onLoadMore={noop} members={{ status: "ready", rows: [{ ...member, display_name: null }], hasMore: false, loadingMore: false }} />);
     expect(html).toContain("Removed person");
     expect(html).not.toContain(PERSON_1);
   });
 
   it("shows loading, error and empty states", () => {
-    expect(renderToStaticMarkup(<MembersList location="au" members={{ status: "loading", rows: [] }} />)).toContain("Loading members");
-    expect(renderToStaticMarkup(<MembersList location="au" members={{ status: "error", rows: [], message: "x" }} />)).toContain("load members");
-    expect(renderToStaticMarkup(<MembersList location="au" members={{ status: "ready", rows: [] }} />)).toContain("Nobody is in this department");
+    expect(renderToStaticMarkup(<MembersList location="au" onLoadMore={noop} members={{ status: "loading", rows: [], hasMore: false, loadingMore: false }} />)).toContain("Loading members");
+    expect(renderToStaticMarkup(<MembersList location="au" onLoadMore={noop} members={{ status: "error", rows: [], message: "x", hasMore: false, loadingMore: false }} />)).toContain("load members");
+    expect(renderToStaticMarkup(<MembersList location="au" onLoadMore={noop} members={{ status: "ready", rows: [], hasMore: false, loadingMore: false }} />)).toContain("Nobody is in this department");
   });
 });
 
@@ -225,7 +233,7 @@ describe("snapshot switch", () => {
     value: { enabled, tracking_started_at: "2026-11-22T10:00:00+00:00", version: "4", updated_at: "2026-11-22T10:00:00+00:00" },
   });
   const sw = (over: Partial<SnapshotSwitchProps> = {}) =>
-    renderToStaticMarkup(<SnapshotSwitch location="uk" control={control(false)} busy={false} onSet={noop} {...over} />);
+    renderToStaticMarkup(<SnapshotSwitch location="uk" control={control(false)} busy={false} intent={null} onOpen={noop} onClose={noop} onSet={noop} {...over} />);
 
   it("shows OFF with what that means, and offers to turn on", () => {
     const html = sw();
@@ -243,11 +251,11 @@ describe("snapshot switch", () => {
   });
 
   it("asks for explicit confirmation and a reason before changing", () => {
-    const off = sw({ control: control(true), initialConfirming: true });
+    const off = sw({ control: control(true), intent: { target: false, expectedVersion: "4" } });
     expect(off).toContain("Turn OFF?");
     expect(off).toContain("Reason (required");
     expect(off).toMatch(/<button type="submit"[^>]* disabled=""/);
-    const ready = sw({ control: control(true), initialConfirming: true, initialReason: "Wrong roster loaded" });
+    const ready = sw({ control: control(true), intent: { target: false, expectedVersion: "4" }, initialReason: "Wrong roster loaded" });
     expect(ready).not.toMatch(/<button type="submit"[^>]* disabled=""/);
     expect(ready).toContain("Yes, turn off");
   });

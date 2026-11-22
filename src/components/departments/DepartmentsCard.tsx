@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { Fragment, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/Button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
+import { departmentsOwnerId, type SwitchIntent } from "@/lib/departments/adminState";
 import type { DepartmentChange } from "@/lib/departments/client";
 import type { DepartmentRow } from "@/lib/domain/departments";
 import {
@@ -22,27 +23,37 @@ import type { HomeChange } from "./HomeDepartmentEditor";
  *
  * Three gates, in this order, before anything is requested:
  *   1. backend  - in Dexie mode show a notice and stop (no Supabase call)
- *   2. owner    - anyone else gets nothing: no controls, no reads
+ *   2. owner    - the LIVE session's user must be the loaded profile's user,
+ *                 and that profile must be an owner. Anyone else gets
+ *                 nothing: no controls, no reads
  *   3. data     - only now are the owner-only functions called
+ *
+ * The panel is keyed by that owner's id. When the account changes, the old
+ * panel is unmounted before the new one exists: its lists, open forms,
+ * pending request and Retry go with it, its cache is cleared, and a late
+ * answer to one of its requests is ignored.
  */
 export function DepartmentsCard() {
   const backend = getBackendMode();
   const auth = useAuthOptional();
   return (
-    <DepartmentsGate backend={backend} role={auth?.profile?.role ?? null}>
-      {auth?.profile ? <DepartmentsOwnerPanel callerId={auth.profile.user_id} /> : null}
+    <DepartmentsGate backend={backend} sessionUserId={auth?.session?.user?.id ?? null} profile={auth?.profile ?? null}>
+      {(ownerId) => <DepartmentsOwnerPanel callerId={ownerId} />}
     </DepartmentsGate>
   );
 }
 
 export interface DepartmentsGateProps {
   backend: BackendMode;
-  role: string | null;
-  children: React.ReactNode;
+  /** The signed-in user of the live session (not the profile's). */
+  sessionUserId: string | null;
+  /** The loaded profile, which can briefly belong to the previous account. */
+  profile: { user_id: string; role: string } | null;
+  children: (ownerId: string) => ReactNode;
 }
 
 /** The backend and owner gates, separated so they can be tested without a client. */
-export function DepartmentsGate({ backend, role, children }: DepartmentsGateProps) {
+export function DepartmentsGate({ backend, sessionUserId, profile, children }: DepartmentsGateProps) {
   if (backend !== "supabase") {
     return (
       <Card>
@@ -56,8 +67,10 @@ export function DepartmentsGate({ backend, role, children }: DepartmentsGateProp
       </Card>
     );
   }
-  if (role !== "owner") return null;
-  return <>{children}</>;
+  const ownerId = departmentsOwnerId(sessionUserId, profile);
+  if (ownerId === null) return null;
+  // The key makes a change of owner a remount, never a re-render.
+  return <Fragment key={ownerId}>{children(ownerId)}</Fragment>;
 }
 
 function listState<T>(query: { isPending: boolean; isError: boolean; error: Error | null; data: T[] | undefined }): ListState<T> {
@@ -90,11 +103,12 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
 
   const active = useDepartmentRows(callerId, "departments_active");
   const archived = useDepartmentRows(callerId, "departments_archived", null, showArchived);
-  const members = useDepartmentRows(callerId, "members", membersOf, membersOf !== null);
+  const members = useDepartmentPaged(callerId, "members", membersOf, membersOf !== null);
   const control = useDepartmentControl(callerId);
   const [selectedPerson, setSelectedPerson] = useState<string | null>(null);
   const [showAudit, setShowAudit] = useState(false);
-  const people = useDepartmentRows(callerId, "people");
+  const people = useDepartmentPaged(callerId, "people");
+  const [switchIntent, setSwitchIntent] = useState<SwitchIntent | null>(null);
   const history = useDepartmentPaged(callerId, "history", selectedPerson, selectedPerson !== null);
   const audit = useDepartmentPaged(callerId, "audit", null, showAudit);
   const change = useDepartmentChange(callerId);
@@ -114,6 +128,14 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
     });
     // Refused because people are still in it: show who.
     if (!ok) setMembersOf(d.id);
+  };
+
+  // The switch change carries exactly what the owner confirmed. The open
+  // confirmation is closed only when the server has confirmed it; after a
+  // lost answer it stays as it was and Retry re-sends the same request.
+  const onSwitch = async (intent: SwitchIntent, reason: string) => {
+    const ok = await change.submit({ kind: "switch", enabled: intent.target, expectedVersion: intent.expectedVersion, reason });
+    if (ok) setSwitchIntent(null);
   };
 
   const onHomeChange = async (c: HomeChange) => {
@@ -161,7 +183,8 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
           showArchived={showArchived}
           departments={listState(showArchived ? archived : active)}
           membersOf={membersOf}
-          members={listState(members)}
+          members={pagedState(members)}
+          onLoadMoreMembers={() => void members.fetchNextPage()}
           busy={busy}
           onToggleArchived={(show) => { setShowArchived(show); setMembersOf(null); }}
           onCreate={(name) => admin({ operation: "create", name })}
@@ -173,7 +196,8 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
 
         <DepartmentPeopleView
           location={location}
-          people={listState(people)}
+          people={pagedState(people)}
+          onLoadMorePeople={() => void people.fetchNextPage()}
           departments={listState(active)}
           selectedPersonId={selectedPerson}
           history={pagedState(history)}
@@ -191,7 +215,10 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
             : { status: "ready", value: control.data }
           }
           busy={busy}
-          onSet={(enabled, reason, expectedVersion) => send({ kind: "switch", enabled, expectedVersion, reason })}
+          intent={switchIntent}
+          onOpen={setSwitchIntent}
+          onClose={() => setSwitchIntent(null)}
+          onSet={(intent, reason) => void onSwitch(intent, reason)}
         />
 
         <DepartmentAuditView

@@ -104,3 +104,63 @@ export function departmentAdminReducer<I>(
 export function isDepartmentChangeBusy(state: DepartmentAdminState<unknown>): boolean {
   return state.status === "submitting";
 }
+
+// ---------------------------------------------------------------------------
+// Who the owner panel belongs to
+// ---------------------------------------------------------------------------
+
+/**
+ * The id the owner panel may be shown and keyed for, or null.
+ *
+ * The profile is loaded a moment AFTER the session changes, so for a short
+ * time the app can hold account B's session with account A's profile. The
+ * panel is only allowed when the loaded profile belongs to the live session
+ * and that profile is an owner. Anything else hides it at once.
+ */
+export function departmentsOwnerId(
+  sessionUserId: string | null | undefined,
+  profile: { user_id: string; role: string } | null | undefined,
+): string | null {
+  if (!sessionUserId || !profile) return null;
+  if (profile.user_id !== sessionUserId) return null;
+  if (profile.role !== "owner") return null;
+  return sessionUserId;
+}
+
+/**
+ * Whether an answer may still be applied: the panel that asked must still be
+ * mounted, for the same signed-in owner who asked.
+ */
+export function acceptsDepartmentAnswer(mounted: boolean, askedBy: string, currentCaller: string): boolean {
+  return mounted && askedBy === currentCaller;
+}
+
+// ---------------------------------------------------------------------------
+// The switch: what the owner confirmed, frozen when the confirmation opened
+// ---------------------------------------------------------------------------
+
+export interface SwitchIntent {
+  /** The state the owner asked for. Never recomputed from later reads. */
+  target: boolean;
+  /** The control version the owner was looking at. */
+  expectedVersion: string;
+}
+
+export type SwitchIntentCheck =
+  /** Still what the owner was looking at: may be submitted. */
+  | "ready"
+  /** The switch is already in the asked-for state (their own change landed, or someone else did it). */
+  | "already_done"
+  /** Someone changed the switch and it is not in the asked-for state: ask again from scratch. */
+  | "changed";
+
+export function openSwitchIntent(control: { enabled: boolean; version: string }): SwitchIntent {
+  return { target: !control.enabled, expectedVersion: control.version };
+}
+
+/** Compare a frozen intent with the latest read. It never flips the target. */
+export function checkSwitchIntent(intent: SwitchIntent, control: { enabled: boolean; version: string }): SwitchIntentCheck {
+  if (control.enabled === intent.target) return "already_done";
+  if (control.version !== intent.expectedVersion) return "changed";
+  return "ready";
+}

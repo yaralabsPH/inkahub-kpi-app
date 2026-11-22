@@ -10,7 +10,13 @@ import {
   type DepartmentPersonRow,
   type DepartmentRow,
 } from "@/lib/domain/departments";
-import type { DepartmentAdminStatus } from "@/lib/departments/adminState";
+import {
+  checkSwitchIntent,
+  openSwitchIntent,
+  type DepartmentAdminStatus,
+  type SwitchIntent,
+  type SwitchIntentCheck,
+} from "@/lib/departments/adminState";
 
 /**
  * F5 departments: presentation only. Everything here is driven by props so
@@ -24,6 +30,12 @@ export interface ListState<T> {
   status: "loading" | "error" | "ready";
   rows: T[];
   message?: string | null;
+}
+
+/** A list read one page at a time ("Load more"). */
+export interface PagedState<T> extends ListState<T> {
+  hasMore: boolean;
+  loadingMore: boolean;
 }
 
 export interface ChangeBannerProps {
@@ -65,7 +77,11 @@ export function ChangeBanner({ status, message, onRetry, onDismiss }: ChangeBann
         )}
       </span>
       {status === "unknown" && <Button size="sm" onClick={onRetry}>Retry</Button>}
-      {status !== "submitting" && <Button size="sm" variant="ghost" onClick={onDismiss}>Dismiss</Button>}
+      {status !== "submitting" && (
+        <Button size="sm" variant="ghost" onClick={onDismiss}>
+          {status === "unknown" ? "Give up (it may have been saved)" : "Dismiss"}
+        </Button>
+      )}
     </div>
   );
 }
@@ -80,7 +96,8 @@ export interface DepartmentsViewProps {
   departments: ListState<DepartmentRow>;
   /** Members of the department whose archive was refused, or being inspected. */
   membersOf: string | null;
-  members: ListState<DepartmentPersonRow>;
+  members: PagedState<DepartmentPersonRow>;
+  onLoadMoreMembers: () => void;
   busy: boolean;
   onToggleArchived: (show: boolean) => void;
   onCreate: (name: string) => void;
@@ -207,7 +224,7 @@ export function DepartmentsView(props: DepartmentsViewProps) {
                   </form>
                 )}
 
-                {props.membersOf === d.id && <MembersList members={props.members} location={location} />}
+                {props.membersOf === d.id && <MembersList members={props.members} location={location} onLoadMore={props.onLoadMoreMembers} />}
               </li>
             );
           })}
@@ -217,7 +234,11 @@ export function DepartmentsView(props: DepartmentsViewProps) {
   );
 }
 
-export function MembersList({ members, location }: { members: ListState<DepartmentPersonRow>; location: string }) {
+export function MembersList({ members, location, onLoadMore }: {
+  members: PagedState<DepartmentPersonRow>;
+  location: string;
+  onLoadMore: () => void;
+}) {
   if (members.status === "loading") return <p className="text-xs text-slate-500" role="status">Loading members{"\u2026"}</p>;
   if (members.status === "error") {
     return <p className="text-xs text-red-600 dark:text-red-400" role="alert">Couldn{"\u2019"}t load members: {members.message ?? "unknown error"}</p>;
@@ -236,6 +257,11 @@ export function MembersList({ members, location }: { members: ListState<Departme
           </li>
         ))}
       </ul>
+      {members.hasMore && (
+        <Button size="sm" variant="ghost" disabled={members.loadingMore} onClick={onLoadMore}>
+          {members.loadingMore ? "Loading..." : "Load more members"}
+        </Button>
+      )}
     </div>
   );
 }
@@ -248,16 +274,21 @@ export interface SnapshotSwitchProps {
   location: string;
   control: { status: "loading" | "error" | "ready"; value: DepartmentControl | null; message?: string | null };
   busy: boolean;
-  onSet: (enabled: boolean, reason: string, expectedVersion: string) => void;
-  /** Test hook: start with the confirmation open. */
-  initialConfirming?: boolean;
+  /**
+   * What the owner asked for, frozen when the confirmation was opened. Null
+   * when no confirmation is open. It is owned by the container, which clears
+   * it once the server has confirmed the change.
+   */
+  intent: SwitchIntent | null;
+  onOpen: (intent: SwitchIntent) => void;
+  onClose: () => void;
+  /** Sends exactly the frozen intent, never a value recomputed from a later read. */
+  onSet: (intent: SwitchIntent, reason: string) => void;
+  /** Test hook. */
   initialReason?: string;
 }
 
-export function SnapshotSwitch({ control, busy, onSet, location, initialConfirming, initialReason }: SnapshotSwitchProps) {
-  const [confirming, setConfirming] = useState(initialConfirming ?? false);
-  const [reason, setReason] = useState(initialReason ?? "");
-
+export function SnapshotSwitch({ control, busy, location, intent, onOpen, onClose, onSet, initialReason }: SnapshotSwitchProps) {
   if (control.status === "loading") return <p className="text-sm text-slate-500" role="status">Loading the switch{"\u2026"}</p>;
   if (control.status === "error" || !control.value) {
     return (
@@ -266,9 +297,8 @@ export function SnapshotSwitch({ control, busy, onSet, location, initialConfirmi
       </p>
     );
   }
-  const { enabled, version, tracking_started_at } = control.value;
-  const target = !enabled;
-  const reasonCheck = checkDepartmentReason(reason, true);
+  const current = control.value;
+  const { enabled, tracking_started_at } = current;
 
   return (
     <section aria-labelledby="f5-switch-heading" className="space-y-2">
@@ -288,31 +318,78 @@ export function SnapshotSwitch({ control, busy, onSet, location, initialConfirmi
         Tracking started {formatDepartmentInstant(tracking_started_at, location)}. Work recorded before that, or while
         this is off, stays {"\u201C"}unknown{"\u201D"} and is never filled in later.
       </p>
-      {!confirming ? (
-        <Button size="sm" variant="secondary" disabled={busy} onClick={() => setConfirming(true)}>
-          {target ? "Turn on\u2026" : "Turn off\u2026"}
+      {intent === null ? (
+        <Button size="sm" variant="secondary" disabled={busy} onClick={() => onOpen(openSwitchIntent(current))}>
+          {enabled ? "Turn off\u2026" : "Turn on\u2026"}
         </Button>
       ) : (
-        <form className="space-y-2 rounded-md ring-1 ring-slate-200 dark:ring-slate-800 p-3" aria-label="Confirm the switch"
-              onSubmit={(e) => { e.preventDefault(); if (reasonCheck.ok && !busy) onSet(target, reason, version); }}>
-          <p className="text-sm font-medium">
-            {target
-              ? "Turn ON? From now on every new scan saves the worker\u2019s home department."
-              : "Turn OFF? New scans will be saved without a department until this is turned on again. Those scans stay unknown."}
-          </p>
-          <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
-            Reason (required, kept in the audit log)
-            <Input value={reason} maxLength={600} onChange={(e) => setReason(e.target.value)} autoComplete="off" />
-          </label>
-          {reason !== "" && !reasonCheck.ok && <p className="text-xs text-red-600" role="alert">{reasonCheck.error}</p>}
-          <div className="flex gap-2">
-            <Button type="submit" size="sm" variant={target ? "primary" : "danger"} disabled={busy || !reasonCheck.ok}>
-              {target ? "Yes, turn on" : "Yes, turn off"}
-            </Button>
-            <Button size="sm" variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
-          </div>
-        </form>
+        <SwitchConfirmation
+          // A new confirmation starts with an empty reason.
+          key={`${intent.target}:${intent.expectedVersion}`}
+          intent={intent}
+          check={checkSwitchIntent(intent, current)}
+          busy={busy}
+          onSet={onSet}
+          onClose={onClose}
+          initialReason={initialReason}
+        />
       )}
     </section>
+  );
+}
+
+function SwitchConfirmation({ intent, check, busy, onSet, onClose, initialReason }: {
+  intent: SwitchIntent;
+  check: SwitchIntentCheck;
+  busy: boolean;
+  onSet: (intent: SwitchIntent, reason: string) => void;
+  onClose: () => void;
+  initialReason?: string;
+}) {
+  const [reason, setReason] = useState(initialReason ?? "");
+  const reasonCheck = checkDepartmentReason(reason, true);
+  const wanted = intent.target ? "ON" : "OFF";
+
+  // The switch is no longer what the owner was looking at. The confirmation
+  // never turns into its opposite: it can only be closed.
+  if (check !== "ready") {
+    return (
+      <div className="space-y-2 rounded-md ring-1 ring-amber-300 dark:ring-amber-700 p-3" role="alert" aria-label="Confirm the switch">
+        <p className="text-sm font-medium">
+          {check === "already_done"
+            ? `The switch is already ${wanted}. There is nothing left to confirm.`
+            : `The switch was changed by someone else while this was open. Nothing was sent. Close this and start again if you still want it ${wanted}.`}
+        </p>
+        {check === "already_done" && (
+          <p className="text-xs text-slate-600 dark:text-slate-300">
+            If a message above says your change was not confirmed, use its Retry: it re-sends the same request and
+            cannot switch it back.
+          </p>
+        )}
+        <Button size="sm" variant="secondary" onClick={onClose}>Close</Button>
+      </div>
+    );
+  }
+
+  return (
+    <form className="space-y-2 rounded-md ring-1 ring-slate-200 dark:ring-slate-800 p-3" aria-label="Confirm the switch"
+          onSubmit={(e) => { e.preventDefault(); if (reasonCheck.ok && !busy) onSet(intent, reason); }}>
+      <p className="text-sm font-medium">
+        {intent.target
+          ? "Turn ON? From now on every new scan saves the worker\u2019s home department."
+          : "Turn OFF? New scans will be saved without a department until this is turned on again. Those scans stay unknown."}
+      </p>
+      <label className="block text-xs font-medium text-slate-600 dark:text-slate-300">
+        Reason (required, kept in the audit log)
+        <Input value={reason} maxLength={600} onChange={(e) => setReason(e.target.value)} autoComplete="off" />
+      </label>
+      {reason !== "" && !reasonCheck.ok && <p className="text-xs text-red-600" role="alert">{reasonCheck.error}</p>}
+      <div className="flex gap-2">
+        <Button type="submit" size="sm" variant={intent.target ? "primary" : "danger"} disabled={busy || !reasonCheck.ok}>
+          {intent.target ? "Yes, turn on" : "Yes, turn off"}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={onClose}>Cancel</Button>
+      </div>
+    </form>
   );
 }

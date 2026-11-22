@@ -8,6 +8,7 @@ import {
   type DepartmentPageRows,
 } from "@/lib/domain/departments";
 import {
+  acceptsDepartmentAnswer,
   departmentAdminReducer,
   departmentPayloadKey,
   initialDepartmentAdminState,
@@ -146,6 +147,19 @@ export function useDepartmentChange(callerId: string): DepartmentChangeHandle {
     };
   }, []);
 
+  // The panel is remounted when the signed-in owner changes (it is keyed by
+  // their id), so this normally never fires. It is a second line of defence:
+  // if the caller ever changes under a mounted hook, the previous owner's
+  // pending request, kept input and Retry are dropped, not carried over.
+  const caller = useRef(callerId);
+  useEffect(() => {
+    if (caller.current === callerId) return;
+    caller.current = callerId;
+    const fresh = initialDepartmentAdminState<DepartmentChange>();
+    current.current = fresh;
+    setState(fresh);
+  }, [callerId]);
+
   const apply = useCallback((action: DepartmentAdminAction<DepartmentChange>) => {
     const next = departmentAdminReducer(current.current, action);
     current.current = next;
@@ -162,9 +176,11 @@ export function useDepartmentChange(callerId: string): DepartmentChangeHandle {
     });
     if (!next.send) return false; // already in flight
     const { requestId } = next.send;
+    const askedBy = callerId;
     const result = await sendDepartmentChange(getSupabase(), change, requestId);
-    // The owner may have signed out or left while we waited: drop the answer.
-    if (!mounted.current) return false;
+    // The owner may have signed out, switched account or left while we
+    // waited: drop the answer. It must not touch another account's screen.
+    if (!acceptsDepartmentAnswer(mounted.current, askedBy, caller.current)) return false;
     if (result.outcome === "ok") {
       apply({ type: "succeeded", requestId });
     } else {
