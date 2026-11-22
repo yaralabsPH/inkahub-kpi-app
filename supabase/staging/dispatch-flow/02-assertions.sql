@@ -104,7 +104,18 @@ RETURNS text LANGUAGE sql AS $$
                 p_choices, pg_temp.f7_expect(p_expect))
 $$;
 
+-- Does this session hold the per-order advisory lock (production_order_lock_ key)?
+CREATE FUNCTION pg_temp.f7_holds_order_lock(p_order text) RETURNS boolean LANGUAGE sql AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM pg_locks l,
+           (SELECT hashtextextended('prod-order|staging|' || p_order, 0) AS k) h
+    WHERE  l.locktype = 'advisory' AND l.pid = pg_backend_pid() AND l.granted AND l.objsubid = 1
+      AND  l.classid::text::bigint = ((h.k >> 32) & 4294967295)
+      AND  l.objid::text::bigint = (h.k & 4294967295))
+$$;
+
 CREATE FUNCTION pg_temp.f7_on_hand(p_id text) RETURNS numeric LANGUAGE sql AS $$
+
   SELECT current_on_hand FROM public.products WHERE location = 'staging' AND id = p_id
 $$;
 
@@ -400,6 +411,57 @@ BEGIN
     pg_temp.f7_evidence_sql('10977001', '[{"sku":"INKA-ABC0001-A2-UN","quantity":1,"work_type":"framed"}]'), 'P0001', 'scanner: invalid_input');
   PERFORM pg_temp.f7_ok('C15 empty line list is valid and answers nothing',
     pg_temp.f7_must('C15', i.kiosk, pg_temp.f7_evidence_sql('10977001', '[]')) -> 'lines' = '[]'::jsonb);
+
+  -- C16: a whole-order scrap AFTER the completion ends that attempt.
+  PERFORM pg_temp.f7_event('f7c16-v', i.f1, 'framed', '10977022', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t);
+  PERFORM pg_temp.f7_event('f7c16-c', i.f1, 'framed', '10977022', 'completed', NULL, 2, t + interval '1 minute');
+  e := pg_temp.f7_must('C16a', i.kiosk, pg_temp.f7_evidence_sql('10977022', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C16a measured before the scrap', e ->> 'status' = 'measured', e::text);
+  PERFORM pg_temp.f7_event('f7c16-x', i.f2, 'framed', '10977022', 'cancelled', NULL, NULL, t + interval '2 minutes');
+  e := pg_temp.f7_must('C16b', i.kiosk, pg_temp.f7_evidence_sql('10977022', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C16b a post-completion scrap makes it missing', e ->> 'status' = 'missing', e::text);
+  PERFORM pg_temp.f7_event('f7c16-v2', i.f2, 'framed', '10977022', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t + interval '3 minutes');
+  PERFORM pg_temp.f7_event('f7c16-c2', i.f2, 'framed', '10977022', 'completed', NULL, 2, t + interval '3 minutes');
+  e := pg_temp.f7_must('C16c', i.kiosk, pg_temp.f7_evidence_sql('10977022', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C16c a new attempt after the scrap is measured (same-instant pair, other framer)',
+    e ->> 'status' = 'measured' AND (e ->> 'person_id')::uuid = i.f2 AND e ->> 'verified_event_id' = 'f7c16-v2' AND e ->> 'completed_event_id' = 'f7c16-c2', e::text);
+
+  -- C17: a same-SKU cancel after completion ends it; another SKU's cancel does not.
+  PERFORM pg_temp.f7_event('f7c17-v', i.f1, 'framed', '10977023', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t);
+  PERFORM pg_temp.f7_event('f7c17-c', i.f1, 'framed', '10977023', 'completed', NULL, 2, t);
+  PERFORM pg_temp.f7_event('f7c17-x1', i.f1, 'framed', '10977023', 'cancelled', 'INKA-ABC0002-A2-FB', 1, t + interval '1 minute');
+  e := pg_temp.f7_must('C17a', i.kiosk, pg_temp.f7_evidence_sql('10977023', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C17a a cancel of another SKU leaves it measured', e ->> 'status' = 'measured', e::text);
+  PERFORM pg_temp.f7_event('f7c17-x2', i.f1, 'framed', '10977023', 'cancelled', 'inka-abc0001-a2-fb', 2, t + interval '2 minutes');
+  e := pg_temp.f7_must('C17b', i.kiosk, pg_temp.f7_evidence_sql('10977023', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C17b a same-SKU cancel after completion makes it missing', e ->> 'status' = 'missing', e::text);
+
+  -- C18: reopened at framing after the completion (a later started row).
+  PERFORM pg_temp.f7_event('f7c18-s', i.f1, 'framed', '10977024', 'started', NULL, NULL, t - interval '1 minute');
+  PERFORM pg_temp.f7_event('f7c18-v', i.f1, 'framed', '10977024', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t);
+  PERFORM pg_temp.f7_event('f7c18-c', i.f1, 'framed', '10977024', 'completed', NULL, 2, t + interval '1 minute');
+  e := pg_temp.f7_must('C18a', i.kiosk, pg_temp.f7_evidence_sql('10977024', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C18a the start of the same attempt does not matter', e ->> 'status' = 'measured', e::text);
+  PERFORM pg_temp.f7_event('f7c18-s2', i.f2, 'framed', '10977024', 'started', NULL, NULL, t + interval '2 minutes');
+  e := pg_temp.f7_must('C18b', i.kiosk, pg_temp.f7_evidence_sql('10977024', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C18b reopened after completion: missing', e ->> 'status' = 'missing', e::text);
+  PERFORM pg_temp.f7_event('f7c18-c2', i.f1, 'framed', '10977024', 'completed', NULL, 2, t + interval '3 minutes');
+  e := pg_temp.f7_must('C18c', i.kiosk, pg_temp.f7_evidence_sql('10977024', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C18c a later completion without a new verification does not revive the old one', e ->> 'status' = 'missing', e::text);
+  PERFORM pg_temp.f7_event('f7c18-v3', i.f2, 'framed', '10977024', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t + interval '4 minutes');
+  PERFORM pg_temp.f7_event('f7c18-c3', i.f2, 'framed', '10977024', 'completed', NULL, 2, t + interval '5 minutes');
+  e := pg_temp.f7_must('C18d', i.kiosk, pg_temp.f7_evidence_sql('10977024', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C18d the pair of the reopened attempt is measured',
+    e ->> 'status' = 'measured' AND e ->> 'verified_event_id' = 'f7c18-v3' AND e ->> 'completed_event_id' = 'f7c18-c3', e::text);
+
+  -- C19: a completion row for ANOTHER SKU is not evidence; same SKU or whole order is.
+  PERFORM pg_temp.f7_event('f7c19-v', i.f1, 'framed', '10977025', 'line_verified', 'INKA-ABC0001-A2-FB', 2, t);
+  PERFORM pg_temp.f7_event('f7c19-cb', i.f1, 'framed', '10977025', 'completed', 'INKA-ABC0002-A2-FB', 2, t + interval '1 minute');
+  e := pg_temp.f7_must('C19a', i.kiosk, pg_temp.f7_evidence_sql('10977025', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C19a verification A + completion B is missing', e ->> 'status' = 'missing', e::text);
+  PERFORM pg_temp.f7_event('f7c19-ca', i.f1, 'framed', '10977025', 'completed', 'INKA-ABC0001-A2-FB', 2, t + interval '2 minutes');
+  e := pg_temp.f7_must('C19b', i.kiosk, pg_temp.f7_evidence_sql('10977025', L)) -> 'lines' -> 0;
+  PERFORM pg_temp.f7_ok('C19b a same-SKU completion is measured', e ->> 'status' = 'measured' AND e ->> 'completed_event_id' = 'f7c19-ca', e::text);
 END $$;
 
 -- ===========================================================================
@@ -495,7 +557,7 @@ BEGIN
 
   -- D09: per-SKU mix: A0 measured (C11) and a second framed SKU manual.
   r := pg_temp.f7_must('D09 mixed per-SKU', i.kiosk, pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977011', t, 4,
-         '[{"sku":"INKA-ABC0001-A0-FB","quantity":1,"work_type":"a0_framed"},{"sku":"INKA-ABC0009-A3-FW","quantity":1,"work_type":"framed"}]', '[]', NULL,
+         '[{"sku":"INKA-ABC0001-A0-FB","quantity":1,"work_type":"a0_framed"},{"sku":"INKA-ABC0009-A3-FW","quantity":1,"work_type":"framed"}]', '[]', P,
          jsonb_build_array(jsonb_build_object('sku', 'INKA-ABC0009-A3-FW', 'person_id', i.f2))));
   PERFORM pg_temp.f7_ok('D09 one row per SKU, each with its own source',
     r -> 'attributions' -> 0 ->> 'source' = 'scan' AND r -> 'attributions' -> 1 ->> 'source' = 'manual'
@@ -518,7 +580,7 @@ BEGIN
     pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977016', t, 1, '[]', '[]',
       P || '{"predicted":{"f7t-hook":1},"target":{"f7t-hook":1}}'), 'P0001', 'packaging');
   PERFORM pg_temp.f7_refused('D11d manual + bad stock: the attribution rolls back too', i.kiosk, 'authenticated',
-    pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977016', t, 2, L, '[{"code":"F7T-NOPE","qty":1}]', NULL,
+    pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977016', t, 2, L, '[{"code":"F7T-NOPE","qty":1}]', P,
       jsonb_build_array(jsonb_build_object('sku', 'INKA-ABC0001-A2-FB', 'person_id', i.f2))), 'P0001', 'scanner: missing_stock_code');
   PERFORM pg_temp.f7_ok('D11e nothing written by any of them', pg_temp.f7_footprint('10977016') = v_before);
   UPDATE public.packaging_settings SET mode = 'scan' WHERE location = 'staging';
@@ -567,12 +629,19 @@ BEGIN
   -- D14: the attribution table is immutable, even for the owner of the table.
   PERFORM pg_temp.f7_ok('D14 attribution rows cannot be updated', pg_temp.f7_try($q$UPDATE public.dispatch_framer_attributions SET display_name = 'x' WHERE location = 'staging'$q$) LIKE '%attribution_immutable%');
 
-  -- D15: the classic legacy deduction after a shared dispatch charges nothing again.
-  PERFORM pg_temp.f7_event('f7d15-d', i.disp, 'dispatch', '10977001', 'dispatched', NULL, 3, now());
-  v_a2 := pg_temp.f7_on_hand('f7t-a2b');
-  r := pg_temp.f7_must('D15 classic re-dispatch deduction', i.kiosk, $q$SELECT public.deduct_inventory_for_event('f7d15-d', '[{"code":"f7t-a2b","qty":2}]')::text$q$);
-  PERFORM pg_temp.f7_ok('D15 skipped by product identity; stock unchanged', (r ->> 'deducted')::int = 0
-    AND (r ->> 'skipped_idempotent')::int = 1 AND pg_temp.f7_on_hand('f7t-a2b') = v_a2, r::text);
+  -- D15: regular framed lines need their Dispatch parcel in the request.
+  v_before := pg_temp.f7_footprint('10977019');
+  PERFORM pg_temp.f7_refused('D15a framed lines with SQL NULL packaging', i.kiosk, 'authenticated',
+    pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977019', t, 2, L, C, NULL,
+      jsonb_build_array(jsonb_build_object('sku', 'INKA-ABC0001-A2-FB', 'person_id', i.f2))), 'P0001', 'scanner: packaging_required');
+  PERFORM pg_temp.f7_refused('D15b framed lines with JSON null packaging', i.kiosk, 'authenticated',
+    pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977019', t, 2, L, C, 'null'::jsonb,
+      jsonb_build_array(jsonb_build_object('sku', 'INKA-ABC0001-A2-FB', 'person_id', i.f2))), 'P0001', 'scanner: packaging_required');
+  PERFORM pg_temp.f7_ok('D15c nothing written, stock unchanged', pg_temp.f7_footprint('10977019') = v_before);
+  r := pg_temp.f7_must('D15d A0-only order needs no Dispatch parcel', i.kiosk, pg_temp.f7_dispatch_sql(gen_random_uuid(), i.disp, 'F77E0005', '10977021', t, 1,
+         '[{"sku":"INKA-ABC0001-A0-FB","quantity":1,"work_type":"a0_framed"}]', '[]', NULL,
+         jsonb_build_array(jsonb_build_object('sku', 'INKA-ABC0001-A0-FB', 'person_id', i.f2))));
+  PERFORM pg_temp.f7_ok('D15e A0-only saved without packaging', r ->> 'status' = 'saved' AND r -> 'packaging_pick' = 'null'::jsonb, r::text);
 
   -- D16: reports roles see attributions at their site; kiosks and staff do not.
   PERFORM pg_temp.f7_ok('D16a manager sees attributions',
@@ -583,6 +652,39 @@ BEGIN
     (pg_temp.f7_must('D16c', i.staff, $q$SELECT count(*)::text FROM public.dispatch_framer_attributions$q$))::int = 0);
   PERFORM pg_temp.f7_ok('D16d other-site kiosk reads none',
     (pg_temp.f7_must('D16d', i.kiosk_other, $q$SELECT count(*)::text FROM public.dispatch_requests$q$))::int = 0);
+END $$;
+
+-- ===========================================================================
+-- G. Classic insert guard (c7): no duplicate dispatch credit; evidence-changing
+--    framing rows take the order lock
+-- ===========================================================================
+DO $$
+DECLARE
+  i f7t_ids%ROWTYPE;
+  v_a2 numeric;
+BEGIN
+  SELECT * INTO i FROM f7t_ids;
+  v_a2 := pg_temp.f7_on_hand('f7t-a2b');
+  -- 10977001 was dispatched by the shared scanners in D01.
+  PERFORM pg_temp.f7_refused('G01 classic dispatch after a shared dispatch is refused (kiosk, as the app inserts it)', i.kiosk, 'authenticated',
+    format($q$INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_quantity, event_type, station_id, note)
+      VALUES ('staging', 'f7g01', %L, 'dispatch', '10977001', 3, 'dispatched', 'classic', 'F7') RETURNING id$q$, i.disp),
+    'P0001', 'scanner: already_dispatched_by_shared_scanner');
+  PERFORM pg_temp.f7_ok('G02 nothing was added; no stock moved',
+    NOT EXISTS (SELECT 1 FROM public.production_events WHERE location = 'staging' AND id = 'f7g01') AND pg_temp.f7_on_hand('f7t-a2b') = v_a2);
+  PERFORM pg_temp.f7_ok('G03 a CS replacement dispatch of the same order still passes', pg_temp.f7_try(format(
+    $q$INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_quantity, event_type, station_id, note, cs_case_id)
+       VALUES ('staging', 'f7g03', %L, 'dispatch', '10977001', 1, 'dispatched', 'classic', 'F7', 'case-g03')$q$, i.disp)) = '');
+  PERFORM pg_temp.f7_ok('G04 an order the shared scanners never dispatched: classic dispatch unchanged', pg_temp.f7_try(format(
+    $q$INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_quantity, event_type, station_id, note)
+       VALUES ('staging', 'f7g04', %L, 'dispatch', '10977032', 1, 'dispatched', 'classic', 'F7')$q$, i.disp)) = '');
+  PERFORM pg_temp.f7_ok('G05 order lock not yet held for 10977033/34/35',
+    NOT pg_temp.f7_holds_order_lock('10977033') AND NOT pg_temp.f7_holds_order_lock('10977034') AND NOT pg_temp.f7_holds_order_lock('10977035'));
+  PERFORM pg_temp.f7_event('f7g06', i.f1, 'framed', '10977033', 'cancelled', NULL, NULL, now());
+  PERFORM pg_temp.f7_event('f7g07', i.f1, 'a0_framed', '10977034', 'started', NULL, NULL, now());
+  PERFORM pg_temp.f7_event('f7g08', i.f1, 'unframed', '10977035', 'started', NULL, NULL, now());
+  PERFORM pg_temp.f7_ok('G06 a framing cancel / start takes the order lock (serialized with dispatch); other work does not',
+    pg_temp.f7_holds_order_lock('10977033') AND pg_temp.f7_holds_order_lock('10977034') AND NOT pg_temp.f7_holds_order_lock('10977035'));
 END $$;
 
 -- ===========================================================================

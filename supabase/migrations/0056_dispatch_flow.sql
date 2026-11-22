@@ -22,14 +22,22 @@
 --                                for one order: dispatched event, dispatch
 --                                stock (F6's locked deduction), F4 packaging,
 --                                attribution rows and receipt, all or nothing
+--   production_events_c7_dispatch_guard  BEFORE INSERT trigger: a classic
+--                                `dispatched` row for an order the shared
+--                                scanners already dispatched is refused (same
+--                                per-order lock); framing started/cancelled
+--                                rows take that lock so they serialize with
+--                                a dispatch reading the evidence
 --   private helpers (no client grants)
 --
 -- Nothing existing is altered: no table, column, constraint, index, policy,
 -- trigger, function or grant of 0001-0055 changes. F6's framing commit, its
--- receipts and the classic credit guard (c6) are untouched: the guard only
--- concerns framing credit, so a framing receipt never prevents a dispatch,
--- and duplicate framing credit stays blocked. The previous app version keeps
--- working: it never calls these functions.
+-- receipts and the classic framing credit guard (c6) are untouched, so a
+-- framing receipt never prevents a dispatch and duplicate framing credit
+-- stays blocked. The previous app version keeps working: it never calls
+-- these functions; its classic dispatch is refused only for an order the
+-- shared scanners already dispatched (CS replacement dispatches pass).
+
 --
 -- Manual attribution creates NO production event (no line_verified,
 -- started or completed row, no time, no framing credit).
@@ -195,16 +203,22 @@ $$;
 -- Framing evidence for an order's framed SKUs. Caller has authorized the
 -- site (and, when committing, holds the order lock).
 --
--- Per required {sku, quantity, work_type}: a VALID PAIR is
+-- Only the CURRENT framing attempt counts. Per required {sku, quantity,
+-- work_type}: a VALID PAIR is
 --   an uncancelled line_verified L (no cancelled row with parent = L) of that
 --   work type and SKU (case-insensitive), not CS replacement work, with
 --   line_quantity >= the required quantity,
---   AND a completed C of the same work type by the SAME person, not CS work,
---   with C.created_at >= L.created_at (F6 writes both at the same instant;
---   event ids are never compared),
---   AND no attempt boundary between them: no whole-order (no SKU) or
---   same-SKU cancelled row of that work type without a parent, at a time in
---   [L.created_at, C.created_at].
+--   AND C = the FIRST completed row at or after L (F6 writes both at the same
+--   instant; event ids are never compared) of the same work type by the SAME
+--   person, not CS work, for the whole order (no SKU) or for that SKU,
+--   AND the attempt was not ended afterwards:
+--     no whole-order (no SKU) or same-SKU cancelled row of that work type
+--     without a parent at or after L (a scrap/cancel during OR after the
+--     work), and
+--     no started row of that work type for the whole order or that SKU
+--     strictly after C (the order was reopened at framing).
+--   A later attempt is evidence only through its own verification and
+--   completion. Conservative: anything doubtful is "missing" (manual choice).
 -- status: measured (valid pairs of exactly one person; the latest L and its
 -- first C are reported), missing (none), conflict (several people).
 -- Bounded: more than 1000 events on the order raises evidence_overflow
@@ -237,23 +251,31 @@ BEGIN
     WHERE  e.location = p_location AND e.order_number = p_order
   ),
   pairs AS (
-    SELECT r.sku, v.staff_id, v.id AS vid, v.created_at AS vat,
-           (SELECT c.id FROM ev c
-            WHERE  c.event_type = 'completed' AND c.department = r.wt AND c.staff_id = v.staff_id
-              AND  c.cs_case_id IS NULL AND c.created_at >= v.created_at
-              AND  NOT EXISTS (
-                     SELECT 1 FROM ev x
-                     WHERE  x.event_type = 'cancelled' AND x.department = r.wt AND x.parent_event_id IS NULL
-                       AND  (x.sku IS NULL OR x.sku = r.sku)
-                       AND  x.created_at >= v.created_at AND x.created_at <= c.created_at)
-            ORDER  BY c.created_at, c.id
-            LIMIT  1) AS cid
+    SELECT r.sku, r.wt, v.staff_id, v.id AS vid, v.created_at AS vat, fc.id AS cid, fc.created_at AS cat
     FROM   req r
     JOIN   ev v ON v.event_type = 'line_verified' AND v.department = r.wt AND v.sku = r.sku
                 AND v.cs_case_id IS NULL AND COALESCE(v.line_quantity, 0) >= r.qty
+    JOIN   LATERAL (
+             SELECT c.id, c.created_at FROM ev c
+             WHERE  c.event_type = 'completed' AND c.department = r.wt AND c.staff_id = v.staff_id
+               AND  c.cs_case_id IS NULL AND c.created_at >= v.created_at
+               AND  (c.sku IS NULL OR c.sku = r.sku)
+             ORDER  BY c.created_at, c.id
+             LIMIT  1) fc ON true
     WHERE  NOT EXISTS (SELECT 1 FROM ev c WHERE c.event_type = 'cancelled' AND c.parent_event_id = v.id)
   ),
-  valid AS (SELECT * FROM pairs WHERE cid IS NOT NULL)
+  valid AS (
+    SELECT p.* FROM pairs p
+    WHERE  NOT EXISTS (
+             SELECT 1 FROM ev x
+             WHERE  x.event_type = 'cancelled' AND x.department = p.wt AND x.parent_event_id IS NULL
+               AND  (x.sku IS NULL OR x.sku = p.sku) AND x.created_at >= p.vat)
+      AND  NOT EXISTS (
+             SELECT 1 FROM ev x
+             WHERE  x.event_type = 'started' AND x.department = p.wt
+               AND  (x.sku IS NULL OR x.sku = p.sku) AND x.created_at > p.cat)
+  )
+
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
            'sku',                r.sku,
            'status',             CASE k.people WHEN 0 THEN 'missing' WHEN 1 THEN 'measured' ELSE 'conflict' END,
@@ -584,6 +606,14 @@ BEGIN
     RAISE EXCEPTION 'scanner: invalid_input' USING ERRCODE = 'P0001';
   END IF;
 
+  -- Regular framed prints are packed at Dispatch: their parcel must be in
+  -- the request (SQL NULL and JSON null alike are refused). A0-only or
+  -- unframed orders may have no Dispatch parcel.
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_lines) l WHERE l.value->>'work_type' = 'framed')
+     AND COALESCE(jsonb_typeof(p_packaging), 'null') <> 'object' THEN
+    RAISE EXCEPTION 'scanner: packaging_required' USING ERRCODE = 'P0001';
+  END IF;
+
   SELECT COALESCE(jsonb_agg(jsonb_build_object('code', e.value->>'code', 'qty', (e.value->>'qty')::NUMERIC::INTEGER) ORDER BY e.value->>'code'), '[]'::jsonb)
   INTO   v_components
   FROM   jsonb_array_elements(p_components) e;
@@ -779,6 +809,52 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Classic insert guard (dispatch credit + evidence serialization)
+-- ---------------------------------------------------------------------------
+
+-- BEFORE INSERT on production_events, narrow on purpose:
+--   * dispatched (not CS replacement, with an order): takes the per-order
+--     lock and refuses the row when a saved shared-scanner dispatch receipt
+--     exists for the order, so the classic station cannot add a second
+--     dispatch credit. The shared commit's own row passes (its receipt is
+--     written after it); an order the shared scanners never dispatched
+--     behaves exactly as before.
+--   * started / cancelled at Framed or A0 Framed (with an order): takes the
+--     same per-order lock and nothing else, so a cancellation, scrap or
+--     reopen is serialized with a dispatch reading the framing evidence
+--     (line_verified / completed already take it in F6's c6 guard).
+-- Named "c7" so it runs after F6's c6 guard and before the F5 triggers
+-- ("f5_..."), keeping the order lock ahead of F5's resolver lock.
+CREATE OR REPLACE FUNCTION public.dispatch_guard_classic_events_()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.order_number IS NULL THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.event_type = 'dispatched' AND NEW.cs_case_id IS NULL THEN
+    PERFORM production_order_lock_(NEW.location, NEW.order_number);
+    IF EXISTS (SELECT 1 FROM dispatch_requests r
+               WHERE r.location = NEW.location AND r.order_number = NEW.order_number
+                 AND r.kind = 'dispatch' AND r.outcome = 'saved') THEN
+      RAISE EXCEPTION 'scanner: already_dispatched_by_shared_scanner: order #% was already dispatched by the shared scanners; nothing more is recorded',
+        NEW.order_number USING ERRCODE = 'P0001';
+    END IF;
+  ELSIF NEW.event_type IN ('started', 'cancelled') AND NEW.department IN ('framed', 'a0_framed') THEN
+    PERFORM production_order_lock_(NEW.location, NEW.order_number);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER production_events_c7_dispatch_guard
+  BEFORE INSERT ON public.production_events
+  FOR EACH ROW EXECUTE FUNCTION public.dispatch_guard_classic_events_();
+
+-- ---------------------------------------------------------------------------
 -- Grants: nothing for anon or PUBLIC; helpers are internal only
 -- ---------------------------------------------------------------------------
 
@@ -787,6 +863,8 @@ REVOKE ALL ON FUNCTION public.dispatch_person_name_(TEXT, UUID)                 
 REVOKE ALL ON FUNCTION public.dispatch_canonical_lines_(JSONB)                        FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.dispatch_framing_evidence_(TEXT, TEXT, JSONB)           FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.dispatch_active_person_name_(TEXT, UUID)                FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.dispatch_guard_classic_events_()                        FROM PUBLIC, anon, authenticated;
+
 
 REVOKE ALL ON FUNCTION public.scanner_activate_dispatch(TEXT, UUID, TEXT, TEXT, TEXT, UUID) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.scanner_dispatch_evidence(TEXT, TEXT, JSONB, UUID)            FROM PUBLIC, anon;

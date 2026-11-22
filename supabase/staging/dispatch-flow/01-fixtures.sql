@@ -14,8 +14,9 @@
 --   Dispatcher  f7800000-0000-4000-8000-000000000005   badge F78E0005
 --   Products    f7r-a2b (code F7R-A2B, 100 on hand), f7r-box (F7R-BOX, 100)
 --   Rule set    f7r-rs version 1 (active at f7race, Dispatch box), mode auto
---   Orders      10978001 .. 10978006; framing by Framer 1 already recorded
---               (verified + completed) on 01, 03, 04, 05 and 06, none on 02.
+--   Orders      10978001 .. 10978008; framing by Framer 1 already recorded
+--               (verified + completed) on 01, 03, 04, 05, 06, 07 and 08,
+--               none on 02.
 
 BEGIN;
 
@@ -67,7 +68,8 @@ INSERT INTO public.production_events (location, id, staff_id, department, order_
 SELECT 'f7race', 'f7r-' || o || '-' || t.kind, 'f7800000-0000-4000-8000-000000000001', 'framed', o,
        CASE WHEN t.kind = 'v' THEN 'INKA-ABC0001-A2-FB' END, 2, t.type, 'f7r', 'F7 race fixture',
        now() - interval '1 hour' + CASE WHEN t.kind = 'c' THEN interval '5 minutes' ELSE interval '0' END
-FROM unnest(ARRAY['10978001', '10978003', '10978004', '10978005', '10978006']) o
+FROM unnest(ARRAY['10978001', '10978003', '10978004', '10978005', '10978006', '10978007', '10978008']) o
+
 CROSS JOIN (VALUES ('v', 'line_verified'), ('c', 'completed')) t(kind, type);
 
 SELECT 'F7 fixtures committed' AS result,

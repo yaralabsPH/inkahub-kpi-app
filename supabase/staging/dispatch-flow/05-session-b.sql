@@ -96,12 +96,10 @@ COMMIT;
 -- ===========================================================================
 -- R5: a classic dispatch races the shared one A holds open.
 -- ===========================================================================
--- R5-B1 (no wait: dispatch rows are not framing credit):
+-- R5-B1: WAITS until A commits (the c7 guard takes the order lock on insert).
 INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_quantity, event_type, station_id, note)
 VALUES ('f7race', 'f7rb-10978005-d', 'f7800000-0000-4000-8000-000000000005', 'dispatch', '10978005', 2, 'dispatched', 'classic', 'F7 race');
--- R5-B2: WAITS until A commits.
-SELECT public.deduct_inventory_for_event('f7rb-10978005-d', '[{"code":"f7r-a2b","qty":2}]')::text AS r5_b;
--- Expect after A commits: "deducted": 0, "skipped_idempotent": 1.
+-- Expect after A commits: ERROR scanner: already_dispatched_by_shared_scanner (nothing inserted, nothing deducted).
 
 -- ===========================================================================
 -- R6: dispatch sign-in of the same person A is signing in for framing. WAITS.
@@ -110,3 +108,33 @@ SELECT public.deduct_inventory_for_event('f7rb-10978005-d', '[{"code":"f7r-a2b",
 SELECT public.scanner_activate_dispatch('f7race', 'f7810000-0000-4000-8000-000000000008', 'f7r-desk', 'S2', 'F78E0002',
   'f7800000-0000-4000-8000-0000000000d2')::text AS r6_b;
 -- Expect after A commits: activated, "clocked_in": false.
+
+-- ===========================================================================
+-- R7: the classic framing station scraps order 10978007; keep OPEN.
+-- ===========================================================================
+-- R7-B1:
+BEGIN;
+INSERT INTO public.production_events (location, id, staff_id, department, order_number, event_type, station_id, note)
+VALUES ('f7race', 'f7rb-10978007-x', 'f7800000-0000-4000-8000-000000000001', 'framed', '10978007', 'cancelled', 'classic', 'Order scrapped (F7 race)');
+-- Expect: INSERT 0 1 at once (it now holds the order lock).
+-- >>> run R7-A1 in session A (it waits) <<<
+
+-- R7-B2:
+COMMIT;
+-- >>> R7-A1 fails with framer_missing <<<
+
+-- ===========================================================================
+-- R8: the classic dispatch station inserts its dispatched event for 10978008
+--     and is still inside that transaction (no deduction call yet); keep OPEN.
+-- ===========================================================================
+-- R8-B1:
+BEGIN;
+INSERT INTO public.production_events (location, id, staff_id, department, order_number, line_quantity, event_type, station_id, note)
+VALUES ('f7race', 'f7rb-10978008-d', 'f7800000-0000-4000-8000-000000000005', 'dispatch', '10978008', 2, 'dispatched', 'classic', 'F7 race');
+-- Expect: INSERT 0 1 at once (no shared receipt exists for this order).
+-- >>> run R8-A1 in session A (it waits) <<<
+
+-- R8-B2:
+COMMIT;
+-- >>> R8-A1 returns already_recorded <<<
+

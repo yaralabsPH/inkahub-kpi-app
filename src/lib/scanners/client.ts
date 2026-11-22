@@ -49,6 +49,7 @@ const REJECTION_TEXT: Record<string, string> = {
   packaging_not_auto: "This site is not in automatic box mode. Use the classic station.",
   packaging_invalid: "The A0 packaging could not be recorded. Use the classic station.",
   packaging_unposted: "The A0 packaging could not be taken from stock. Nothing was saved. Use the classic station.",
+  packaging_required: "Framed prints need their Dispatch box in the save. Nothing was saved. Use the classic dispatch station.",
   missing_stock_code: "A stock code is missing at this site. Nothing was saved. Use the classic station.",
   stock_floor: "Stock would go below zero and the database refused it. Nothing was saved.",
   unavailable: "Shared scanners are not set up on this database yet.",

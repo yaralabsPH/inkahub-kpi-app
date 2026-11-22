@@ -29,6 +29,7 @@ describe("0056 migration", () => {
     const fns = [...m56.matchAll(/CREATE OR REPLACE FUNCTION public\.([a-z_]+)\(/g)].map((x) => x[1]);
     expect(fns.sort()).toEqual([
       "dispatch_active_person_name_", "dispatch_attribution_immutable_", "dispatch_canonical_lines_", "dispatch_framing_evidence_",
+      "dispatch_guard_classic_events_",
       "dispatch_person_name_", "scanner_activate_dispatch", "scanner_commit_dispatch", "scanner_dispatch_evidence", "scanner_dispatch_people",
     ]);
     const bodies = m56.split("CREATE OR REPLACE FUNCTION").slice(1);
@@ -60,6 +61,21 @@ describe("0056 migration", () => {
     expect(m56).toMatch(/PERFORM production_order_lock_\(p_location, p_order_number\)/);
     expect(m56).toMatch(/production_deduct_locked_\(p_location, v_event/);
     expect(m56).toMatch(/packaging_apply\(p_location, 'dsp:'/);
+  });
+
+  it("guards classic dispatch credit and serializes framing cancel/start on the order lock (c7, before F5)", () => {
+    expect(m56).toMatch(/CREATE OR REPLACE TRIGGER production_events_c7_dispatch_guard\s+BEFORE INSERT ON public\.production_events/);
+    const g = m56.split("CREATE OR REPLACE FUNCTION public.dispatch_guard_classic_events_()")[1].split("$$;")[0];
+    expect(g).toMatch(/NEW\.event_type = 'dispatched' AND NEW\.cs_case_id IS NULL/);
+    expect(g).toMatch(/already_dispatched_by_shared_scanner/);
+    expect(g).toMatch(/NEW\.event_type IN \('started', 'cancelled'\) AND NEW\.department IN \('framed', 'a0_framed'\)/);
+    expect((g.match(/PERFORM production_order_lock_\(NEW\.location, NEW\.order_number\)/g) ?? []).length).toBe(2);
+    expect("production_events_c7_dispatch_guard" > "production_events_c6_scanner_guard").toBe(true);
+    expect("production_events_c7_dispatch_guard" < "production_events_f5_10_sanitize").toBe(true);
+  });
+
+  it("refuses framed lines without their Dispatch parcel", () => {
+    expect(m56).toMatch(/work_type' = 'framed'\)\s+AND COALESCE\(jsonb_typeof\(p_packaging\), 'null'\) <> 'object' THEN\s+RAISE EXCEPTION 'scanner: packaging_required'/);
   });
 
   it("manual attribution never writes a framing event", () => {

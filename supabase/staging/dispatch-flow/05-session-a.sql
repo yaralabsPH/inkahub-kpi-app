@@ -109,8 +109,9 @@ SELECT public.scanner_commit_dispatch('f7race', 'f7810000-0000-4000-8000-0000000
 -- Expect (after B commits): {"status": "already_recorded", "reason": "order already dispatched"}.
 
 -- ===========================================================================
--- R5. Shared dispatch first; a classic dispatch deduction races it: it
---     waits for the order lock, then charges nothing again.
+-- R5. Shared dispatch first; the classic dispatch station races it: its
+--     `dispatched` insert waits for the order lock (c7 guard), then is
+--     REFUSED (already dispatched by the shared scanners): no second credit.
 -- ===========================================================================
 -- R5-A1: keep OPEN.
 BEGIN;
@@ -120,11 +121,11 @@ SELECT public.scanner_commit_dispatch('f7race', 'f7810000-0000-4000-8000-0000000
   '{"rule_set_id":"f7r-rs","rule_set_version":1,"resolved":true,"predicted":{"f7r-box":1},"target":{"f7r-box":1},"snapshot":{}}',
   '[]', 'f7800000-0000-4000-8000-0000000000d1') ->> 'status' AS r5_a;
 -- Expect: saved.
--- >>> run R5-B1 and R5-B2 in session B (R5-B2 waits) <<<
+-- >>> run R5-B1 in session B (it waits) <<<
 
 -- R5-A2:
 COMMIT;
--- >>> R5-B2 returns deducted 0, skipped_idempotent 1 <<<
+-- >>> R5-B1 fails with already_dispatched_by_shared_scanner <<<
 
 -- ===========================================================================
 -- R6. One person signed in by a framing scanner and a dispatch scanner at
@@ -142,6 +143,40 @@ COMMIT;
 -- >>> R6-B1 returns activated, "clocked_in": false <<<
 
 -- ===========================================================================
+-- R7. A framing scrap races a dispatch. Order 10978007 has Framer 1's
+--     measured record. Session B's classic whole-order scrap (cancelled, no
+--     SKU) holds the order lock (c7 guard); this dispatch, sent with NO
+--     manual choice, waits, then re-reads the evidence: the attempt is over,
+--     so it is refused framer_missing and nothing is saved.
+-- ===========================================================================
+-- >>> first run R7-B1 in session B <<<
+
+-- R7-A1: waits until R7-B2 commits.
+SELECT public.scanner_commit_dispatch('f7race', 'f7810000-0000-4000-8000-000000000009', 'f7r-desk', 'S1',
+  'f7800000-0000-4000-8000-000000000005', 'F78E0005', '10978007', now(), 2,
+  '[{"sku":"INKA-ABC0001-A2-FB","quantity":2,"work_type":"framed"}]', '[{"code":"F7R-A2B","qty":2}]',
+  '{"rule_set_id":"f7r-rs","rule_set_version":1,"resolved":true,"predicted":{"f7r-box":1},"target":{"f7r-box":1},"snapshot":{}}',
+  '[]', 'f7800000-0000-4000-8000-0000000000d1')::text AS r7_a;
+-- Expect (after B commits): ERROR scanner: framer_missing: INKA-ABC0001-A2-FB.
+-- (Run before B commits it would have saved with Framer 1 measured.)
+
+-- ===========================================================================
+-- R8. The classic dispatch event is inserted and held open WITHOUT its
+--     deduction call (the app awaits the insert first). The c7 guard holds
+--     the order lock from the insert itself: the shared dispatch waits, then
+--     sees the classic dispatch and adds nothing.
+-- ===========================================================================
+-- >>> first run R8-B1 in session B <<<
+
+-- R8-A1: waits until R8-B2 commits.
+SELECT public.scanner_commit_dispatch('f7race', 'f7810000-0000-4000-8000-000000000010', 'f7r-desk', 'S1',
+  'f7800000-0000-4000-8000-000000000005', 'F78E0005', '10978008', now(), 2,
+  '[{"sku":"INKA-ABC0001-A2-FB","quantity":2,"work_type":"framed"}]', '[{"code":"F7R-A2B","qty":2}]',
+  '{"rule_set_id":"f7r-rs","rule_set_version":1,"resolved":true,"predicted":{"f7r-box":1},"target":{"f7r-box":1},"snapshot":{}}',
+  '[]', 'f7800000-0000-4000-8000-0000000000d1')::text AS r8_a;
+-- Expect (after B commits): {"status": "already_recorded", "reason": "order already dispatched"}.
+
+-- ===========================================================================
 -- A-END. Totals (either session). Every column must say true.
 -- ===========================================================================
 SELECT
@@ -156,7 +191,14 @@ SELECT
   (SELECT count(*) FROM public.production_events WHERE location = 'f7race' AND order_number = '10978006' AND event_type = 'dispatched') = 1 AS r3b_saved_once,
   (SELECT count(*) FROM public.dispatch_framer_attributions WHERE location = 'f7race' AND order_number = '10978004') = 0 AS r4_no_shared_rows,
   (SELECT count(*) FROM public.ledger WHERE location = 'f7race' AND source_id LIKE 'prod:order_10978005:%') = 1 AS r5_one_component_row,
+  NOT EXISTS (SELECT 1 FROM public.production_events WHERE location = 'f7race' AND id = 'f7rb-10978005-d') AS r5_classic_refused,
+  (SELECT count(*) FROM public.production_events WHERE location = 'f7race' AND order_number = '10978005' AND event_type = 'dispatched') = 1 AS r5_one_dispatch_credit,
+  NOT EXISTS (SELECT 1 FROM public.production_events WHERE location = 'f7race' AND order_number = '10978007' AND event_type = 'dispatched')
+    AND NOT EXISTS (SELECT 1 FROM public.dispatch_requests WHERE location = 'f7race' AND order_number = '10978007') AS r7_nothing_saved,
+  (SELECT count(*) FROM public.production_events WHERE location = 'f7race' AND order_number = '10978008' AND event_type = 'dispatched') = 1
+    AND NOT EXISTS (SELECT 1 FROM public.dispatch_requests WHERE location = 'f7race' AND order_number = '10978008') AS r8_only_classic,
   (SELECT count(*) FROM public.production_events WHERE location = 'f7race' AND event_type = 'clock_in'
      AND staff_id = 'f7800000-0000-4000-8000-000000000002') = 1 AS r6_one_clock_in,
   NOT EXISTS (SELECT 1 FROM public.production_events WHERE location = 'f7race'
-     AND event_type IN ('line_verified', 'completed', 'started') AND id NOT LIKE 'f7r-%' AND id NOT LIKE 'f7rb-%') AS no_framing_invented;
+     AND event_type IN ('line_verified', 'completed', 'started', 'cancelled') AND id NOT LIKE 'f7r-%' AND id NOT LIKE 'f7rb-%') AS no_framing_invented;
+
