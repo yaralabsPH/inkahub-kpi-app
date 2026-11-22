@@ -106,7 +106,7 @@ ids, rule sets and order numbers).
 - Done when: tests cover first apply, swap box, raise and lower quantity,
   remove all, no-op, and repeated application converging to zero deltas.
 
-### [ ] Task 5: Migration
+### [x] Task 5: Migration
 
 - Files: `supabase/migrations/0047_packaging_auto_pick.sql` (provisional
   number: use the next free number after every migration already on the
@@ -397,3 +397,4 @@ Coder adds one line per task.
 - Task 2: ruleSet.ts (zod + structural checks), evaluate.ts, 20 tests. Country condition omitted per CJ Q5. Added per-pick bounds (20 per item, 10 items) shared with the SQL.
 - Task 3: 512-combination parity with autoMailTubeForUnframedOrder for orders without a framed parcel; no differences. Documented the one deliberate difference (CJ Q4: prints go in the box when a framed parcel exists).
 - Task 4: reconcile.ts + 11 tests (deltas, convergence, partial posting).
+- Task 5: 0047_packaging_auto_pick.sql (number provisional, not confirmed with CJ yet; see Open questions). Additive only: the only DROP/ALTER statements are DROP POLICY IF EXISTS / ENABLE RLS on the four new tables. Differences from the plan text: apply derives order, packing point, shipment key and staff from the event instead of taking them as arguments; state is derived server-side from p_resolved/predicted/target; ledger key uses a per-pick posting counter (post_seq) rather than revision so a retry can never reuse a key; added mode_changed_at. Ran migration twice + verify script in a local in-memory Postgres (PGlite, scratch dir, not a project dependency) against both on-hand floor variants: all checks pass. Not applied to any real database.
