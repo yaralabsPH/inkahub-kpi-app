@@ -581,7 +581,8 @@ function LineCard({
               <span className="st-paper" style={{ width: iconW, height: iconH }} />
             </span>
             <div className="st-spec-txt">
-              <span className="st-spec-label">{orientation ? `SIZE · ${orientation.toUpperCase()}` : "SIZE"}</span>
+              {/* Orientation replaces the SIZE label when Shopify states it; the icon rotates too. */}
+              <span className="st-spec-label">{orientation ? orientation.toUpperCase() : "SIZE"}</span>
               <span className="st-spec-val">{line.size ?? "—"}</span>
             </div>
           </div>

@@ -163,6 +163,9 @@
 .st-spec-txt { display: flex; flex-direction: column; gap: 1px; }
 .st-spec-label { font-size: 10px; letter-spacing: .1em; font-weight: 600; color: var(--muted); white-space: nowrap; }
 .st-spec-val { font-size: 18px; font-weight: 700; white-space: nowrap; line-height: 1.2; }
+/* Dark mode: a faint light outline keeps black frames visible on dark cards. */
+.dark .st-thumb.framed { box-shadow: 0 0 0 1px rgba(255,255,255,.28), 0 8px 18px rgba(0,0,0,.4); }
+.dark .st-frame-ico.framed { box-shadow: 0 0 0 1px rgba(255,255,255,.35); }
 .st-paper { display: inline-block; border: 2px solid currentColor; border-radius: 2px; }
 .st-frame-ico { display: inline-block; width: 20px; height: 26px; border-radius: 2px; }
 .st-frame-ico.framed { border: 5px solid; background: #fff; box-shadow: 0 0 0 1px rgba(16,24,40,.18); }
@@ -214,6 +217,20 @@
 .st-btn-primary { height: 48px; padding: 0 20px; border-radius: 12px; border: none; background: var(--blue); font-size: 15px; font-weight: 700; color: #fff; }
 .st-btn-primary:disabled { opacity: .5; }
 .st-buffer { font: 12px var(--mono); color: var(--muted); }
+
+/* Tablet landscape (e.g. 1280x800): tighter spacing so the three spec
+   chips stay on one row next to the 170px action column. */
+@media (max-width: 1400px) {
+  .st-topbar { padding: 0 24px; gap: 16px; }
+  .st-layout { padding: 24px 28px; gap: 24px; }
+  .st-sidebar { flex-basis: 316px; padding: 22px; gap: 18px; }
+  .st-card { gap: 18px; padding: 0 22px; }
+  .st-specs { gap: 8px; }
+  .st-spec { gap: 8px; padding-right: 12px; }
+  .st-spec-val { font-size: 17px; }
+  .st-action { flex-basis: 160px; }
+  .st-btn-check { width: 160px; font-size: 15px; padding: 0 6px; white-space: nowrap; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .st-root *, .st-root *::before, .st-root *::after { animation: none !important; transition: none !important; }
