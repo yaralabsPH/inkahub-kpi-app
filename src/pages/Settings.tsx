@@ -11,6 +11,7 @@ import { getSupabase, isSupabaseConfigured } from "@/lib/repository/supabase/cli
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { SupplierPaymentTermsCard } from "@/components/SupplierPaymentTermsCard";
 import { ProductionBenchmarksCard } from "@/components/ProductionBenchmarksCard";
+import { PackagingRulesCard } from "@/components/PackagingRulesCard";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Input, Select } from "@/components/ui/Input";
@@ -150,6 +151,8 @@ export function Settings() {
       <SupplierPaymentTermsCard />
 
       <ProductionBenchmarksCard />
+
+      <PackagingRulesCard />
 
       <CrossLocationDiagnostics />
 

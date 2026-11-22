@@ -250,7 +250,7 @@ ids, rule sets and order numbers).
   again never creates a second pick.
 - Done when: tests cover success, conflict and replay.
 
-### [ ] Task 11: Settings — mode, versions and catalogue
+### [x] Task 11: Settings — mode, versions and catalogue
 
 - Files: `src/components/PackagingRulesCard.tsx`, `src/pages/Settings.tsx`
 - Do: owner/manager card (hidden for other roles),
@@ -403,3 +403,4 @@ Coder adds one line per task.
 - Task 8: stationScreenModel gets a packaging mode (auto never blocks); useOrderPackaging hook; pure session.ts and packagingSubmit.ts carry the logic because the test setup has no React renderer for hooks (tests cover them instead of the hook). handleCompleteOrder changes are one guarded branch plus one call. completeBlockReason left alone: it has no packaging rule. Replacement work predicts nothing (spec Q2 default: the station has no case lines), worker chooses or it is flagged. Not in the plan: src/lib/domain/packaging/session.ts, src/lib/state/packagingSubmit.ts. Finding for CJ, not changed: in scan mode the scanned-box list is never cleared after Complete, so boxes carry to the next order unless the worker taps Clear all.
 - Task 9: PackagingPanel (station and classic looks, saved-pick views ready for Task 10), slot on StationOrderScreen and the classic ActiveScreen, legacy box barcodes become a manual pick in auto mode (first scan replaces the prediction, later scans add one). Scan mode renders the old panels untouched. 15 new component tests. Also touched: station.css (three small classes).
 - Task 10: Rescanning a completed order shows its saved pick with Change box; one tap on a reason saves through packaging_override with the seen revision. packagingCorrection.ts holds the transitions (success, replay, conflict, no connection keeps the request id, refusal), 7 tests. A stray box scan never changes a saved pick. Not in the plan: src/lib/state/packagingCorrection.ts.
+- Task 11: PackagingRulesCard (owner/manager, Supabase only) + PackagingRulesView + editing.ts helpers, 14 tests. Includes Save draft and Activate (activation gate: saved, valid, at least one example, all pass) so a draft whose rules came from elsewhere can be activated; the rule and example editors themselves are Task 12. Not in the plan: src/components/packaging/PackagingRulesView.tsx, src/lib/domain/packaging/editing.ts.
