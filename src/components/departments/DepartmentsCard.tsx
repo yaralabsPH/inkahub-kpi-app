@@ -7,12 +7,15 @@ import type { DepartmentRow } from "@/lib/domain/departments";
 import {
   useDepartmentChange,
   useDepartmentControl,
+  useDepartmentPaged,
   useDepartmentRows,
   useDepartmentsSession,
 } from "@/lib/hooks/useDepartments";
 import { getBackendMode, type BackendMode } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
 import { ChangeBanner, DepartmentsView, SnapshotSwitch, type ListState } from "./DepartmentEditor";
+import { DepartmentAuditView, DepartmentPeopleView, type PagedState } from "./DepartmentPeople";
+import type { HomeChange } from "./HomeDepartmentEditor";
 
 /**
  * F5 departments on the Team page.
@@ -63,6 +66,22 @@ function listState<T>(query: { isPending: boolean; isError: boolean; error: Erro
   return { status: "ready", rows: query.data };
 }
 
+interface PagedQuery<T> {
+  isPending: boolean;
+  isError: boolean;
+  error: Error | null;
+  data: { pages: Array<{ rows: T[] }> } | undefined;
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+}
+
+function pagedState<T>(query: PagedQuery<T>): PagedState<T> {
+  const more = { hasMore: query.hasNextPage, loadingMore: query.isFetchingNextPage };
+  if (query.isError) return { status: "error", rows: [], message: query.error?.message ?? null, ...more };
+  if (query.isPending || !query.data) return { status: "loading", rows: [], ...more };
+  return { status: "ready", rows: query.data.pages.flatMap((p) => p.rows), ...more };
+}
+
 function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
   useDepartmentsSession(callerId);
   const location = useAppStore((s) => s.location);
@@ -73,6 +92,11 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
   const archived = useDepartmentRows(callerId, "departments_archived", null, showArchived);
   const members = useDepartmentRows(callerId, "members", membersOf, membersOf !== null);
   const control = useDepartmentControl(callerId);
+  const [selectedPerson, setSelectedPerson] = useState<string | null>(null);
+  const [showAudit, setShowAudit] = useState(false);
+  const people = useDepartmentRows(callerId, "people");
+  const history = useDepartmentPaged(callerId, "history", selectedPerson, selectedPerson !== null);
+  const audit = useDepartmentPaged(callerId, "audit", null, showAudit);
   const change = useDepartmentChange(callerId);
   const busy = change.state.status === "submitting";
 
@@ -92,9 +116,25 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
     if (!ok) setMembersOf(d.id);
   };
 
+  const onHomeChange = async (c: HomeChange) => {
+    const ok = await change.submit({
+      kind: "admin",
+      args: {
+        operation: c.operation, departmentId: c.departmentId, personId: c.personId, name: null,
+        expectedVersion: c.expectedVersion, expectedAssignmentId: c.expectedAssignmentId, reason: c.reason,
+      },
+    });
+    if (ok) setSelectedPerson(null);
+  };
+
+  // Also runs when the window regains focus (the app-wide query default), so
+  // adding or removing a team member above is picked up without a callback.
   const refresh = () => {
     void active.refetch();
     void control.refetch();
+    void people.refetch();
+    if (selectedPerson) void history.refetch();
+    if (showAudit) void audit.refetch();
     if (showArchived) void archived.refetch();
     if (membersOf) void members.refetch();
   };
@@ -131,6 +171,18 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
           onShowMembers={setMembersOf}
         />
 
+        <DepartmentPeopleView
+          location={location}
+          people={listState(people)}
+          departments={listState(active)}
+          selectedPersonId={selectedPerson}
+          history={pagedState(history)}
+          busy={busy}
+          onSelect={setSelectedPerson}
+          onSubmit={(c) => void onHomeChange(c)}
+          onLoadMoreHistory={() => void history.fetchNextPage()}
+        />
+
         <SnapshotSwitch
           location={location}
           control={
@@ -140,6 +192,14 @@ function DepartmentsOwnerPanel({ callerId }: { callerId: string }) {
           }
           busy={busy}
           onSet={(enabled, reason, expectedVersion) => send({ kind: "switch", enabled, expectedVersion, reason })}
+        />
+
+        <DepartmentAuditView
+          location={location}
+          open={showAudit}
+          audit={pagedState(audit)}
+          onToggle={setShowAudit}
+          onLoadMore={() => void audit.fetchNextPage()}
         />
       </CardBody>
     </Card>
