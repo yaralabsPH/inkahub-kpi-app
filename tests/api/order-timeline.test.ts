@@ -271,6 +271,20 @@ describe("POST reconcile: owner only, bounded, read-only towards Shopify", () =>
     expect((s.rpc.mock.calls[1][1] as { p_order: { site: string } }).p_order.site).toBe("us");
     expect(r.body.shopify).toMatchObject({ status: "recorded", routedHere: false });
   });
+  it("task3 review: ORDER_TIMELINE_INGEST off stops ALL reconciliation writes before any RPC or Shopify read; reads keep working", async () => {
+    for (const off of [undefined, "off", "ON"]) {
+      const s = setup({ env: { ORDER_TIMELINE_INGEST: off }, rpc: () => ({ data: { identity: null, evidence: [] }, error: null }) });
+      const r = await post(s);
+      expect([r.status, r.body.code]).toEqual([503, "DISABLED"]);
+      expect(s.rpc).not.toHaveBeenCalled();
+      expect(s.fetchFn).not.toHaveBeenCalled();
+      // authorized reads stay available with the switch off
+      expect((await s.get({ action: "order", site: "uk", orderNumber: "10190203" })).status).toBe(200);
+      expect(s.rpc.mock.calls.map((c) => c[0])).toEqual(["read_order_timeline"]);
+    }
+    // validation and role checks still come first (no information about the switch to non-owners)
+    expect((await post(setup({ role: "manager", env: { ORDER_TIMELINE_INGEST: undefined } }))).status).toBe(403);
+  });
   it("Shopify failures or ambiguous matches are errors (records untouched), not success; unconfigured Shopify refreshes app events only", async () => {
     const down = setup({ fetch: async () => ({ ok: false, status: 500, json: async () => ({}) }) });
     expect((await post(down)).body.code).toBe("SHOPIFY_UNAVAILABLE");

@@ -262,6 +262,8 @@ export function ingestWebhookPayload(payload: unknown, shop: string): ShopifyOrd
 }
 
 export interface ReconcileDeps {
+  /** ORDER_TIMELINE_INGEST === "on". Off = no reconciliation writes at all (rollback switch). */
+  enabled: boolean;
   rpc: RpcClient;
   routing: RoutingConfig | null;
   shopify: { shop: string; token: string; fetch: FetchLike } | null;
@@ -282,6 +284,11 @@ export async function reconcileOrder(p: ReportingPrincipal, body: unknown, deps:
   const site = siteOf(b.site);
   const orderNumber = normalizeOrderNumber(b.orderNumber) ?? badRequest("orderNumber must be 1..64 characters");
   authorizeTimeline(p, site, "reconcile");
+  // rollback switch: with ingestion off, reconciliation writes NOTHING (checked before any RPC or Shopify read)
+  if (!deps.enabled) {
+    deps.audit?.({ event: "timeline_reconcile_disabled", site });
+    throw new ReportingHttpError(503, "DISABLED", "Timeline ingestion is disabled; reconciliation is off");
+  }
   const a = await deps.rpc.rpc("reconcile_order_timeline_app", { p_site: site, p_order_number: orderNumber });
   if (a.error) return rpcFailure("reconcile_order_timeline_app", a.error.message, deps.audit, site);
   const app = parseIngest(a.data);

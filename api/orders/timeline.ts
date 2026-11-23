@@ -156,7 +156,7 @@ export function createOrderTimelineHandler(deps: TimelineHandlerDeps = defaults(
         const shop = normalizeShop(env.SHOPIFY_SHOP_DOMAIN);
         const enabled = env.ORDER_TIMELINE_INGEST === "on";
         const shopify = enabled && shop && env.SHOPIFY_ADMIN_TOKEN ? { shop, token: env.SHOPIFY_ADMIN_TOKEN, fetch: deps.fetch } : null;
-        return void res.status(200).json(await reconcileOrder(principal, body, { rpc, routing: enabled ? cfg : null, shopify, audit: deps.audit }));
+        return void res.status(200).json(await reconcileOrder(principal, body, { enabled, rpc, routing: enabled ? cfg : null, shopify, audit: deps.audit }));
       }
       res.setHeader("Allow", "GET, POST");
       res.status(405).json({ error: "Method not allowed", code: "METHOD" });
