@@ -50,7 +50,7 @@ scenario by the coder. Hosted acceptance is **not** claimed.
 - One scope per pipeline.
 - Staging uses an explicitly synthetic shop and AU scope only.
 
-## Request (one per Part, after that Part's success route)
+## Request (one per Part; placement rules below are mandatory)
 
 ```
 POST https://<staging-preview>/api/orders/timeline
@@ -61,7 +61,11 @@ x-inka-make-key: <secret>          (no Authorization header, no Shopify headers)
 
 Envelope (schemaVersion 1, ≤ 256 KiB, 1–500 members, explicit-zone ISO time, unknown fields refused):
 
-| Part (clone) | stage | members | occurrenceId (stable for retries) | Place after |
+"Data available after" is the point where the envelope's data exists. It is **not**
+where the reporter goes: the reporter must still be placed per "Placement"
+below, as a terminal side branch or after every required write and handoff.
+
+| Part (clone) | stage | members | occurrenceId (stable for retries) | Data available after |
 |---|---|---|---|---|
 | 1 (8746725) | `submitted` | `{memberKey, orderNumber}`: the accepted list (defines batch membership version) | `p1:<batchId>:v<version>` | the batch id and accepted order list are final |
 | 2 (8746726) | `files_found` | `{memberKey, shopifyOrderId}`: successful subset with the explicit Part 2 name→id mapping | `p2:<batchId>:v<version>:<executionId>` | the files-found success route, after the mapping is known |
@@ -108,17 +112,35 @@ Responses:
 | 413 | Too large. |
 | 503 `DISABLED` / `CONFIG` / `UNAVAILABLE` | Not recorded; retry the **same** envelope later. |
 
-## Exact Ignore error-handler setup (in each STAGING clone only)
+## Placement and Ignore error handler (in each STAGING clone only)
 
-1. After the Part's success step, add **HTTP → Make a request**, with method
-   POST, the URL and headers above, and body type Raw / JSON containing the
-   envelope. Set "Evaluate all states as errors" to Yes, so non-2xx goes to
-   the handler, and set a timeout of 10 seconds.
-2. Right-click that module → **Add error handler** → **Ignore**.
-3. Do not put any module after the reporter on the main route that depends on
-   its output. The printing-preparation route must continue whether the
-   report succeeds or not.
-4. Never add these modules to the three live systems.
+Why placement matters: when a module's error is handled by **Ignore** (or
+**Skip**), Make drops that bundle and does not run the modules after it on
+the same route. This applies even when those later modules don't use the
+reporter's output (https://help.make.com/skip-error-handler). A reporter
+placed on the main chain BEFORE a required write or cross-part handoff could
+therefore stop the pipeline when the endpoint fails.
+
+1. Place the reporter in ONE of these two positions only:
+   - **Terminal side branch (preferred):** add a Router after the Part's
+     success point, keep the existing main route unchanged as its own branch,
+     and put the reporter alone at the END of a separate branch, with nothing
+     after it.
+   - **After everything:** put it on the main route only after ALL of that
+     Part's required writes (sheets, data stores, Dropbox, job registry) and
+     ALL cross-part handoffs (webhook/scenario calls that start the next
+     Part), as the last module of that route.
+   - Never place it before a necessary main-chain write or handoff, even if
+     nothing uses its output.
+2. The reporter is **HTTP → Make a request**, with method POST, the URL and
+   headers above, and body type Raw / JSON containing the envelope. Set
+   "Evaluate all states as errors" to Yes, so non-2xx goes to the handler,
+   and set a timeout of 10 seconds.
+3. Right-click that module → **Add error handler** → **Ignore**.
+4. Nothing may depend on the reporter's output, and no module may follow it.
+5. Check that the router branch order or filters don't make the main route
+   wait on, or be filtered by, the reporter branch.
+6. Never add these modules to the three live systems.
 
 ## Replay and retention
 
@@ -155,9 +177,14 @@ Responses:
    - an identical retry (`duplicate`);
    - an altered retry (409);
    - a wrong key (401);
-   - the endpoint deliberately unavailable, where the clone continues via
-     Ignore and the step stays missing until the original envelope is
-     replayed.
+   - the endpoint deliberately unavailable for EACH reporting Part (for
+     example a wrong staging URL or key, or ingestion off). An error being
+     "ignored" is not enough. Prove downstream processing actually completed:
+     - that Part's required staging writes exist;
+     - the next Part was triggered and ran to its own success;
+     - after Part 6, the batch's staging outputs (sheets, Dropbox folders,
+       packing slips) are complete, the same as in a run with the endpoint up.
+     The milestone stays missing until the original envelope is replayed.
 4. Check the Reports order timeline for an AU synthetic order (the five steps,
    batch/run context, adjacent durations) and `make_batch` for unresolved
    members.
