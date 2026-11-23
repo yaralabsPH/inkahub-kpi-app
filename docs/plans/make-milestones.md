@@ -38,3 +38,9 @@ Files: src/components/OrderTimelineCard.tsx; docs/releases/make-milestones.md; t
 ## Implementation log
 
 Not started. F10 prerequisite pending.
+
+## Verified AU identity handoff (2026-11-23)
+
+Part1 knows accepted display order numbers and batch id; Part2 supplies immutable Shopify ids. Persist scoped shop/site/batch membership aliases and the original Part1 occurrence/time, then resolve them atomically from explicit Part2 mappings. A stable member key may connect stages without inventing Shopify ids. Successful subsets must refer to the same batch/membership version. Unresolved or ambiguous members remain durable and cannot attach to an arbitrary order. An existing canonical order mapped to a different site must not be reassigned by Make. Preserve idempotent original-envelope retries and reject conflicting occurrences. Do not add per-order Shopify calls to Part1.
+
+Successful pipeline milestones are confirmed source evidence; missing stages remain missing. The general shared-store location rule is still unconfigured pending clarification; synthetic staging tests use an explicitly synthetic shop and AU scope. This is an implementation clarification within the approved F11 scope.
