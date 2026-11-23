@@ -45,7 +45,7 @@ Files if needed: `api/_lib/shopify-webhooks.ts`, its existing API tests and rele
 
 Files: existing adapters/tests and, only if necessary after Codex/Claude review, one additive migration after 0060. Read `docs/HARDENING.md`.
 
-- [ ] Claude first gives Codex a short recommendation for the smallest reliable complete-order proof using available source records. Do not implement a large event/backfill engine. Existing projection flags alone are not proof.
+- [x] Claude first gives Codex a short recommendation for the smallest reliable complete-order proof using available source records. Do not implement a large event/backfill engine. Existing projection flags alone are not proof.
 - [ ] For framing, inspect the existing saved scanner receipt and its full event list. A partial work-type completion or manually attributed framer must not become full framing. Honor cancellation and CS/replacement exclusions.
 - [ ] For shipment/delivery, inspect complete bounded line-item/fulfillment coverage and source timestamps. A current fulfilled flag or one package arriving cannot prove the whole order's completion time. Missing carrier delivery time remains unknown. Keep immutable occurrences and retry/cancellation semantics intact.
 - [ ] Implement only a reviewed, source-supported minimum; otherwise retain accurate partial/missing states and record the precise outstanding source requirement. Never seed invented production completion facts to make a test green.
@@ -53,9 +53,9 @@ Files: existing adapters/tests and, only if necessary after Codex/Claude review,
 
 ### 4. Review, Preview and acceptance
 
-- [ ] Codex reviews the actual diff. Run meaningful focused tests, API typecheck and build, then the required final gate once. No repeated broad checks without a new change or failure.
+- [x] Codex reviews the actual diff. Run meaningful focused tests, API typecheck and build, then the required final gate once. No repeated broad checks without a new change or failure.
 - [ ] Apply only newly reviewed SQL to **rsfdqkjasiozmbdtgquv**, if needed. Free staging has room; no cleanup or upgrade needed now.
-- [ ] Deploy only a new Preview from the reviewed commit. Pin all frontend/backend DB variables to new staging. Preserve production deployment and shared environment records. Use normal deployment-specific access, never a project-wide protection bypass.
+- [x] Deploy only a new Preview from the reviewed commit. Pin all frontend/backend DB variables to new staging. Preserve production deployment and shared environment records. Use normal deployment-specific access, never a project-wide protection bypass.
 - [ ] Verify the hosted source refresh and role denial, stored timestamps/durations, partial/missing behavior, duplicate handling, and actual Reports UI. If exercising Shopify HMAC, test the deployed raw-body path rather than assuming unit tests prove it.
 - [ ] Finish with all temporary Make inspectors/copies inactive and queues empty; no real printing, notifications, Shopify mutations or production DB calls. Update release/review notes and a draft stacked PR. No main merge.
 
@@ -69,7 +69,13 @@ Rollback: previous Preview plus ingestion off; retain additive evidence. No prod
 
 ## Implementation log
 
-- Planning/source discovery only. No new app code, SQL migration or deployment in this continuation yet.
+- Initial checkpoint was planning/source discovery only. Task 1 is now implemented, reviewed and deployed as described below.
 - Task 1: owner-only **Refresh sources** in `OrderTimelineCard` (role passed from Reports; stored-data Refresh kept for all readers) calls the existing POST reconcile, then reloads the same order. Pure `createSourceRefresher`/`describeReconcile` allow one request per identity, drop late answers after a user/site/order change, and report not_configured, not_found, unrouted, routing conflict, fact conflicts and `SHOPIFY_UNAVAILABLE` (app copy already committed) as incomplete; malformed answers as unknown. No API, endpoint, dependency or interface change; server owner denial was already tested in `tests/api/order-timeline.test.ts`.
 - Task 1 review r1 (two P2s): `describeReconcile` now validates and reports `app.conflicts` (any conflict = partial; missing/invalid = unknown). `createSourceRefresher` keeps a per-identity in-flight lock released on settlement, separate from the displayed message; refreshing A again after A→B→A re-attaches to the running request instead of a second POST, while an old answer nobody re-asked for still neither paints nor reloads. Tests cover A-B-A with completed and rejected old requests.
 - Task 1 review r2 (P2): restored the current-identity check after the session token resolves, so an intent abandoned by a user/site/order change before the POST sends nothing (no POST, reload or message); the lock is still released in `finally`, and re-asking after A-B-A still re-attaches with one POST. Regression test with a deferred token.
+
+- Task 1 accepted on 23 November: final app commit `cccb0b557d4b8e8a17b524e637c07ab674f34258`; independent review has no remaining material findings. 139 files / 3,319 tests and build pass; GitHub Actions run 45172058349 is green. No SQL change.
+- New Preview `dpl_hkwZc8w3jWDqqeCoQ6J7ibonh9D4` is Ready at https://inka-arthouse-c7nv30kth-inka-arthouse-s-projects.vercel.app. Served bundle references only the new Free staging database, with no service-role key. Production deployment and shared env records remain unchanged.
+- Hosted acceptance: 30/30 checks pass in the repeat-fixture path (owner reconcile, unauthenticated 401, four non-owner roles 403, exact source timestamps, partial framing, confirmed dispatch, six original non-app facts preserved, no duplicate evidence). Initial network failures mean the first insertion response is not retained as a completed acceptance run. The successful run verifies exactly two matching synthetic source rows and eight timeline facts. Browser click independently shows “0 new, 2 already recorded” and the honest Shopify-not-configured warning. See `docs/reviews/order-timeline-commissioning-r1.md`.
+- Task 3 consultation: Claude recommends scanner-receipt coverage for framing and complete bounded line-item/fulfillment coverage plus actual carrier timestamps for shipment/delivery. This is a recommendation, not implemented proof. Classic events remain partial framing; shipped/delivered remain missing. No physical scanner, stock deduction or real Shopify write was tested.
+- Remaining: CJ's routing answer (delivery country, assigned warehouse, or printing form), read-only Shopify commissioning, and reviewed whole-order framing/shipping/delivery proof. Task 4 hosted acceptance above covers Task 1 only; full-journey acceptance remains unchecked. No Make scenario was called or changed during this UI deployment continuation.
