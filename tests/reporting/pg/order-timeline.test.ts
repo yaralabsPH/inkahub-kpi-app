@@ -31,7 +31,7 @@ async function read(site: string, num: string, limit = 500) {
 
 beforeAll(async () => {
   db = await reportingDb();
-  await db.query("insert into auth.users (id) values ($1)", [STAFF]);
+  await db.query("insert into auth.users (id) values ($1), ('22222222-2222-4222-8222-222222222222')", [STAFF]);
 });
 
 describe("0059 ingestion", () => {
@@ -183,6 +183,230 @@ describe("0059 flow alias uniqueness is site-wide (review task2 P2)", () => {
     expect(keys).toContain("uk/a56");
     expect(keys).not.toContain("uk/a55");
     expect((await read("uk", "55")).error?.message).toMatch(/ambiguous/); // consistent with the single-order read
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0061: scanner-attested full framing from a saved F6 commit receipt
+// ---------------------------------------------------------------------------
+
+interface ReceiptLine { sku: string; qty: number; wt: "framed" | "a0_framed" }
+interface EventRow { location: string; id: string; staff_id: string; department: string; order_number: string; line_sku: string | null; line_quantity: number | null; event_type: string; station_id: string; note: string; created_at: string; cs_case_id: string | null; parent_event_id: string | null }
+/**
+ * Writes exactly what scanner_commit_framing (0055 steps 9 and 11) writes for one saved commit: per-line
+ * line_verified events (ids -vNN, lines sorted by SKU), one completed event per work type (-c-<wt>), all at the
+ * scan time on the shared station, then the receipt whose result lists every event id. Hooks alter the rows
+ * or the receipt to build invalid variants.
+ */
+async function seedReceipt(o: {
+  site?: string; order: string; rid: string; at: string; lines?: ReceiptLine[];
+  event?: (e: EventRow) => EventRow | null; result?: (r: Record<string, unknown>) => Record<string, unknown>; extraEvents?: EventRow[];
+}) {
+  const site = o.site ?? "uk";
+  const lines = [...(o.lines ?? [{ sku: "INKA-AB1234-A3-FB", qty: 1, wt: "framed" }, { sku: "INKA-CD5678-A2-FW", qty: 2, wt: "framed" }])].sort((a, b) => (a.sku < b.sku ? -1 : 1));
+  const rid = o.rid.replace(/-/g, "");
+  const base = { location: site, staff_id: STAFF, order_number: o.order, station_id: "shared:R1:A", note: "Shared scanner", created_at: o.at, cs_case_id: null, parent_event_id: null };
+  const events: EventRow[] = lines.map((l, i) => ({ ...base, id: `scn-${rid}-v${String(i + 1).padStart(2, "0")}`, department: l.wt, line_sku: l.sku, line_quantity: l.qty, event_type: "line_verified" }));
+  for (const wt of [...new Set(lines.map((l) => l.wt))].sort()) {
+    events.push({ ...base, id: `scn-${rid}-c-${wt}`, department: wt, line_sku: null, line_quantity: lines.filter((l) => l.wt === wt).reduce((s, l) => s + l.qty, 0), event_type: "completed" });
+  }
+  const ids = events.map((e) => e.id);
+  for (const raw of [...events, ...(o.extraEvents ?? [])]) {
+    const e = o.event ? o.event(raw) : raw;
+    if (!e) continue;
+    await db.query(
+      `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, cs_case_id, parent_event_id)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [e.location, e.id, e.staff_id, e.department, e.order_number, e.line_sku, e.line_quantity, e.event_type, e.station_id, e.note, e.created_at, e.cs_case_id, e.parent_event_id]);
+  }
+  const result: Record<string, unknown> = {
+    status: "saved", request_id: o.rid, order_number: o.order, staff_id: STAFF, display_name: "Fixture", pieces: 3,
+    work_types: [...new Set(lines.map((l) => l.wt))], event_ids: ids, deduction: null, packaging_pick: null, negative_codes: [],
+  };
+  await db.query(
+    `insert into public.scanner_requests (location, request_id, kind, caller, receiver_id, scanner_id, staff_id, order_number, payload_hash, outcome, result, scanned_at)
+     values ($1,$2,'commit',$3,'R1','A',$3,$4,$5,'saved',$6,$7)`,
+    [site, o.rid, STAFF, o.order, "a".repeat(64), JSON.stringify(o.result ? o.result(result) : result), o.at]);
+  return { ids, site };
+}
+const ownerAt = (site: string): ReportingPrincipal => ({ userId: STAFF, role: "owner", nav: new Set(["reports"]), sites: new Set([site]) });
+const timelineOf = (site: string, num: string) => readOrderTimeline(ownerAt(site), { site, orderNumber: num }, { rpc: rpc(), now: () => Date.parse("2026-11-23T00:00:00Z") });
+const reconcileApp = async (site: string, num: string) => {
+  const r = await rpc().rpc("reconcile_order_timeline_app", { p_site: site, p_order_number: num });
+  if (r.error) throw new Error(r.error.message);
+  return r.data as { accepted: number; duplicates: number; conflicts: number };
+};
+let shopId = 61000;
+async function linkOrder(site: string, num: string) {
+  const id = String(++shopId);
+  await ingest(order(id, site, num), [ev({ key: `order:${id}:ordered`, shopifyOrderId: id, orderNumber: num, happenedAt: "2026-11-20T08:00:00Z" })]);
+}
+const proofRows = (site: string, rid: string) =>
+  db.query<{ occurrence_key: string; framing_complete: boolean | null; retracts_key: string | null; happened_at: string }>(
+    `select occurrence_key, framing_complete, retracts_key, to_char(happened_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') happened_at
+       from public.order_timeline_evidence where source = 'app' and (occurrence_key = $1 or retracts_key = $1) order by occurrence_key`, [`${site}/receipt:${rid}`]).then((r) => r.rows);
+const snapshot = async () => (await db.query<{ n: string }>(
+  `select (select md5(coalesce(string_agg(t::text, '|' order by t.location, t.id), '')) from public.production_events t)
+       || (select md5(coalesce(string_agg(t::text, '|' order by t.location, t.request_id), '')) from public.scanner_requests t) n`)).rows[0].n;
+const AT = "2026-11-20T10:00:00Z";
+
+describe("0061 scanner receipt framing proof", () => {
+  it("a valid saved receipt gives confirmed full framing at the scan time; replay is all duplicates; sources are never mutated", async () => {
+    await linkOrder("uk", "10000101");
+    const rid = "00000000-0000-4000-8000-000000000101";
+    await seedReceipt({ order: "10000101", rid, at: AT });
+    const before = await snapshot();
+    // 0059's per-work-type copy (one completed event) + the receipt proof
+    expect(await reconcileApp("uk", "10000101")).toMatchObject({ accepted: 2, duplicates: 0, conflicts: 0 });
+    expect(await reconcileApp("uk", "10000101")).toMatchObject({ accepted: 0, duplicates: 2, conflicts: 0 });
+    expect(await proofRows("uk", rid)).toEqual([{ occurrence_key: `uk/receipt:${rid}`, framing_complete: true, retracts_key: null, happened_at: AT }]);
+    const t = await timelineOf("uk", "10000101");
+    const framed = t.stages?.find((s) => s.stage === "framed");
+    expect(framed).toMatchObject({ status: "confirmed", source: "app", kind: "confirmed" });
+    expect(Date.parse(framed!.at!)).toBe(Date.parse(AT));
+    expect(t.framedByWorkType.map((f) => [f.workType, Date.parse(f.at), f.kind])).toEqual([["framed", Date.parse(AT), "confirmed"]]);
+    expect(await snapshot()).toBe(before);
+  });
+
+  it("A0 + framed in one commit: one proof covering both work types", async () => {
+    await linkOrder("uk", "10000102");
+    const rid = "00000000-0000-4000-8000-000000000102";
+    await seedReceipt({ order: "10000102", rid, at: AT, lines: [{ sku: "INKA-AB1234-A0-FB", qty: 1, wt: "a0_framed" }, { sku: "INKA-CD5678-A3-FW", qty: 1, wt: "framed" }] });
+    expect(await reconcileApp("uk", "10000102")).toMatchObject({ accepted: 3, conflicts: 0 });
+    expect((await timelineOf("uk", "10000102")).stages?.find((s) => s.stage === "framed")?.status).toBe("confirmed");
+  });
+
+  it("classic/manual framing without a receipt stays partial, even with scanner-looking ids", async () => {
+    await linkOrder("uk", "10000103");
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at) values
+      ('uk','classic-103','${STAFF}','framed','10000103','completed','${AT}'),
+      ('uk','scn-00000000000040008000000000000103-c-framed','${STAFF}','framed','10000103','completed','${AT}')`);
+    expect(await reconcileApp("uk", "10000103")).toMatchObject({ accepted: 2 });
+    expect((await timelineOf("uk", "10000103")).stages?.find((s) => s.stage === "framed")?.status).toBe("partial");
+  });
+
+  it("a later CS case and its replacement work never erase the original proof; the replacement is excluded", async () => {
+    await linkOrder("uk", "10000104");
+    const rid = "00000000-0000-4000-8000-000000000104";
+    await seedReceipt({ order: "10000104", rid, at: AT });
+    await reconcileApp("uk", "10000104");
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at, cs_case_id)
+      values ('uk','repl-104','${STAFF}','framed','10000104','completed','2026-11-22T10:00:00Z','CS-104')`);
+    expect(await reconcileApp("uk", "10000104")).toMatchObject({ accepted: 1, duplicates: 2, conflicts: 0 });
+    const t = await timelineOf("uk", "10000104");
+    const framed = t.stages?.find((s) => s.stage === "framed");
+    expect(framed?.status).toBe("confirmed");
+    expect(Date.parse(framed!.at!)).toBe(Date.parse(AT)); // the original scan time, not the replacement's
+    expect(t.framedByWorkType.map((f) => [f.workType, Date.parse(f.at), f.kind])).toEqual([["framed", Date.parse(AT), "confirmed"]]);
+    expect(t.evidence.filter((e) => e.caseId === "CS-104")).toHaveLength(1);
+  });
+
+  it("wrong site or order never proves: a receipt elsewhere, or a result naming another order", async () => {
+    await linkOrder("au", "10000105");
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at) values ('au','classic-105','${STAFF}','framed','10000105','completed','${AT}')`);
+    await seedReceipt({ site: "uk", order: "10000105", rid: "00000000-0000-4000-8000-000000000105", at: AT }); // UK receipt, AU lookup
+    expect(await reconcileApp("au", "10000105")).toMatchObject({ accepted: 1 });
+    expect((await timelineOf("au", "10000105")).stages?.find((s) => s.stage === "framed")?.status).toBe("partial");
+    // receipt at the site but its result names another order
+    await linkOrder("uk", "10000106");
+    const rid = "00000000-0000-4000-8000-000000000106";
+    await seedReceipt({ order: "10000106", rid, at: AT, result: (r) => ({ ...r, order_number: "10009999" }) });
+    await reconcileApp("uk", "10000106");
+    expect(await proofRows("uk", rid)).toEqual([]);
+  });
+
+  const INVALID: Array<[string, Parameters<typeof seedReceipt>[0] extends infer P ? Omit<P & object, "order" | "rid" | "at"> : never]> = [
+    ["empty event_ids", { result: (r) => ({ ...r, event_ids: [] }) }],
+    ["duplicate id", { result: (r) => ({ ...r, event_ids: [...(r.event_ids as string[]), (r.event_ids as string[])[0]] }) }],
+    ["non-string id", { result: (r) => ({ ...r, event_ids: [...(r.event_ids as string[]), 7] }) }],
+    ["event_ids not an array", { result: (r) => ({ ...r, event_ids: (r.event_ids as string[]).join(",") }) }],
+    ["missing event", { event: (e) => (e.id.endsWith("-v01") ? null : e) }],
+    ["listed id of another request", { result: (r) => ({ ...r, event_ids: (r.event_ids as string[]).map((x) => x.replace(/-v01$/, "-v01x")) }), extraEvents: [] }],
+    ["result request id mismatch", { result: (r) => ({ ...r, request_id: "00000000-0000-4000-8000-000000009999" }) }],
+    ["result status not saved", { result: (r) => ({ ...r, status: "already_recorded" }) }],
+    ["CS-tagged receipt event", { event: (e) => (e.id.endsWith("-v02") ? { ...e, cs_case_id: "CS-9" } : e) }],
+    ["event time differs from scan time", { event: (e) => (e.id.endsWith("-c-framed") ? { ...e, created_at: "2026-11-20T10:00:01Z" } : e) }],
+    ["event at another order", { event: (e) => (e.id.endsWith("-v01") ? { ...e, order_number: "10009998" } : e) }],
+    ["completed id holds a line_verified event", { event: (e) => (e.id.endsWith("-c-framed") ? { ...e, event_type: "line_verified", line_sku: "INKA-ZZ0000-A3-FB" } : e) }],
+    ["line id holds a completed event", { event: (e) => (e.id.endsWith("-v01") ? { ...e, event_type: "completed", line_sku: null } : e) }],
+    ["no completed event listed", { result: (r) => ({ ...r, event_ids: (r.event_ids as string[]).filter((x) => !x.includes("-c-")) }) }],
+    ["no per-line event listed", { result: (r) => ({ ...r, event_ids: (r.event_ids as string[]).filter((x) => x.includes("-c-")) }) }],
+    ["completed work type without lines", { result: (r) => ({ ...r, event_ids: [...(r.event_ids as string[]), `scn-${String(r.request_id).replace(/-/g, "")}-c-a0_framed`] }),
+      extraEvents: [] }],
+    ["non-framing record", { result: (r) => ({ ...r, event_ids: [...(r.event_ids as string[]), `scn-${String(r.request_id).replace(/-/g, "")}-c-unframed`] }) }],
+    ["different staff on one event", { event: (e) => (e.id.endsWith("-v01") ? { ...e, staff_id: "22222222-2222-4222-8222-222222222222" } : e) }],
+    ["different station on one event", { event: (e) => (e.id.endsWith("-v02") ? { ...e, station_id: "shared:R2:A" } : e) }],
+  ];
+  it.each(INVALID.map(([name, hooks], i) => [name, hooks, i] as const))("invalid receipt (%s): no proof, framing stays partial or missing", async (_name, hooks, i) => {
+    const num = String(10000200 + i);
+    const rid = `00000000-0000-4000-8000-${String(200 + i).padStart(12, "0")}`;
+    await linkOrder("uk", num);
+    const ridHex = rid.replace(/-/g, "");
+    // extra events the variants list but the scanner never wrote (a stray a0 completion, an unframed record)
+    const extra: EventRow[] = [
+      { location: "uk", id: `scn-${ridHex}-c-a0_framed`, staff_id: STAFF, department: "a0_framed", order_number: num, line_sku: null, line_quantity: 1, event_type: "completed", station_id: "shared:R1:A", note: "Shared scanner", created_at: AT, cs_case_id: null, parent_event_id: null },
+      { location: "uk", id: `scn-${ridHex}-c-unframed`, staff_id: STAFF, department: "unframed", order_number: num, line_sku: null, line_quantity: 1, event_type: "completed", station_id: "shared:R1:A", note: "Shared scanner", created_at: AT, cs_case_id: null, parent_event_id: null },
+    ];
+    await seedReceipt({ order: num, rid, at: AT, ...hooks, extraEvents: hooks.extraEvents ?? extra });
+    const before = await snapshot();
+    await reconcileApp("uk", num);
+    expect(await proofRows("uk", rid)).toEqual([]);
+    expect(["partial", "missing"]).toContain((await timelineOf("uk", num)).stages?.find((s) => s.stage === "framed")?.status);
+    expect(await snapshot()).toBe(before);
+  });
+
+  it("proof first, then a per-line cancellation: a retraction at the actual cancel time revokes it; repeats are duplicates", async () => {
+    await linkOrder("uk", "10000301");
+    const rid = "00000000-0000-4000-8000-000000000301";
+    const { ids } = await seedReceipt({ order: "10000301", rid, at: AT });
+    await reconcileApp("uk", "10000301");
+    expect((await timelineOf("uk", "10000301")).stages?.find((s) => s.stage === "framed")?.status).toBe("confirmed");
+    const line = ids.find((x) => x.endsWith("-v01"))!;
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at, parent_event_id)
+      values ('uk','cx-301','${STAFF}','framed','10000301','cancelled','2026-11-20T11:30:00Z',$1)`, [line]);
+    // the retraction is new; the completed copy is a duplicate; the proof is no longer re-emitted (it stays stored, revoked)
+    expect(await reconcileApp("uk", "10000301")).toMatchObject({ accepted: 1, duplicates: 1, conflicts: 0 });
+    expect(await reconcileApp("uk", "10000301")).toMatchObject({ accepted: 0, duplicates: 2, conflicts: 0 });
+    expect(await proofRows("uk", rid)).toEqual([
+      { occurrence_key: `uk/receipt-cancel:${rid}:cx-301`, framing_complete: null, retracts_key: `uk/receipt:${rid}`, happened_at: "2026-11-20T11:30:00Z" },
+      { occurrence_key: `uk/receipt:${rid}`, framing_complete: true, retracts_key: null, happened_at: AT },
+    ]);
+    const t = await timelineOf("uk", "10000301");
+    expect(t.stages?.find((s) => s.stage === "framed")?.status).toBe("partial"); // the completed copy stands; full proof revoked
+    expect(t.evidence.some((e) => e.revoked && e.stage === "framed")).toBe(true);
+  });
+
+  it("cancellation before the first reconcile: no proof is emitted, the retraction still is, and order of arrival does not matter", async () => {
+    await linkOrder("uk", "10000302");
+    const rid = "00000000-0000-4000-8000-000000000302";
+    const { ids } = await seedReceipt({ order: "10000302", rid, at: AT });
+    const completed = ids.find((x) => x.endsWith("-c-framed"))!;
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at, parent_event_id)
+      values ('uk','cx-302','${STAFF}','framed','10000302','cancelled','2026-11-20T12:00:00Z',$1)`, [completed]);
+    await reconcileApp("uk", "10000302");
+    expect(await proofRows("uk", rid)).toEqual([
+      { occurrence_key: `uk/receipt-cancel:${rid}:cx-302`, framing_complete: null, retracts_key: `uk/receipt:${rid}`, happened_at: "2026-11-20T12:00:00Z" },
+    ]);
+    // a proof arriving afterwards (e.g. from an earlier copy) would still be revoked by the stored retraction
+    await ingest(null, [{ source: "app", key: `uk/receipt:${rid}`, site: "uk", shop: null, shopifyOrderId: null, orderNumber: "10000302", stage: "framed", kind: "confirmed", happenedAt: AT, framingComplete: true }]);
+    expect((await timelineOf("uk", "10000302")).stages?.find((s) => s.stage === "framed")?.status).not.toBe("confirmed");
+  });
+
+  it("over the ingest bound fails explicitly before writing anything", async () => {
+    await linkOrder("uk", "10000401");
+    const values = Array.from({ length: 201 }, (_, i) => `('uk','d401-${i}','${STAFF}','dispatch','10000401','dispatched','2026-11-20T12:00:00Z')`).join(",");
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at) values ${values}`);
+    const r = await rpc().rpc("reconcile_order_timeline_app", { p_site: "uk", p_order_number: "10000401" });
+    expect(r.error?.message).toMatch(/exceed the limit 200/);
+    expect((await db.query("select count(*)::int n from public.order_timeline_evidence where source = 'app' and order_number = '10000401'")).rows[0]).toEqual({ n: 0 });
+  });
+
+  it("keeps the service-only, security-invoker, empty search_path function and can read receipts as service_role only", async () => {
+    const f = (await db.query<{ secdef: boolean; cfg: string[] }>(`select p.prosecdef secdef, p.proconfig cfg from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = 'reconcile_order_timeline_app'`)).rows;
+    expect(f).toEqual([{ secdef: false, cfg: ['search_path=""'] }]);
+    const sel = (role: string) => db.query<{ ok: boolean }>(`select has_table_privilege($1, 'public.scanner_requests', 'SELECT') ok`, [role]).then((r) => r.rows[0].ok);
+    expect(await sel("service_role")).toBe(true);
+    expect(await sel("anon")).toBe(false);
   });
 });
 
