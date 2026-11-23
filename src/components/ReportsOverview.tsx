@@ -34,6 +34,8 @@ export interface ReportsOverviewProps {
   userId: string | null;
   role: string | null;
   ownName: string | null;
+  /** True when the detailed (legacy) Reports view follows below with its own filters. */
+  detailBelow?: boolean;
 }
 
 const PERIODS: Array<{ value: OverviewPeriodKind; label: string }> = [
@@ -67,7 +69,7 @@ export function buildOverviewRequest(input: {
   }
 }
 
-export function ReportsOverview({ supabase, site, userId, role, ownName }: ReportsOverviewProps) {
+export function ReportsOverview({ supabase, site, userId, role, ownName, detailBelow }: ReportsOverviewProps) {
   const selfOnly = role === "staff";
   const [period, setPeriod] = useState<OverviewPeriodKind>("week");
   const [custom, setCustom] = useState(() => ({ from: "", to: "" }));
@@ -138,6 +140,10 @@ export function ReportsOverview({ supabase, site, userId, role, ownName }: Repor
     <Card>
       <CardHeader>
         <CardTitle>Production summary</CardTitle>
+        <p className="text-xs text-slate-500 mt-1">
+          Published period totals by person and department. These filters apply to this summary only
+          {detailBelow ? "; the detailed view below keeps its own period and filters." : "."}
+        </p>
       </CardHeader>
       <CardBody className="space-y-4">
         <div className="flex flex-wrap items-end gap-3 text-sm">

@@ -203,7 +203,7 @@ function RoleReports() {
   const layout = reportsLayoutFor(role);
   if (layout === "pending") return <div className="p-6 text-sm text-slate-500" role="status">Loading your access…</div>;
   if (layout === "denied") return <div className="p-6 text-sm text-slate-600 dark:text-slate-300">Reports are not available on kiosk accounts.</div>;
-  const overview = <ReportsOverview supabase={supabase} site={location} userId={auth.user?.id ?? null} role={role} ownName={auth.profile?.display_name ?? null} />;
+  const overview = <ReportsOverview supabase={supabase} site={location} userId={auth.user?.id ?? null} role={role} ownName={auth.profile?.display_name ?? null} detailBelow={layout === "full"} />;
   if (layout === "overview_only") return <div className="p-4 md:p-6 space-y-4">{overview}</div>;
   return (
     <>
