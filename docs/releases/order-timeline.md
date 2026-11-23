@@ -1,8 +1,12 @@
 # F10 Order timeline — release notes (staging only)
 
-Branch `feature/order-timeline`. Nothing here is applied, pushed, deployed or
-registered by the coder. Production and the three live Make systems are not
-touched. Staging and live acceptance are **pending**.
+Branch `feature/order-timeline`, included in the F11 Preview at `e216051`.
+Synthetic staging acceptance passed on 2026-11-23: hosted role checks, order
+lookup, adjacent durations, duplicate replay and the browser display. Production
+and the three live Make systems are untouched. Real Shopify routing, webhook
+subscription/raw-body acceptance and reconciliation commissioning remain pending.
+See [F11 staging release](make-milestones.md) and
+[the commissioning review](../reviews/make-milestones-r2.md).
 
 ## What ships
 

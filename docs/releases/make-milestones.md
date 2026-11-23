@@ -1,23 +1,45 @@
 # F11 Automation progress — release and commissioning guide (staging only)
 
 Branch `feature/make-milestones`, stacked on `feature/order-timeline` at
-`06bb313`. Nothing here is applied, pushed, deployed or installed into any Make
-scenario by the coder. Hosted acceptance is **not** claimed.
+`06bb313`. Synthetic AU staging acceptance passed on 2026-11-23 at application
+commit `e216051`. No production release or main merge. See
+[the commissioning review](../reviews/make-milestones-r2.md) for evidence and limits.
 
 ## Current commissioning state (2026-11-23, as reported by root)
 
 | Item | State |
 |---|---|
-| Staging database | Unavailable (disk exhaustion). 0059 and 0060 are **not applied** anywhere. |
+| Staging database | Fresh Free project `rsfdqkjasiozmbdtgquv`, Inka Arthouse 2; about 18.4 MB. All 55 existing migrations through 0060 installed as one reviewed baseline, including 0059/0060. |
 | Six AU staging clones (all inactive/gated) | P1 = 8746725, P2 = 8746726, P3 = 8746728, P4 = 8746730 (no reporter; unchanged), P5 = 8746731, P6 = 8746732 |
 | Utility scenario | 8746734: separate, off, queue empty; not a milestone reporter. |
 | Staging sheets | Four created and verified (both connections). |
 | Dropbox staging folders | All nine verified (both connections). |
-| Task 3 (clone run) | Not done; synthetic fixture preparation only in progress. |
-| Milestone HTTP modules in clones | **Not added.** No integration has run. |
-| `MAKE_MILESTONE_SCOPES` | Not set in any environment. |
+| Task 3 (clone run) | One positive fake order `99000001`, batch `261123-205053-26c318a2e958`: all six Parts succeeded; five reports accepted; final packing-slip state Ready. Earlier unavailable-endpoint and timestamp-failure trials also completed downstream. |
+| Milestone HTTP modules in clones | Tested terminal reporters with retained original envelopes. All six clones subsequently restored to timing CLOSED, inactive, on-demand, empty queues; the temporary Preview URL/key were removed. |
+| `MAKE_MILESTONE_SCOPES` | Dedicated synthetic `au-staging` scope in Preview only. No production scope. |
 | Live Make systems (all three) and production | Unchanged and read-only. |
-| General shared-store order-location rule (`ORDER_TIMELINE_ROUTING`) | Still unset, pending the user's explanation. |
+| General shared-store order-location rule (`ORDER_TIMELINE_ROUTING`) | Still unset; the user confirmed a shared store and routing by order location, but the precise Shopify field/rule has not been verified. The isolated AU Make scope is verified. |
+
+Preview: https://inka-arthouse-ieqqyzvxf-inka-arthouse-s-projects.vercel.app/reports
+(`dpl_2GSPeGRkHtEjKLayUvjgB9Y8q1Q3`, source `e216051`). Select Australia and
+look up `99000001`. Test account credentials and the temporary deployment share
+link remain in private local handoff files, never in git. The in-app browser was
+left signed into the synthetic owner account on this report.
+
+The new project is a small test environment, not a copy of production history.
+F1 capture/processors remain off and no production summary is published, so its
+unavailable message is expected. The order timeline works independently.
+Migration history contains baseline `20261123091131_fresh_staging_baseline_0001_to_0060`;
+do not blindly replay the original migration files with `db push`. The reviewed
+baseline includes restricted grants needed by the fresh database. Old staging
+`ybrzhrgfrnvtcwymjdrq` was not deleted; its data was not copied into this project.
+
+For another Make trial, use the reviewed Preview templates and exact clone IDs,
+obtain a current deployment-specific share link, confirm empty staging queues,
+and commission a new synthetic order deliberately. The tested share expires
+2026-11-25 around 09:36 UTC. Do not enable any live scenario or use a project-wide
+protection bypass. Saved exact envelopes can be replayed without rerunning the
+printing workflow; all five identical positive-trial replays returned `duplicate`.
 
 ## What ships
 
