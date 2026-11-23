@@ -12,6 +12,8 @@
  * confirmed fulfillment covering the order; delivered needs Shopify evidence;
  * framing is complete only with explicit whole-order proof. CS/replacement
  * work never completes the original order. Missing stages stay missing.
+ * Durations only: adjacent confirmed gaps, neutral median/P90 and counts; no
+ * lateness, thresholds or performance labels exist here.
  */
 
 export const ORDER_SITES = ["au", "uk", "us"] as const;
@@ -169,15 +171,17 @@ export function projectTimeline(evidence: readonly OrderEvidence[]): TimelineVie
     .map((e) => ({ fulfillmentId: e.fulfillmentId as string, at: strictIso(e.happenedAt) as string, complete: e.fulfillmentComplete === true, kind: e.kind }));
   const complete = fulfillments.find((f) => f.complete && f.kind === "confirmed") ?? null;
   const unconfirmedComplete = fulfillments.find((f) => f.complete && f.kind !== "confirmed");
+  // precedence: confirmed complete > confirmed partial > unconfirmed (an inferred "complete" never outranks
+  // confirmed partial evidence; it stays listed in `fulfillments` with its kind)
+  const confirmedPartial = fulfillments.find((f) => f.kind === "confirmed");
+  const unconfirmed = unconfirmedComplete ?? fulfillments[0];
   stages.shipped = complete
     ? { status: "confirmed", at: complete.at, source: "shopify", kind: "confirmed" }
-    : unconfirmedComplete
-      ? { status: "unconfirmed", at: unconfirmedComplete.at, source: "shopify", kind: unconfirmedComplete.kind }
-      : fulfillments.some((f) => f.kind === "confirmed")
-        ? { status: "partial", at: (fulfillments.find((f) => f.kind === "confirmed") as (typeof fulfillments)[number]).at, source: "shopify", kind: "confirmed" }
-        : fulfillments.length
-          ? { status: "unconfirmed", at: fulfillments[0].at, source: "shopify", kind: fulfillments[0].kind }
-          : missing;
+    : confirmedPartial
+      ? { status: "partial", at: confirmedPartial.at, source: "shopify", kind: "confirmed" }
+      : unconfirmed
+        ? { status: "unconfirmed", at: unconfirmed.at, source: "shopify", kind: unconfirmed.kind }
+        : missing;
   // per work type: the confirmed record wins over an earlier inferred/reported one; kind is kept
   const framedByWorkType: TimelineView["framedByWorkType"] = [];
   for (const e of original) {
@@ -215,6 +219,58 @@ export function median(values: readonly number[]): number | null {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
+/**
+ * Display/measurement order of the stages: F10 ordered, the five F11 automation
+ * steps, then framing, dispatch, shipment and delivery. Cancellation is a flag,
+ * not a step.
+ */
+export const TIMELINE_SEQUENCE = [
+  "ordered", "make_submitted", "make_files_found", "make_planned", "make_images_ready", "make_packing_ready",
+  "framed", "dispatched", "shipped", "delivered",
+] as const satisfies readonly OrderStage[];
+export type SequenceStage = (typeof TIMELINE_SEQUENCE)[number];
+
+/** Elapsed time between two ADJACENT sequence stages. Durations only: no classification. */
+export interface StageGap {
+  from: SequenceStage;
+  to: SequenceStage;
+  /** measured: both endpoints confirmed and to >= from; unknown: an endpoint is missing/unconfirmed/partial; anomaly: negative. */
+  status: "measured" | "unknown" | "anomaly";
+  hours: number | null;
+}
+
+/** The confirmed instant of a stage (complete shipment / whole-order framing only), or null. */
+function confirmedAt(t: TimelineView, s: SequenceStage, nowMs: number | null): number | null {
+  const v = t.stages[s];
+  if (v.status !== "confirmed" || !v.at) return null;
+  const ms = Date.parse(v.at);
+  return nowMs !== null && ms > nowMs ? null : ms;
+}
+
+/**
+ * One gap per adjacent pair, never across a missing stage: if a middle stage
+ * has no confirmed time BOTH neighbouring gaps are unknown. Negative gaps are
+ * anomalies with no hours. `nowUtc` (optional) ignores evidence after it.
+ */
+export function stageGaps(t: TimelineView, nowUtc?: string): StageGap[] {
+  const n = nowUtc === undefined ? null : strictIso(nowUtc);
+  if (nowUtc !== undefined && !n) throw new RangeError("now must be an explicit UTC/offset instant");
+  const nowMs = n ? Date.parse(n) : null;
+  const out: StageGap[] = [];
+  for (let i = 1; i < TIMELINE_SEQUENCE.length; i++) {
+    const from = TIMELINE_SEQUENCE[i - 1];
+    const to = TIMELINE_SEQUENCE[i];
+    const a = confirmedAt(t, from, nowMs);
+    const b = confirmedAt(t, to, nowMs);
+    if (a === null || b === null) out.push({ from, to, status: "unknown", hours: null });
+    else if (b < a) out.push({ from, to, status: "anomaly", hours: null });
+    else out.push({ from, to, status: "measured", hours: (b - a) / 3_600_000 });
+  }
+  return out;
+}
+
+export interface GapSummary { from: SequenceStage; to: SequenceStage; samples: number; unknown: number; anomalies: number; median: number | null; p90: number | null }
+
 export interface FlowMetrics {
   /** Recorded original, non-cancelled orders confirmed as ordered in the period (and not after now). */
   cohort: number;
@@ -223,12 +279,12 @@ export interface FlowMetrics {
   /** Samples with a shipment before the order time: excluded, never negative time. */
   anomalies: number;
   orderToShipHours: { median: number | null; p90: number | null };
-  late: { configured: false; reason: string } | { configured: true; thresholdHours: number; count: number };
+  /** Per adjacent stage pair over the same cohort: measured samples, unknown and anomalies. */
+  stageGaps: GapSummary[];
 }
 
-/** One site, each identity once. Elapsed hours only. `lateThresholdHours` null = rule not configured. */
-export function flowMetrics(timelines: readonly TimelineView[], period: { startUtc: string; endUtcExclusive: string }, nowUtc: string, lateThresholdHours: number | null): FlowMetrics {
-  if (lateThresholdHours !== null && !(Number.isFinite(lateThresholdHours) && lateThresholdHours > 0)) throw new RangeError("late threshold must be a positive number of hours");
+/** One site, each identity once. Elapsed hours only; neutral numbers, no classification. */
+export function flowMetrics(timelines: readonly TimelineView[], period: { startUtc: string; endUtcExclusive: string }, nowUtc: string): FlowMetrics {
   const sa = strictIso(period.startUtc);
   const sb = strictIso(period.endUtcExclusive);
   const sn = strictIso(nowUtc);
@@ -244,7 +300,9 @@ export function flowMetrics(timelines: readonly TimelineView[], period: { startU
   const hours: number[] = [];
   let anomalies = 0;
   let open = 0;
-  let late = 0;
+  const gapHours = TIMELINE_SEQUENCE.slice(1).map(() => [] as number[]);
+  const gapUnknown = gapHours.map(() => 0);
+  const gapAnomalies = gapHours.map(() => 0);
   for (const t of cohort) {
     const o = Date.parse(t.orderedAt as string);
     // a shipment recorded after `now` is not part of the current picture
@@ -254,8 +312,12 @@ export function flowMetrics(timelines: readonly TimelineView[], period: { startU
       else hours.push(h);
     } else {
       open++;
-      if (lateThresholdHours !== null && (now - o) / 3_600_000 > lateThresholdHours) late++;
     }
+    stageGaps(t, sn).forEach((g, i) => {
+      if (g.status === "measured") gapHours[i].push(g.hours as number);
+      else if (g.status === "anomaly") gapAnomalies[i]++;
+      else gapUnknown[i]++;
+    });
   }
   return {
     cohort: cohort.length,
@@ -263,6 +325,8 @@ export function flowMetrics(timelines: readonly TimelineView[], period: { startU
     openOrders: open,
     anomalies,
     orderToShipHours: { median: median(hours), p90: percentile(hours, 0.9) },
-    late: lateThresholdHours === null ? { configured: false, reason: "Late-order rule not configured" } : { configured: true, thresholdHours: lateThresholdHours, count: late },
+    stageGaps: gapHours.map((hs, i) => ({
+      from: TIMELINE_SEQUENCE[i], to: TIMELINE_SEQUENCE[i + 1], samples: hs.length, unknown: gapUnknown[i], anomalies: gapAnomalies[i], median: median(hs), p90: percentile(hs, 0.9),
+    })),
   };
 }

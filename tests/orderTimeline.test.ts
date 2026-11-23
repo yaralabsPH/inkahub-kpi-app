@@ -4,7 +4,9 @@ import {
   flowMetrics,
   median,
   occurrenceKey,
+  stageGaps,
   strictIso,
+  TIMELINE_SEQUENCE,
   TimelineIdentityError,
   mergeEvidence,
   normalizeShop,
@@ -106,21 +108,14 @@ describe("flow metrics", () => {
       order("3", "2026-11-20T02:00:00Z", null), // open
       order("4", "2026-11-20T03:00:00Z", null, true), // cancelled: not in cohort
       order("5", "2026-11-19T03:00:00Z", "2026-11-20T03:00:00Z"), // outside period
-    ], P, "2026-11-22T00:00:00Z", null);
+    ], P, "2026-11-22T00:00:00Z");
     expect([m.cohort, m.completeShipmentSamples, m.openOrders]).toEqual([3, 2, 1]);
     expect(m.orderToShipHours).toEqual({ median: 15, p90: 20 }); // median of [10, 20] averages the middle pair
-    expect(m.late).toEqual({ configured: false, reason: "Late-order rule not configured" });
   });
   it("negative gaps are excluded as anomalies, never shown as negative time", () => {
-    const m = flowMetrics([order("1", "2026-11-20T05:00:00Z", "2026-11-20T04:00:00Z")], P, "2026-11-22T00:00:00Z", null);
+    const m = flowMetrics([order("1", "2026-11-20T05:00:00Z", "2026-11-20T04:00:00Z")], P, "2026-11-22T00:00:00Z");
     expect(m.completeShipmentSamples).toBe(0);
     expect(m.anomalies).toBe(1);
-  });
-  it("late orders need a configured positive threshold and exclude shipped/cancelled", () => {
-    const list = [order("1", "2026-11-20T00:00:00Z", null), order("2", "2026-11-20T20:00:00Z", null), order("3", "2026-11-20T00:00:00Z", "2026-11-20T10:00:00Z")];
-    const m = flowMetrics(list, P, "2026-11-21T12:00:00Z", 24);
-    expect(m.late).toMatchObject({ configured: true, thresholdHours: 24, count: 1 });
-    expect(() => flowMetrics(list, P, "2026-11-21T12:00:00Z", 0)).toThrow();
   });
 });
 
@@ -133,8 +128,8 @@ describe("review r1 corrections", () => {
     expect(() => projectTimeline([])).toThrow(TimelineIdentityError);
     expect(projectTimeline([o])).toMatchObject({ identity: `uk|${SHOP}|1001`, site: "uk" });
     const P = { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" };
-    expect(() => flowMetrics([projectTimeline([o]), projectTimeline([o])], P, "2026-11-22T00:00:00Z", null)).toThrow(/once/);
-    expect(() => flowMetrics([projectTimeline([o]), projectTimeline([ev({ key: "a", site: "au" })])], P, "2026-11-22T00:00:00Z", null)).toThrow(/one site/);
+    expect(() => flowMetrics([projectTimeline([o]), projectTimeline([o])], P, "2026-11-22T00:00:00Z")).toThrow(/once/);
+    expect(() => flowMetrics([projectTimeline([o]), projectTimeline([ev({ key: "a", site: "au" })])], P, "2026-11-22T00:00:00Z")).toThrow(/one site/);
   });
   it("P1: framing is complete only with explicit whole-order proof", () => {
     const one = projectTimeline([o, ev({ key: "f", stage: "framed", source: "app", workType: "framed" })]);
@@ -148,7 +143,7 @@ describe("review r1 corrections", () => {
     expect(t.stages.shipped).toMatchObject({ status: "unconfirmed", kind: "inferred" });
     expect(t.stages.delivered).toMatchObject({ status: "unconfirmed", kind: "reported" });
     expect(t.completeShipmentAt).toBeNull();
-    const m = flowMetrics([t], { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" }, "2026-11-22T00:00:00Z", null);
+    const m = flowMetrics([t], { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" }, "2026-11-22T00:00:00Z");
     expect([m.completeShipmentSamples, m.openOrders]).toEqual([0, 1]);
   });
   it("P2: occurrence keys are source-qualified; same-source changed identity still conflicts; source/kind/site validated", () => {
@@ -171,13 +166,13 @@ describe("review r1 corrections", () => {
     for (const bad of ["2026-11-20T09:00:00", "2026-02-30T00:00:00Z", "2026-11-20", "20 Nov 2026", "2026-11-20T25:00:00Z"]) expect(strictIso(bad)).toBeNull();
     expect(mergeEvidence([], [ev({ key: "l", happenedAt: "2026-11-20T09:00:00" })]).rejected).toHaveLength(1);
     const P = { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" };
-    expect(() => flowMetrics([], { startUtc: P.endUtcExclusive, endUtcExclusive: P.startUtc }, "2026-11-22T00:00:00Z", null)).toThrow();
-    expect(() => flowMetrics([], P, "2026-11-22T00:00:00", null)).toThrow();
+    expect(() => flowMetrics([], { startUtc: P.endUtcExclusive, endUtcExclusive: P.startUtc }, "2026-11-22T00:00:00Z")).toThrow();
+    expect(() => flowMetrics([], P, "2026-11-22T00:00:00")).toThrow();
     const shippedLater = projectTimeline([o, ev({ key: "s", stage: "shipped", fulfillmentId: "F", fulfillmentComplete: true, happenedAt: "2026-11-23T09:00:00Z" })]);
-    const m = flowMetrics([shippedLater], P, "2026-11-21T12:00:00Z", null); // now is before the shipment
+    const m = flowMetrics([shippedLater], P, "2026-11-21T12:00:00Z"); // now is before the shipment
     expect([m.completeShipmentSamples, m.openOrders]).toEqual([0, 1]);
     const futureOrder = projectTimeline([ev({ key: "fo", happenedAt: "2026-11-20T20:00:00Z" })]);
-    expect(flowMetrics([futureOrder], P, "2026-11-20T12:00:00Z", null).cohort).toBe(0);
+    expect(flowMetrics([futureOrder], P, "2026-11-20T12:00:00Z").cohort).toBe(0);
   });
 });
 
@@ -186,9 +181,9 @@ describe("review r2 corrections", () => {
   const P = { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" };
   it("A: a cancellation after now does not remove the order; one at or before now does", () => {
     const t = projectTimeline([o, ev({ key: "c", stage: "cancelled", happenedAt: "2026-11-22T09:00:00Z" })]);
-    const before = flowMetrics([t], P, "2026-11-21T12:00:00Z", null);
+    const before = flowMetrics([t], P, "2026-11-21T12:00:00Z");
     expect([before.cohort, before.openOrders]).toEqual([1, 1]);
-    expect(flowMetrics([t], P, "2026-11-22T10:00:00Z", null).cohort).toBe(0);
+    expect(flowMetrics([t], P, "2026-11-22T10:00:00Z").cohort).toBe(0);
   });
   it("B: inferred-only framing/fulfillment is unconfirmed, not partial; confirmed partial wins; work-type kind kept", () => {
     const inf = projectTimeline([o, ev({ key: "f", stage: "framed", source: "app", workType: "framed", kind: "inferred" })]);
@@ -205,5 +200,67 @@ describe("review r2 corrections", () => {
       ev({ key: "s1", stage: "shipped", kind: "inferred", fulfillmentId: "F1", fulfillmentComplete: false, happenedAt: "2026-11-21T09:00:00Z" }),
       ev({ key: "s2", stage: "shipped", kind: "confirmed", fulfillmentId: "F2", fulfillmentComplete: false, happenedAt: "2026-11-21T10:00:00Z" })]);
     expect(both.stages.shipped).toMatchObject({ status: "partial", kind: "confirmed", at: "2026-11-21T10:00:00.000Z" });
+  });
+});
+
+describe("review checkpoint P2: inferred complete never outranks confirmed partial", () => {
+  const o = ev({ key: "o" });
+  it("confirmed partial wins; the inferred complete record is retained separately and never completes the order", () => {
+    const evs = [o,
+      ev({ key: "s1", stage: "shipped", kind: "confirmed", fulfillmentId: "F1", fulfillmentComplete: false, happenedAt: "2026-11-21T10:00:00Z" }),
+      ev({ key: "s2", stage: "shipped", kind: "inferred", fulfillmentId: "F2", fulfillmentComplete: true, happenedAt: "2026-11-21T09:00:00Z" })];
+    const t = projectTimeline(evs);
+    expect(t.stages.shipped).toMatchObject({ status: "partial", kind: "confirmed", at: "2026-11-21T10:00:00.000Z" });
+    expect(t.completeShipmentAt).toBeNull();
+    expect(t.fulfillments.find((f) => f.fulfillmentId === "F2")).toMatchObject({ complete: true, kind: "inferred" });
+    expect(projectTimeline([...evs].reverse())).toEqual(t);
+  });
+});
+
+describe("durations only: adjacent stage gaps", () => {
+  const at = (h: number) => new Date(Date.parse("2026-11-20T09:00:00Z") + h * 3_600_000).toISOString();
+  const o = ev({ key: "o", happenedAt: at(0) });
+  const make = (stage: OrderEvidence["stage"], h: number, over: Partial<OrderEvidence> = {}) => ev({ key: `${stage}-${h}`, stage, source: "make", happenedAt: at(h), ...over });
+  it("measures only adjacent stages with confirmed endpoints, in the fixed F10+F11 order", () => {
+    expect(TIMELINE_SEQUENCE).toEqual(["ordered", "make_submitted", "make_files_found", "make_planned", "make_images_ready", "make_packing_ready", "framed", "dispatched", "shipped", "delivered"]);
+    const g = stageGaps(projectTimeline([o, make("make_submitted", 1), make("make_files_found", 3)]));
+    expect(g).toHaveLength(TIMELINE_SEQUENCE.length - 1);
+    expect(g[0]).toEqual({ from: "ordered", to: "make_submitted", status: "measured", hours: 1 });
+    expect(g[1]).toEqual({ from: "make_submitted", to: "make_files_found", status: "measured", hours: 2 });
+    expect(g[2]).toMatchObject({ from: "make_files_found", to: "make_planned", status: "unknown", hours: null });
+  });
+  it("a missing middle stage leaves BOTH neighbouring gaps unknown; it is never skipped over", () => {
+    const g = stageGaps(projectTimeline([o, make("make_submitted", 1), make("make_planned", 5)]));
+    expect(g.find((x) => x.from === "make_submitted")).toMatchObject({ to: "make_files_found", status: "unknown", hours: null });
+    expect(g.find((x) => x.to === "make_planned")).toMatchObject({ from: "make_files_found", status: "unknown", hours: null });
+    expect(g.some((x) => x.from === "make_submitted" && x.to === "make_planned")).toBe(false);
+  });
+  it("unconfirmed/partial endpoints are unknown; negative gaps are anomalies, never negative time", () => {
+    const t = projectTimeline([o,
+      make("make_submitted", 1, { kind: "inferred" }),
+      ev({ key: "f", stage: "framed", source: "app", workType: "framed", happenedAt: at(10) }), // partial framing
+      ev({ key: "d", stage: "dispatched", source: "app", happenedAt: at(12) }),
+      ev({ key: "s", stage: "shipped", fulfillmentId: "F1", fulfillmentComplete: true, happenedAt: at(11) })]);
+    const g = stageGaps(t);
+    expect(g[0]).toMatchObject({ status: "unknown", hours: null });
+    expect(g.find((x) => x.to === "dispatched")).toMatchObject({ status: "unknown" });
+    expect(g.find((x) => x.from === "dispatched")).toEqual({ from: "dispatched", to: "shipped", status: "anomaly", hours: null });
+  });
+  it("partial shipment never ends the shipped gap; evidence after now is not used", () => {
+    const part = projectTimeline([o, ev({ key: "d", stage: "dispatched", source: "app", happenedAt: at(2) }), ev({ key: "s", stage: "shipped", fulfillmentId: "F1", fulfillmentComplete: false, happenedAt: at(3) })]);
+    expect(stageGaps(part).find((x) => x.to === "shipped")).toMatchObject({ status: "unknown" });
+    const full = projectTimeline([o, ev({ key: "d", stage: "dispatched", source: "app", happenedAt: at(2) }), ev({ key: "s", stage: "shipped", fulfillmentId: "F1", fulfillmentComplete: true, happenedAt: at(3) })]);
+    expect(stageGaps(full).find((x) => x.to === "shipped")).toMatchObject({ status: "measured", hours: 1 });
+    expect(stageGaps(full, at(2.5)).find((x) => x.to === "shipped")).toMatchObject({ status: "unknown" });
+  });
+  it("flow metrics aggregate neutral per-gap samples/unknown/anomalies and contain no lateness output", () => {
+    const P = { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" };
+    const t1 = projectTimeline([o, make("make_submitted", 2)]);
+    const t2 = projectTimeline([ev({ key: "o2", shopifyOrderId: "2002", happenedAt: at(0) }), make("make_submitted", 4, { shopifyOrderId: "2002" })]);
+    const t3 = projectTimeline([ev({ key: "o3", shopifyOrderId: "3003", happenedAt: at(0) })]);
+    const m = flowMetrics([t1, t2, t3], P, "2026-11-22T00:00:00Z");
+    expect(m.stageGaps[0]).toEqual({ from: "ordered", to: "make_submitted", samples: 2, unknown: 1, anomalies: 0, median: 3, p90: 4 });
+    expect(m).not.toHaveProperty("late");
+    expect(JSON.stringify(m)).not.toMatch(/late|threshold|sla/i);
   });
 });
