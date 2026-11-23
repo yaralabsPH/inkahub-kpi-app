@@ -11,10 +11,10 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { overviewKey, overviewQuery, type OverviewRequest, type OverviewResult } from "@/lib/domain/reportsOverview";
 
 export type OverviewStatus = "idle" | "loading" | "ready" | "not_ready" | "error";
-export interface OverviewState {
+export interface OverviewState<T = OverviewResult> {
   key: string;
   status: OverviewStatus;
-  data: OverviewResult | null;
+  data: T | null;
   error: string | null;
   code: string | null;
 }
@@ -23,17 +23,22 @@ export const IDLE_OVERVIEW: OverviewState = { key: "", status: "idle", data: nul
 /** Not an error to retry blindly: the site has no usable publication (yet). */
 const NOT_READY = new Set(["READ_MODE_LEGACY", "READ_MODE_SHADOW", "UNAVAILABLE"]);
 
-export interface OverviewLoaderDeps {
+export interface OverviewLoaderDeps<R = OverviewRequest> {
+  /** Endpoint (default the overview); F9 timing reuses the same lifecycle. */
+  path?: string;
+  /** Query string of a request; it is also part of the identity key. */
+  queryOf?: (r: R) => string;
   fetch: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
   token: () => Promise<string | null>;
-  onChange: (s: OverviewState) => void;
+  onChange: (s: OverviewState<any>) => void; // eslint-disable-line @typescript-eslint/no-explicit-any
 }
 
-export function createOverviewLoader(deps: OverviewLoaderDeps) {
-  let state: OverviewState = IDLE_OVERVIEW;
+export function createOverviewLoader<R = OverviewRequest, T = OverviewResult>(deps: OverviewLoaderDeps<R>) {
+  const queryOf = deps.queryOf ?? (overviewQuery as unknown as (r: R) => string);
+  let state: OverviewState<T> = IDLE_OVERVIEW as OverviewState<T>;
   let ac: AbortController | null = null;
   let seq = 0;
-  const set = (s: OverviewState) => {
+  const set = (s: OverviewState<T>) => {
     state = s;
     deps.onChange(s);
   };
@@ -41,15 +46,16 @@ export function createOverviewLoader(deps: OverviewLoaderDeps) {
     state: () => state,
     /** Load (or reload, for Retry) one identity. */
     /** `identity` = trusted user + role + audience scope. */
-    async load(identity: string | null, request: OverviewRequest | null): Promise<void> {
+    async load(identity: string | null, request: R | null): Promise<void> {
       ac?.abort();
-      const key = overviewKey(identity, request);
       const mine = ++seq;
       if (!request || !identity) {
         ac = null;
-        set(IDLE_OVERVIEW);
+        set(IDLE_OVERVIEW as OverviewState<T>);
         return;
       }
+      const q = queryOf(request);
+      const key = `${identity}|${q}`;
       const controller = new AbortController();
       ac = controller;
       // a different identity never keeps the previous figures on screen
@@ -59,7 +65,7 @@ export function createOverviewLoader(deps: OverviewLoaderDeps) {
         const token = await deps.token();
         if (!current()) return;
         if (!token) return set({ key, status: "error", data: null, error: "Sign in again to load the report", code: "UNAUTHENTICATED" });
-        const res = await deps.fetch(`/api/reports/overview?${overviewQuery(request)}`, { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal });
+        const res = await deps.fetch(`${deps.path ?? "/api/reports/overview"}?${q}`, { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal });
         const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
         if (!current()) return;
         if (!res.ok) {
@@ -67,7 +73,7 @@ export function createOverviewLoader(deps: OverviewLoaderDeps) {
           const error = typeof body?.error === "string" ? body.error : `The report could not be loaded (${res.status})`;
           return set({ key, status: NOT_READY.has(code) ? "not_ready" : "error", data: null, error, code });
         }
-        set({ key, status: "ready", data: body as unknown as OverviewResult, error: null, code: null });
+        set({ key, status: "ready", data: body as unknown as T, error: null, code: null });
       } catch (e) {
         if (!current()) return;
         set({ key, status: "error", data: null, error: e instanceof Error ? e.message : String(e), code: "NETWORK" });

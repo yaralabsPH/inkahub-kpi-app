@@ -27,6 +27,7 @@ import {
 } from "@/lib/domain/reportsOverview";
 import { useReportsOverview, type OverviewState } from "@/lib/hooks/useReportsOverview";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
+import { FrameTimingSection } from "@/components/FrameTimingSection";
 import { PRODUCTION_DEPARTMENT_LABELS, type ProductionDepartment } from "@/lib/domain";
 
 export interface ReportsOverviewProps {
@@ -212,6 +213,10 @@ export function ReportsOverview({ supabase, site, scopeKey, userId, role, ownNam
         </div>
         {problem ? <div className="text-sm text-rose-700 dark:text-rose-300" role="alert">{problem}</div> : null}
         <OverviewBodyView state={state} nameOf={nameOf} onRetry={() => setRefreshKey((n) => n + 1)} />
+        {data && scopeKey ? (
+          // F9: the SAME displayed request and pinned report version as the summary above
+          <FrameTimingSection supabase={supabase} scopeKey={scopeKey} request={{ ...data.request, generationId: data.meta.generationId }} />
+        ) : null}
       </CardBody>
     </Card>
   );

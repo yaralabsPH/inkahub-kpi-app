@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useMutations } from "@/lib/hooks/useMutations";
@@ -12,6 +12,8 @@ import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { SupplierPaymentTermsCard } from "@/components/SupplierPaymentTermsCard";
 import { ProductionBenchmarksCard } from "@/components/ProductionBenchmarksCard";
 import { PackagingRulesCard } from "@/components/PackagingRulesCard";
+import { FrameTimingWeightsCard, supabaseWeightsRpc } from "@/components/FrameTimingWeightsCard";
+import { getBackendMode } from "@/lib/repository/supabase/client";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Input, Select } from "@/components/ui/Input";
@@ -153,6 +155,7 @@ export function Settings() {
       <ProductionBenchmarksCard />
 
       <PackagingRulesCard />
+      <OwnerFrameTimingWeights />
 
       <CrossLocationDiagnostics />
 
@@ -1219,4 +1222,16 @@ async function applyCartonDefaults(
   return count;
 }
 
-
+/**
+ * F9: owner-only frame timing weights for the selected site (Supabase only).
+ * Shown only for a loaded profile that matches the signed-in user; the RPCs
+ * re-check the owner role on the server.
+ */
+function OwnerFrameTimingWeights() {
+  const auth = useAuthOptional();
+  const site = useAppStore((s) => s.location);
+  const isOwner = !!auth && !auth.loading && !!auth.user && auth.profile?.user_id === auth.user.id && auth.profile?.role === "owner";
+  const rpc = useMemo(() => (getBackendMode() === "supabase" ? supabaseWeightsRpc(getSupabase()) : null), []);
+  if (!isOwner || !rpc || !["au", "uk", "us"].includes(site)) return null;
+  return <FrameTimingWeightsCard key={site} rpc={rpc} site={site} />;
+}
