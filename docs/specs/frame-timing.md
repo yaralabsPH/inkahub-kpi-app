@@ -31,3 +31,9 @@ Hardening: F8 server authorization applies on every timing request; staff only o
 Bounded server work over selected dates plus the attendance/timing context needed for those dates; browser receives aggregated rows. Max731 production dates and explicit exceptional-cardinality failure. Show unavailable timing, missing weights and attendance coverage instead of treating absence as zero. Legacy data lacking capture metadata remains classic-event behavior and is labelled accordingly. Estimates are assumptions, never payroll or precise stopwatch claims.
 
 Dexie retains its current local report behavior; advanced published timing requires Supabase. Release additive0058 only to isolated staging and Preview after local gates + real SQL rollback fixtures/API/UI checks. Root handles application of SQL, role fixtures, deployment and cleanup. Previous Preview remains rollback; do not delete weight history or existing generations. No production connection or migration edits.
+
+## Approved implementation refinements (2026-11-23)
+
+The database may return a bounded whole-person/day stream to the server, where one shared TypeScript timing engine computes aggregates. Only aggregates reach the browser. Bound candidates before building a large JSON payload; constrain source image reads to the requested audience/dates and required event keys. This avoids maintaining competing SQL and TypeScript timing algorithms.
+
+Owners may clear all weights by appending an empty immutable version. Empty means estimates unavailable; history remains intact. The same owner authorization and expected-version check apply. This supports correcting a mistaken configuration and returning staging to blank defaults after acceptance checks.
