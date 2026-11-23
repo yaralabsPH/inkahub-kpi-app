@@ -9,10 +9,11 @@ scenario by the coder. Hosted acceptance is **not** claimed.
 | Item | State |
 |---|---|
 | Staging database | Unavailable (disk exhaustion). 0059 and 0060 are **not applied** anywhere. |
-| Six AU staging clones | 8746725, 8746726, 8746728, 8746730, 8746731, 8746732. Inactive/gated. Which clone is which Part has not been recorded here, and root maps them. |
-| Utility scenario | 8746734 (separate; not a milestone reporter). |
-| Staging sheets | Four created. |
-| Dropbox staging setup | Pending. |
+| Six AU staging clones (all inactive/gated) | P1 = 8746725, P2 = 8746726, P3 = 8746728, P4 = 8746730 (no reporter; unchanged), P5 = 8746731, P6 = 8746732 |
+| Utility scenario | 8746734: separate, off, queue empty; not a milestone reporter. |
+| Staging sheets | Four created and verified (both connections). |
+| Dropbox staging folders | All nine verified (both connections). |
+| Task 3 (clone run) | Not done; synthetic fixture preparation only in progress. |
 | Milestone HTTP modules in clones | **Not added.** No integration has run. |
 | `MAKE_MILESTONE_SCOPES` | Not set in any environment. |
 | Live Make systems (all three) and production | Unchanged and read-only. |
@@ -60,14 +61,14 @@ x-inka-make-key: <secret>          (no Authorization header, no Shopify headers)
 
 Envelope (schemaVersion 1, ≤ 256 KiB, 1–500 members, explicit-zone ISO time, unknown fields refused):
 
-| Part | stage | members | occurrenceId (stable for retries) | Place after |
+| Part (clone) | stage | members | occurrenceId (stable for retries) | Place after |
 |---|---|---|---|---|
-| 1 | `submitted` | `{memberKey, orderNumber}`: the accepted list (defines batch membership version) | `p1:<batchId>:v<version>` | the batch id and accepted order list are final |
-| 2 | `files_found` | `{memberKey, shopifyOrderId}`: successful subset with the explicit Part 2 name→id mapping | `p2:<batchId>:v<version>:<executionId>` | the files-found success route, after the mapping is known |
-| 3 | `planned` | `{memberKey}` planned subset | `p3:<batchId>:v<version>:<executionId>` | planning success |
-| 4 | — | **unchanged; no report** (its `planned_at` overwrite stays as is) | — | — |
-| 5 | `images_ready` | `{memberKey}` subset | `p5:<batchId>:v<version>:<executionId>` | images-ready success |
-| 6 | `packing_slips_ready` | `{memberKey}` subset | `p6:<batchId>:v<version>:<executionId>` | packing-slips success |
+| 1 (8746725) | `submitted` | `{memberKey, orderNumber}`: the accepted list (defines batch membership version) | `p1:<batchId>:v<version>` | the batch id and accepted order list are final |
+| 2 (8746726) | `files_found` | `{memberKey, shopifyOrderId}`: successful subset with the explicit Part 2 name→id mapping | `p2:<batchId>:v<version>:<executionId>` | the files-found success route, after the mapping is known |
+| 3 (8746728) | `planned` | `{memberKey}` planned subset | `p3:<batchId>:v<version>:<executionId>` | planning success |
+| 4 (8746730) | — | **unchanged; no report** (its `planned_at` overwrite stays as is) | — | — |
+| 5 (8746731) | `images_ready` | `{memberKey}` subset | `p5:<batchId>:v<version>:<executionId>` | images-ready success |
+| 6 (8746732) | `packing_slips_ready` | `{memberKey}` subset | `p6:<batchId>:v<version>:<executionId>` | packing-slips success |
 
 Redacted examples:
 
@@ -135,6 +136,12 @@ Responses:
 - Blocked members never attach: ambiguous mapping, mapping conflict, an order
   already routed to another site, or an alias differing from the recorded
   order. They are visible through `action=make_batch`.
+- If a member turns ambiguous or mapping-conflicted AFTER its steps were
+  attached, each attached step is withdrawn by an exact retraction (shown in
+  the evidence list as withdrawn). The effective timeline is then the same as
+  if the conflict had been known first, and the stored history is unchanged.
+- An unrouted order may be routed once to the scope's site (root ruling); an
+  order already routed elsewhere is never changed.
 
 ## Staging acceptance (root, after DB recovery and code review; cloned scenarios only)
 

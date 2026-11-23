@@ -113,7 +113,8 @@ const revokedAt = (rows: readonly StoredEvidence[], nowMs: number) =>
 const evidenceDto = (revoked: ReadonlySet<string>) => (e: StoredEvidence): EvidenceDto => ({
   stage: e.stage, source: e.source, kind: e.kind, at: e.happenedAt, receivedAt: e.receivedAt, fulfillmentId: e.fulfillmentId ?? null, workType: e.workType ?? null, batchId: e.batchId ?? null, caseId: e.caseId ?? null,
   retraction: !!e.retractsKey, revoked: revoked.has(occurrenceKey(e)),
-  runId: e.source === "make" ? e.key.split("|")[0] : null,
+  // make keys are "mk:<sha256>|<occurrence id>": the run id is the part after the separator
+  runId: e.source === "make" && e.key.includes("|") ? e.key.slice(e.key.indexOf("|") + 1) : null,
 });
 
 function badRequest(m: string): never {

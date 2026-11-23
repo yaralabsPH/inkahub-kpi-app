@@ -22,7 +22,13 @@
 -- 3. make_milestone_refs: each envelope's successful subset (member keys of the
 --    SAME batch/version). pending until the member resolves; attached once the
 --    milestone is written to the order timeline; not_member / blocked fail
---    closed. Nothing is ever attached to a guessed or arbitrary order.
+--    closed. Nothing is ever attached to a guessed or arbitrary order. If a
+--    member later turns ambiguous or mapping-conflicted, every fact already
+--    attached for it gets an F10 exact-source retraction (timed at the fact
+--    itself, so the effective timeline equals the order where the conflict was
+--    known first) and the ref becomes retracted; history is never edited.
+-- Timeline keys are globally unique and bounded: "mk:" / "mkx:" (retraction)
+-- + sha256(site|shop|occurrence|member) + "|" + occurrence id (<= 189 chars).
 -- Resolution runs inside the same transaction as each envelope, so events that
 -- arrive before their membership or mapping attach atomically when it arrives.
 -- An existing canonical order routed to another site is never reassigned or
@@ -67,7 +73,7 @@ CREATE TABLE public.make_milestone_refs (
   occurrence_id    text NOT NULL,
   member_key       text NOT NULL CHECK (member_key ~ '^[A-Za-z0-9._:#/-]{1,64}$'),
   shopify_order_id text CHECK (shopify_order_id IS NULL OR shopify_order_id ~ '^[0-9]{1,20}$'),
-  status           text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'attached', 'not_member', 'blocked')),
+  status           text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'attached', 'not_member', 'blocked', 'retracted')),
   PRIMARY KEY (site, shop, occurrence_id, member_key),
   FOREIGN KEY (site, shop, occurrence_id) REFERENCES public.make_milestone_occurrences (site, shop, occurrence_id) ON DELETE RESTRICT
 );
@@ -109,6 +115,29 @@ CREATE TRIGGER make_milestone_occurrences_guard BEFORE UPDATE OR DELETE ON publi
 CREATE TRIGGER make_milestone_members_guard BEFORE UPDATE OR DELETE ON public.make_milestone_members FOR EACH ROW EXECUTE FUNCTION public.make_milestone_guard();
 CREATE TRIGGER make_milestone_refs_guard BEFORE UPDATE OR DELETE ON public.make_milestone_refs FOR EACH ROW EXECUTE FUNCTION public.make_milestone_guard();
 REVOKE ALL ON FUNCTION public.make_milestone_guard() FROM PUBLIC, anon, authenticated;
+
+-- Globally unique, deterministic, bounded timeline key for one (site, shop, occurrence, member).
+CREATE FUNCTION public.make_milestone_key(p_prefix text, p_site text, p_shop text, p_occurrence text, p_member text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SET search_path = ''
+AS $fn$
+  SELECT p_prefix || ':' || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+           p_site || '|' || p_shop || '|' || p_occurrence || '|' || p_member, 'UTF8')), 'hex') || '|' || p_occurrence
+$fn$;
+REVOKE ALL ON FUNCTION public.make_milestone_key(text, text, text, text, text) FROM PUBLIC, anon, authenticated;
+
+CREATE FUNCTION public.make_milestone_stage(p_stage text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+SET search_path = ''
+AS $fn$
+  SELECT CASE p_stage WHEN 'submitted' THEN 'make_submitted' WHEN 'files_found' THEN 'make_files_found' WHEN 'planned' THEN 'make_planned'
+                      WHEN 'images_ready' THEN 'make_images_ready' WHEN 'packing_slips_ready' THEN 'make_packing_ready' END
+$fn$;
+REVOKE ALL ON FUNCTION public.make_milestone_stage(text) FROM PUBLIC, anon, authenticated;
 
 -- Resolve one (batch, version) inside the caller's transaction. Internal (service only).
 CREATE FUNCTION public.make_milestone_resolve(p_site text, p_shop text, p_batch text, p_version integer)
@@ -189,10 +218,9 @@ BEGIN
        WHERE m.site = p_site AND m.shop = p_shop AND m.batch_id = p_batch AND m.membership_version = p_version AND m.member_key = mem.member_key;
     END IF;
     SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
-             'source', 'make', 'key', oc.occurrence_id || '|' || r.member_key, 'site', p_site, 'shop', p_shop,
+             'source', 'make', 'key', public.make_milestone_key('mk', p_site, p_shop, oc.occurrence_id, r.member_key), 'site', p_site, 'shop', p_shop,
              'shopifyOrderId', mem.shopify_order_id, 'orderNumber', mem.order_number,
-             'stage', CASE oc.stage WHEN 'submitted' THEN 'make_submitted' WHEN 'files_found' THEN 'make_files_found' WHEN 'planned' THEN 'make_planned'
-                                    WHEN 'images_ready' THEN 'make_images_ready' ELSE 'make_packing_ready' END,
+             'stage', public.make_milestone_stage(oc.stage),
              'kind', 'confirmed', 'happenedAt', public.order_timeline_utc(oc.happened_at), 'batchId', oc.batch_id)
              ORDER BY oc.happened_at, oc.occurrence_id), '[]'::jsonb)
       INTO v_ev
@@ -213,6 +241,36 @@ BEGIN
      WHERE r.site = oc.site AND r.shop = oc.shop AND r.occurrence_id = oc.occurrence_id
        AND oc.site = p_site AND oc.shop = p_shop AND oc.batch_id = p_batch AND oc.membership_version = p_version
        AND r.member_key = mem.member_key AND r.status = 'pending';
+  END LOOP;
+
+  -- A member that became ambiguous/conflicted AFTER facts were attached: retract each attached fact exactly
+  -- (F10 retraction of the same source key, timed at the fact itself) so the effective timeline fails closed
+  -- the same way as when the conflict was known first. Refs move attached -> retracted (no duplicate retraction).
+  FOR mem IN SELECT * FROM public.make_milestone_members m
+              WHERE m.site = p_site AND m.shop = p_shop AND m.batch_id = p_batch AND m.membership_version = p_version
+                AND m.status IN ('ambiguous', 'site_conflict', 'alias_conflict', 'mapping_conflict') AND m.shopify_order_id IS NOT NULL
+              ORDER BY m.member_key LOOP
+    SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+             'source', 'make', 'key', public.make_milestone_key('mkx', p_site, p_shop, oc.occurrence_id, r.member_key), 'site', p_site, 'shop', p_shop,
+             'shopifyOrderId', mem.shopify_order_id, 'orderNumber', mem.order_number, 'stage', public.make_milestone_stage(oc.stage),
+             'kind', 'confirmed', 'happenedAt', public.order_timeline_utc(oc.happened_at), 'batchId', oc.batch_id,
+             'retractsKey', public.make_milestone_key('mk', p_site, p_shop, oc.occurrence_id, r.member_key))
+             ORDER BY oc.happened_at, oc.occurrence_id), '[]'::jsonb)
+      INTO v_ev
+      FROM public.make_milestone_refs r
+      JOIN public.make_milestone_occurrences oc ON oc.site = r.site AND oc.shop = r.shop AND oc.occurrence_id = r.occurrence_id
+     WHERE oc.site = p_site AND oc.shop = p_shop AND oc.batch_id = p_batch AND oc.membership_version = p_version
+       AND r.member_key = mem.member_key AND r.status = 'attached';
+    IF pg_catalog.jsonb_array_length(v_ev) = 0 THEN CONTINUE; END IF;
+    v_r := public.ingest_order_timeline(NULL, v_ev);
+    IF (v_r ->> 'conflicts')::integer > 0 THEN
+      RAISE EXCEPTION 'make_milestone: retraction conflicts for member %', mem.member_key;
+    END IF;
+    UPDATE public.make_milestone_refs r SET status = 'retracted'
+      FROM public.make_milestone_occurrences oc
+     WHERE r.site = oc.site AND r.shop = oc.shop AND r.occurrence_id = oc.occurrence_id
+       AND oc.site = p_site AND oc.shop = p_shop AND oc.batch_id = p_batch AND oc.membership_version = p_version
+       AND r.member_key = mem.member_key AND r.status = 'attached';
   END LOOP;
 
   -- references of fail-closed members are blocked (unresolved members stay pending)
@@ -237,6 +295,7 @@ AS $fn$
     'pending', (SELECT count(*) FROM public.make_milestone_refs r WHERE r.site = p_site AND r.shop = p_shop AND r.occurrence_id = p_occurrence AND r.status = 'pending'),
     'blocked', (SELECT count(*) FROM public.make_milestone_refs r WHERE r.site = p_site AND r.shop = p_shop AND r.occurrence_id = p_occurrence AND r.status = 'blocked'),
     'notMember', (SELECT count(*) FROM public.make_milestone_refs r WHERE r.site = p_site AND r.shop = p_shop AND r.occurrence_id = p_occurrence AND r.status = 'not_member'),
+    'retracted', (SELECT count(*) FROM public.make_milestone_refs r WHERE r.site = p_site AND r.shop = p_shop AND r.occurrence_id = p_occurrence AND r.status = 'retracted'),
     'resolved', (SELECT count(*) FROM public.make_milestone_members m WHERE m.site = p_site AND m.shop = p_shop AND m.batch_id = p_batch AND m.membership_version = p_version AND m.status = 'resolved'),
     'unresolved', (SELECT count(*) FROM public.make_milestone_members m WHERE m.site = p_site AND m.shop = p_shop AND m.batch_id = p_batch AND m.membership_version = p_version AND m.status = 'unresolved'),
     'conflicted', (SELECT count(*) FROM public.make_milestone_members m WHERE m.site = p_site AND m.shop = p_shop AND m.batch_id = p_batch AND m.membership_version = p_version
@@ -350,6 +409,8 @@ $fn$;
 REVOKE ALL ON FUNCTION public.ingest_make_milestone(text, text, text, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.read_make_batch(text, text, text, integer) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.make_milestone_resolve(text, text, text, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.make_milestone_key(text, text, text, text, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.make_milestone_stage(text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.make_milestone_counts(text, text, text, text, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.ingest_make_milestone(text, text, text, jsonb) TO service_role;
 GRANT EXECUTE ON FUNCTION public.read_make_batch(text, text, text, integer) TO service_role;

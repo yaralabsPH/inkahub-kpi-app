@@ -23,8 +23,10 @@ async function send(e: Env, site = "au", shop = SHOP) {
   if (r.error) throw new Error(r.error.message);
   return r.data as { result: string; reason: string | null; members: Record<string, number> };
 }
-const evidenceKeys = async (where = "true") =>
-  (await db.query<{ occurrence_key: string }>(`select occurrence_key from public.order_timeline_evidence where source = 'make' and ${where} order by 1`)).rows.map((r) => r.occurrence_key);
+/** Attached (non-retraction) make facts as "<occurrence id>|<order alias>" (keys are hashed: "mk:<sha256>|<occurrence id>"). */
+const evidenceKeys = async (where = "true", on: PGlite = db) =>
+  (await on.query<{ k: string }>(`select substr(occurrence_key, position('|' in occurrence_key) + 1) || '|' || order_number as k from public.order_timeline_evidence
+     where source = 'make' and retracts_key is null and ${where} order by 1`)).rows.map((r) => r.k);
 const owner: ReportingPrincipal = { userId: OWNER, role: "owner", nav: new Set(["reports"]), sites: new Set(["au", "uk"]) };
 
 beforeAll(async () => {
@@ -66,7 +68,7 @@ describe("0060 membership resolution", () => {
     expect(await evidenceKeys()).toEqual([]);
     const r = await send(env({ members: [{ memberKey: "m1", orderNumber: "#9001" }, { memberKey: "m2", orderNumber: "9002" }] }));
     expect(r).toMatchObject({ result: "accepted", members: { resolved: 1, unresolved: 1 } });
-    expect(await evidenceKeys("shopify_order_id = '8001'")).toEqual(["p1:B1:v1|m1", "p2:B1:v1|m1", "p3:B1:v1|m1"]);
+    expect(await evidenceKeys("shopify_order_id = '8001'")).toEqual(["p1:B1:v1|9001", "p2:B1:v1|9001", "p3:B1:v1|9001"]);
     // m2 has no Part 2 mapping: durable and unresolved, attached to nothing
     expect((await db.query("select member_key, status, shopify_order_id from public.make_milestone_members where batch_id = 'B1' order by 1")).rows)
       .toEqual([{ member_key: "m1", status: "resolved", shopify_order_id: "8001" }, { member_key: "m2", status: "unresolved", shopify_order_id: null }]);
@@ -85,10 +87,10 @@ describe("0060 membership resolution", () => {
       members: [{ memberKey: "a", shopifyOrderId: "8101" }, { memberKey: "b", shopifyOrderId: "8102" }] }));
     const p5 = await send(env({ stage: "images_ready", occurrenceId: "p5:S:v1", batchId: "S", happenedAt: "2026-11-20T12:00:00Z", members: [{ memberKey: "a" }, { memberKey: "zz" }] }));
     expect(p5.members).toMatchObject({ attached: 1, notMember: 1 });
-    expect(await evidenceKeys("batch_id = 'S'")).toEqual(["p1:S:v1|a", "p1:S:v1|b", "p2:S:v1|a", "p2:S:v1|b", "p5:S:v1|a"]); // c: submitted but unresolved, b: no images_ready
+    expect(await evidenceKeys("batch_id = 'S'")).toEqual(["p1:S:v1|9101", "p1:S:v1|9102", "p2:S:v1|9101", "p2:S:v1|9102", "p5:S:v1|9101"]); // c: submitted but unresolved, b: no images_ready
     // version 2 (changed membership) is separate: its refs never attach through version 1's members
     await send(env({ stage: "packing_slips_ready", occurrenceId: "p6:S:v2", batchId: "S", membershipVersion: 2, happenedAt: "2026-11-20T13:00:00Z", members: [{ memberKey: "a" }] }));
-    expect(await evidenceKeys("occurrence_key like 'p6:S:%'")).toEqual([]);
+    expect(await evidenceKeys("occurrence_key like '%|p6:S:%'")).toEqual([]);
     expect((await db.query("select status from public.make_milestone_refs where occurrence_id = 'p6:S:v2'")).rows).toEqual([{ status: "pending" }]);
   });
   it("cross-site: an order already routed to another site is never reassigned or attached; the member stays blocked", async () => {
@@ -123,6 +125,89 @@ describe("0060 membership resolution", () => {
     expect(r.data).toMatchObject({ batchId: "B1", members: expect.arrayContaining([expect.objectContaining({ memberKey: "m2", status: "unresolved", orderNumber: "9002" })]) });
     expect((await rpc().rpc("read_make_batch", { p_site: "au", p_shop: SHOP, p_batch_id: "B1", p_limit: 1 })).error?.message).toMatch(/exceed the limit/);
     expect((await rpc().rpc("read_make_batch", { p_site: "uk", p_shop: SHOP, p_batch_id: "B1", p_limit: 100 })).data).toMatchObject({ members: [] }); // another site's scope sees nothing
+  });
+});
+
+describe("review task1 P1: globally scoped deterministic timeline keys", () => {
+  it("AU and UK scopes reusing identical occurrence/member ids attach to their own orders; retries stay idempotent", async () => {
+    const SHOP2 = "inka-staging-synthetic-uk.myshopify.com";
+    const p1 = env({ occurrenceId: "p1:G:v1", batchId: "G", members: [{ memberKey: "m", orderNumber: "9601" }] });
+    const p2 = (id: string) => env({ stage: "files_found", occurrenceId: "p2:G:v1", batchId: "G", happenedAt: "2026-11-20T10:00:00Z", members: [{ memberKey: "m", shopifyOrderId: id }] });
+    expect(await send(p1, "au", SHOP)).toMatchObject({ result: "accepted" });
+    expect((await send(p2("8601"), "au", SHOP)).members).toMatchObject({ attached: 1 });
+    expect(await send(p1, "uk", SHOP2)).toMatchObject({ result: "accepted" });
+    expect((await send(p2("8602"), "uk", SHOP2)).members).toMatchObject({ attached: 1 });
+    const rows = (await db.query<{ occurrence_key: string; site: string; shopify_order_id: string }>(
+      "select occurrence_key, site, shopify_order_id from public.order_timeline_evidence where batch_id = 'G' order by site, occurrence_key")).rows;
+    expect(rows).toHaveLength(4);
+    expect(new Set(rows.map((r) => r.occurrence_key)).size).toBe(4);
+    expect(rows.every((r) => r.occurrence_key.length <= 200 && /^mk:[0-9a-f]{64}\|p[12]:G:v1$/.test(r.occurrence_key))).toBe(true);
+    expect(rows.map((r) => [r.site, r.shopify_order_id])).toEqual([["au", "8601"], ["au", "8601"], ["uk", "8602"], ["uk", "8602"]]);
+    // identical retries in both scopes: duplicates, no new rows
+    for (const [site, shop, id] of [["au", SHOP, "8601"], ["uk", SHOP2, "8602"]] as const) {
+      expect(await send(p1, site, shop)).toMatchObject({ result: "duplicate" });
+      expect(await send(p2(id), site, shop)).toMatchObject({ result: "duplicate" });
+    }
+    expect((await db.query("select count(*)::int n from public.order_timeline_evidence where batch_id = 'G'")).rows[0]).toEqual({ n: 4 });
+  });
+});
+
+describe("review task1 P1: conflicts discovered after attachment fail closed like conflicts known first", () => {
+  const makeStagesOn = async (on: PGlite, orderNumber: string) => {
+    const t = await readOrderTimeline(owner, { site: "au", orderNumber }, { rpc: pgRpc(on), now: () => Date.parse("2026-11-21T00:00:00Z") });
+    return (t.stages ?? []).filter((x) => x.stage.startsWith("make_") && x.status !== "missing").map((x) => x.stage);
+  };
+  const run = async (on: PGlite, list: Env[]) => {
+    for (const e of list) {
+      const r = await pgRpc(on).rpc("ingest_make_milestone", { p_site: "au", p_shop: SHOP, p_scope: "au-staging", p_envelope: e });
+      if (r.error) throw new Error(r.error.message);
+    }
+  };
+  it("mapping conflict: P1, P2(m->1010) attach, then P2'(m->1011) retracts exactly; equal to mappings-before-membership; retries never resurrect", async () => {
+    const P1 = env({ occurrenceId: "p1:K:v1", batchId: "K", members: [{ memberKey: "m", orderNumber: "9010" }] });
+    const P2a = env({ stage: "files_found", occurrenceId: "p2:K:v1:a", batchId: "K", happenedAt: "2026-11-20T10:00:00Z", members: [{ memberKey: "m", shopifyOrderId: "1010" }] });
+    const P2b = env({ stage: "files_found", occurrenceId: "p2:K:v1:b", batchId: "K", happenedAt: "2026-11-20T10:30:00Z", members: [{ memberKey: "m", shopifyOrderId: "1011" }] });
+    await run(db, [P1, P2a]);
+    expect(await makeStagesOn(db, "9010")).toEqual(["make_submitted", "make_files_found"]); // attached first
+    await run(db, [P2b]);
+    expect(await makeStagesOn(db, "9010")).toEqual([]); // stale confirmations suppressed
+    const t = await readOrderTimeline(owner, { site: "au", orderNumber: "9010" }, { rpc: rpc(), now: () => Date.parse("2026-11-21T00:00:00Z") });
+    expect(t.evidence.filter((e) => e.source === "make").map((e) => [e.stage, e.retraction, e.revoked])).toEqual([
+      ["make_submitted", false, true], ["make_submitted", true, false], ["make_files_found", false, true], ["make_files_found", true, false]]);
+    expect(t.cancelled).toBeNull(); // never an order cancellation
+    // history is immutable: original facts still stored; refs record what happened
+    expect((await db.query("select status from public.make_milestone_refs where occurrence_id like 'p%:K:%' order by occurrence_id")).rows.map((r) => (r as { status: string }).status))
+      .toEqual(["retracted", "retracted", "blocked"]);
+    // retries (all three, any order) are duplicates: no second retraction, no resurrection
+    const before = (await db.query("select count(*)::int n from public.order_timeline_evidence where batch_id = 'K'")).rows[0];
+    for (const e of [P2a, P1, P2b, P2a]) expect((await send(e)).result).toBe("duplicate");
+    expect((await db.query("select count(*)::int n from public.order_timeline_evidence where batch_id = 'K'")).rows[0]).toEqual(before);
+    expect(await makeStagesOn(db, "9010")).toEqual([]);
+    // a later successful step for the conflicted member never attaches
+    expect((await send(env({ stage: "planned", occurrenceId: "p3:K:v1", batchId: "K", happenedAt: "2026-11-20T11:00:00Z", members: [{ memberKey: "m" }] }))).members).toMatchObject({ blocked: 1, attached: 0 });
+    // equivalent eventual state with the mappings arriving before membership: same effective timeline (nothing)
+    const other = await reportingDb();
+    await run(other, [P2b, P2a, P1]);
+    expect(await makeStagesOn(other, "9010")).toEqual([]);
+    expect((await other.query("select status from public.make_milestone_members where batch_id = 'K'")).rows).toEqual([{ status: "mapping_conflict" }]);
+    expect(await evidenceKeys("true", other)).toEqual([]);
+  });
+  it("ambiguity: m1->1020 attached, then m2->1020 makes both ambiguous and retracts m1's facts; equal to the order where both were known first", async () => {
+    const P1 = env({ occurrenceId: "p1:Q:v1", batchId: "Q", members: [{ memberKey: "m1", orderNumber: "9020" }, { memberKey: "m2", orderNumber: "9021" }] });
+    const A = env({ stage: "files_found", occurrenceId: "p2:Q:v1:a", batchId: "Q", happenedAt: "2026-11-20T10:00:00Z", members: [{ memberKey: "m1", shopifyOrderId: "1020" }] });
+    const B = env({ stage: "files_found", occurrenceId: "p2:Q:v1:b", batchId: "Q", happenedAt: "2026-11-20T10:05:00Z", members: [{ memberKey: "m2", shopifyOrderId: "1020" }] });
+    await run(db, [P1, A]);
+    expect(await makeStagesOn(db, "9020")).toEqual(["make_submitted", "make_files_found"]);
+    await run(db, [B]);
+    expect((await db.query("select member_key, status from public.make_milestone_members where batch_id = 'Q' order by 1")).rows)
+      .toEqual([{ member_key: "m1", status: "ambiguous" }, { member_key: "m2", status: "ambiguous" }]);
+    expect(await makeStagesOn(db, "9020")).toEqual([]);
+    expect((await send(B)).result).toBe("duplicate");
+    expect(await makeStagesOn(db, "9020")).toEqual([]);
+    const other = await reportingDb();
+    await run(other, [B, A, P1]);
+    expect(await makeStagesOn(other, "9020")).toEqual([]);
+    expect(await evidenceKeys("true", other)).toEqual([]);
   });
 });
 
