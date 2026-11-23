@@ -170,13 +170,16 @@ describe("owner-only Refresh sources", () => {
   const ok = (shopify: unknown, app: unknown = { accepted: 2, duplicates: 1, conflicts: 0, route: "app" }) => ({ site: "au", orderNumber: "9001", app, shopify });
   const recorded = (over: Record<string, unknown> = {}) => ({ status: "recorded", routedHere: true, note: null, result: { accepted: 3, duplicates: 0, conflicts: 0, route: "matched" }, ...over });
   type Reply = { ok: boolean; status: number; body: unknown } | Error;
-  function harness(opts: { token?: string | null } = {}) {
+  function harness(opts: { token?: string | null; tokenGate?: Promise<void> } = {}) {
     const calls: Array<{ url: string; init: { method: string; headers: Record<string, string>; body: string } }> = [];
     const pending: Array<(r: Reply) => void> = [];
     let current = KEY;
     let reloads = 0;
     const r = createSourceRefresher({
-      token: async () => (opts.token === undefined ? "t.t.t" : opts.token),
+      token: async () => {
+        if (opts.tokenGate) await opts.tokenGate;
+        return opts.token === undefined ? "t.t.t" : opts.token;
+      },
       fetch: (url, init) => {
         calls.push({ url, init });
         return new Promise((resolve, reject) => pending.push((x) => (x instanceof Error ? reject(x) : resolve({ ok: x.ok, status: x.status, json: async () => x.body }))));
@@ -378,6 +381,42 @@ describe("owner-only Refresh sources", () => {
       await tick();
       expect(h.r.state()).toMatchObject({ tone: "ok" });
       expect(h.reloads()).toBe(1);
+    });
+
+    it("review r2: a deferred session token resolving after a user/site/order change sends no POST, reload or message", async () => {
+      const others = [refreshKeyOf("22222222-2222-4222-8222-222222222222|owner|site", R), refreshKeyOf(SCOPE, { site: "uk", orderNumber: "#9001" }), B];
+      for (const next of others) {
+        let open!: () => void;
+        const h = harness({ tokenGate: new Promise<void>((r) => (open = r)) });
+        const done = h.r.refresh(SCOPE, R);
+        await tick();
+        h.setCurrent(next);
+        h.r.reset();
+        open();
+        await done;
+        expect(h.calls).toHaveLength(0);
+        expect(h.reloads()).toBe(0);
+        expect(h.r.state()).toEqual(idle);
+        expect(h.r.inFlight()).toEqual([]);
+      }
+      // A -> B -> A and asking again while the token is pending re-attaches: exactly one POST, which then paints
+      let open!: () => void;
+      const h = harness({ tokenGate: new Promise<void>((r) => (open = r)) });
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      h.setCurrent(B);
+      h.r.reset();
+      h.setCurrent(KEY);
+      h.r.reset();
+      void h.r.refresh(SCOPE, R);
+      open();
+      await tick();
+      expect(h.calls).toHaveLength(1);
+      h.pending[0]({ ok: true, status: 200, body: ok(recorded()) });
+      await tick();
+      expect(h.r.state()).toMatchObject({ key: KEY, tone: "ok" });
+      expect(h.reloads()).toBe(1);
+      expect(h.r.inFlight()).toEqual([]);
     });
 
     it("A and B may each have one request; B's answer never paints on A", async () => {

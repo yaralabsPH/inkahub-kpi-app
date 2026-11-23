@@ -207,6 +207,8 @@ export function createSourceRefresher(deps: SourceRefresherDeps) {
     };
     try {
       const token = await deps.token();
+      // abandoned before anything was sent (identity changed and not re-asked): send nothing
+      if (!current()) return;
       if (!token) return finish("error", "Sign in again to refresh sources.", false);
       const res = await deps.fetch("/api/orders/timeline", {
         method: "POST",
