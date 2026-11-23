@@ -11,9 +11,11 @@ Branch `feature/frame-timing`, stacked on `feature/reports-v2` (F8 fix
   - `public.read_frame_timing_weights(site)` / `public.save_frame_timing_weights(site, expected_version, weights)`
     — authenticated, SECURITY DEFINER, owner role from `profiles`; known sizes
     A0–A4/GW, positive ≤ 1000; a stale `expected_version` is `version_conflict`.
+    An empty object appends a **cleared** version (estimates unavailable; history kept) — Settings "Clear all weights".
   - `public.read_frame_timing_rows(...)` — service only; verification and
     clock rows of the PINNED generation (checked_generation, sel_eval,
-    source_versions departments), ≤ 731 dates, > 50,000 rows refused.
+    source_versions departments and frozen station), ≤ 731 dates; verification images read by key, clock
+    images filtered by window/audience; > 50,000 rows refused before any JSON is built.
 - `GET /api/reports/timing` (route 12): F8 authorization, `generationId`
   required (the summary's), 410 when that version is gone; streams timed on
   the server before filters; aggregates only.
@@ -49,7 +51,12 @@ app does not call them. Weight history is kept; do not delete it.
   estimates unavailable. Attendance is capped at 450 min per pair.
 - Estimates use the site's CURRENT weight version for every period shown
   (an assumption applied to this report, not the version in force then).
-- Legacy events without shared-scanner ids are timed as one capture each.
+- Only rows with a strict `scn-…-vNN` id AND a `shared:` station are one shared capture; everything else
+  (including legacy or lookalike ids) is one capture per event.
+- Shift, clock and missing-weight notes describe the selected person (everyone when unfiltered).
+- After acceptance checks, root can return staging to blank defaults with "Clear all weights".
+- The clock-event read still scans the generation's source_versions for the site (filtered in the scan,
+  not materialized); no new index was added.
 - The stream read scans the generation's `source_versions` for clock events;
   performance is proven offline only. Physical scanner commissioning remains
   separate.

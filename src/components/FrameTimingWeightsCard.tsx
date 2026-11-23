@@ -44,33 +44,63 @@ export function weightsFromForm(form: Record<string, string>): Partial<Record<We
 }
 
 export type SubmitOutcome =
-  | { kind: "saved"; version: number; message: string }
+  | { kind: "saved"; version: number; weights: Record<string, number>; message: string }
   | { kind: "conflict"; version: number; weights: Record<string, number>; message: string }
+  /** The save conflicted and the current values could not be read: the form must be reloaded first. */
+  | { kind: "reload_failed"; message: string }
   | { kind: "error"; message: string };
 
-/** Validate and save from the version the form was loaded at; on a conflict, return the current values. */
-export async function submitWeights(rpc: WeightsRpc, site: string, version: number, form: Record<string, string>): Promise<SubmitOutcome> {
-  let weights;
+/**
+ * Validate and save from the version the form was loaded at (`clear` appends an EMPTY version:
+ * estimates unavailable, history kept). Never rejects: every failure is an outcome.
+ */
+export async function submitWeights(rpc: WeightsRpc, site: string, version: number, form: Record<string, string>, opts: { clear?: boolean } = {}): Promise<SubmitOutcome> {
+  let weights: Record<string, number>;
   try {
-    weights = weightsFromForm(form);
+    weights = opts.clear ? {} : (weightsFromForm(form) as Record<string, number>);
   } catch (e) {
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
   }
   try {
-    const r = await rpc.save(site, version, weights as Record<string, number>);
-    return { kind: "saved", version: r.version, message: `Saved as version ${r.version}.` };
+    const r = await rpc.save(site, version, weights);
+    return { kind: "saved", version: r.version, weights: r.weights ?? {}, message: opts.clear ? `Weights cleared (version ${r.version}); estimates are unavailable until new weights are saved.` : `Saved as version ${r.version}.` };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (!/version_conflict/.test(msg)) return { kind: "error", message: msg };
-    const cur = await rpc.read(site);
-    return { kind: "conflict", version: cur.version, weights: cur.weights ?? {}, message: "Someone saved weights for this site meanwhile. The current values are shown; check them and save again." };
+    try {
+      const cur = await rpc.read(site);
+      return { kind: "conflict", version: cur.version, weights: cur.weights ?? {}, message: "Someone saved weights for this site meanwhile. The current values are shown; check them and save again." };
+    } catch (re) {
+      return { kind: "reload_failed", message: `Someone saved weights meanwhile and the current values could not be loaded (${re instanceof Error ? re.message : String(re)}). Reload before saving.` };
+    }
   }
+}
+
+type CardStatus = { kind: "idle" | "loading" | "saving" | "error" | "saved" | "conflict" | "reload_failed"; message?: string };
+
+/** Save is possible only from a loaded version and while nothing is in flight. */
+export function canSave(version: number | null, status: CardStatus): boolean {
+  return version !== null && status.kind !== "saving" && status.kind !== "loading";
+}
+/** Reload is offered whenever the shown values may not be the current ones. */
+export function needsReload(version: number | null, status: CardStatus): boolean {
+  return version === null || status.kind === "error" || status.kind === "reload_failed" || status.kind === "conflict";
+}
+
+/** The card state after an outcome (pure; tested). */
+export function afterSubmit(prev: { version: number | null; form: Record<string, string> }, r: SubmitOutcome): { version: number | null; form: Record<string, string>; status: CardStatus } {
+  const toForm = (w: Record<string, number>) => Object.fromEntries(Object.entries(w).map(([k, v]) => [k, String(v)]));
+  if (r.kind === "saved") return { version: r.version, form: toForm(r.weights), status: { kind: "saved", message: r.message } };
+  if (r.kind === "conflict") return { version: r.version, form: toForm(r.weights), status: { kind: "conflict", message: r.message } };
+  // unknown current version: saving is blocked until a successful reload
+  if (r.kind === "reload_failed") return { version: null, form: prev.form, status: { kind: "reload_failed", message: r.message } };
+  return { ...prev, status: { kind: "error", message: r.message } };
 }
 
 export function FrameTimingWeightsCard({ rpc, site }: { rpc: WeightsRpc; site: string }) {
   const [version, setVersion] = useState<number | null>(null);
   const [form, setForm] = useState<Record<string, string>>({});
-  const [status, setStatus] = useState<{ kind: "idle" | "loading" | "saving" | "error" | "saved" | "conflict"; message?: string }>({ kind: "loading" });
+  const [status, setStatus] = useState<CardStatus>({ kind: "loading" });
 
   const load = useCallback(async () => {
     setStatus({ kind: "loading" });
@@ -80,23 +110,26 @@ export function FrameTimingWeightsCard({ rpc, site }: { rpc: WeightsRpc; site: s
       setForm(Object.fromEntries(Object.entries(r.weights ?? {}).map(([k, v]) => [k, String(v)])));
       setStatus({ kind: "idle" });
     } catch (e) {
-      setStatus({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+      setVersion(null);
+      setStatus({ kind: "error", message: `Couldn't load the weights: ${e instanceof Error ? e.message : String(e)}` });
     }
   }, [rpc, site]);
   useEffect(() => {
     void load();
   }, [load]);
 
-  const save = async () => {
+  const save = async (clear = false) => {
     if (version === null) return;
     setStatus({ kind: "saving" });
-    const r = await submitWeights(rpc, site, version, form);
-    if (r.kind === "saved") setVersion(r.version);
-    if (r.kind === "conflict") {
-      setVersion(r.version);
-      setForm(Object.fromEntries(Object.entries(r.weights).map(([k, v]) => [k, String(v)])));
+    let next;
+    try {
+      next = afterSubmit({ version, form }, await submitWeights(rpc, site, version, form, { clear }));
+    } catch (e) {
+      next = { version: null, form, status: { kind: "error" as const, message: e instanceof Error ? e.message : String(e) } };
     }
-    setStatus({ kind: r.kind, message: r.message });
+    setVersion(next.version);
+    setForm(next.form);
+    setStatus(next.status);
   };
 
   return (
@@ -124,13 +157,21 @@ export function FrameTimingWeightsCard({ rpc, site }: { rpc: WeightsRpc; site: s
           ))}
         </div>
         <div className="flex items-center gap-3">
-          <Button size="sm" onClick={() => void save()} disabled={version === null || status.kind === "saving" || status.kind === "loading"}>
+          <Button size="sm" onClick={() => void save()} disabled={!canSave(version, status)}>
             Save new version
           </Button>
-          <span className="text-xs text-slate-500">{version === null ? "" : version === 0 ? "No weights saved yet." : `Current version ${version}.`}</span>
+          <Button size="sm" variant="secondary" onClick={() => void save(true)} disabled={!canSave(version, status) || version === 0}>
+            Clear all weights
+          </Button>
+          {needsReload(version, status) && status.kind !== "loading" ? (
+            <Button size="sm" variant="secondary" onClick={() => void load()}>
+              Reload
+            </Button>
+          ) : null}
+          <span className="text-xs text-slate-500">{version === null ? "" : version === 0 ? "No weights saved yet." : Object.keys(form).length === 0 && status.kind !== "saving" ? `Current version ${version} is empty (cleared).` : `Current version ${version}.`}</span>
         </div>
         {status.message ? (
-          <div className={status.kind === "error" || status.kind === "conflict" ? "text-xs text-rose-700 dark:text-rose-300" : "text-xs text-emerald-700"} role={status.kind === "error" || status.kind === "conflict" ? "alert" : "status"}>
+          <div className={status.kind === "error" || status.kind === "conflict" || status.kind === "reload_failed" ? "text-xs text-rose-700 dark:text-rose-300" : "text-xs text-emerald-700"} role={status.kind === "error" || status.kind === "conflict" || status.kind === "reload_failed" ? "alert" : "status"}>
             {status.message}
           </div>
         ) : null}

@@ -9,7 +9,7 @@ const U1 = "11111111-1111-4111-8111-111111111111";
 const U2 = "22222222-2222-4222-8222-222222222222";
 const GEN = "99999999-9999-4999-8999-999999999999";
 const gen: GenerationMeta = { generationId: GEN, site: "au", state: "published", complete: true, ruleVersion: "r1", sourceCutoffUtc: "2026-11-22T23:00:00Z", verifiedAtUtc: "2026-11-22T23:01:00Z", publishedAtUtc: "2026-11-22T23:02:00Z", expiresAtUtc: null, readMode: "summary" };
-const ROW = (id: string, at: string, pieces: number | string) => [id, U1, at, "2026-11-22", "verify", "framed", "INKA-ABC0003-A3-FN", pieces, true, false, null];
+const ROW = (id: string, at: string, pieces: number | string) => [id, U1, at, "2026-11-22", "verify", "framed", "INKA-ABC0003-A3-FN", pieces, true, false, null, null];
 
 function setup(role: string, opts: { nav?: unknown; rows?: unknown[]; rpcError?: string; generation?: GenerationMeta | null } = {}) {
   const rpc = vi.fn(async () => (opts.rpcError ? { data: null, error: { message: opts.rpcError } } : { data: { rows: opts.rows ?? [], weights: { version: 2, weights: { A3: 1 } } }, error: null }));
@@ -63,6 +63,8 @@ describe("GET /api/reports/timing", () => {
   it("row parsing refuses malformed rows and stored weights", () => {
     expect(() => parseTimingRows({ rows: [["x"]], weights: null })).toThrow();
     expect(() => parseTimingRows({ rows: [], weights: { version: 1, weights: { A9: 1 } } })).toThrow();
+    expect(parseTimingRows({ rows: [], weights: { version: 3, weights: {} } }).weights).toEqual({ version: 3, weights: {} }); // cleared version
+    expect(() => parseTimingRows({ rows: [ROW("a", "x", 1).slice(0, 11)], weights: null })).toThrow(); // station column required
     expect(parseTimingRows({ rows: [ROW("a", "2026-11-22T09:00:00Z", "2")], weights: null }).rows[0].pieces).toBe(2); // numeric text from jsonb
   });
 });

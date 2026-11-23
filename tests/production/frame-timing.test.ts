@@ -15,23 +15,34 @@ const CUT = "2026-11-20T23:00:00Z";
 const t = (hm: string) => `2026-11-20T${hm}:00Z`;
 let n = 0;
 const v = (at: string, sku: string, pieces: number, over: Partial<TimingStreamRow> = {}): TimingStreamRow => ({
-  id: `e${++n}`, staffId: W1, at: t(at), productionDate: "2026-11-20", kind: "verify", workType: "framed", sku, pieces, effective: true, rework: false, departmentId: null, ...over,
+  id: `e${++n}`, staffId: W1, at: t(at), productionDate: "2026-11-20", kind: "verify", workType: "framed", sku, pieces, effective: true, rework: false, departmentId: null, stationId: null, ...over,
 });
+const SHARED = "shared:rcv-1:scn-1";
 const clock = (at: string, kind: "clock_in" | "clock_out", over: Partial<TimingStreamRow> = {}): TimingStreamRow => ({
-  id: `c${++n}`, staffId: W1, at: t(at), productionDate: "2026-11-20", kind, workType: null, sku: null, pieces: 0, effective: true, rework: false, departmentId: null, ...over,
+  id: `c${++n}`, staffId: W1, at: t(at), productionDate: "2026-11-20", kind, workType: null, sku: null, pieces: 0, effective: true, rework: false, departmentId: null, stationId: null, ...over,
 });
 const group = (b: ReturnType<typeof computeFrameTiming>, key: string, rework = false) => b.groups.find((g) => g.key === key && g.rework === rework)!;
 
 describe("scan-gap measurement", () => {
   it("one shared capture with several lines is one gap, split by pieces (3 min over 2 and 1 pieces)", () => {
-    expect(captureKey(`scn-${RID}-v01`)).toBe(captureKey(`scn-${RID}-v02`));
-    expect(captureKey(`scn-${RID}-c-framed`)).not.toBe(captureKey(`scn-${RID}-v01`));
-    const rows = [v("09:00", A3, 1), v("09:03", A3, 2, { id: `scn-${RID}-v01` }), v("09:03", "INKA-ABC0009-A3-FB", 1, { id: `scn-${RID}-v02` })];
+    expect(captureKey(`scn-${RID}-v01`, SHARED)).toBe(captureKey(`scn-${RID}-v02`, SHARED));
+    expect(captureKey(`scn-${RID}-c-framed`, SHARED)).not.toBe(captureKey(`scn-${RID}-v01`, SHARED));
+    const rows = [v("09:00", A3, 1), v("09:03", A3, 2, { id: `scn-${RID}-v01`, stationId: SHARED }), v("09:03", "INKA-ABC0009-A3-FB", 1, { id: `scn-${RID}-v02`, stationId: SHARED })];
     const b = computeFrameTiming(rows, null, CUT);
     expect(group(b, "A3-FN").timedPieces).toBe(2);
     expect(group(b, "A3-FN").measuredMinutes).toBeCloseTo(2);
     expect(group(b, "A3-FB").measuredMinutes).toBeCloseTo(1);
     expect(b.coverage.timedPieces).toBe(3); // the first capture is untimed; the shared lines never make a zero gap
+  });
+  it("review r1 #1: classic rows with scanner-like ids are separate captures (only the first 09:03 piece is timed, 3 min)", () => {
+    const rows = [v("09:00", A3, 1, { stationId: "bench-2" }), v("09:03", A3, 1, { id: `scn-${RID}-v01`, stationId: "bench-2" }), v("09:03", A3, 1, { id: `scn-${RID}-v02`, stationId: "bench-2" })];
+    const g = group(computeFrameTiming(rows, null, CUT), "A3-FN");
+    expect(g.timedPieces).toBe(1);
+    expect(g.measuredMinutes).toBeCloseTo(3);
+    expect(captureKey(`scn-${RID}-v01`, null)).toBe(`evt:scn-${RID}-v01`);
+  });
+  it("the same request id on two different shared stations is two captures", () => {
+    expect(captureKey(`scn-${RID}-v01`, SHARED)).not.toBe(captureKey(`scn-${RID}-v01`, "shared:rcv-2:scn-9"));
   });
   it("exactly 30 minutes is timed, 30 min + 1 s, zero and the first capture are not", () => {
     const b = computeFrameTiming([v("09:00", A3, 1), v("09:30", A3, 1), { ...v("09:30", A3, 1), at: "2026-11-20T10:00:01Z" }, v("10:30", A3, 1, { at: "2026-11-20T10:00:01Z" })], null, CUT);
@@ -39,7 +50,7 @@ describe("scan-gap measurement", () => {
     expect(group(b, "A3-FN").measuredMinutes).toBeCloseTo(30);
   });
   it("a worker's stream runs across scanners/stations; another worker never links in", () => {
-    const b = computeFrameTiming([v("09:00", A3, 1, { id: `scn-${RID}-v01` }), v("09:05", A3, 1), v("09:07", A3, 1, { staffId: W2 })], null, CUT);
+    const b = computeFrameTiming([v("09:00", A3, 1, { id: `scn-${RID}-v01`, stationId: SHARED }), v("09:05", A3, 1), v("09:07", A3, 1, { staffId: W2 })], null, CUT);
     expect(group(b, "A3-FN").timedPieces).toBe(1);
     expect(group(b, "A3-FN").measuredMinutes).toBeCloseTo(5);
   });
@@ -130,6 +141,27 @@ describe("Max-method estimates", () => {
     const onlyB = computeFrameTiming(rows, W, CUT, { departmentId: "dB" });
     expect(group(onlyB, "A2-FB").estimatedMinutes).toBeCloseTo(group(all, "A2-FB").estimatedMinutes);
     expect(group(all, "A2-FB").estimatedMinutes).toBeCloseTo(90); // 300*0.9 = 270 split 2:1
+  });
+});
+
+describe("review r1 follow-ups", () => {
+  it("shift/clock/weight diagnostics are scoped to the selected person; timing stays whole-stream", () => {
+    const rows = [clock("08:00", "clock_in"), v("09:00", A1, 1), clock("12:00", "clock_out"), v("09:00", A3, 1, { staffId: W2 })]; // W2: no clock pair, no A3 weight
+    const W: WeightSet = { version: 1, weights: { A1: 2 } };
+    const all = computeFrameTiming(rows, W, CUT);
+    expect(all.coverage.shifts).toBe(1);
+    const onlyW1 = computeFrameTiming(rows, W, CUT, { staffId: W1 });
+    expect(onlyW1.coverage).toMatchObject({ shifts: 1, malformedAttendanceDays: 0, missingWeightSizes: [], noAttendancePieces: 0 });
+    const onlyW2 = computeFrameTiming(rows, W, CUT, { staffId: W2 });
+    expect(onlyW2.coverage).toMatchObject({ shifts: 0, noAttendancePieces: 1 });
+  });
+  it("an empty (cleared) version makes every estimate unavailable and says so in the CSV", () => {
+    const b = computeFrameTiming([clock("08:00", "clock_in"), v("09:00", A1, 1), clock("12:00", "clock_out")], { version: 5, weights: {} }, CUT);
+    expect(b.coverage.estimatedPieces).toBe(0);
+    expect(b.coverage.missingWeightPieces).toBe(1);
+    expect(frameTimingCsv(b, { site: "au", firstDate: "x", lastDate: "x", generationId: "g", sourceCutoffUtc: CUT, filters: "" }, csvCell)).toContain("version 5 is empty");
+    expect(validateWeights({}, { allowEmpty: true })).toEqual({});
+    expect(() => validateWeights({})).toThrow();
   });
 });
 

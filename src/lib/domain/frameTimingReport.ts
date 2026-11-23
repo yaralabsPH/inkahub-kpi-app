@@ -46,6 +46,8 @@ export interface TimingStreamRow {
   effective: boolean;
   rework: boolean;
   departmentId: string | null;
+  /** Frozen station_id of the event image (F6 shared stations are "shared:<receiver>:<scanner>"). */
+  stationId: string | null;
 }
 
 export interface WeightSet { version: number; weights: Partial<Record<WeightSize, number>> }
@@ -88,10 +90,14 @@ export interface FrameTimingBody {
   weights: WeightSet | null;
 }
 
-/** Capture identity: one shared-scanner request, or one classic event. */
-export function captureKey(id: string): string {
+/**
+ * Capture identity: one shared-scanner request (strict scn-<32hex>-vNN id AND a
+ * trusted "shared:" station, per station), or one classic event. A classic row
+ * whose id merely looks like a scanner id stays its own capture.
+ */
+export function captureKey(id: string, stationId: string | null): string {
   const m = SCN.exec(id);
-  return m ? `scn-${m[1]}` : `evt:${id}`;
+  return m && typeof stationId === "string" && stationId.startsWith("shared:") ? `scn-${m[1]}|${stationId}` : `evt:${id}`;
 }
 
 export function sizeOf(sku: string | null): { size: string | null; variant: string | null } {
@@ -99,11 +105,12 @@ export function sizeOf(sku: string | null): { size: string | null; variant: stri
   return p ? { size: p.size ?? null, variant: p.variant ?? null } : { size: null, variant: null };
 }
 
-export function validateWeights(w: unknown): Partial<Record<WeightSize, number>> {
+/** `allowEmpty`: an empty set is the explicit "cleared" version (estimates unavailable). */
+export function validateWeights(w: unknown, opts: { allowEmpty?: boolean } = {}): Partial<Record<WeightSize, number>> {
   if (!w || typeof w !== "object" || Array.isArray(w)) throw new RangeError("weights must be an object");
   const out: Partial<Record<WeightSize, number>> = {};
   const entries = Object.entries(w as Record<string, unknown>);
-  if (entries.length === 0) throw new RangeError("enter at least one size weight");
+  if (entries.length === 0 && !opts.allowEmpty) throw new RangeError("enter at least one size weight");
   for (const [k, v] of entries) {
     if (!(WEIGHT_SIZES as readonly string[]).includes(k)) throw new RangeError(`unknown size ${k.slice(0, 10)}`);
     if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > MAX_WEIGHT) throw new RangeError(`weight for ${k} must be a positive number up to ${MAX_WEIGHT}`);
@@ -119,11 +126,12 @@ const isBreak = (r: TimingStreamRow) => r.kind !== "verify" || (r.effective && !
 interface RowOut { row: TimingStreamRow; measured: number | null; estimate: number | null; unavailable: "attendance" | "weight" | null }
 
 /** Measured and estimated minutes for every framing row (before filters). */
-export function timeStream(rows: readonly TimingStreamRow[], weights: WeightSet | null, cutoffUtc: string): { rows: RowOut[]; shifts: number; malformedAttendanceDays: number; missingWeightSizes: Set<string> } {
+/** Per worker-day diagnostics (scoped to the selected person when the report is filtered). */
+export interface DayDiagnostics { staffId: string; shifts: number; malformed: boolean; missingWeightSizes: string[] }
+
+export function timeStream(rows: readonly TimingStreamRow[], weights: WeightSet | null, cutoffUtc: string): { rows: RowOut[]; days: DayDiagnostics[] } {
   const out: RowOut[] = [];
-  let shifts = 0;
-  let malformed = 0;
-  const missing = new Set<string>();
+  const days: DayDiagnostics[] = [];
   const byDay = new Map<string, TimingStreamRow[]>();
   for (const r of rows) {
     const k = `${r.staffId}|${r.productionDate}`;
@@ -133,13 +141,15 @@ export function timeStream(rows: readonly TimingStreamRow[], weights: WeightSet 
   }
   const cutoff = ms(cutoffUtc);
   for (const list of byDay.values()) {
+    let shifts = 0;
+    const missing = new Set<string>();
     // 1. captures and breaks, in time order (a break at the same instant comes first)
     type El = { t: number; brk: boolean; key: string; lines: TimingStreamRow[] };
     const caps = new Map<string, El>();
     const els: El[] = [];
     for (const r of list) {
       if (isFrame(r)) {
-        const key = captureKey(r.id);
+        const key = captureKey(r.id, r.stationId);
         const c = caps.get(key);
         if (c) {
           c.lines.push(r);
@@ -176,7 +186,7 @@ export function timeStream(rows: readonly TimingStreamRow[], weights: WeightSet 
         }
         pairs.push([ms(a.at), ms(b.at)]);
       }
-    if (pairs === null) malformed++;
+    const malformedDay = pairs === null;
     const shiftOf = (t: number) => (pairs ? pairs.findIndex(([a, b]) => t >= a && t <= b) : -1);
     // 3. Max method per shift
     const frames = [...measuredOf.keys()];
@@ -206,8 +216,9 @@ export function timeStream(rows: readonly TimingStreamRow[], weights: WeightSet 
       const e = estimateOf.get(f);
       out.push({ row: f, measured: measuredOf.get(f) ?? null, estimate: e?.estimate ?? null, unavailable: e?.unavailable ?? null });
     }
+    days.push({ staffId: list[0].staffId, shifts, malformed: malformedDay, missingWeightSizes: [...missing] });
   }
-  return { rows: out, shifts, malformedAttendanceDays: malformed, missingWeightSizes: missing };
+  return { rows: out, days };
 }
 
 /** Aggregate per size-variant and normal/rework AFTER the whole stream was timed. */
@@ -218,7 +229,15 @@ export function computeFrameTiming(rows: readonly TimingStreamRow[], weights: We
     (!filters.workType || r.workType === filters.workType) &&
     (!filters.departmentId || (filters.departmentId === "unknown" ? r.departmentId === null : r.departmentId === filters.departmentId));
   const groups = new Map<string, TimingGroup>();
-  const cov: TimingCoverage = { framePieces: 0, timedPieces: 0, untimedPieces: 0, estimatedPieces: 0, unavailablePieces: 0, noAttendancePieces: 0, missingWeightPieces: 0, missingWeightSizes: [...t.missingWeightSizes].sort(), shifts: t.shifts, malformedAttendanceDays: t.malformedAttendanceDays };
+  // Shift/attendance/weight diagnostics describe the selected person's days only (all people when unfiltered);
+  // the timing itself was computed on every complete stream above.
+  const diag = t.days.filter((d) => !filters.staffId || d.staffId === filters.staffId);
+  const cov: TimingCoverage = {
+    framePieces: 0, timedPieces: 0, untimedPieces: 0, estimatedPieces: 0, unavailablePieces: 0, noAttendancePieces: 0, missingWeightPieces: 0,
+    missingWeightSizes: [...new Set(diag.flatMap((d) => d.missingWeightSizes))].sort(),
+    shifts: diag.reduce((s, d) => s + d.shifts, 0),
+    malformedAttendanceDays: diag.filter((d) => d.malformed).length,
+  };
   for (const o of t.rows) {
     if (!keep(o.row)) continue;
     const { size, variant } = sizeOf(o.row.sku);
@@ -273,7 +292,7 @@ export function frameTimingCsv(body: FrameTimingBody, ctx: { site: string; first
     ["generation", ctx.generationId],
     ["source_cutoff_utc", ctx.sourceCutoffUtc],
     ["measured_method", "scan gap: minutes since the same worker's previous framing scan, gaps over 30 min or across a clock/other scan/day not timed; not stopwatch timing"],
-    ["estimated_method", body.weights ? `Max method: 405/450 of verified shift attendance (max 450 min) minus measured minutes, split by size weights version ${body.weights.version} (an assumption applied to this report)` : "Max method: unavailable (no size weights saved for this site)"],
+    ["estimated_method", body.weights && Object.keys(body.weights.weights).length === 0 ? `Max method: unavailable (size weights version ${body.weights.version} is empty: weights were cleared)` : body.weights ? `Max method: 405/450 of verified shift attendance (max 450 min) minus measured minutes, split by size weights version ${body.weights.version} (an assumption applied to this report)` : "Max method: unavailable (no size weights saved for this site)"],
     [],
     ["frame", "work", "pieces", "timed_pieces", "measured_minutes", "measured_min_per_piece", "untimed_pieces", "estimated_pieces", "estimated_minutes", "estimated_min_per_piece", "unavailable_pieces"],
   ];

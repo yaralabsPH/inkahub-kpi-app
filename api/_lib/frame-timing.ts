@@ -32,8 +32,8 @@ export function parseTimingRows(v: unknown): { rows: TimingStreamRow[]; weights:
   const o = v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : bad("not an object");
   const list = Array.isArray(o.rows) ? o.rows : bad("rows");
   const rows = list.map((r): TimingStreamRow => {
-    if (!Array.isArray(r) || r.length !== 11) return bad("row shape");
-    const [id, staffId, at, productionDate, kind, workType, sku, pieces, effective, rework, departmentId] = r as unknown[];
+    if (!Array.isArray(r) || r.length !== 12) return bad("row shape");
+    const [id, staffId, at, productionDate, kind, workType, sku, pieces, effective, rework, departmentId, stationId] = r as unknown[];
     if (typeof id !== "string" || typeof staffId !== "string" || typeof at !== "string" || typeof productionDate !== "string") return bad("row fields");
     if (kind !== "verify" && kind !== "clock_in" && kind !== "clock_out") return bad("row kind");
     const n = typeof pieces === "string" ? Number(pieces) : pieces;
@@ -44,6 +44,7 @@ export function parseTimingRows(v: unknown): { rows: TimingStreamRow[]; weights:
       workType: typeof workType === "string" ? workType : null,
       sku: typeof sku === "string" ? sku : null,
       departmentId: typeof departmentId === "string" ? departmentId : null,
+      stationId: typeof stationId === "string" ? stationId : null,
     };
   });
   let weights: WeightSet | null = null;
@@ -51,7 +52,7 @@ export function parseTimingRows(v: unknown): { rows: TimingStreamRow[]; weights:
     const w = o.weights as Record<string, unknown>;
     if (typeof w.version !== "number" || !Number.isSafeInteger(w.version) || w.version < 1) return bad("weights version");
     try {
-      weights = { version: w.version, weights: validateWeights(w.weights) };
+      weights = { version: w.version, weights: validateWeights(w.weights, { allowEmpty: true }) }; // empty = cleared
     } catch {
       return bad("weights values");
     }

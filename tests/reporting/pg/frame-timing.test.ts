@@ -22,18 +22,20 @@ const RID = "0123456789abcdef0123456789abcdef";
 const A3 = "INKA-ABC0003-A3-FN";
 const A2 = "INKA-ABC0002-A2-FB";
 const UN = "INKA-HIG0207-A3-UN";
+const A4 = "INKA-ABC0004-A4-FN";
 const owner: ReportingPrincipal = { userId: OWNER, role: "owner", nav: new Set(["reports", "welcome"]), sites: new Set(["uk"]) };
 const staff: ReportingPrincipal = { userId: W2, role: "staff", nav: new Set(["reports", "welcome"]), sites: new Set(["uk"]) };
 const REQ = { site: "uk", firstDate: "2026-02-10", lastDate: "2026-02-10" };
 let db: PGlite;
 let gen1 = "";
 
-async function ins(id: string, staffId: string, type: string, at: string, sku: string | null = null, qty: number | null = null, dept = "framed", parent: string | null = null) {
+const SHARED = "shared:rcv-1:scn-1";
+async function ins(id: string, staffId: string, type: string, at: string, sku: string | null = null, qty: number | null = null, dept = "framed", parent: string | null = null, station = "s") {
   await db.query(
     `insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at, parent_event_id,
        business_department_id, business_department_name, business_department_status)
-     values ('uk',$1,$2,$3,$4,$5,$6,$7,'s','',$8,$9,$10,'Framing','assigned')`,
-    [id, staffId, dept, type.startsWith("clock") ? null : "O-1", sku, qty, type, at, parent, DA],
+     values ('uk',$1,$2,$3,$4,$5,$6,$7,$11,'',$8,$9,$10,'Framing','assigned')`,
+    [id, staffId, dept, type.startsWith("clock") ? null : "O-1", sku, qty, type, at, parent, DA, station],
   );
 }
 async function publish() {
@@ -60,8 +62,14 @@ beforeAll(async () => {
   // 09:25 A2 verified then cancelled (ignored); 09:28 A2 timed 8 min (09:20 -> 09:28).
   await ins("ci", W2, "clock_in", "2026-02-10T08:00:00Z");
   await ins("v1", W2, "line_verified", "2026-02-10T09:00:00Z", A3, 1);
-  await ins(`scn-${RID}-v01`, W2, "line_verified", "2026-02-10T09:03:00Z", A3, 2);
-  await ins(`scn-${RID}-v02`, W2, "line_verified", "2026-02-10T09:03:00Z", A2, 1);
+  await ins(`scn-${RID}-v01`, W2, "line_verified", "2026-02-10T09:03:00Z", A3, 2, "framed", null, SHARED);
+  await ins(`scn-${RID}-v02`, W2, "line_verified", "2026-02-10T09:03:00Z", A2, 1, "framed", null, SHARED);
+  // Review r1 #1: the OWNER works a classic bench whose ids merely look like a scanner request: 09:00, then two
+  // 09:03 rows. They are separate classic captures: only the first 09:03 piece is timed (3 min).
+  const LOOK = "fedcba9876543210fedcba9876543210";
+  await ins("o1", OWNER, "line_verified", "2026-02-10T09:00:00Z", A4, 1, "framed", null, "bench-2");
+  await ins(`scn-${LOOK}-v01`, OWNER, "line_verified", "2026-02-10T09:03:00Z", A4, 1, "framed", null, "bench-2");
+  await ins(`scn-${LOOK}-v02`, OWNER, "line_verified", "2026-02-10T09:03:00Z", A4, 1, "framed", null, "bench-2");
   await ins("u1", W2, "line_verified", "2026-02-10T09:10:00Z", UN, 1, "unframed");
   await ins("v3", W2, "line_verified", "2026-02-10T09:12:00Z", A3, 1);
   await ins("v4", W2, "line_verified", "2026-02-10T09:20:00Z", A3, 1);
@@ -97,9 +105,27 @@ describe("F9 timing over the real SQL", () => {
     expect(a2.measuredMinutes).toBeCloseTo(1 + 8);
     expect(t.groups.some((x) => x.key.endsWith("-UN"))).toBe(false);
     expect(t.weights).toBeNull();
+    const look = g(t, "A4-FN");
+    expect([look.pieces, look.timedPieces]).toEqual([3, 1]);
+    expect(look.measuredMinutes).toBeCloseTo(3); // classic lookalikes are not one shared capture
     expect(t.coverage.missingWeightPieces).toBe(2); // v1, v3 unmeasured with no weights: unavailable, not zero
   }, 60_000);
 
+  it("the stream read carries the frozen station and is bounded to the audience; a self read sees only that person", async () => {
+    const c = pgRpc(db);
+    const args = { p_site: "uk", p_audience_kind: "site", p_audience_staff: null, p_generation: gen1, p_first_date: "2026-02-10", p_last_date: "2026-02-10", p_start: "2026-02-10T04:00:00Z", p_end: "2026-02-11T04:00:00Z", p_row_limit: 1000 };
+    const site = (await c.rpc("read_frame_timing_rows", args)).data as { rows: unknown[][] };
+    const byId = new Map(site.rows.map((r) => [r[0], r]));
+    expect(byId.get(`scn-${RID}-v01`)?.[11]).toBe(SHARED);
+    expect(byId.get("o1")?.[11]).toBe("bench-2");
+    expect(byId.get("ci")?.[4]).toBe("clock_in");
+    expect(site.rows).toHaveLength(13); // W2: 8 verifications (v5 cancelled but present) + 2 clocks; owner: 3
+    const self = (await c.rpc("read_frame_timing_rows", { ...args, p_audience_kind: "self", p_audience_staff: W2 })).data as { rows: unknown[][] };
+    expect(new Set(self.rows.map((r) => r[1]))).toEqual(new Set([W2]));
+    expect(self.rows.filter((r) => r[4] !== "verify").map((r) => r[0]).sort()).toEqual(["ci", "co"]);
+    expect((await c.rpc("read_frame_timing_rows", { ...args, p_row_limit: 12 })).error?.message).toMatch(/more than 12 rows exceed the limit 12/);
+    expect((await c.rpc("read_frame_timing_rows", { ...args, p_row_limit: 13 })).error).toBeNull(); // exactly the limit is allowed
+  }, 60_000);
   it("staff timing is their own stream; a forged person, kiosk and a missing/foreign generation are refused", async () => {
     const self = await timing(staff, { ...REQ, generationId: gen1 });
     expect(self.request.staffId).toBe(W2);
@@ -120,7 +146,7 @@ describe("F9 timing over the real SQL", () => {
     await expect(read(W2)).rejects.toThrow(/owner_only/);
     await expect(read(null)).rejects.toThrow(/not_signed_in/);
     await expect(save(MGR, 0, { A3: 1 })).rejects.toThrow(/owner_only/);
-    for (const bad of [{}, { A9: 1 }, { A3: 0 }, { A3: -2 }, { A3: 1001 }, { A3: "1" }]) await expect(save(OWNER, 0, bad)).rejects.toThrow(/invalid_weights/);
+    for (const bad of [[], { A9: 1 }, { A3: 0 }, { A3: -2 }, { A3: 1001 }, { A3: "1" }]) await expect(save(OWNER, 0, bad)).rejects.toThrow(/invalid_weights/);
     expect(await save(OWNER, 0, { A3: 1, A2: 2 })).toMatchObject({ version: 1 });
     await expect(save(OWNER, 0, { A3: 5 })).rejects.toThrow(/version_conflict/); // a stale form never overwrites
     expect(await save(OWNER, 1, { A3: 1, A2: 1 })).toMatchObject({ version: 2 });
@@ -133,5 +159,16 @@ describe("F9 timing over the real SQL", () => {
     expect(g(t, "A3-FN").estimatedPieces).toBe(2);
     expect(g(t, "A3-FN").estimatedMinutes).toBeCloseTo(386);
     expect(g(t, "A3-FN").measuredMinutes).toBeCloseTo(10); // unchanged: never blended
+    // approved reset: an EMPTY immutable version clears every estimate; history stays
+    expect(await save(OWNER, 2, {})).toMatchObject({ version: 3, weights: {} });
+    expect(await read(OWNER)).toMatchObject({ version: 3, weights: {} });
+    await expect(save(MGR, 3, {})).rejects.toThrow(/owner_only/);
+    await expect(save(OWNER, 2, {})).rejects.toThrow(/version_conflict/);
+    const cleared = await timing(owner, { ...REQ, generationId: gen1 });
+    expect(cleared.weights).toEqual({ version: 3, weights: {} });
+    expect(cleared.coverage.estimatedPieces).toBe(0);
+    expect(g(cleared, "A3-FN").measuredMinutes).toBeCloseTo(10);
+    const history = (await db.query<{ version: number; weights: unknown }>("select version, weights from public.frame_timing_weight_versions where site = 'uk' order by version")).rows;
+    expect(history).toEqual([{ version: 1, weights: { A2: 2, A3: 1 } }, { version: 2, weights: { A2: 1, A3: 1 } }, { version: 3, weights: {} }]);
   }, 60_000);
 });

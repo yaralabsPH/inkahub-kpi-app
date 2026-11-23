@@ -83,11 +83,16 @@ export function FrameTimingView({ state, onRetry }: { state: OverviewState<Frame
         <>
           <div className="text-[11px] text-slate-500" role="status">
             Same report version as the summary ({d.meta.generationId.slice(0, 8)}).{" "}
-            {d.weights ? `Estimates use size weights version ${d.weights.version} — an assumption applied to this report.` : "No size weights saved for this site: estimates are unavailable."}{" "}
+            {d.weights && Object.keys(d.weights.weights).length === 0
+              ? `Size weights version ${d.weights.version} is empty (weights were cleared): estimates are unavailable.`
+              : d.weights
+                ? `Estimates use size weights version ${d.weights.version} — an assumption applied to this report.`
+                : "No size weights saved for this site: estimates are unavailable."}{" "}
             Coverage: {d.coverage.timedPieces} of {d.coverage.framePieces} frame pieces measured; {d.coverage.estimatedPieces} estimated; {d.coverage.unavailablePieces} unavailable
             {d.coverage.noAttendancePieces ? ` (${d.coverage.noAttendancePieces} without a verified shift` : " ("}
             {d.coverage.missingWeightPieces ? `${d.coverage.noAttendancePieces ? ", " : ""}${d.coverage.missingWeightPieces} missing a weight${d.coverage.missingWeightSizes.length ? `: ${d.coverage.missingWeightSizes.join(", ")}` : ""}` : ""})
             {d.coverage.malformedAttendanceDays ? `; ${d.coverage.malformedAttendanceDays} day(s) with incomplete clock records` : ""}.
+            {" "}Shift and clock notes cover {d.request.staffId ? "the selected person only" : "everyone in this report"}.
           </div>
           {d.groups.length === 0 ? (
             <div className="text-xs text-slate-500">No framing scans in this period.</div>
