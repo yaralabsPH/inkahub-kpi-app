@@ -7,8 +7,8 @@
  * (order, case) identities computed by the database for each group; nothing
  * here adds daily or group Orders together.
  */
-import { isProductionDate, isReportSite, productionDatesBetween, productionWeekStart, type ReportSite } from "./productionPeriods";
-import type { PublishedMeta } from "./productionReporting";
+import { isProductionDate, isReportSite, productionDatesBetween, productionWeekStart, type ReportSite } from "./productionPeriods.js";
+import type { PublishedMeta } from "./productionReporting.js";
 
 export const OVERVIEW_MAX_DATES = 731;
 export const OVERVIEW_GROUP_LIMIT = 1000;

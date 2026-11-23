@@ -20,7 +20,7 @@
  * The whole stream and every shift are computed BEFORE person/work-type/
  * department filters, so filtering never changes a gap or an allocation.
  */
-import { parseSku } from "./skuRouting";
+import { parseSku } from "./skuRouting.js";
 
 export const GAP_CAP_MIN = 30;
 export const ATTENDANCE_CAP_MIN = 450;

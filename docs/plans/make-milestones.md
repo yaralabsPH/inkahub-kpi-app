@@ -69,8 +69,15 @@ Successful pipeline milestones are confirmed source evidence; missing stages rem
 
 The first F10/F11 Preview at 75517a4 is READY, but timeline and reports functions fail at module load: Node ESM cannot resolve extensionless `./productionCounts` from `src/lib/domain/productionReporting.js`. Local build/type checks use bundler resolution and missed this. Production is unchanged.
 
-- [ ] Reproduce the actual server import failure using emitted, unbundled JavaScript under Node ESM; no hosted data writes.
-- [ ] Add explicit `.js` extensions to relative runtime imports in the server-reachable shared modules that need them. Inspect the transitive graph; do not redesign reporting or change feature behavior.
-- [ ] Add a small no-network server import smoke check that catches this deployed-runtime failure, using existing dependencies. Avoid broad test infrastructure or new packages.
-- [ ] Run that check, relevant API/domain tests, API/frontend type checks and build. Commit and push only this feature branch; no main merge or production release.
+- [x] Reproduce the actual server import failure using emitted, unbundled JavaScript under Node ESM; no hosted data writes.
+- [x] Add explicit `.js` extensions to relative runtime imports in the server-reachable shared modules that need them. Inspect the transitive graph; do not redesign reporting or change feature behavior.
+- [x] Add a small no-network server import smoke check that catches this deployed-runtime failure, using existing dependencies. Avoid broad test infrastructure or new packages.
+- [x] Run that check, relevant API/domain tests, API/frontend type checks and build. Commit and push only this feature branch; no main merge or production release.
 - [ ] Root reviews the change and redeploys a Preview. Require actual app JSON responses, then repeat the configured F10/F11 staging acceptance. Existing database migrations and live Make systems stay unchanged.
+
+Hosted runtime follow-up log (coder):
+- Reproduced locally: TypeScript emitted the 12 api/ entrypoints and their graph unbundled (specifiers as written, like Vercel), and plain Node ESM import of `node_modules/.api-runtime-check/api/orders/timeline.js` failed with the same ERR_MODULE_NOT_FOUND for `./productionCounts` from `productionReporting.js`. Static scan of the emitted graph: 15 extensionless relative runtime imports in 8 shared modules (productionReporting, productionReportView, productionReportingProjection, productionWelcomeView, productionFrameTiming, productionReportingFreshness, frameTimingReport, reportsOverview → productionCounts/productionPeriods/productionFrameTiming/productionReporting/skuRouting). 8 entrypoints failed (timeline, the 6 reports/* handlers, daily-digest); dropbox and shopify handlers loaded.
+- Fix: added `.js` to every extensionless relative import in exactly those 8 files (21 specifier lines, including 4 type-only for consistency). No behavior, schema, env or other code changed.
+- New `tests/api/runtime-imports.test.ts` (existing tsc + node, no packages, no network): emits the unbundled graph into `node_modules/.api-runtime-check`, asserts every relative specifier names an existing file, and imports each of the 12 entrypoints in a fresh Node process with app config/credential variables removed. Red before the fix (9/14 failing, same error as the Preview), green after (14/14). Added to `typecheck:api`.
+- Checks (log `C:/Users/cjgom/dev/morning-20261123/runtime-import-fix-checks.log`): `npx tsc -b` 0, `typecheck:api` 0, `typecheck:digest` 0, `vitest run tests/api tests/reporting tests/production tests/orderTimeline.test.ts` 76 files / 2216 tests passed, `npm run build` 0. Full suite not rerun (import-specifier-only change, covered by the affected suites).
+- Remaining: root review, new Preview, real app JSON responses, then the configured F10/F11 staging acceptance.
