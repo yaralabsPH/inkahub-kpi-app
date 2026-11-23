@@ -124,7 +124,7 @@ export interface TimelineView {
   identity: string;
   site: OrderSite;
   stages: Record<OrderStage, StageView>;
-  framedByWorkType: Array<{ workType: string; at: string }>;
+  framedByWorkType: Array<{ workType: string; at: string; kind: EvidenceKind }>;
   fulfillments: Array<{ fulfillmentId: string; at: string; complete: boolean; kind: EvidenceKind }>;
   /** First CONFIRMED fulfillment that completed the order; null while partial, unconfirmed or unknown. */
   completeShipmentAt: string | null;
@@ -157,8 +157,13 @@ export function projectTimeline(evidence: readonly OrderEvidence[]): TimelineVie
   for (const s of ORDER_STAGES) if (s !== "shipped" && s !== "delivered" && s !== "framed") stages[s] = byKind((e) => e.stage === s);
   stages.delivered = byKind((e) => e.stage === "delivered" && e.source === "shopify");
   const framedAll = byKind((e) => e.stage === "framed" && e.framingComplete === true);
+  // partial means CONFIRMED partial work; inferred/reported-only framing is "unconfirmed"
+  const framedConfirmed = original.find((e) => e.stage === "framed" && e.kind === "confirmed");
   const anyFramed = original.find((e) => e.stage === "framed");
-  stages.framed = framedAll.status !== "missing" ? framedAll : anyFramed ? view(anyFramed, "partial") : missing;
+  stages.framed = framedAll.status === "confirmed" ? framedAll
+    : framedConfirmed ? view(framedConfirmed, "partial")
+      : framedAll.status !== "missing" ? framedAll
+        : anyFramed ? view(anyFramed, "unconfirmed") : missing;
   const fulfillments = original
     .filter((e) => e.stage === "shipped" && e.source === "shopify" && e.fulfillmentId)
     .map((e) => ({ fulfillmentId: e.fulfillmentId as string, at: strictIso(e.happenedAt) as string, complete: e.fulfillmentComplete === true, kind: e.kind }));
@@ -168,12 +173,19 @@ export function projectTimeline(evidence: readonly OrderEvidence[]): TimelineVie
     ? { status: "confirmed", at: complete.at, source: "shopify", kind: "confirmed" }
     : unconfirmedComplete
       ? { status: "unconfirmed", at: unconfirmedComplete.at, source: "shopify", kind: unconfirmedComplete.kind }
-      : fulfillments.length
-        ? { status: "partial", at: fulfillments[0].at, source: "shopify", kind: fulfillments[0].kind }
-        : missing;
+      : fulfillments.some((f) => f.kind === "confirmed")
+        ? { status: "partial", at: (fulfillments.find((f) => f.kind === "confirmed") as (typeof fulfillments)[number]).at, source: "shopify", kind: "confirmed" }
+        : fulfillments.length
+          ? { status: "unconfirmed", at: fulfillments[0].at, source: "shopify", kind: fulfillments[0].kind }
+          : missing;
+  // per work type: the confirmed record wins over an earlier inferred/reported one; kind is kept
   const framedByWorkType: TimelineView["framedByWorkType"] = [];
   for (const e of original) {
-    if (e.stage === "framed" && e.workType && !framedByWorkType.some((f) => f.workType === e.workType)) framedByWorkType.push({ workType: e.workType, at: strictIso(e.happenedAt) as string });
+    if (e.stage !== "framed" || !e.workType) continue;
+    const i = framedByWorkType.findIndex((f) => f.workType === e.workType);
+    const rec = { workType: e.workType, at: strictIso(e.happenedAt) as string, kind: e.kind };
+    if (i < 0) framedByWorkType.push(rec);
+    else if (framedByWorkType[i].kind !== "confirmed" && e.kind === "confirmed") framedByWorkType[i] = rec;
   }
   framedByWorkType.sort((a, b) => (a.workType < b.workType ? -1 : 1));
   return {
@@ -226,7 +238,9 @@ export function flowMetrics(timelines: readonly TimelineView[], period: { startU
   const a = Date.parse(sa);
   const b = Date.parse(sb);
   const now = Date.parse(sn);
-  const cohort = timelines.filter((t) => t.orderedAt && !t.cancelled && Date.parse(t.orderedAt) >= a && Date.parse(t.orderedAt) < b && Date.parse(t.orderedAt) <= now);
+  // only a confirmed cancellation at or before now removes an order
+  const cancelledByNow = (t: TimelineView) => t.cancelled && t.stages.cancelled.at !== null && Date.parse(t.stages.cancelled.at) <= now;
+  const cohort = timelines.filter((t) => t.orderedAt && !cancelledByNow(t) && Date.parse(t.orderedAt) >= a && Date.parse(t.orderedAt) < b && Date.parse(t.orderedAt) <= now);
   const hours: number[] = [];
   let anomalies = 0;
   let open = 0;

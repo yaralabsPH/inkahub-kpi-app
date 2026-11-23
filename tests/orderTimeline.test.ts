@@ -180,3 +180,30 @@ describe("review r1 corrections", () => {
     expect(flowMetrics([futureOrder], P, "2026-11-20T12:00:00Z", null).cohort).toBe(0);
   });
 });
+
+describe("review r2 corrections", () => {
+  const o = ev({ key: "o" });
+  const P = { startUtc: "2026-11-20T00:00:00Z", endUtcExclusive: "2026-11-21T00:00:00Z" };
+  it("A: a cancellation after now does not remove the order; one at or before now does", () => {
+    const t = projectTimeline([o, ev({ key: "c", stage: "cancelled", happenedAt: "2026-11-22T09:00:00Z" })]);
+    const before = flowMetrics([t], P, "2026-11-21T12:00:00Z", null);
+    expect([before.cohort, before.openOrders]).toEqual([1, 1]);
+    expect(flowMetrics([t], P, "2026-11-22T10:00:00Z", null).cohort).toBe(0);
+  });
+  it("B: inferred-only framing/fulfillment is unconfirmed, not partial; confirmed partial wins; work-type kind kept", () => {
+    const inf = projectTimeline([o, ev({ key: "f", stage: "framed", source: "app", workType: "framed", kind: "inferred" })]);
+    expect(inf.stages.framed).toMatchObject({ status: "unconfirmed", kind: "inferred" });
+    expect(inf.framedByWorkType).toEqual([{ workType: "framed", at: "2026-11-20T09:00:00.000Z", kind: "inferred" }]);
+    const mixed = projectTimeline([o,
+      ev({ key: "f1", stage: "framed", source: "app", workType: "framed", kind: "inferred", happenedAt: "2026-11-20T10:00:00Z" }),
+      ev({ key: "f2", stage: "framed", source: "app", workType: "framed", kind: "confirmed", happenedAt: "2026-11-20T11:00:00Z" })]);
+    expect(mixed.stages.framed).toMatchObject({ status: "partial", kind: "confirmed", at: "2026-11-20T11:00:00.000Z" });
+    expect(mixed.framedByWorkType[0]).toMatchObject({ kind: "confirmed", at: "2026-11-20T11:00:00.000Z" });
+    const ship = projectTimeline([o, ev({ key: "s", stage: "shipped", kind: "inferred", fulfillmentId: "F1", fulfillmentComplete: false })]);
+    expect(ship.stages.shipped).toMatchObject({ status: "unconfirmed", kind: "inferred" });
+    const both = projectTimeline([o,
+      ev({ key: "s1", stage: "shipped", kind: "inferred", fulfillmentId: "F1", fulfillmentComplete: false, happenedAt: "2026-11-21T09:00:00Z" }),
+      ev({ key: "s2", stage: "shipped", kind: "confirmed", fulfillmentId: "F2", fulfillmentComplete: false, happenedAt: "2026-11-21T10:00:00Z" })]);
+    expect(both.stages.shipped).toMatchObject({ status: "partial", kind: "confirmed", at: "2026-11-21T10:00:00.000Z" });
+  });
+});
