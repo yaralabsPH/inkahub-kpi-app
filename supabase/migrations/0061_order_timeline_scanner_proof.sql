@@ -19,6 +19,14 @@
 --   * Every cancellation (event_type 'cancelled', same site) of any listed event emits a same-source retraction
 --     of that key: key '<site>/receipt-cancel:<request_id>:<cancellation id>', at the cancellation's own
 --     created_at. Retractions apply whichever was reconciled first; repeats are duplicates. No date is invented.
+--   * A proof already stored for this site/order whose receipt is no longer valid (e.g. an owner removed a listed
+--     event, or the receipt is gone) is withdrawn by a same-source retraction keyed
+--     '<site>/receipt-invalid:<request_id>', timed at the FIRST reconciliation that observed the invalidity (the
+--     database time of that transaction). A later replay reuses the stored time, so it is a duplicate. Calls for
+--     one site/order are serialized by a transaction advisory lock, so two concurrent reconciliations cannot
+--     record two different first-observation times. A receipt that never produced a proof gets no withdrawal.
+--     Restoring a missing source row does NOT undo the withdrawal (evidence is immutable); that needs a new
+--     receipt. Genuine cancellation retractions keep the cancellation's own time.
 --   * Later CS cases are not inspected: replacement work carries its own cs_case_id and is excluded by the
 --     timeline projection, so it never erases original history. Classic/manual framing never carries
 --     framingComplete and stays partial.
@@ -50,9 +58,12 @@ DECLARE
   v_valid   boolean := false;
   v_cancels jsonb := '[]'::jsonb;
   v_proof   jsonb := '[]'::jsonb;
+  v_withdraw jsonb := '[]'::jsonb;
 BEGIN
   IF p_site IS NULL OR p_site NOT IN ('au', 'uk', 'us') THEN RAISE EXCEPTION 'reconcile_order_timeline_app: unsupported site'; END IF;
   IF p_order_number IS NULL OR pg_catalog.length(p_order_number) NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'reconcile_order_timeline_app: order number must be 1..64 characters'; END IF;
+  -- one reconciliation per site/order at a time (first-observation times below must be unique)
+  PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('order_timeline_app:' || p_site || '/' || p_order_number, 0));
   SELECT count(*) INTO v_n FROM (SELECT 1 FROM public.production_events pe WHERE pe.location = p_site AND pe.order_number = p_order_number LIMIT 501) z;
   IF v_n > 500 THEN RAISE EXCEPTION 'reconcile_order_timeline_app: more than 500 events exceed the limit 500'; END IF;
 
@@ -141,7 +152,29 @@ BEGIN
     END IF;
   END IF;
 
-  v_list := v_list || v_cancels || v_proof;
+  -- withdraw any stored receipt proof for this site/order that is not the currently valid receipt's proof
+  -- (bounded: one saved commit per site/order, so more than a handful means something is wrong)
+  IF (SELECT count(*) FROM (SELECT 1 FROM public.order_timeline_evidence x
+        WHERE x.site = p_site AND x.order_number = p_order_number AND x.source = 'app' AND x.retracts_key IS NULL
+          AND x.framing_complete IS TRUE AND pg_catalog.starts_with(x.occurrence_key, p_site || '/receipt:') LIMIT 11) z) > 10 THEN
+    RAISE EXCEPTION 'reconcile_order_timeline_app: more than 10 stored receipt proofs exceed the limit 10';
+  END IF;
+  SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+           'source', 'app', 'key', w.wkey, 'site', p_site, 'shop', NULL, 'shopifyOrderId', NULL, 'orderNumber', p_order_number,
+           'stage', 'framed', 'kind', 'confirmed', 'retractsKey', w.pkey,
+           -- first observation: the stored withdrawal time if one exists, else this transaction's time
+           'happenedAt', public.order_timeline_utc(coalesce(
+             (SELECT y.happened_at FROM public.order_timeline_evidence y WHERE y.source = 'app' AND y.occurrence_key = w.wkey), pg_catalog.now())))
+         ORDER BY w.pkey), '[]'::jsonb)
+    INTO v_withdraw
+    FROM (SELECT x.occurrence_key AS pkey,
+                 p_site || '/receipt-invalid:' || pg_catalog.substr(x.occurrence_key, pg_catalog.length(p_site || '/receipt:') + 1) AS wkey
+            FROM public.order_timeline_evidence x
+           WHERE x.site = p_site AND x.order_number = p_order_number AND x.source = 'app' AND x.retracts_key IS NULL
+             AND x.framing_complete IS TRUE AND pg_catalog.starts_with(x.occurrence_key, p_site || '/receipt:')
+             AND NOT (v_valid AND x.occurrence_key = v_key)) w;
+
+  v_list := v_list || v_cancels || v_proof || v_withdraw;
   IF pg_catalog.jsonb_array_length(v_list) > 200 THEN
     RAISE EXCEPTION 'reconcile_order_timeline_app: more than 200 occurrences exceed the limit 200';
   END IF;

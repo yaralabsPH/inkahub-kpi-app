@@ -230,7 +230,8 @@ async function seedReceipt(o: {
   return { ids, site };
 }
 const ownerAt = (site: string): ReportingPrincipal => ({ userId: STAFF, role: "owner", nav: new Set(["reports"]), sites: new Set([site]) });
-const timelineOf = (site: string, num: string) => readOrderTimeline(ownerAt(site), { site, orderNumber: num }, { rpc: rpc(), now: () => Date.parse("2026-11-23T00:00:00Z") });
+// real clock: first-observation withdrawals are timed by the database, and the read applies retractions up to "now"
+const timelineOf = (site: string, num: string) => readOrderTimeline(ownerAt(site), { site, orderNumber: num }, { rpc: rpc(), now: () => Date.now() + 60_000 });
 const reconcileApp = async (site: string, num: string) => {
   const r = await rpc().rpc("reconcile_order_timeline_app", { p_site: site, p_order_number: num });
   if (r.error) throw new Error(r.error.message);
@@ -390,6 +391,49 @@ describe("0061 scanner receipt framing proof", () => {
     // a proof arriving afterwards (e.g. from an earlier copy) would still be revoked by the stored retraction
     await ingest(null, [{ source: "app", key: `uk/receipt:${rid}`, site: "uk", shop: null, shopifyOrderId: null, orderNumber: "10000302", stage: "framed", kind: "confirmed", happenedAt: AT, framingComplete: true }]);
     expect((await timelineOf("uk", "10000302")).stages?.find((s) => s.stage === "framed")?.status).not.toBe("confirmed");
+  });
+
+  it("review P2: an owner removing a listed event after the proof withdraws it at the first observation; replay keeps that time; restoring does not undo", async () => {
+    await linkOrder("uk", "10000303");
+    const rid = "00000000-0000-4000-8000-000000000303";
+    const { ids } = await seedReceipt({ order: "10000303", rid, at: AT });
+    await reconcileApp("uk", "10000303");
+    expect((await timelineOf("uk", "10000303")).stages?.find((s) => s.stage === "framed")?.status).toBe("confirmed");
+    // Reports owner "Remove" hard-deletes the per-line event
+    const line = ids.find((x) => x.endsWith("-v02"))!;
+    const removed = (await db.query("delete from public.production_events where location = 'uk' and id = $1 returning *", [line])).rows[0] as Record<string, unknown>;
+    const t0 = Date.now();
+    expect(await reconcileApp("uk", "10000303")).toMatchObject({ accepted: 1, duplicates: 1, conflicts: 0 });
+    const withdrawal = (await db.query<{ k: string; r: string; at: Date }>(
+      `select occurrence_key k, retracts_key r, happened_at at from public.order_timeline_evidence where source = 'app' and occurrence_key = $1`, [`uk/receipt-invalid:${rid}`])).rows;
+    expect(withdrawal).toHaveLength(1);
+    expect(withdrawal[0].r).toBe(`uk/receipt:${rid}`);
+    expect(Math.abs(withdrawal[0].at.getTime() - t0)).toBeLessThan(60_000); // observed now, never the scan or an invented time
+    expect((await timelineOf("uk", "10000303")).stages?.find((s) => s.stage === "framed")?.status).toBe("partial");
+    // replay later: the stored first-observation time is reused, so it is a duplicate, not a conflict
+    expect(await reconcileApp("uk", "10000303")).toMatchObject({ accepted: 0, duplicates: 2, conflicts: 0 });
+    // restoring the source row makes the receipt valid again, but the immutable withdrawal still applies
+    await db.query(`insert into public.production_events (location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, station_id, note, created_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, [removed.location, removed.id, removed.staff_id, removed.department, removed.order_number, removed.line_sku, removed.line_quantity, removed.event_type, removed.station_id, removed.note, removed.created_at]);
+    expect(await reconcileApp("uk", "10000303")).toMatchObject({ accepted: 0, duplicates: 2, conflicts: 0 });
+    expect((await timelineOf("uk", "10000303")).stages?.find((s) => s.stage === "framed")?.status).toBe("partial");
+  });
+
+  it("a receipt deleted after its proof also withdraws it; an invalid receipt that never proved gets no phantom withdrawal", async () => {
+    await linkOrder("uk", "10000304");
+    const rid = "00000000-0000-4000-8000-000000000304";
+    await seedReceipt({ order: "10000304", rid, at: AT });
+    await reconcileApp("uk", "10000304");
+    await db.query("delete from public.scanner_requests where location = 'uk' and request_id = $1", [rid]);
+    expect(await reconcileApp("uk", "10000304")).toMatchObject({ accepted: 1, conflicts: 0 });
+    expect((await proofRows("uk", rid)).map((r) => r.occurrence_key)).toEqual([`uk/receipt-invalid:${rid}`, `uk/receipt:${rid}`]);
+    // never-proven invalid receipt (missing event from the start): nothing retracts a proof that never existed
+    await linkOrder("uk", "10000305");
+    const rid2 = "00000000-0000-4000-8000-000000000305";
+    await seedReceipt({ order: "10000305", rid: rid2, at: AT, event: (e) => (e.id.endsWith("-v01") ? null : e) });
+    await reconcileApp("uk", "10000305");
+    await reconcileApp("uk", "10000305");
+    expect(await proofRows("uk", rid2)).toEqual([]);
   });
 
   it("over the ingest bound fails explicitly before writing anything", async () => {
