@@ -264,7 +264,7 @@ function RoleReports() {
           />
           {orderTimelineVisible(a.role) ? (
             <div key={`timeline|${a.scopeKey}`} className="mt-4 space-y-4">
-              <OrderTimelineCard supabase={supabase} scopeKey={a.scopeKey} site={location} />
+              <OrderTimelineCard supabase={supabase} scopeKey={a.scopeKey} site={location} role={a.role} />
               <OrderFlowSection supabase={supabase} scopeKey={a.scopeKey} site={location} />
             </div>
           ) : null}

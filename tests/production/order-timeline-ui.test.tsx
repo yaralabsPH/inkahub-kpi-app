@@ -1,7 +1,10 @@
 /** F10 UI seams: request scope (no stale order/site), rendered states and labels, role visibility. */
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { automationContext, effectiveRequest, OrderTimelineView, timelineQuery, type OrderTimelineView as TimelineData, type TimelineRequest } from "../../src/components/OrderTimelineCard";
+import {
+  automationContext, createSourceRefresher, describeReconcile, effectiveRequest, OrderTimelineView, refreshKeyOf, SourceRefreshMessage, TimelineActions, timelineQuery,
+  type OrderTimelineView as TimelineData, type SourceRefreshState, type TimelineRequest,
+} from "../../src/components/OrderTimelineCard";
 import { flowQuery, flowRequestFor, OrderFlowView, type OrderFlowView as FlowData } from "../../src/components/OrderFlowSection";
 import { createOverviewLoader, type OverviewState } from "../../src/lib/hooks/useReportsOverview";
 import { orderTimelineVisible } from "../../src/pages/Reports";
@@ -158,5 +161,152 @@ describe("F11 automation steps in the card", () => {
     expect(text(html)).not.toMatch(/\bfailed\b|percent|%|printed/i);
     expect(automationContext(data, data.stages![2])).toBe(""); // missing: no context invented
     expect(automationContext(data, data.stages![0])).toBe(""); // not an automation step
+  });
+});
+
+describe("owner-only Refresh sources", () => {
+  const R: TimelineRequest = { site: "au", orderNumber: "#9001" };
+  const KEY = refreshKeyOf(SCOPE, R);
+  const ok = (shopify: unknown, app: unknown = { accepted: 2, duplicates: 1, conflicts: 0, route: "app" }) => ({ site: "au", orderNumber: "9001", app, shopify });
+  const recorded = (over: Record<string, unknown> = {}) => ({ status: "recorded", routedHere: true, note: null, result: { accepted: 3, duplicates: 0, conflicts: 0, route: "matched" }, ...over });
+  type Reply = { ok: boolean; status: number; body: unknown } | Error;
+  function harness(opts: { token?: string | null } = {}) {
+    const calls: Array<{ url: string; init: { method: string; headers: Record<string, string>; body: string } }> = [];
+    const pending: Array<(r: Reply) => void> = [];
+    let current = KEY;
+    let reloads = 0;
+    const r = createSourceRefresher({
+      token: async () => (opts.token === undefined ? "t.t.t" : opts.token),
+      fetch: (url, init) => {
+        calls.push({ url, init });
+        return new Promise((resolve, reject) => pending.push((x) => (x instanceof Error ? reject(x) : resolve({ ok: x.ok, status: x.status, json: async () => x.body }))));
+      },
+      currentKey: () => current,
+      onChange: () => {},
+      reload: () => reloads++,
+    });
+    return { r, calls, pending, reloads: () => reloads, setCurrent: (k: string) => (current = k) };
+  }
+  const idle: SourceRefreshState = { key: "", busy: false, tone: null, message: null };
+
+  it("only owners see Refresh sources; every reader keeps the stored-data Refresh", () => {
+    for (const role of ["manager", "cs", null]) {
+      const html = renderToStaticMarkup(<TimelineActions active role={role} busy={false} onReload={() => {}} onRefreshSources={() => {}} />);
+      expect(html).toContain(">Refresh<");
+      expect(html).not.toContain("Refresh sources");
+    }
+    const owner = renderToStaticMarkup(<TimelineActions active role="owner" busy={false} onReload={() => {}} onRefreshSources={() => {}} />);
+    expect(owner).toContain(">Refresh<");
+    expect(owner).toContain("Refresh sources");
+    expect(renderToStaticMarkup(<TimelineActions active role="owner" busy onReload={() => {}} onRefreshSources={() => {}} />)).toMatch(/disabled=""[^>]*>Refreshing sources…/);
+    expect(renderToStaticMarkup(<TimelineActions active={false} role="owner" busy={false} onReload={() => {}} onRefreshSources={() => {}} />)).toBe("");
+  });
+
+  it("POSTs the existing reconcile action with the session, then reloads the same order; a double click sends one request", async () => {
+    const h = harness();
+    void h.r.refresh(SCOPE, R);
+    void h.r.refresh(SCOPE, R);
+    await tick();
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0].url).toBe("/api/orders/timeline");
+    expect(h.calls[0].init.method).toBe("POST");
+    expect(h.calls[0].init.headers.Authorization).toBe("Bearer t.t.t");
+    expect(JSON.parse(h.calls[0].init.body)).toEqual({ action: "reconcile", site: "au", orderNumber: "#9001" });
+    expect(h.r.state()).toMatchObject({ key: KEY, busy: true });
+    h.pending[0]({ ok: true, status: 200, body: ok(recorded()) });
+    await tick();
+    expect(h.r.state()).toMatchObject({ busy: false, tone: "ok" });
+    expect(h.r.state().message).toBe("Sources refreshed. App events: 2 new, 1 already recorded. Shopify: 3 new, 0 already recorded.");
+    expect(h.reloads()).toBe(1);
+    const msg = renderToStaticMarkup(<SourceRefreshMessage state={h.r.state()} />);
+    expect(msg).toContain("Sources refreshed");
+    expect(text(msg)).not.toMatch(CLASSIFY);
+  });
+
+  it("partial outcomes never read as a full synchronization", () => {
+    const partials = [
+      ok({ status: "not_configured", note: "Shopify reading is not configured; only app events were refreshed" }),
+      ok({ status: "not_found", note: "No Shopify order has this number" }),
+      ok(recorded({ routedHere: false, note: "This order belongs to another site and is not shown here" })),
+      ok(recorded({ note: "Shopify routing disagrees with the recorded site; the recorded site was kept", result: { accepted: 0, duplicates: 2, conflicts: 0, route: "conflict" } })),
+      ok(recorded({ result: { accepted: 1, duplicates: 0, conflicts: 2, route: "matched" } })),
+    ];
+    for (const body of partials) {
+      const d = describeReconcile(body, R);
+      expect(d.tone).toBe("partial");
+      expect(d.message).not.toContain("Sources refreshed");
+    }
+    expect(describeReconcile(partials[0], R).message).toContain("Shopify not refreshed: Shopify reading is not configured");
+    expect(describeReconcile(partials[4], R).message).toContain("2 conflicting facts kept as first recorded");
+  });
+
+  it("malformed or mismatched answers are an unknown outcome, not success", () => {
+    const bad = [
+      null, [], "ok", {},
+      ok(recorded(), { accepted: -1, duplicates: 0, conflicts: 0, route: "app" }),
+      ok({ status: "weird" }),
+      ok(recorded({ result: null })),
+      { ...ok(recorded()), site: "uk" },
+      { ...ok(recorded()), orderNumber: "9002" },
+    ];
+    for (const body of bad) {
+      const d = describeReconcile(body, R);
+      expect(d.tone).toBe("error");
+      expect(d.message).toContain("unknown");
+    }
+  });
+
+  it("API errors: a Shopify failure after the app copy is partial and reloads; refused requests do not reload", async () => {
+    const cases: Array<[Reply, string, boolean, string]> = [
+      [{ ok: false, status: 503, body: { error: "Shopify returned 502", code: "SHOPIFY_UNAVAILABLE" } }, "partial", true, "App events were refreshed; Shopify could not be read (Shopify returned 502). Refresh incomplete."],
+      [{ ok: false, status: 403, body: { error: "Only an owner can refresh an order's timeline", code: "FORBIDDEN" } }, "error", false, "Refresh sources failed: Only an owner can refresh an order's timeline"],
+      [{ ok: false, status: 503, body: { error: "Timeline ingestion is disabled; reconciliation is off", code: "DISABLED" } }, "error", false, "Refresh sources failed: Timeline ingestion is disabled"],
+      [{ ok: false, status: 503, body: { error: "The timeline could not record this order", code: "UNAVAILABLE" } }, "error", true, "Some events may already be saved"],
+      [{ ok: false, status: 502, body: "<html>" }, "error", true, "request failed (502)"],
+      [new Error("Failed to fetch"), "error", true, "outcome unknown (Failed to fetch)"],
+    ];
+    for (const [reply, tone, reload, message] of cases) {
+      const h = harness();
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      h.pending[0](reply);
+      await tick();
+      expect(h.r.state()).toMatchObject({ busy: false, tone });
+      expect(h.r.state().message).toContain(message);
+      expect(h.reloads()).toBe(reload ? 1 : 0);
+    }
+    const noSession = harness({ token: null });
+    await noSession.r.refresh(SCOPE, R);
+    expect(noSession.calls).toHaveLength(0);
+    expect(noSession.r.state()).toMatchObject({ tone: "error", message: "Sign in again to refresh sources." });
+  });
+
+  it("a late answer after the user, site or order changed neither paints nor reloads another order", async () => {
+    const others = [
+      refreshKeyOf("22222222-2222-4222-8222-222222222222|owner|site", R),
+      refreshKeyOf(SCOPE, { site: "uk", orderNumber: "#9001" }),
+      refreshKeyOf(SCOPE, { site: "au", orderNumber: "9002" }),
+      "",
+    ];
+    for (const next of others) {
+      const h = harness();
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      h.setCurrent(next);
+      h.r.reset();
+      h.pending[0]({ ok: true, status: 200, body: ok(recorded()) });
+      await tick();
+      expect(h.r.state()).toEqual(idle);
+      expect(h.reloads()).toBe(0);
+    }
+    // identity changed before the reset effect ran: the answer is still dropped
+    const h = harness();
+    void h.r.refresh(SCOPE, R);
+    await tick();
+    h.setCurrent(refreshKeyOf(SCOPE, { site: "au", orderNumber: "1" }));
+    h.pending[0](new Error("late"));
+    await tick();
+    expect(h.r.state()).toMatchObject({ key: KEY, busy: true });
+    expect(h.reloads()).toBe(0);
   });
 });

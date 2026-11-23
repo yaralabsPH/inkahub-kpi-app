@@ -7,7 +7,7 @@
  * scope + site + order, so a change clears the result and late answers for an
  * older site/order are dropped.
  */
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { Search } from "lucide-react";
 import { Button } from "@/components/ui/Button";
@@ -89,13 +89,167 @@ export function useTimelineLoad<R, T>(supabase: SupabaseClient, queryOf: (r: R) 
 /** The looked-up order only while the selected site is the one it was looked up for. */
 export const effectiveRequest = (r: TimelineRequest | null, site: string): TimelineRequest | null => (r && r.site === site ? r : null);
 
-export function OrderTimelineCard({ supabase, scopeKey, site }: { supabase: SupabaseClient; scopeKey: string; site: string }) {
+// ---------------------------------------------------------------------------
+// Owner-only "Refresh sources": the existing POST {action:"reconcile"} copies
+// one order's app events and reads Shopify (read-only), then the stored
+// timeline is reloaded. The server re-authorizes (owner only); the UI only
+// hides the action for other roles.
+// ---------------------------------------------------------------------------
+
+export type SourceRefreshTone = "ok" | "partial" | "error";
+export interface SourceRefreshState { key: string; busy: boolean; tone: SourceRefreshTone | null; message: string | null }
+const IDLE_REFRESH: SourceRefreshState = { key: "", busy: false, tone: null, message: null };
+
+const bareOrder = (s: string) => s.trim().replace(/^#/, "").trim();
+const count = (v: unknown): number | null => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null);
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+
+/**
+ * One reconcile response -> a concise, honest outcome. Only "ok" claims both
+ * sources were refreshed; a missing, unconfigured, unrouted or conflicting
+ * Shopify read is "partial"; a shape we don't recognise is an error (outcome unknown).
+ */
+export function describeReconcile(body: unknown, r: TimelineRequest): { tone: SourceRefreshTone; message: string } {
+  const unknown = { tone: "error" as const, message: "Refresh sources returned an unexpected answer; whether anything was saved is unknown. The timeline shows what is stored." };
+  const o = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+  if (!o || o.site !== r.site || typeof o.orderNumber !== "string" || bareOrder(o.orderNumber) !== bareOrder(r.orderNumber)) return unknown;
+  const app = o.app && typeof o.app === "object" ? (o.app as Record<string, unknown>) : null;
+  const appNew = count(app?.accepted);
+  const appDup = count(app?.duplicates);
+  const s = o.shopify && typeof o.shopify === "object" ? (o.shopify as Record<string, unknown>) : null;
+  if (appNew === null || appDup === null || !s) return unknown;
+  const appText = `App events: ${appNew} new, ${appDup} already recorded.`;
+  const note = typeof s.note === "string" && s.note ? s.note : null;
+  if (s.status === "not_found" || s.status === "not_configured") {
+    return { tone: "partial", message: `${appText} Shopify not refreshed: ${note ?? (s.status === "not_found" ? "no Shopify order has this number" : "Shopify reading is not configured")}. Refresh incomplete.` };
+  }
+  if (s.status !== "recorded") return unknown;
+  const res = s.result && typeof s.result === "object" ? (s.result as Record<string, unknown>) : null;
+  const shNew = count(res?.accepted);
+  const shDup = count(res?.duplicates);
+  const shConf = count(res?.conflicts);
+  if (shNew === null || shDup === null || shConf === null || typeof s.routedHere !== "boolean") return unknown;
+  const shText = `Shopify: ${shNew} new, ${shDup} already recorded${shConf ? `, ${plural(shConf, "conflicting fact")} kept as first recorded` : ""}.`;
+  if (!s.routedHere || note) return { tone: "partial", message: `${appText} ${shText} ${note ?? "The Shopify order is not linked to this site"}. Refresh incomplete.` };
+  if (shConf) return { tone: "partial", message: `Sources read, with conflicts. ${appText} ${shText}` };
+  return { tone: "ok", message: `Sources refreshed. ${appText} ${shText}` };
+}
+
+/** HTTP failures that wrote nothing (validation, auth, ingestion switched off): no reload needed. */
+const NOTHING_WRITTEN = new Set(["BAD_REQUEST", "UNAUTHENTICATED", "FORBIDDEN", "DISABLED", "METHOD"]);
+
+export interface SourceRefresherDeps {
+  fetch: (url: string, init: { method: "POST"; headers: Record<string, string>; body: string }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+  token: () => Promise<string | null>;
+  /** The identity (scope + site + order) currently on screen; a result for any other is dropped. */
+  currentKey: () => string;
+  onChange: (s: SourceRefreshState) => void;
+  /** Reload the stored timeline of the CURRENT order (called only while `key` is still current). */
+  reload: () => void;
+}
+
+export const refreshKeyOf = (scopeKey: string, r: TimelineRequest) => `${scopeKey}|${timelineQuery(r)}`;
+
+export function createSourceRefresher(deps: SourceRefresherDeps) {
+  let state: SourceRefreshState = IDLE_REFRESH;
+  let seq = 0;
+  const set = (s: SourceRefreshState) => {
+    state = s;
+    deps.onChange(s);
+  };
+  return {
+    state: () => state,
+    /** Start one refresh; ignored while one is already running for this identity. */
+    async refresh(scopeKey: string, r: TimelineRequest): Promise<void> {
+      const key = refreshKeyOf(scopeKey, r);
+      if (state.busy && state.key === key) return;
+      const mine = ++seq;
+      set({ key, busy: true, tone: null, message: null });
+      const current = () => mine === seq && deps.currentKey() === key;
+      const finish = (tone: SourceRefreshTone, message: string, reload: boolean) => {
+        if (!current()) return;
+        set({ key, busy: false, tone, message });
+        if (reload) deps.reload();
+      };
+      try {
+        const token = await deps.token();
+        if (!current()) return;
+        if (!token) return finish("error", "Sign in again to refresh sources.", false);
+        const res = await deps.fetch("/api/orders/timeline", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "reconcile", site: r.site, orderNumber: r.orderNumber }),
+        });
+        const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+        if (!current()) return;
+        if (res.ok) {
+          const d = describeReconcile(body, r);
+          return finish(d.tone, d.message, true);
+        }
+        const code = typeof body?.code === "string" ? body.code : `HTTP_${res.status}`;
+        const error = typeof body?.error === "string" ? body.error : `request failed (${res.status})`;
+        // the app copy is committed before Shopify is read, so a Shopify failure is a partial refresh
+        if (code === "SHOPIFY_UNAVAILABLE") return finish("partial", `App events were refreshed; Shopify could not be read (${error}). Refresh incomplete.`, true);
+        if (NOTHING_WRITTEN.has(code)) return finish("error", `Refresh sources failed: ${error}`, false);
+        return finish("error", `Refresh sources did not complete: ${error}. Some events may already be saved; the timeline shows what is stored.`, true);
+      } catch (e) {
+        finish("error", `Refresh sources outcome unknown (${e instanceof Error ? e.message : "network error"}). The timeline shows what is stored.`, true);
+      }
+    },
+    /** Identity changed: forget the old result; a late answer is ignored. */
+    reset() {
+      seq++;
+      if (state !== IDLE_REFRESH) set(IDLE_REFRESH);
+    },
+  };
+}
+
+/** Buttons for the looked-up order. Only an owner gets Refresh sources; every reader keeps the stored-data Refresh. */
+export function TimelineActions({ active, role, busy, onReload, onRefreshSources }: { active: boolean; role: string | null; busy: boolean; onReload: () => void; onRefreshSources: () => void }) {
+  if (!active) return null;
+  return (
+    <>
+      <Button type="button" variant="secondary" size="sm" onClick={onReload}>Refresh</Button>
+      {role === "owner" ? (
+        <Button type="button" variant="secondary" size="sm" disabled={busy} aria-busy={busy} onClick={onRefreshSources} title="Copy this order's app events and read Shopify, then reload">
+          {busy ? "Refreshing sources…" : "Refresh sources"}
+        </Button>
+      ) : null}
+    </>
+  );
+}
+
+export function SourceRefreshMessage({ state }: { state: SourceRefreshState }) {
+  if (state.busy) return <div className="text-xs text-slate-500" role="status">Refreshing sources…</div>;
+  if (!state.message) return null;
+  const cls = state.tone === "ok" ? "text-emerald-700 dark:text-emerald-300" : state.tone === "partial" ? "text-amber-700 dark:text-amber-300" : "text-rose-700 dark:text-rose-300";
+  return <div className={`text-xs ${cls}`} role={state.tone === "error" ? "alert" : "status"}>{state.message}</div>;
+}
+
+export function OrderTimelineCard({ supabase, scopeKey, site, role }: { supabase: SupabaseClient; scopeKey: string; site: string; role: string | null }) {
   const [draft, setDraft] = useState("");
   const [request, setRequest] = useState<TimelineRequest | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   // only a request for the CURRENT site is ever loaded or shown (no frame of another site's order)
   const active = effectiveRequest(request, site);
   const state = useTimelineLoad<TimelineRequest, OrderTimelineView>(supabase, timelineQuery, scopeKey, active, refreshKey);
+  const currentKey = active ? refreshKeyOf(scopeKey, active) : "";
+  const currentKeyRef = useRef(currentKey);
+  currentKeyRef.current = currentKey;
+  const [sources, setSources] = useState<SourceRefreshState>(IDLE_REFRESH);
+  const refresher = useMemo(
+    () =>
+      createSourceRefresher({
+        fetch: (url, init) => window.fetch(url, init),
+        token: async () => (await supabase.auth.getSession()).data.session?.access_token ?? null,
+        currentKey: () => currentKeyRef.current,
+        onChange: setSources,
+        reload: () => setRefreshKey((k) => k + 1),
+      }),
+    [supabase],
+  );
+  useEffect(() => refresher.reset(), [refresher, currentKey]);
+  const shownSources = sources.key === currentKey ? sources : IDLE_REFRESH;
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const n = draft.trim();
@@ -117,9 +271,18 @@ export function OrderTimelineCard({ supabase, scopeKey, site }: { supabase: Supa
               onChange={(e) => setDraft(e.target.value)}
             />
             <Button type="submit" size="sm" disabled={!draft.trim() || !isReportSite(site)}><Search size={14} /> Look up</Button>
-            {active ? <Button type="button" variant="secondary" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>Refresh</Button> : null}
+            <TimelineActions
+              active={!!active}
+              role={role}
+              busy={shownSources.busy}
+              onReload={() => setRefreshKey((k) => k + 1)}
+              onRefreshSources={() => {
+                if (active && role === "owner") void refresher.refresh(scopeKey, active);
+              }}
+            />
           </form>
           {!isReportSite(site) ? <p className="text-xs text-slate-500">Choose AU, UK or US to look up an order.</p> : null}
+          <SourceRefreshMessage state={shownSources} />
           <OrderTimelineView state={state} onRetry={() => setRefreshKey((k) => k + 1)} />
         </section>
       </CardBody>

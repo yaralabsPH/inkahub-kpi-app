@@ -25,11 +25,11 @@
 
 Files: `src/components/OrderTimelineCard.tsx`, `src/pages/Reports.tsx`, `tests/production/order-timeline-ui.test.tsx`, existing API tests only if behavior changes.
 
-- [ ] Add an owner-only **Refresh sources** action for the currently looked-up order; pass the trusted role from Reports. Preserve ordinary stored-data Refresh for readers.
-- [ ] Call the existing POST `{action:"reconcile", site, orderNumber}` with the current Supabase session, then reload the same timeline on success. No new endpoint, dependency, cron or repository interface.
-- [ ] Prevent concurrent submissions; show a concise loading/error/result message. `not_configured`, `not_found`, routing disagreement and partial source failure must not look like full synchronization. If app evidence was copied before Shopify failed, preserve it and say the refresh was incomplete.
-- [ ] Bind asynchronous results to user scope, site and order. A late response after switching scope must neither paint an old message nor reload another order. Unauthorized API requests must still be denied server-side.
-- [ ] Focused tests for owner/non-owner rendering, POST and reload, failure, double-click and stale-response behavior. Commit before returning to Codex review.
+- [x] Add an owner-only **Refresh sources** action for the currently looked-up order; pass the trusted role from Reports. Preserve ordinary stored-data Refresh for readers.
+- [x] Call the existing POST `{action:"reconcile", site, orderNumber}` with the current Supabase session, then reload the same timeline on success. No new endpoint, dependency, cron or repository interface.
+- [x] Prevent concurrent submissions; show a concise loading/error/result message. `not_configured`, `not_found`, routing disagreement and partial source failure must not look like full synchronization. If app evidence was copied before Shopify failed, preserve it and say the refresh was incomplete.
+- [x] Bind asynchronous results to user scope, site and order. A late response after switching scope must neither paint an old message nor reload another order. Unauthorized API requests must still be denied server-side.
+- [x] Focused tests for owner/non-owner rendering, POST and reload, failure, double-click and stale-response behavior. Commit before returning to Codex review.
 
 ### 2. Resolve and commission routing
 
@@ -70,3 +70,4 @@ Rollback: previous Preview plus ingestion off; retain additive evidence. No prod
 ## Implementation log
 
 - Planning/source discovery only. No new app code, SQL migration or deployment in this continuation yet.
+- Task 1: owner-only **Refresh sources** in `OrderTimelineCard` (role passed from Reports; stored-data Refresh kept for all readers) calls the existing POST reconcile, then reloads the same order. Pure `createSourceRefresher`/`describeReconcile` allow one request per identity, drop late answers after a user/site/order change, and report not_configured, not_found, unrouted, routing conflict, fact conflicts and `SHOPIFY_UNAVAILABLE` (app copy already committed) as incomplete; malformed answers as unknown. No API, endpoint, dependency or interface change; server owner denial was already tested in `tests/api/order-timeline.test.ts`.
