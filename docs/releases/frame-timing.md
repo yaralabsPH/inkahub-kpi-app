@@ -55,8 +55,6 @@ app does not call them. Weight history is kept; do not delete it.
   (including legacy or lookalike ids) is one capture per event.
 - Shift, clock and missing-weight notes describe the selected person (everyone when unfiltered).
 - After acceptance checks, root can return staging to blank defaults with "Clear all weights".
-- The clock-event read still scans the generation's source_versions for the site (filtered in the scan,
-  not materialized); no new index was added.
-- The stream read scans the generation's `source_versions` for clock events;
-  performance is proven offline only. Physical scanner commissioning remains
+- The clock-event read still scans the generation's `source_versions` for the site (filtered in the scan,
+  not materialized; no new index); performance is proven offline only. Physical scanner commissioning remains
   separate.
