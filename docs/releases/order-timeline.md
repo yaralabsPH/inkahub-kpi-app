@@ -1,12 +1,10 @@
 # F10 Order timeline — release notes (staging only)
 
-Branch `feature/order-timeline`, included in the F11 Preview at `e216051`.
-Synthetic staging acceptance passed on 2026-11-23: hosted role checks, order
-lookup, adjacent durations, duplicate replay and the browser display. Production
-and the three live Make systems are untouched. Real Shopify routing, webhook
-subscription/raw-body acceptance and reconciliation commissioning remain pending.
-See [F11 staging release](make-milestones.md) and
-[the commissioning review](../reviews/make-milestones-r2.md).
+Current staging release: application `b2e3afcc`, branch `feature/order-timeline-commissioning`, draft PR21 on PR20. [Open Preview](https://inka-arthouse-bzm9p9cwg-inka-arthouse-s-projects.vercel.app/reports).
+
+Owner source refresh and country routing are commissioned. Scanner receipts prove full framing; complete bounded Shopify item coverage proves whole shipment and, when every contributing fulfillment has a delivery timestamp, delivery. Durations only. See [commissioning acceptance](../reviews/order-timeline-commissioning-r2.md).
+
+Only Free staging `rsfdqkjasiozmbdtgquv` was changed. 0061 and 0062 are applied after its consolidated 0001–0060 baseline. Do not run a blind database push. Production and live Make systems are unchanged. Automatic Shopify subscriptions and historical backfill are not part of this release.
 
 ## What ships
 
@@ -32,7 +30,7 @@ See [F11 staging release](make-milestones.md) and
     only with explicit Reports permission + membership; staff/kiosk 403
     before any read.
   - `POST {action:"reconcile",site,orderNumber}`: owner only. Copies that
-    order's recorded app framing/dispatch for that site, then makes ONE
+    order's recorded app framing/dispatch for that site, then resolves the immutable order ID and makes a second, generation-fenced
     read-only Shopify GraphQL query (Admin API `2026-10`) and records the
     order. No mutations, fulfillment actions or subscriptions.
   - `POST` with `X-Shopify-Hmac-Sha256`: order webhooks (`orders/create`,
@@ -44,13 +42,9 @@ See [F11 staging release](make-milestones.md) and
 - Reports: "Order timeline" lookup card and "Order flow durations" for
   owner/manager/CS. Durations only: median/P90, sample/unknown/anomaly counts,
   and a coverage label ("recorded orders, not complete Shopify history").
-- What the Shopify data can and cannot prove:
-  - Each fulfillment is recorded at the time it was created in Shopify. That
-    is not whole-order shipment, so order-to-complete-shipment stays unknown
-    until a source that times whole-order shipment is commissioned.
-  - Delivery is per fulfillment. Whole-order delivered needs explicit proof
-    (none today).
-  - Shopify's current "fulfilled" state is never used to backdate a time.
+- Additive 0061 validates the scanner receipt and its original events, records full framing at scan time, and withdraws proof when an event is cancelled or its source disappears. Classic/manual completion remains partial. Completeness is scanner-attested, not a new Shopify quantity check.
+- Additive 0062 stores a service-only generation/revision/hash and active proof keys. Refresh takes a ticket before reading Shopify. Stale results cannot overwrite newer proof. Changed/absent proof withdraws the previous keys at first observation and uses fresh revision keys for any new proof. Webhooks can invalidate, never promote whole proof.
+- Shipment proof requires an explicitly unedited, uncancelled order, complete lists, successful fulfillments and exact coverage. Bounds: 50 order lines, fewer than 20 fulfillments, at most 20 lines per fulfillment. Ambiguity stays unknown. Shipment time is the latest contributing fulfillment creation; delivery is the latest actual Shopify-reported delivery time only when every contributor has one. No use of current fulfilled state or updatedAt as historical delivery time. The UI labels delivery provenance accordingly.
 
 ## Configuration (server env, Preview/staging only until approved)
 
@@ -67,41 +61,16 @@ Routing contract (one shared store; the shop never implies a site):
 {"version":1,"shops":{"<shop>.myshopify.com":{"kind":"shipping_country","map":{"AU":"au","GB":"uk","US":"us"}}}}
 ```
 
-`kind` is `shipping_country` (ISO alpha-2), `order_tag` (exact tag), or
-`note_attribute` (with `name`). Zero or several matching sites means
-unrouted, with a reason. **The real predicate must be root's verified AU/UK/US
-routing field from the current printing system.** The map above is an
-example, not a ruling. If the verified field fits none of the three kinds, a
-small additive extractor is needed first.
+The commissioned Preview uses `shipping_country` for the one shared shop `inka-arthouse.myshopify.com`. CJ selected nearest production facility by order delivery country. A reviewed 242-country map uses country reference points and actual Airport West (AU), Derby (UK) and San Diego (US) facility coordinates. RETURNS PILE is excluded. This is a country-level geographic approximation, not customer-address distance or transit time. Missing/unmapped countries remain unrouted; no catch-all. The current snapshot omits AC, AX, BL, BQ, CW, MF, SS, SX, TA and UM. Live printing routing was not changed.
 
-## Staging steps (root, after database recovery/headroom)
+## Accepted staging checks
 
-1. Apply 0059 on staging only. Rollback-transaction checks: authenticated and
-   anon cannot select either table or execute the four RPCs; service role can
-   run them; update/delete of evidence fails.
-2. Tiny replay fixtures (synthetic shop/order ids, no bulk load): ingest an
-   order, replay it (duplicate), alter it (conflict, original kept), send a
-   fulfillment before its order (unrouted, then routed), and route it to a
-   second site (conflict, site unchanged). Use the same order number at two
-   sites and confirm they never merge.
-3. **Routing stays unset** until the user explains which location decides the
-   site (shipping country, Shopify fulfillment location or submitting-form
-   site) and root verifies it. Then set up the Preview env with that routing
-   JSON and a staging webhook secret. Oversized tag (>250) or attribute
-   (>100) lists leave an order unrouted.
-   Send signed synthetic payloads. Expect: wrong signature 401, other shop
-   403, oversized 413, valid 200. **Confirm the raw body is readable on
-   Vercel**: a 503 `CONFIG` "Raw body unavailable" means the runtime parsed
-   the body first and the adapter needs changing. It never accepts unsigned
-   data.
-4. Per role on Preview: owner (lookup, flow, reconcile), manager (lookup/flow;
-   reconcile 403), CS with/without Reports, staff/kiosk (no cards; API 403).
-   Switch sites mid-lookup: the old order never shows under the new site.
-5. Confirm the order-number alias: Shopify name minus one leading `#` equals
-   the app's scanned order number.
-6. Reconciliation commissioning: owner reconciles a few known staging orders.
-   Shopify webhook subscription is a separate, human-approved step, and it
-   is not done by this branch.
+- Local gate: 3,373 tests / 139 files, type checks and build pass. Review corrections cover deleted scan sources and missing current routing.
+- Owned fixtures: `10999991` shows all ten steps; `10999992` shows partial framing after a per-line cancellation. Exact scanner/reconcile replays add no evidence. Inventory ledger remains empty, prior order `99000001` keeps its eight facts.
+- Complete shipment/delivery fixture uses the actual service code and hosted database with synthetic Shopify input. Five automation reports for this fixture were posted directly to the scoped endpoint, not executed by Make. Earlier actual staging Make-chain validation remains on `99000001`.
+- A real read-only refresh of shared-store order `10250610` succeeds through the deployed API, routes to US and proves full shipment at its Shopify fulfillment creation time. Delivery remains missing because Shopify has no deliveredAt. No real Shopify order was mutated.
+- No session returns401; non-owner reconciliation returns403. Browser confirms complete and cancelled-scan states. The separate production summary has no published F1 snapshot in this fresh staging database.
+- Automatic webhook subscriptions and deployed raw-body HMAC acceptance were not commissioned; use explicit owner Refresh sources. There is no historical backfill or lateness classification.
 
 ## Rollback
 
