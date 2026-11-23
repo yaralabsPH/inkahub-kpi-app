@@ -6,7 +6,10 @@
  *   GET  ?action=flow&site=&firstDate=&lastDate=   app session (same readers)
  *   POST {action:"reconcile", site, orderNumber}   app session, owner only
  *   POST (Shopify order webhook)                   X-Shopify-Hmac-Sha256 over the raw body only
+ *   GET  ?action=make_batch&site=&batchId=         app session (same readers): F11 batch membership status
+ *   POST (F11 Make part report, schemaVersion 1)   x-inka-make-scope + x-inka-make-key only (MAKE_MILESTONE_SCOPES)
  *
+ * Exactly one auth method per request (session, Shopify signature or Make scope key).
  * The two auth paths are separate: a request carrying a Shopify signature is
  * ONLY ever verified as a webhook (no session fallback), and one carrying both
  * a session and a signature is refused. Webhooks: size limit, secret present,
@@ -30,6 +33,9 @@ import {
 } from "../_lib/shopify-webhooks.js";
 import { queryRecord } from "../reports/summary.js";
 import { normalizeShop } from "../../src/lib/domain/orderTimeline.js";
+import {
+  authenticateMake, EnvelopeError, ingestMakeEnvelope, MAKE_BODY_MAX_BYTES, MakeConflict, parseMakeScopes, readMakeBatch, validateEnvelope,
+} from "../_lib/make-milestones.js";
 
 export interface TimelineHandlerDeps {
   auth(): AuthDeps | null;
@@ -108,11 +114,65 @@ export function createOrderTimelineHandler(deps: TimelineHandlerDeps = defaults(
     }
   }
 
+  /** F11: one Make part report. Scope auth before any body read/parse/database work; site/shop only from the scope. */
+  async function makeReport(req: MinimalRequest & RawBodyRequest, res: MinimalResponse) {
+    const env = deps.env();
+    let scopes;
+    try {
+      scopes = parseMakeScopes(env.MAKE_MILESTONE_SCOPES);
+    } catch {
+      return void res.status(503).json({ error: "Milestone scopes are invalid", code: "CONFIG" });
+    }
+    if (!scopes) return void res.status(503).json({ error: "Milestone reporting is not configured", code: "CONFIG" });
+    const scope = authenticateMake(req.headers, scopes);
+    if (!scope) {
+      deps.audit?.({ event: "make_bad_key" });
+      return void res.status(401).json({ error: "Invalid milestone credentials", code: "UNAUTHENTICATED" });
+    }
+    if (env.ORDER_TIMELINE_INGEST !== "on") return void res.status(503).json({ error: "Timeline ingestion is disabled", code: "DISABLED" });
+    const declared = Number(header(req, "content-length") ?? "0");
+    if (Number.isFinite(declared) && declared > MAKE_BODY_MAX_BYTES) return void res.status(413).json({ error: "Payload too large", code: "TOO_LARGE" });
+    let envelope;
+    try {
+      const raw = await readRawBody(req, MAKE_BODY_MAX_BYTES).catch((e) => {
+        // a runtime that already parsed JSON is acceptable here (no signature over the bytes); size is re-checked
+        if (e instanceof BodyError && e.code === "RAW_BODY_UNAVAILABLE" && req.body && typeof req.body === "object") {
+          const text = JSON.stringify(req.body);
+          if (Buffer.byteLength(text, "utf8") > MAKE_BODY_MAX_BYTES) throw new BodyError("TOO_LARGE", "request body is too large");
+          return Buffer.from(text, "utf8");
+        }
+        throw e;
+      });
+      envelope = validateEnvelope(JSON.parse(raw.toString("utf8")), deps.now());
+    } catch (e) {
+      if (e instanceof BodyError && e.code === "TOO_LARGE") return void res.status(413).json({ error: "Payload too large", code: "TOO_LARGE" });
+      return void res.status(400).json({ error: e instanceof EnvelopeError ? e.message : "Body must be a JSON envelope", code: "BAD_REQUEST" });
+    }
+    const rpc = deps.rpc();
+    if (!rpc) return void res.status(503).json({ error: "Timeline storage is not configured", code: "CONFIG" });
+    try {
+      const r = await ingestMakeEnvelope(rpc, scope, envelope, deps.audit);
+      res.status(200).json({ result: r.result, stage: envelope.stage, occurrenceId: envelope.occurrenceId, members: r.members });
+    } catch (e) {
+      if (e instanceof MakeConflict) return void res.status(409).json({ error: e.message, code: "CONFLICT" });
+      const { status, body } = errorResponse(e);
+      res.status(status).json(body);
+    }
+  }
+
   return async function handler(req: MinimalRequest & RawBodyRequest, res: MinimalResponse) {
     res.setHeader("Cache-Control", "no-store");
     const signed = hasHeader(req, "x-shopify-hmac-sha256");
     const session = hasHeader(req, "authorization");
-    if (signed && session) return void res.status(400).json({ error: "Use one authentication method", code: "BAD_REQUEST" });
+    const make = hasHeader(req, "x-inka-make-key") || hasHeader(req, "x-inka-make-scope");
+    if ([signed, session, make].filter(Boolean).length > 1) return void res.status(400).json({ error: "Use one authentication method", code: "BAD_REQUEST" });
+    if (make) {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return void res.status(405).json({ error: "Method not allowed", code: "METHOD" });
+      }
+      return makeReport(req, res);
+    }
     if (signed) {
       if (req.method !== "POST") {
         res.setHeader("Allow", "POST");
@@ -127,11 +187,13 @@ export function createOrderTimelineHandler(deps: TimelineHandlerDeps = defaults(
       const { principal } = await authorizeReportingRequest(req.headers, auth);
       const rpc = deps.rpc();
       if (req.method === "GET") {
-        const q = queryRecord(req.query, ["action", "site", "orderNumber", "firstDate", "lastDate"]);
-        if (q.action !== "order" && q.action !== "flow") throw new ReportingHttpError(400, "BAD_REQUEST", "action must be order or flow");
+        const q = queryRecord(req.query, ["action", "site", "orderNumber", "firstDate", "lastDate", "batchId"]);
+        if (q.action !== "order" && q.action !== "flow" && q.action !== "make_batch") throw new ReportingHttpError(400, "BAD_REQUEST", "action must be order, flow or make_batch");
         const { action, ...rest } = q;
         if (!rpc) throw new ReportingHttpError(500, "CONFIG", "Timeline service configuration missing");
         const readDeps = { rpc, now: deps.now, audit: deps.audit };
+        if (action === "make_batch") return void res.status(200).json(await readMakeBatch(principal, rest, rpc, deps.env().MAKE_MILESTONE_SCOPES));
+        if ("batchId" in rest) throw new ReportingHttpError(400, "BAD_REQUEST", "unknown parameter batchId");
         if (action === "order") {
           for (const k of Object.keys(rest)) if (k !== "site" && k !== "orderNumber") throw new ReportingHttpError(400, "BAD_REQUEST", `unknown parameter ${k}`);
           return void res.status(200).json(await readOrderTimeline(principal, rest, readDeps));

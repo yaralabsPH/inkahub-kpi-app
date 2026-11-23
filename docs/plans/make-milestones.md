@@ -18,9 +18,9 @@ Reordered batch mapping; changed successful subsets; conflicting duplicate paylo
 ### Task 1: Batch ingestion
 
 Files: api/_lib/make-milestones.ts; api/orders/timeline.ts; supabase/migrations/0060_make_milestones.sql; tests/api/make-milestones.test.ts; tests/reporting/pg/make-milestones.test.ts.
-- [ ] First write failing tests for the five review conditions, identical retries and eventual resolution after explicit membership arrives.
-- [ ] Implement schemaVersion1 envelope, scoped dedicated secret authentication before DB/parser work, stable run/event/membership IDs, strict size/stage/time bounds, transactional durable acceptance and unresolved-event status. Reuse F10 identities/evidence; record actual success subsets and never infer missing stages.
-- [ ] Targeted tests/typechecks pass; commit task1.
+- [x] First write failing tests for the five review conditions, identical retries and eventual resolution after explicit membership arrives.
+- [x] Implement schemaVersion1 envelope, scoped dedicated secret authentication before DB/parser work, stable run/event/membership IDs, strict size/stage/time bounds, transactional durable acceptance and unresolved-event status. Reuse F10 identities/evidence; record actual success subsets and never infer missing stages.
+- [x] Targeted tests/typechecks pass; commit task1.
 
 ### Task 2: Progress and commissioning guide
 
@@ -37,7 +37,18 @@ Files: src/components/OrderTimelineCard.tsx; docs/releases/make-milestones.md; t
 
 ## Implementation log
 
-Not started. F10 prerequisite pending.
+- Branch `feature/make-milestones` created from `06bb313` (F10 accepted for isolated staging validation, r2).
+- Task 1: `0060_make_milestones.sql`:
+  - **Tables:** `make_milestone_occurrences` (immutable original envelopes, PK site+shop+occurrence_id, canonical `content`); `make_milestone_members` (Part 1 membership of one batch+version: stable `member_key`, display alias `order_number` with one leading `#` removed, first Shopify id mapping, status unresolved|resolved|ambiguous|site_conflict|alias_conflict|mapping_conflict; identity fields immutable by trigger); `make_milestone_refs` (each envelope's successful subset: pending|attached|not_member|blocked).
+  - **Ingest:** `ingest_make_milestone(site, shop, scope, envelope)` is service-only and atomic. An identical retry is `duplicate`; altered content under the same occurrence, or a second Part 1 occurrence for an already-defined batch/version, is `conflict` and writes nothing; any invalid record rolls back the whole envelope.
+  - **Resolution:** `make_milestone_resolve` runs in the same transaction. Non-members are refused, and one member stated with two ids, or two members with one id, fails closed. An order already routed to another site (`site_conflict`), or recorded with a different alias (`alias_conflict`), is never attached or reassigned. Resolved members get confirmed `make_*` evidence through F10 `ingest_order_timeline` (key `<occurrence>|<member>`, batch id, actual happened_at); an unrouted order is routed once to the scope's site (F10 spec: explicit Make membership may supply the location; flagged for review below). A timeline conflict raises, so nothing is acknowledged.
+  - **Read:** `read_make_batch` (bounded) keeps unresolved and fail-closed members visible.
+- Server: `api/_lib/make-milestones.ts`; `api/orders/timeline.ts` gains a third, exclusive auth path (`x-inka-make-scope` + `x-inka-make-key`, constant-time against `MAKE_MILESTONE_SCOPES`). The order is: auth (401), ingestion switch (503 `DISABLED`), size ≤ 256 KiB (413), strict schemaVersion 1 validation (400, unknown fields incl. site/shop refused, ≤ 500 members, explicit-zone time, not > 5 min in the future), RPC; conflict is 409 and a failed or unexpected transaction is 503. Also added `GET ?action=make_batch&site=&batchId=` (same readers as the timeline; staff/kiosk 403 before any read) so unresolved members are visible. Still 12 functions. `typecheck:api` list extended; `tests/reporting/reportingJobs.test.ts` migration tail extended for 0060 (file not named in the plan, same edit as F9/F10).
+- Tests: PGlite 10 (duplicate/conflict/redefinition, rollback, shape bounds, event-before-membership with real F10 read, changed subset + version isolation + non-member, cross-site refusal, ambiguous + mapping conflict, alias conflict, batch read, grants); API 8 (bad/cross-scope keys 401 with no RPC, config/disabled 503, mixed auth 400, 413, 15 malformed envelopes 400, scope-only site/shop with normalized alias/UTC, 409/503/duplicate, scope config, make_batch auth). Honesty note: both test files were written before the code, but I did not run them red first; instead eight mutations (any key accepted, switch ignored, body site allowed, altered=duplicate, membership redefinable, no site conflict, no not_member, no ambiguity) each fail ≥ 1 test (`C:/Users/cjgom/dev/morning-20261123/f11-mutate.py`). Targeted suites 64/64 (with F10 PG + migration tail), `typecheck:api` clean.
+
+## Open questions
+
+- For root review (not blocking local work): when a resolved Make member names a Shopify order that is NOT yet routed, 0060 routes it once to the connector scope's site (the F10 spec allows explicit Make membership to supply location). An order already routed elsewhere is never changed (`site_conflict`). If root prefers Make never to route, the minimal change is to skip attaching until F10 routing exists (members stay `unresolved` with reason) — one condition in `make_milestone_resolve`.
 
 ## Verified AU identity handoff (2026-11-23)
 
