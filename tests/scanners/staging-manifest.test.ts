@@ -22,7 +22,8 @@ describe("0055 migration", () => {
   it("is the only F6 number; 0048-0051 stay free for F3", () => {
     const files = readdirSync(migrations);
     expect(files.filter((f) => f.startsWith("0055"))).toEqual(["0055_scanner_stations.sql"]);
-    expect(files.filter((f) => /^005[0189]|^004[89]/.test(f))).toEqual([]);
+    // F3 keeps 0048-0051; later numbers were allocated after F6 (0057 F8, 0058 F9).
+    expect(files.filter((f) => /^005[01]|^004[89]/.test(f))).toEqual([]);
   });
 
   it("pins search_path on every function and revokes defaults", () => {
