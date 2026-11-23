@@ -9,7 +9,7 @@
 
 ## Global constraints
 
-Branch feature/make-milestones stacked on completed F10. Existing database is unavailable; no hosted calls, live scenarios, messages or billing changes. Additive0060 only if needed. Five stages, no F12. Existing API slot receives explicit make source with separate auth. All payloads and logs must be secret-free. Respect10:00 Asia/Shanghai checkpoint.
+Branch feature/make-milestones stacked on completed F10. New afternoon request resumes work, no old10am deadline. Root verifies reported staging upgrade/recovery before hosted tests. All THREE live Make systems remain read-only. Duplicating current AU into an isolated staging chain and testing that chain is explicitly authorized. No external messages, actual printing or billing changes. Additive0060 only if needed. Five stages, no F12 and no late/fast classification. Existing API slot receives explicit make source with separate auth. Payloads/logs secret-free; runtime credentials server-side only.
 
 ## Review focus
 
@@ -28,6 +28,12 @@ Files: src/components/OrderTimelineCard.tsx; docs/releases/make-milestones.md; t
 - [ ] Show five recorded/missing automation steps, source time and batch context using existing projection. Test later stage without earlier stage, preserving missing status.
 - [ ] Write redacted request examples, per-part placements after success, exact Ignore error-handler instructions, replay original envelope contract, retention limitations and cloned-staging-only acceptance steps. Part4 unchanged. Do not install into live scenarios.
 - [ ] Run existing full typecheck/test/build gate, request independent review, record blocked real staging/Make checks accurately, commit checkpoint.
+
+### Task 3: Clone and test AU safely (external operations after code review)
+
+- [ ] Record current AU source blueprint hashes/versions and all outbound resource references; discover actual order-location routing. Source scenarios are never changed.
+- [ ] Create clearly named STAGING duplicates of all AU parts, disabled/manual initially; remap internal hooks and every write resource to staging-owned copies. Use a manifest allowing writes/runs only for exact clone IDs. Replace live notifications/printer actions with staging logs. Keep processing logic otherwise faithful. Redacted clone map/replay instructions in docs/releases/make-milestones.md; secrets only provider configuration.
+- [ ] Validate no live-write destination remains, then run tiny synthetic fixtures through clones into the staging timeline. Test success, missing earlier step, retry and one deliberately unavailable milestone endpoint with Ignore handler so the clone pipeline continues. Verify original scenario hashes/config unchanged and no live side effects. Leave clones manual/disabled after tests; report links and any unconnected boundary honestly.
 
 ## Implementation log
 

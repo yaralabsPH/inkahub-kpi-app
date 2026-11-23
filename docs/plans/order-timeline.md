@@ -9,7 +9,7 @@
 
 ## Global constraints
 
-Branch feature/order-timeline, based on fd0a1b3. Staging down: local work only, no hosted DB calls/billing/production/Make mutations. F3 migration numbers0048-0051 reserved, existing migrations immutable. Twelve API functions maximum. Stop at 10:00 Asia/Shanghai with a committed honest checkpoint if unfinished; do not rush or claim the whole feature done. Use external result logs, never secret payloads in repository. Production guardrails and all hardening requirements are in the spec.
+Branch feature/order-timeline, based on fd0a1b3; resume from ad60a2f. CJ's new afternoon request supersedes the earlier10am checkpoint. User says staging upgraded; root verifies health before staging migrations/tests. All production/live Make mutations forbidden; isolated AU clones/testing authorized under F11 spec. F3 numbers0048-0051 reserved; migrations immutable. Twelve API functions maximum, no billing changes. No late/fast labels, rules or settings anywhere. Shared Shopify store routes by verified order-location predicate from current Make source. Use external result logs, never secrets in repository. Fix remaining review precedence issue first with targeted regression; then complete below. Historical log entries are provenance, not current requirements.
 
 ## Review focus
 
@@ -22,8 +22,8 @@ Branch feature/order-timeline, based on fd0a1b3. Staging down: local work only, 
 ### Task 1: Evidence model and pure projection
 
 Files: src/lib/domain/orderTimeline.ts; tests/orderTimeline.test.ts.
-- [x] Write failing tests for canonical site/shop/order identity; immutable occurrence dedupe/conflict; missing vs confirmed stages; partial shipment; cancellation/replacement exclusion; negative/out-of-order gaps; median/P90 and optional late threshold; time handling. Keep fixtures synthetic and minimal.
-- [x] Implement exported typed evidence/projection/flow helpers with explicit bounded contracts. Include F11 stage identifiers now without implementing its receiver. A stage completion is distinct from order completion; multiple work types cannot be collapsed into fully framed without proof. Flow cohort is recorded original orders ordered in the selected period, completed shipment samples separately labelled, current late orders exclude cancelled/shipped and require configured threshold.
+- [ ] Finish focused tests: existing identity/replay/proof/cancellation/math checks plus remaining inferred-complete/confirmed-partial precedence bug, adjacent stage-duration missing/anomaly cases and removal of lateness output.
+- [ ] Finish helpers: stage durations measured only when both endpoints have confirmed nonnegative evidence. Missing stages stay unknown. Include F11 stages. Flow cohort is recorded original orders ordered in selected period; neutral median/P90/sample counts, no performance classifications. Remove late threshold/output entirely. Preserve site isolation and completed-order proof.
 - [ ] Run targeted tests, typecheck; commit task1. (partial: stage-waiting helper pending) This is a safe checkpoint if the deadline arrives.
 
 ### Task 2: Durable ingestion and authorized reads
@@ -37,10 +37,10 @@ Files: supabase/migrations/0059_order_timeline.sql; api/_lib/order-timeline.ts; 
 ### Task 3: Reports UI and verification
 
 Files: src/components/OrderTimelineCard.tsx; src/components/OrderFlowSection.tsx; src/pages/Reports.tsx; docs/releases/order-timeline.md.
-- [ ] Implement compact existing-style cards: order search, source/time/missing stage list, partial/cancelled labels, flow cohort/coverage and freshness, median/P90, configured-late rule or unavailable reason. Use existing site zones. Clear/cancel stale requests on site/order changes. No unrelated redesign or external calls per row.
+- [ ] Implement compact existing-style cards: order search, source/time/missing stage list, partial/cancelled labels, adjacent durations, flow cohort/coverage/freshness, neutral median/P90. No late/fast classification or setting. Use existing site zones. Clear/cancel stale requests on site/order changes. No unrelated redesign or external calls per row.
 - [ ] Add targeted request-scope regression test and manually inspect local UI if feasible. Dexie shows explicit Supabase requirement. Preserve all old Reports behavior.
 - [ ] Run npx tsc -b, npm run typecheck:api, npm run typecheck:digest, npm run test -- --run, npm run build and append-only migration guard. Record exact results once, fix meaningful failures, commit. Independent reviewer checks scope/security/correctness.
-- [ ] Release guide lists env mapping, optional late threshold, staged migration and role checks, tiny replay fixtures, Shopify subscription/reconciliation commissioning, rollback. Real staging/Preview acceptance remains unchecked until recovery; no bulk load.
+- [ ] Release guide lists verified shared-shop order-location routing, staged migration/role checks, tiny replay fixtures, Shopify reconciliation commissioning and rollback. Root applies staging only after recovery/headroom; no bulk history load. Verify Reports UI on actual Preview and isolated AU Make cloned chain after F11.
 
 ## Implementation log
 
