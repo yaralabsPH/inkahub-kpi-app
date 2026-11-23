@@ -22,9 +22,9 @@ Branch feature/order-timeline, based on fd0a1b3. Staging down: local work only, 
 ### Task 1: Evidence model and pure projection
 
 Files: src/lib/domain/orderTimeline.ts; tests/orderTimeline.test.ts.
-- [ ] Write failing tests for canonical site/shop/order identity; immutable occurrence dedupe/conflict; missing vs confirmed stages; partial shipment; cancellation/replacement exclusion; negative/out-of-order gaps; median/P90 and optional late threshold; time handling. Keep fixtures synthetic and minimal.
-- [ ] Implement exported typed evidence/projection/flow helpers with explicit bounded contracts. Include F11 stage identifiers now without implementing its receiver. A stage completion is distinct from order completion; multiple work types cannot be collapsed into fully framed without proof. Flow cohort is recorded original orders ordered in the selected period, completed shipment samples separately labelled, current late orders exclude cancelled/shipped and require configured threshold.
-- [ ] Run targeted tests, typecheck; commit task1. This is a safe checkpoint if the deadline arrives.
+- [x] Write failing tests for canonical site/shop/order identity; immutable occurrence dedupe/conflict; missing vs confirmed stages; partial shipment; cancellation/replacement exclusion; negative/out-of-order gaps; median/P90 and optional late threshold; time handling. Keep fixtures synthetic and minimal.
+- [x] Implement exported typed evidence/projection/flow helpers with explicit bounded contracts. Include F11 stage identifiers now without implementing its receiver. A stage completion is distinct from order completion; multiple work types cannot be collapsed into fully framed without proof. Flow cohort is recorded original orders ordered in the selected period, completed shipment samples separately labelled, current late orders exclude cancelled/shipped and require configured threshold.
+- [x] Run targeted tests, typecheck; commit task1. This is a safe checkpoint if the deadline arrives.
 
 ### Task 2: Durable ingestion and authorized reads
 
@@ -44,7 +44,10 @@ Files: src/components/OrderTimelineCard.tsx; src/components/OrderFlowSection.tsx
 
 ## Implementation log
 
-Not started. Actual Claude read-only discovery completed; Make connected-tool access was declined, so exported evidence only. No live site mapping or retention verified. Missing configuration is a commissioning prerequisite, not permission to invent it.
+- Task 1 (checkpoint before 02:00 UTC): `src/lib/domain/orderTimeline.ts` — identity `site|normalized shop|numeric order id` (null when any part is missing/invalid, never guessed); immutable occurrence merge (duplicate vs conflict keeps the original; malformed time/unknown stage rejected); projection with F10 + F11 stage ids, missing stages explicit, arrival-order independent, dispatch never shipment, partial vs complete fulfillment, delivered only from Shopify evidence, CS/replacement evidence listed but never completing the original, framing per work type; flow metrics over recorded non-cancelled orders ordered in the period (complete-shipment samples, open orders, negative gaps excluded as anomalies, nearest-rank median/P90 in elapsed hours, late count only with a configured positive threshold else "Late-order rule not configured"). `tests/orderTimeline.test.ts` 10 tests red (module missing) then green; mutation (partial counted as complete) fails 1. `npx tsc -b` clean. Ruling: P90 is nearest-rank — cost if wrong: small samples differ from interpolated percentiles.
+- Pending: Task 2 (0059 migration, ingestion/read RPCs, Shopify HMAC adapter, `api/orders/timeline.ts`, retire `api/shopify/whoami.ts` after caller check, API/PGlite tests, typecheck lists) and Task 3 (Reports cards, stale-request test, release guide, full gate). F11 receiver follows after F10 foundation review.
+
+Earlier: actual Claude read-only discovery completed; Make connected-tool access was declined, so exported evidence only. No live site mapping or retention verified. Missing configuration is a commissioning prerequisite, not permission to invent it.
 
 ## Open questions
 
