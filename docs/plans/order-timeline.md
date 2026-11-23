@@ -24,7 +24,7 @@ Branch feature/order-timeline, based on fd0a1b3. Staging down: local work only, 
 Files: src/lib/domain/orderTimeline.ts; tests/orderTimeline.test.ts.
 - [x] Write failing tests for canonical site/shop/order identity; immutable occurrence dedupe/conflict; missing vs confirmed stages; partial shipment; cancellation/replacement exclusion; negative/out-of-order gaps; median/P90 and optional late threshold; time handling. Keep fixtures synthetic and minimal.
 - [x] Implement exported typed evidence/projection/flow helpers with explicit bounded contracts. Include F11 stage identifiers now without implementing its receiver. A stage completion is distinct from order completion; multiple work types cannot be collapsed into fully framed without proof. Flow cohort is recorded original orders ordered in the selected period, completed shipment samples separately labelled, current late orders exclude cancelled/shipped and require configured threshold.
-- [x] Run targeted tests, typecheck; commit task1. This is a safe checkpoint if the deadline arrives.
+- [ ] Run targeted tests, typecheck; commit task1. (partial: stage-waiting helper pending) This is a safe checkpoint if the deadline arrives.
 
 ### Task 2: Durable ingestion and authorized reads
 
@@ -52,3 +52,4 @@ Earlier: actual Claude read-only discovery completed; Make connected-tool access
 ## Open questions
 
 None requiring CJ before offline implementation. Business inputs remain unset as described by the spec. If a concrete implementation conflict appears, return it to Codex, the delegated planner, with proposed minimal resolution.
+- Task 1 review r1 corrections: projections refuse mixed/unmapped identities and keep `identity`/`site`; flow metrics refuse mixed sites and duplicate identities; framing is `partial` unless `framingComplete: true` (work-type list kept); only confirmed evidence confirms stages — reported/inferred show `unconfirmed` and never set `completeShipmentAt` or enter metrics; occurrence keys are `source|key` and source/kind/site are validated; median averages the middle pair (P90 nearest-rank); `strictIso` requires explicit Z/offset ISO on real dates, period start < end and `now` validated, evidence after `now` excluded. 16 tests pass, `npx tsc -b` clean. **Task 1 is PARTIAL:** the stage-waiting-time helper (dwell between consecutive stages) is not implemented yet.
