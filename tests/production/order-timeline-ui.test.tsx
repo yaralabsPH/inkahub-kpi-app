@@ -240,9 +240,21 @@ describe("owner-only Refresh sources", () => {
     expect(describeReconcile(partials[4], R).message).toContain("2 conflicting facts kept as first recorded");
   });
 
+  it("review r1: app conflicts with a clean Shopify read are partial, never green", () => {
+    const d = describeReconcile(ok(recorded(), { accepted: 1, duplicates: 0, conflicts: 1, route: "app" }), R);
+    expect(d.tone).toBe("partial");
+    expect(d.message).toContain("App events: 1 new, 0 already recorded, 1 conflicting fact kept as first recorded.");
+    expect(d.message).not.toContain("Sources refreshed");
+    const nf = describeReconcile(ok({ status: "not_found", note: "No Shopify order has this number" }, { accepted: 0, duplicates: 0, conflicts: 2, route: "app" }), R);
+    expect(nf).toMatchObject({ tone: "partial" });
+    expect(nf.message).toContain("2 conflicting facts");
+  });
+
   it("malformed or mismatched answers are an unknown outcome, not success", () => {
     const bad = [
       null, [], "ok", {},
+      ok(recorded(), { accepted: 2, duplicates: 1, route: "app" }),
+      ok(recorded(), { accepted: 2, duplicates: 1, conflicts: "0", route: "app" }),
       ok(recorded(), { accepted: -1, duplicates: 0, conflicts: 0, route: "app" }),
       ok({ status: "weird" }),
       ok(recorded({ result: null })),
@@ -308,5 +320,83 @@ describe("owner-only Refresh sources", () => {
     await tick();
     expect(h.r.state()).toMatchObject({ key: KEY, busy: true });
     expect(h.reloads()).toBe(0);
+  });
+
+  describe("review r1: the in-flight lock is per identity, not the displayed message (A -> B -> A)", () => {
+    const B = refreshKeyOf(SCOPE, { site: "au", orderNumber: "9002" });
+    async function aba(h: ReturnType<typeof harness>) {
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      h.setCurrent(B);
+      h.r.reset();
+      h.setCurrent(KEY);
+      h.r.reset();
+      expect(h.r.state()).toEqual(idle);
+      expect(h.r.inFlight()).toEqual([KEY]);
+    }
+
+    it("refreshing A again while the first A request is unsettled sends no second POST; the running answer then paints and reloads A once", async () => {
+      const h = harness();
+      await aba(h);
+      void h.r.refresh(SCOPE, R);
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      expect(h.calls).toHaveLength(1);
+      expect(h.r.state()).toMatchObject({ key: KEY, busy: true });
+      h.pending[0]({ ok: true, status: 200, body: ok(recorded()) });
+      await tick();
+      expect(h.r.state()).toMatchObject({ key: KEY, busy: false, tone: "ok" });
+      expect(h.reloads()).toBe(1);
+      expect(h.r.inFlight()).toEqual([]);
+    });
+
+    it("an old A answer that completes after A-B-A without a new click neither paints nor reloads, and releases the lock", async () => {
+      const h = harness();
+      await aba(h);
+      h.pending[0]({ ok: true, status: 200, body: ok(recorded()) });
+      await tick();
+      expect(h.r.state()).toEqual(idle);
+      expect(h.reloads()).toBe(0);
+      expect(h.r.inFlight()).toEqual([]);
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      expect(h.calls).toHaveLength(2);
+    });
+
+    it("an old A request that rejects after A-B-A releases the lock silently; the next refresh is a new POST", async () => {
+      const h = harness();
+      await aba(h);
+      h.pending[0](new Error("Failed to fetch"));
+      await tick();
+      expect(h.r.state()).toEqual(idle);
+      expect(h.reloads()).toBe(0);
+      expect(h.r.inFlight()).toEqual([]);
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      expect(h.calls).toHaveLength(2);
+      h.pending[1]({ ok: true, status: 200, body: ok(recorded()) });
+      await tick();
+      expect(h.r.state()).toMatchObject({ tone: "ok" });
+      expect(h.reloads()).toBe(1);
+    });
+
+    it("A and B may each have one request; B's answer never paints on A", async () => {
+      const h = harness();
+      void h.r.refresh(SCOPE, R);
+      await tick();
+      h.setCurrent(B);
+      h.r.reset();
+      void h.r.refresh(SCOPE, { site: "au", orderNumber: "9002" });
+      await tick();
+      expect(h.calls).toHaveLength(2);
+      h.setCurrent(KEY);
+      h.r.reset();
+      h.pending[1]({ ok: true, status: 200, body: { ...ok(recorded()), orderNumber: "9002" } });
+      h.pending[0]({ ok: true, status: 200, body: ok(recorded()) });
+      await tick();
+      expect(h.r.state()).toEqual(idle);
+      expect(h.reloads()).toBe(0);
+      expect(h.r.inFlight()).toEqual([]);
+    });
   });
 });

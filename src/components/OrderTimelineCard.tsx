@@ -116,9 +116,10 @@ export function describeReconcile(body: unknown, r: TimelineRequest): { tone: So
   const app = o.app && typeof o.app === "object" ? (o.app as Record<string, unknown>) : null;
   const appNew = count(app?.accepted);
   const appDup = count(app?.duplicates);
+  const appConf = count(app?.conflicts);
   const s = o.shopify && typeof o.shopify === "object" ? (o.shopify as Record<string, unknown>) : null;
-  if (appNew === null || appDup === null || !s) return unknown;
-  const appText = `App events: ${appNew} new, ${appDup} already recorded.`;
+  if (appNew === null || appDup === null || appConf === null || !s) return unknown;
+  const appText = `App events: ${appNew} new, ${appDup} already recorded${appConf ? `, ${plural(appConf, "conflicting fact")} kept as first recorded` : ""}.`;
   const note = typeof s.note === "string" && s.note ? s.note : null;
   if (s.status === "not_found" || s.status === "not_configured") {
     return { tone: "partial", message: `${appText} Shopify not refreshed: ${note ?? (s.status === "not_found" ? "no Shopify order has this number" : "Shopify reading is not configured")}. Refresh incomplete.` };
@@ -131,7 +132,7 @@ export function describeReconcile(body: unknown, r: TimelineRequest): { tone: So
   if (shNew === null || shDup === null || shConf === null || typeof s.routedHere !== "boolean") return unknown;
   const shText = `Shopify: ${shNew} new, ${shDup} already recorded${shConf ? `, ${plural(shConf, "conflicting fact")} kept as first recorded` : ""}.`;
   if (!s.routedHere || note) return { tone: "partial", message: `${appText} ${shText} ${note ?? "The Shopify order is not linked to this site"}. Refresh incomplete.` };
-  if (shConf) return { tone: "partial", message: `Sources read, with conflicts. ${appText} ${shText}` };
+  if (shConf || appConf) return { tone: "partial", message: `Sources read, with conflicts. ${appText} ${shText}` };
   return { tone: "ok", message: `Sources refreshed. ${appText} ${shText}` };
 }
 
@@ -153,55 +154,80 @@ export const refreshKeyOf = (scopeKey: string, r: TimelineRequest) => `${scopeKe
 export function createSourceRefresher(deps: SourceRefresherDeps) {
   let state: SourceRefreshState = IDLE_REFRESH;
   let seq = 0;
+  /** Requests still unsettled, per identity: the lock, independent of what is displayed. */
+  const inFlight = new Map<string, number>();
+  /** The request whose answer may paint and reload (0 = none; cleared when the identity changes). */
+  let shown = 0;
   const set = (s: SourceRefreshState) => {
     state = s;
     deps.onChange(s);
   };
   return {
     state: () => state,
-    /** Start one refresh; ignored while one is already running for this identity. */
+    /** Identities with an unsettled request (for tests and diagnostics). */
+    inFlight: () => [...inFlight.keys()],
+    /**
+     * Start one refresh. While a request for this identity is unsettled no second
+     * one is sent; asking again (e.g. after looking at another order and coming
+     * back) re-attaches the display to the running request instead.
+     */
     async refresh(scopeKey: string, r: TimelineRequest): Promise<void> {
       const key = refreshKeyOf(scopeKey, r);
-      if (state.busy && state.key === key) return;
-      const mine = ++seq;
-      set({ key, busy: true, tone: null, message: null });
-      const current = () => mine === seq && deps.currentKey() === key;
-      const finish = (tone: SourceRefreshTone, message: string, reload: boolean) => {
-        if (!current()) return;
-        set({ key, busy: false, tone, message });
-        if (reload) deps.reload();
-      };
-      try {
-        const token = await deps.token();
-        if (!current()) return;
-        if (!token) return finish("error", "Sign in again to refresh sources.", false);
-        const res = await deps.fetch("/api/orders/timeline", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "reconcile", site: r.site, orderNumber: r.orderNumber }),
-        });
-        const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-        if (!current()) return;
-        if (res.ok) {
-          const d = describeReconcile(body, r);
-          return finish(d.tone, d.message, true);
+      const running = inFlight.get(key);
+      if (running !== undefined) {
+        if (shown !== running) {
+          shown = running;
+          set({ key, busy: true, tone: null, message: null });
         }
-        const code = typeof body?.code === "string" ? body.code : `HTTP_${res.status}`;
-        const error = typeof body?.error === "string" ? body.error : `request failed (${res.status})`;
-        // the app copy is committed before Shopify is read, so a Shopify failure is a partial refresh
-        if (code === "SHOPIFY_UNAVAILABLE") return finish("partial", `App events were refreshed; Shopify could not be read (${error}). Refresh incomplete.`, true);
-        if (NOTHING_WRITTEN.has(code)) return finish("error", `Refresh sources failed: ${error}`, false);
-        return finish("error", `Refresh sources did not complete: ${error}. Some events may already be saved; the timeline shows what is stored.`, true);
-      } catch (e) {
-        finish("error", `Refresh sources outcome unknown (${e instanceof Error ? e.message : "network error"}). The timeline shows what is stored.`, true);
+        return;
+      }
+      const mine = ++seq;
+      inFlight.set(key, mine);
+      shown = mine;
+      set({ key, busy: true, tone: null, message: null });
+      try {
+        await run(key, mine, r);
+      } finally {
+        if (inFlight.get(key) === mine) inFlight.delete(key);
       }
     },
-    /** Identity changed: forget the old result; a late answer is ignored. */
+    /** Identity changed: forget the shown result; a late answer neither paints nor reloads. The lock stays until settlement. */
     reset() {
-      seq++;
+      shown = 0;
       if (state !== IDLE_REFRESH) set(IDLE_REFRESH);
     },
   };
+
+  async function run(key: string, mine: number, r: TimelineRequest): Promise<void> {
+    const current = () => mine === shown && deps.currentKey() === key;
+    const finish = (tone: SourceRefreshTone, message: string, reload: boolean) => {
+      if (!current()) return;
+      set({ key, busy: false, tone, message });
+      if (reload) deps.reload();
+    };
+    try {
+      const token = await deps.token();
+      if (!token) return finish("error", "Sign in again to refresh sources.", false);
+      const res = await deps.fetch("/api/orders/timeline", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "reconcile", site: r.site, orderNumber: r.orderNumber }),
+      });
+      const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      if (res.ok) {
+        const d = describeReconcile(body, r);
+        return finish(d.tone, d.message, true);
+      }
+      const code = typeof body?.code === "string" ? body.code : `HTTP_${res.status}`;
+      const error = typeof body?.error === "string" ? body.error : `request failed (${res.status})`;
+      // the app copy is committed before Shopify is read, so a Shopify failure is a partial refresh
+      if (code === "SHOPIFY_UNAVAILABLE") return finish("partial", `App events were refreshed; Shopify could not be read (${error}). Refresh incomplete.`, true);
+      if (NOTHING_WRITTEN.has(code)) return finish("error", `Refresh sources failed: ${error}`, false);
+      return finish("error", `Refresh sources did not complete: ${error}. Some events may already be saved; the timeline shows what is stored.`, true);
+    } catch (e) {
+      finish("error", `Refresh sources outcome unknown (${e instanceof Error ? e.message : "network error"}). The timeline shows what is stored.`, true);
+    }
+  }
 }
 
 /** Buttons for the looked-up order. Only an owner gets Refresh sources; every reader keeps the stored-data Refresh. */
