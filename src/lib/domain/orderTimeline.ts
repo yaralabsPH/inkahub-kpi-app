@@ -45,7 +45,8 @@ export interface OrderEvidence {
   fulfillmentId?: string | null;
   /**
    * Explicit whole-order proof on a shipped/delivered record: this record's time is when the WHOLE order
-   * was shipped/delivered. Never derived from a later order state (current adapters never set it).
+   * was shipped/delivered. Never derived from a later order state. Only the 0062 proof path sets it, on an
+   * aggregate record with no fulfillmentId (revision keys, withdrawn by retraction); per-parcel records never do.
    */
   fulfillmentComplete?: boolean | null;
   workType?: string | null;
@@ -181,8 +182,11 @@ export function projectTimeline(evidence: readonly OrderEvidence[], cutoffUtc?: 
   };
   const stages = Object.fromEntries(ORDER_STAGES.map((s) => [s, missing])) as Record<OrderStage, StageView>;
   for (const s of ORDER_STAGES) if (s !== "shipped" && s !== "delivered" && s !== "framed") stages[s] = byKind((e) => e.stage === s);
+  // Aggregate whole-order proof (Task 3b): a Shopify record flagged complete that is NOT about one parcel.
+  // It is projected on its own and never listed as a parcel.
+  const isWhole = (e: OrderEvidence) => e.source === "shopify" && e.fulfillmentComplete === true && !e.fulfillmentId;
   // whole-order delivered needs an explicit whole-order record; per-fulfillment deliveries are only partial
-  const deliveredRecords = original.filter((e) => e.stage === "delivered" && e.source === "shopify");
+  const deliveredRecords = original.filter((e) => e.stage === "delivered" && e.source === "shopify" && !isWhole(e));
   const deliveredAll = byKind((e) => e.stage === "delivered" && e.source === "shopify" && e.fulfillmentComplete === true);
   const deliveredConfirmed = deliveredRecords.find((e) => e.kind === "confirmed");
   stages.delivered = deliveredAll.status === "confirmed" ? deliveredAll
@@ -200,7 +204,10 @@ export function projectTimeline(evidence: readonly OrderEvidence[], cutoffUtc?: 
   const fulfillments = original
     .filter((e) => e.stage === "shipped" && e.source === "shopify" && e.fulfillmentId)
     .map((e) => ({ fulfillmentId: e.fulfillmentId as string, at: strictIso(e.happenedAt) as string, complete: e.fulfillmentComplete === true, kind: e.kind }));
-  const complete = fulfillments.find((f) => f.complete && f.kind === "confirmed") ?? null;
+  const whole = original.find((e) => e.stage === "shipped" && isWhole(e) && e.kind === "confirmed");
+  const complete = whole
+    ? { fulfillmentId: "", at: strictIso(whole.happenedAt) as string, complete: true, kind: whole.kind }
+    : fulfillments.find((f) => f.complete && f.kind === "confirmed") ?? null;
   const unconfirmedComplete = fulfillments.find((f) => f.complete && f.kind !== "confirmed");
   // precedence: confirmed complete > confirmed partial > unconfirmed (an inferred "complete" never outranks
   // confirmed partial evidence; it stays listed in `fulfillments` with its kind)

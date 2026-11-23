@@ -97,6 +97,13 @@ describe("rendered timeline", () => {
     expect(html).toContain("partial (whole order not proven)");
     expect(text(html)).not.toMatch(CLASSIFY);
   });
+  it("Task 3b: a Shopify delivery is labelled as Shopify-reported, never as independent carrier verification", () => {
+    const d = timeline("uk", "100");
+    const withDelivery = { ...d, stages: [...d.stages!, { stage: "delivered", status: "confirmed", at: "2026-11-24T09:00:00.000000Z", source: "shopify", kind: "confirmed" }] };
+    const out = renderToStaticMarkup(<OrderTimelineView state={ready(withDelivery)} onRetry={() => {}} />);
+    expect(out).toContain("Shopify-reported delivery time");
+    expect(text(out)).not.toMatch(/carrier[- ]verified|verified by carrier/i);
+  });
   it("times are shown in the site's time zone (UK 09:00Z = 09:00 GMT; AU = 20:00 AEDT)", () => {
     expect(html).toContain("09:00");
     const au = renderToStaticMarkup(<OrderTimelineView state={ready(timeline("au", "200"))} onRetry={() => {}} />);

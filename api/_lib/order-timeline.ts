@@ -17,8 +17,8 @@ import {
 import { audienceFor, ReportingHttpError, type ReportingPrincipal } from "./production-reporting.js";
 import type { RpcClient } from "./reporting-jobs.js";
 import {
-  evidenceFromFacts, factsFromGraphqlOrder, factsFromWebhookOrder, fetchShopifyOrder, normalizeOrderNumber, routeOrder,
-  ShopifyPayloadError, ShopifyReadError, type FetchLike, type RoutingConfig, type ShopifyOrderFacts,
+  evidenceFromFacts, factsFromGraphqlOrder, factsFromWebhookOrder, fetchShopifyOrder, fetchShopifyOrderById, normalizeOrderNumber, PROOF_FULFILLMENT_PAGE, routeOrder,
+  ShopifyPayloadError, ShopifyReadError, wholeOrderProof, type FetchLike, type RoutingConfig, type ShopifyOrderFacts,
 } from "./shopify-webhooks.js";
 
 export const ORDER_ROW_LIMIT = 500;
@@ -241,13 +241,17 @@ function parseIngest(v: unknown): IngestResult {
   return { accepted: n("accepted"), duplicates: n("duplicates"), conflicts: n("conflicts"), route: typeof o.route === "string" ? o.route : unavailable("ingest route") };
 }
 
-/** One order's facts -> routed identity + evidence, persisted atomically. A failure is never acknowledged. */
+const orderOf = (f: ShopifyOrderFacts, route: { site: string | null; reason: string | null }) =>
+  ({ shop: f.shop, shopifyOrderId: f.shopifyOrderId, orderNumber: f.orderNumber, site: route.site, routeReason: route.reason });
+
+/**
+ * Webhook: one order's facts -> routed identity + evidence, persisted atomically together with the whole-order
+ * proof invalidation (0062: the generation is advanced and any active whole proof withdrawn; a webhook never
+ * creates proof). A failure is never acknowledged.
+ */
 export async function ingestOrderFacts(rpc: RpcClient, cfg: RoutingConfig, f: ShopifyOrderFacts, audit?: Audit): Promise<IngestResult & { site: string | null }> {
   const route = routeOrder(cfg, f.shop, f.route);
-  const { data, error } = await rpc.rpc("ingest_order_timeline", {
-    p_order: { shop: f.shop, shopifyOrderId: f.shopifyOrderId, orderNumber: f.orderNumber, site: route.site, routeReason: route.reason },
-    p_evidence: evidenceFromFacts(f),
-  });
+  const { data, error } = await rpc.rpc("ingest_order_timeline_webhook", { p_order: orderOf(f, route), p_evidence: evidenceFromFacts(f) });
   if (error) {
     audit?.({ event: "timeline_ingest_failed" });
     throw new ReportingHttpError(503, "UNAVAILABLE", "The timeline could not record this order");
@@ -273,11 +277,25 @@ export interface ReconcileDeps {
   shopify: { shop: string; token: string; fetch: FetchLike } | null;
   audit?: Audit;
 }
+/** Whole-order proof outcome of one refresh (0062). "stale": a newer refresh or webhook superseded this read. */
+export type WholeOrderOutcome = "proven" | "unchanged" | "withdrawn" | "none" | "stale";
 export interface ReconcileResult {
   site: ReportSite;
   orderNumber: string;
   app: IngestResult;
-  shopify: { status: "recorded"; routedHere: boolean; note: string | null; result: IngestResult } | { status: "not_found" | "not_configured"; note: string };
+  shopify:
+    | { status: "recorded"; routedHere: boolean; note: string | null; result: IngestResult; wholeOrder: WholeOrderOutcome }
+    | { status: "not_found" | "not_configured"; note: string };
+}
+
+const WHOLE: readonly string[] = ["proven", "unchanged", "withdrawn", "none", "stale"];
+async function proofRpc(rpc: RpcClient, fn: string, args: Record<string, unknown>, audit: Audit | undefined, site: string): Promise<unknown> {
+  const { data, error } = await rpc.rpc(fn, args);
+  if (error) {
+    audit?.({ event: "timeline_proof_failed", fn, site });
+    throw new ReportingHttpError(503, "UNAVAILABLE", "The timeline could not record this order");
+  }
+  return data;
 }
 
 /** Owner-only, explicit and bounded: one order at one site. Read-only towards Shopify; never reassigns a site. */
@@ -298,20 +316,50 @@ export async function reconcileOrder(p: ReportingPrincipal, body: unknown, deps:
   const app = parseIngest(a.data);
   if (!deps.routing || !deps.shopify) return { site, orderNumber, app, shopify: { status: "not_configured", note: "Shopify reading is not configured; only app events were refreshed" } };
   if (!deps.routing.shops[deps.shopify.shop]) return { site, orderNumber, app, shopify: { status: "not_configured", note: "The configured Shopify shop is not in the routing allowlist" } };
-  let node: unknown;
-  let facts: ShopifyOrderFacts;
-  try {
-    node = await fetchShopifyOrder(deps.shopify.fetch, deps.shopify.shop, deps.shopify.token, orderNumber);
-    if (node === null) return { site, orderNumber, app, shopify: { status: "not_found", note: "No Shopify order has this number" } };
-    facts = factsFromGraphqlOrder(node, deps.shopify.shop);
-  } catch (e) {
+  const { shop, token, fetch } = deps.shopify;
+  const readFailed = (e: unknown): never => {
     deps.audit?.({ event: "timeline_shopify_read_failed", site });
     throw new ReportingHttpError(503, "SHOPIFY_UNAVAILABLE", e instanceof ShopifyReadError || e instanceof ShopifyPayloadError ? e.message : "Shopify could not be read");
+  };
+  // 1. alias -> immutable id. Nothing from this read is recorded; without an id nothing is targeted.
+  let id: string;
+  try {
+    const hit = await fetchShopifyOrder(fetch, shop, token, orderNumber);
+    if (hit === null) return { site, orderNumber, app, shopify: { status: "not_found", note: "No Shopify order has this number" } };
+    id = hit.id;
+  } catch (e) {
+    return readFailed(e);
   }
-  const r = await ingestOrderFacts(deps.rpc, deps.routing, facts, deps.audit);
-  const routedHere = r.site === site;
-  const note = r.site === null ? "The order's location could not be routed to a site; it stays unlinked"
-    : routedHere ? (r.route === "conflict" ? "Shopify routing disagrees with the recorded site; the recorded site was kept" : null)
-      : "This order belongs to another site and is not shown here";
-  return { site, orderNumber, app, shopify: { status: "recorded", routedHere, note, result: { accepted: r.accepted, duplicates: r.duplicates, conflicts: r.conflicts, route: r.route } } };
+  // 2. ticket BEFORE the snapshot is read
+  const ticket = await proofRpc(deps.rpc, "order_timeline_proof_begin", { p_shop: shop, p_shopify_order_id: id }, deps.audit, site);
+  if (typeof ticket !== "number" && typeof ticket !== "string") throw new ReportingHttpError(503, "UNAVAILABLE", "The timeline could not record this order");
+  const apply = (order: unknown, evidence: unknown[], proof: unknown) =>
+    proofRpc(deps.rpc, "order_timeline_proof_apply", { p_shop: shop, p_shopify_order_id: id, p_ticket: ticket, p_order: order, p_evidence: evidence, p_proof: proof }, deps.audit, site);
+  // 3. the snapshot by id; a failed or unusable read withdraws the proof through this ticket (an older ticket changes nothing)
+  let facts: ShopifyOrderFacts;
+  let proof: ReturnType<typeof wholeOrderProof>;
+  try {
+    const node = await fetchShopifyOrderById(fetch, shop, token, id);
+    if (node === null) throw new ShopifyReadError("The Shopify order could not be read by its id");
+    facts = factsFromGraphqlOrder(node, shop, PROOF_FULFILLMENT_PAGE);
+    if (facts.shopifyOrderId !== id || facts.orderNumber !== orderNumber) throw new ShopifyReadError("Shopify returned a different order");
+    proof = wholeOrderProof(node);
+  } catch (e) {
+    await apply(null, [], null).catch(() => deps.audit?.({ event: "timeline_proof_invalidate_failed", site }));
+    return readFailed(e);
+  }
+  // 4. base facts and the proof transition, atomically, only if this ticket is still current
+  const route = routeOrder(deps.routing, shop, facts.route);
+  const data = await apply(orderOf(facts, route), evidenceFromFacts(facts),
+    proof.status === "proven" ? { hash: proof.hash, shippedAt: proof.shippedAt, deliveredAt: proof.deliveredAt } : null);
+  const r = parseIngest(data);
+  const outcome = (data as { proof?: unknown } | null)?.proof;
+  const wholeOrder = typeof outcome === "string" && WHOLE.includes(outcome) ? (outcome as WholeOrderOutcome) : unavailable("proof outcome");
+  if (r.conflicts || r.route === "conflict") deps.audit?.({ event: "timeline_conflict", conflicts: r.conflicts, route: r.route });
+  const routedHere = route.site === site;
+  const note = wholeOrder === "stale" ? "A newer Shopify update arrived during this refresh, so nothing was recorded from it; refresh again"
+    : route.site === null ? "The order's location could not be routed to a site; it stays unlinked"
+      : routedHere ? (r.route === "conflict" ? "Shopify routing disagrees with the recorded site; the recorded site was kept" : null)
+        : "This order belongs to another site and is not shown here";
+  return { site, orderNumber, app, shopify: { status: "recorded", routedHere, note, result: { accepted: r.accepted, duplicates: r.duplicates, conflicts: r.conflicts, route: r.route }, wholeOrder } };
 }

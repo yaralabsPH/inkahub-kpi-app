@@ -4,7 +4,7 @@ import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createOrderTimelineHandler } from "../../api/orders/timeline";
 import {
-  evidenceFromFacts, factsFromGraphqlOrder, factsFromWebhookOrder, parseRoutingConfig, readRawBody, routeOrder, verifyShopifyHmac, SHOPIFY_ADMIN_API_VERSION,
+  evidenceFromFacts, factsFromGraphqlOrder, factsFromWebhookOrder, parseRoutingConfig, readRawBody, routeOrder, verifyShopifyHmac, wholeOrderProof, SHOPIFY_ADMIN_API_VERSION,
 } from "../../api/_lib/shopify-webhooks";
 import type { AuthDeps } from "../../api/_lib/production-reporting";
 import { projectTimeline, stageGaps } from "../../src/lib/domain/orderTimeline";
@@ -84,7 +84,9 @@ describe("Shopify webhook: verification before any parsing or database work", ()
     expect(r.status).toBe(200);
     expect(s.rpc).toHaveBeenCalledTimes(1);
     const [fn, args] = s.rpc.mock.calls[0];
-    expect(fn).toBe("ingest_order_timeline");
+    // 0062: base facts + whole-proof invalidation in one call; the webhook never carries a proof
+    expect(fn).toBe("ingest_order_timeline_webhook");
+    expect(Object.keys(args).sort()).toEqual(["p_evidence", "p_order"]);
     expect(args.p_order).toEqual({ shop: SHOP, shopifyOrderId: "5550001", orderNumber: "10190203", site: "uk", routeReason: null });
     const evs = args.p_evidence as Array<Record<string, unknown>>;
     expect(evs.map((e) => e.key)).toEqual(["order:5550001:ordered", "fulfillment:77:created"]);
@@ -248,7 +250,13 @@ describe("POST reconcile: owner only, bounded, read-only towards Shopify", () =>
   const body = { action: "reconcile", site: "uk", orderNumber: "10190203" };
   const post = (s: ReturnType<typeof setup>, b: unknown = body) => s.call({ method: "POST", headers: { authorization: "Bearer aaa.bbb.ccc" }, body: b });
   const node = { legacyResourceId: "9", name: "#10190203", createdAt: "2026-11-20T09:00:00Z", cancelledAt: null, displayFulfillmentStatus: "UNFULFILLED", tags: [], customAttributes: [], shippingAddress: { countryCodeV2: "GB" }, fulfillments: [] };
-  const okFetch = (nodes: unknown[]) => async () => ({ ok: true, status: 200, json: async () => ({ data: { orders: { nodes } } }) });
+  /** Lookup (alias -> id) answers `nodes`; the by-id snapshot answers `byId` (default: the first node). */
+  const okFetch = (nodes: unknown[], byId: unknown = nodes[0] ?? null) => async (_url: string, init: { body: string }) =>
+    ({ ok: true, status: 200, json: async () => (JSON.parse(init.body).query.includes("OrderTimelineProof") ? { data: { order: byId } } : { data: { orders: { nodes } } }) });
+  const proofRpc = (proof = "proven") => (fn: string) => ({
+    data: fn === "order_timeline_proof_begin" ? 7 : fn === "order_timeline_proof_apply" ? { accepted: 1, duplicates: 0, conflicts: 0, route: "routed", proof } : { accepted: 0, duplicates: 0, conflicts: 0, route: "none" },
+    error: null,
+  });
   it("managers and CS are 403 before any read; bad bodies are 400", async () => {
     for (const s of [setup({ role: "manager" }), setup({ role: "cs", nav: ["reports"] })]) {
       expect((await post(s)).status).toBe(403);
@@ -261,15 +269,17 @@ describe("POST reconcile: owner only, bounded, read-only towards Shopify", () =>
     expect(s.rpc).not.toHaveBeenCalled();
   });
   it("owner: app evidence for the site, then one read-only GraphQL query at the verified API version; routing elsewhere is never reassigned", async () => {
-    const s = setup({ fetch: okFetch([{ ...node, shippingAddress: { countryCodeV2: "US" } }]) });
+    const s = setup({ fetch: okFetch([{ ...node, shippingAddress: { countryCodeV2: "US" } }]), rpc: proofRpc("none") });
     const r = await post(s);
     expect(r.status).toBe(200);
     expect(s.rpc.mock.calls[0]).toEqual(["reconcile_order_timeline_app", { p_site: "uk", p_order_number: "10190203" }]);
-    const [url, init] = s.fetchFn.mock.calls[0] as unknown as [string, { method: string; body: string }];
-    expect(url).toBe(`https://${SHOP}/admin/api/${SHOPIFY_ADMIN_API_VERSION}/graphql.json`);
-    expect(init.body).not.toMatch(/mutation/);
-    expect((s.rpc.mock.calls[1][1] as { p_order: { site: string } }).p_order.site).toBe("us");
-    expect(r.body.shopify).toMatchObject({ status: "recorded", routedHere: false });
+    for (const [url, init] of s.fetchFn.mock.calls as unknown as Array<[string, { method: string; body: string }]>) {
+      expect(url).toBe(`https://${SHOP}/admin/api/${SHOPIFY_ADMIN_API_VERSION}/graphql.json`);
+      expect(init.body).not.toMatch(/mutation/);
+    }
+    expect(s.rpc.mock.calls.map((c) => c[0])).toEqual(["reconcile_order_timeline_app", "order_timeline_proof_begin", "order_timeline_proof_apply"]);
+    expect((s.rpc.mock.calls[2][1] as { p_order: { site: string } }).p_order.site).toBe("us");
+    expect(r.body.shopify).toMatchObject({ status: "recorded", routedHere: false, wholeOrder: "none" });
   });
   it("task3 review: ORDER_TIMELINE_INGEST off stops ALL reconciliation writes before any RPC or Shopify read; reads keep working", async () => {
     for (const off of [undefined, "off", "ON"]) {
@@ -294,5 +304,182 @@ describe("POST reconcile: owner only, bounded, read-only towards Shopify", () =>
     const none = setup({ env: { SHOPIFY_ADMIN_TOKEN: undefined } });
     expect((await post(none)).body.shopify).toMatchObject({ status: "not_configured" });
     expect(none.fetchFn).not.toHaveBeenCalled();
+  });
+
+  // ---- Task 3b: alias -> id, ticket BEFORE the snapshot, snapshot by id, one atomic apply ----
+  const order = (over: Record<string, unknown> = {}) => ({ ...proofNode(), legacyResourceId: "9", name: "#10190203", ...over });
+  it("resolves the id first, begins the ticket, THEN reads the snapshot by id and applies facts + proof with that ticket", async () => {
+    const seq: string[] = [];
+    const s = setup({
+      fetch: async (_u: string, init: { body: string }) => {
+        const q = JSON.parse(init.body);
+        seq.push(q.query.includes("OrderTimelineProof") ? `fetch:byId:${q.variables.id}` : "fetch:lookup");
+        return okFetch([{ legacyResourceId: "9", name: "#10190203" }], order())(_u, init);
+      },
+      rpc: (fn) => {
+        seq.push(`rpc:${fn}`);
+        return proofRpc()(fn);
+      },
+    });
+    const r = await post(s);
+    expect(r.status).toBe(200);
+    expect(seq).toEqual(["rpc:reconcile_order_timeline_app", "fetch:lookup", "rpc:order_timeline_proof_begin", "fetch:byId:gid://shopify/Order/9", "rpc:order_timeline_proof_apply"]);
+    const args = s.rpc.mock.calls[2][1] as Record<string, unknown>;
+    expect(args).toMatchObject({ p_shop: SHOP, p_shopify_order_id: "9", p_ticket: 7 });
+    expect(args.p_proof).toEqual({ hash: expect.stringMatching(/^[0-9a-f]{64}$/), shippedAt: "2026-11-22T10:00:00.000Z", deliveredAt: "2026-11-24T09:00:00.000Z" });
+    expect((args.p_evidence as Array<{ key: string }>).map((e) => e.key)).toContain("fulfillment:101:created");
+    expect(JSON.stringify(args)).not.toMatch(/GB|countryCode/);
+    expect(r.body.shopify).toMatchObject({ status: "recorded", routedHere: true, note: null, wholeOrder: "proven" });
+    // an unproven snapshot applies the base facts with no proof
+    const u = setup({ fetch: okFetch([{ legacyResourceId: "9", name: "#10190203" }], order({ edited: true })), rpc: proofRpc("withdrawn") });
+    await post(u);
+    expect((u.rpc.mock.calls[2][1] as Record<string, unknown>).p_proof).toBeNull();
+  });
+  it("a failed or mismatched snapshot read withdraws through its own ticket and is reported, never applied as facts", async () => {
+    for (const byId of [null, order({ legacyResourceId: "10" }), order({ name: "#10190204" }), order({ fulfillments: Array.from({ length: 20 }, () => ({})) })]) {
+      const s = setup({ fetch: okFetch([{ legacyResourceId: "9", name: "#10190203" }], byId), rpc: proofRpc("withdrawn") });
+      expect((await post(s)).body.code).toBe("SHOPIFY_UNAVAILABLE");
+      expect(s.rpc.mock.calls.map((c) => c[0])).toEqual(["reconcile_order_timeline_app", "order_timeline_proof_begin", "order_timeline_proof_apply"]);
+      expect(s.rpc.mock.calls[2][1]).toMatchObject({ p_ticket: 7, p_order: null, p_evidence: [], p_proof: null });
+    }
+    // a lookup failure or an inexact name match targets nothing (no ticket, no apply)
+    for (const nodes of [[{ legacyResourceId: "9", name: "#101902031" }], [{ legacyResourceId: "x", name: "#10190203" }]]) {
+      const s = setup({ fetch: okFetch(nodes), rpc: proofRpc() });
+      const b = (await post(s)).body;
+      expect(b.code === "SHOPIFY_UNAVAILABLE" || (b.shopify as { status: string }).status === "not_found").toBe(true);
+      expect(s.rpc.mock.calls.map((c) => c[0])).toEqual(["reconcile_order_timeline_app"]);
+    }
+  });
+  it("a superseded (stale) refresh is reported as incomplete; a malformed outcome is an error", async () => {
+    const s = setup({ fetch: okFetch([{ legacyResourceId: "9", name: "#10190203" }], order()), rpc: proofRpc("stale") });
+    expect((await post(s)).body.shopify).toMatchObject({ wholeOrder: "stale", note: expect.stringMatching(/newer Shopify update/) });
+    const bad = setup({ fetch: okFetch([{ legacyResourceId: "9", name: "#10190203" }], order()), rpc: proofRpc("maybe") });
+    expect((await post(bad)).status).toBeGreaterThanOrEqual(500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 3b: pure whole-order proof
+// ---------------------------------------------------------------------------
+
+type Ful = { legacyResourceId: string; createdAt: string; status: string; deliveredAt: string | null; fulfillmentLineItems: unknown };
+const ful = (id: string, createdAt: string, parts: Array<[string, number]>, deliveredAt: string | null = null, status = "SUCCESS"): Ful => ({
+  legacyResourceId: id, createdAt, status, deliveredAt,
+  fulfillmentLineItems: { nodes: parts.map(([l, q]) => ({ quantity: q, lineItem: { id: l } })), pageInfo: { hasNextPage: false } },
+});
+function proofNode(over: Record<string, unknown> = {}) {
+  return {
+    legacyResourceId: "9", name: "#10190203", createdAt: "2026-11-20T09:00:00Z", cancelledAt: null, edited: false, tags: [], customAttributes: [], shippingAddress: { countryCodeV2: "GB" },
+    lineItems: { nodes: [
+      { id: "gid://shopify/LineItem/1", quantity: 2, currentQuantity: 2, requiresShipping: true },
+      { id: "gid://shopify/LineItem/2", quantity: 1, currentQuantity: 1, requiresShipping: true },
+      { id: "gid://shopify/LineItem/3", quantity: 1, currentQuantity: 1, requiresShipping: false },
+    ], pageInfo: { hasNextPage: false } },
+    fulfillments: [
+      ful("101", "2026-11-21T10:00:00Z", [["gid://shopify/LineItem/1", 2]], "2026-11-23T09:00:00Z"),
+      ful("102", "2026-11-22T10:00:00Z", [["gid://shopify/LineItem/2", 1]], "2026-11-24T09:00:00Z"),
+    ],
+    ...over,
+  };
+}
+
+describe("whole-order proof (pure, conservative)", () => {
+  const L1 = "gid://shopify/LineItem/1";
+  const L2 = "gid://shopify/LineItem/2";
+  const L3 = "gid://shopify/LineItem/3";
+  const unknown = (n: unknown) => expect(wholeOrderProof(n).status).toBe("unknown");
+  it("multiple exact parcels: shipped = latest contributor creation, delivered = latest Shopify-reported delivery", () => {
+    expect(wholeOrderProof(proofNode())).toMatchObject({ status: "proven", shippedAt: "2026-11-22T10:00:00.000Z", deliveredAt: "2026-11-24T09:00:00.000Z" });
+  });
+  it("one exact parcel; a non-shipping line never needs a fulfillment", () => {
+    const one = proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2], [L2, 1]], "2026-11-23T09:00:00Z")] });
+    expect(wholeOrderProof(one)).toMatchObject({ status: "proven", shippedAt: "2026-11-21T10:00:00.000Z", deliveredAt: "2026-11-23T09:00:00.000Z" });
+  });
+  it("delivery stays unknown unless every contributor has a valid delivery at or after its creation; updatedAt is never read", () => {
+    const missing = proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2]], "2026-11-23T09:00:00Z"), { ...ful("102", "2026-11-22T10:00:00Z", [[L2, 1]]), updatedAt: "2026-11-25T00:00:00Z" }] });
+    expect(wholeOrderProof(missing)).toMatchObject({ status: "proven", deliveredAt: null });
+    const backwards = proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2]], "2026-11-23T09:00:00Z"), ful("102", "2026-11-22T10:00:00Z", [[L2, 1]], "2026-11-22T09:00:00Z")] });
+    expect(wholeOrderProof(backwards)).toMatchObject({ status: "proven", deliveredAt: null });
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2], [L2, 1]], "soon")] }));
+  });
+  it("edited, cancelled or unknown edit/cancel state is unknown (quantity equality never implies unedited)", () => {
+    unknown(proofNode({ edited: true }));
+    unknown(proofNode({ edited: undefined }));
+    unknown(proofNode({ edited: "false" }));
+    unknown(proofNode({ cancelledAt: "2026-11-22T00:00:00Z" }));
+    unknown(proofNode({ cancelledAt: undefined }));
+  });
+  it("changed, non-integer or non-positive quantities, truncated or malformed lists are unknown", () => {
+    const li = (nodes: unknown[], hasNextPage: unknown = false) => ({ nodes, pageInfo: { hasNextPage } });
+    const base = proofNode().lineItems.nodes;
+    unknown(proofNode({ lineItems: li(base.map((n, i) => (i === 0 ? { ...n, currentQuantity: 1 } : n))) }));
+    unknown(proofNode({ lineItems: li(base.map((n, i) => (i === 0 ? { ...n, quantity: 2.5, currentQuantity: 2.5 } : n))) }));
+    unknown(proofNode({ lineItems: li(base, true) }));
+    unknown(proofNode({ lineItems: { nodes: base } }));
+    unknown(proofNode({ lineItems: li([...base, base[0]]) })); // duplicate line id
+    unknown(proofNode({ lineItems: li(base.filter((n) => !n.requiresShipping)) })); // nothing to ship
+    unknown(proofNode({ fulfillments: Array.from({ length: 20 }, (_, i) => ful(String(200 + i), "2026-11-21T10:00:00Z", [[L1, 1]])) }));
+    unknown(proofNode({ fulfillments: [{ ...ful("101", "2026-11-21T10:00:00Z", [[L1, 2], [L2, 1]]), fulfillmentLineItems: { nodes: [{ quantity: 2, lineItem: { id: L1 } }, { quantity: 1, lineItem: { id: L2 } }], pageInfo: { hasNextPage: true } } }] }));
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2]]), ful("101", "2026-11-22T10:00:00Z", [[L2, 1]])] })); // duplicate fulfillment
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2], ["gid://shopify/LineItem/99", 1], [L2, 1]])] })); // unknown line
+  });
+  it("coverage must be exact on every shippable line: under, over and overcovered non-shipping lines are unknown", () => {
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2]])] }));
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2], [L2, 1]]), ful("102", "2026-11-22T10:00:00Z", [[L1, 1]])] }));
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2], [L2, 1], [L3, 2]])] }));
+  });
+  it("an earlier contributor's cancellation with a reship is ambiguous history: unknown, never a later cover", () => {
+    unknown(proofNode({ fulfillments: [
+      ful("101", "2026-11-21T10:00:00Z", [[L1, 2]], null, "CANCELLED"),
+      ful("102", "2026-11-22T10:00:00Z", [[L2, 1]], "2026-11-24T09:00:00Z"),
+      ful("103", "2026-11-23T10:00:00Z", [[L1, 2]], "2026-11-25T09:00:00Z"),
+    ] }));
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-21T10:00:00Z", [[L1, 2], [L2, 1]], null, "OPEN")] }));
+    unknown(proofNode({ fulfillments: [ful("101", "2026-11-19T10:00:00Z", [[L1, 2], [L2, 1]])] })); // before the order
+  });
+  it("the hash is canonical (input order irrelevant) and changes with a corrected delivery time", () => {
+    const a = wholeOrderProof(proofNode()) as { hash: string };
+    const reordered = proofNode({ fulfillments: [...proofNode().fulfillments].reverse(), lineItems: { nodes: [...proofNode().lineItems.nodes].reverse(), pageInfo: { hasNextPage: false } } });
+    expect((wholeOrderProof(reordered) as { hash: string }).hash).toBe(a.hash);
+    const corrected = proofNode({ fulfillments: [proofNode().fulfillments[0], { ...proofNode().fulfillments[1], deliveredAt: "2026-11-24T11:00:00Z" }] });
+    expect((wholeOrderProof(corrected) as { hash: string }).hash).not.toBe(a.hash);
+  });
+  it("REST webhook facts never carry whole-order proof", () => {
+    const f = factsFromWebhookOrder(ORDER, SHOP);
+    expect(evidenceFromFacts(f).some((e) => e.fulfillmentComplete === true)).toBe(false);
+  });
+});
+
+describe("projection: aggregate whole proof is separate from parcels", () => {
+  const e = (over: Record<string, unknown>) => ({ site: "uk", shop: SHOP, shopifyOrderId: "9", orderNumber: "10190203", source: "shopify" as const, kind: "confirmed" as const, receivedAt: "2026-11-25T00:00:00Z", ...over });
+  const parcels = [
+    e({ key: "order:9:ordered", stage: "ordered", happenedAt: "2026-11-20T09:00:00Z" }),
+    e({ key: "fulfillment:101:created", stage: "shipped", happenedAt: "2026-11-21T10:00:00Z", fulfillmentId: "101", fulfillmentComplete: false }),
+    e({ key: "fulfillment:102:created", stage: "shipped", happenedAt: "2026-11-22T10:00:00Z", fulfillmentId: "102", fulfillmentComplete: false }),
+    e({ key: "fulfillment:101:delivered:confirmed", stage: "delivered", happenedAt: "2026-11-23T09:00:00Z", fulfillmentId: "101" }),
+  ];
+  const whole = [
+    e({ key: "order:9:whole-shipped:r1", stage: "shipped", happenedAt: "2026-11-22T10:00:00Z", fulfillmentComplete: true }),
+    e({ key: "order:9:whole-delivered:r1", stage: "delivered", happenedAt: "2026-11-24T09:00:00Z", fulfillmentComplete: true }),
+  ];
+  it("active proof confirms shipped/delivered and completes shipment metrics; parcel lists keep only parcels", () => {
+    const t = projectTimeline([...parcels, ...whole] as never);
+    expect(t.stages.shipped).toMatchObject({ status: "confirmed", at: "2026-11-22T10:00:00.000Z" });
+    expect(t.stages.delivered).toMatchObject({ status: "confirmed", at: "2026-11-24T09:00:00.000Z" });
+    expect(t.completeShipmentAt).toBe("2026-11-22T10:00:00.000Z");
+    expect(t.fulfillments.map((f) => f.fulfillmentId)).toEqual(["101", "102"]);
+    expect(t.deliveries.map((d) => d.fulfillmentId)).toEqual(["101"]);
+  });
+  it("a withdrawn proof leaves only partial parcels and no complete-shipment sample", () => {
+    const withdrawn = [
+      e({ key: "order:9:whole-shipped:r1:withdrawn", stage: "shipped", happenedAt: "2026-11-25T08:00:00Z", retractsKey: "order:9:whole-shipped:r1" }),
+      e({ key: "order:9:whole-delivered:r1:withdrawn", stage: "delivered", happenedAt: "2026-11-25T08:00:00Z", retractsKey: "order:9:whole-delivered:r1" }),
+    ];
+    const t = projectTimeline([...parcels, ...whole, ...withdrawn] as never);
+    expect(t.stages.shipped.status).toBe("partial");
+    expect(t.stages.delivered.status).toBe("partial");
+    expect(t.completeShipmentAt).toBeNull();
+    // as of a cutoff before the withdrawal, the proof was active then
+    expect(projectTimeline([...parcels, ...whole, ...withdrawn] as never, "2026-11-25T00:00:00Z").completeShipmentAt).toBe("2026-11-22T10:00:00.000Z");
   });
 });

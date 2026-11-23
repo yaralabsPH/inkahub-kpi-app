@@ -356,7 +356,7 @@ export function OrderTimelineView({ state, onRetry }: { state: OverviewState<Ord
                     {STATUS_TEXT[s.status] ?? s.status}{s.kind && s.kind !== "confirmed" ? ` (${s.kind})` : ""}
                   </td>
                   <td className="tabular-nums">{siteTime(s.at, d.site)}</td>
-                  <td>{s.source ?? "—"}{automationContext(d, s)}</td>
+                  <td>{s.stage === "delivered" && s.source === "shopify" ? "shopify (Shopify-reported delivery time)" : s.source ?? "—"}{automationContext(d, s)}</td>
                   <td className="tabular-nums">{g ? gapText(g) : ""}</td>
                 </tr>
               );

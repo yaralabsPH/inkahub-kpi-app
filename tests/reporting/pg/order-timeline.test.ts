@@ -454,6 +454,146 @@ describe("0061 scanner receipt framing proof", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// 0062: generation-fenced whole-order shipment/delivery proof
+// ---------------------------------------------------------------------------
+
+describe("0062 whole-order proof fence", () => {
+  const H = (c: string) => c.repeat(64);
+  const begin = async (id: string) => {
+    const r = await rpc().rpc("order_timeline_proof_begin", { p_shop: SHOP, p_shopify_order_id: id });
+    if (r.error) throw new Error(r.error.message);
+    return Number(r.data);
+  };
+  const base = (id: string, num: string, site: string | null = "uk") => ({
+    p_order: order(id, site, num), p_evidence: [ev({ key: `order:${id}:ordered`, shopifyOrderId: id, orderNumber: num, happenedAt: "2026-11-20T08:00:00Z" })],
+  });
+  const apply = async (id: string, num: string, ticket: number, proof: Record<string, unknown> | null, b: { p_order: unknown; p_evidence: unknown[] } | null = base(id, num)) => {
+    const r = await rpc().rpc("order_timeline_proof_apply", { p_shop: SHOP, p_shopify_order_id: id, p_ticket: ticket, p_order: b?.p_order ?? null, p_evidence: b?.p_evidence ?? [], p_proof: proof });
+    if (r.error) throw new Error(r.error.message);
+    return r.data as { accepted: number; duplicates: number; conflicts: number; route: string; proof: string };
+  };
+  const proofA = { hash: H("a"), shippedAt: "2026-11-21T10:00:00Z", deliveredAt: "2026-11-23T09:00:00Z" };
+  const state = async (id: string) => (await db.query<{ g: number; r: number; h: string | null; s: string | null; d: string | null }>(`select generation::int g, proof_revision r, proof_hash h, shipped_key s, delivered_key d from public.order_timeline_proof_state where shopify_order_id = $1`, [id])).rows[0];
+  const wholeKeys = async (id: string) => (await db.query<{ k: string; r: string | null }>(
+    `select occurrence_key k, retracts_key r from public.order_timeline_evidence where shopify_order_id = $1 and occurrence_key like '%whole-%' order by received_at, occurrence_key`, [id])).rows;
+  const stagesOf = async (num: string) => {
+    const t = await timelineOf("uk", num);
+    return { shipped: t.stages?.find((s) => s.stage === "shipped"), delivered: t.stages?.find((s) => s.stage === "delivered"), t };
+  };
+
+  it("begin -> apply records the proof under revision keys; the projection confirms whole shipment and Shopify-reported delivery; unchanged replay adds nothing", async () => {
+    const t = await begin("62001");
+    expect(await apply("62001", "62001", t, proofA)).toMatchObject({ proof: "proven", route: "routed", conflicts: 0 });
+    expect(await state("62001")).toEqual({ g: 1, r: 1, h: H("a"), s: "order:62001:whole-shipped:r1", d: "order:62001:whole-delivered:r1" });
+    const { shipped, delivered } = await stagesOf("62001");
+    expect(shipped?.status).toBe("confirmed");
+    expect(Date.parse(shipped!.at!)).toBe(Date.parse(proofA.shippedAt));
+    expect(delivered?.status).toBe("confirmed");
+    expect(Date.parse(delivered!.at!)).toBe(Date.parse(proofA.deliveredAt));
+    const before = (await wholeKeys("62001")).length;
+    const t2 = await begin("62001");
+    expect(await apply("62001", "62001", t2, proofA)).toMatchObject({ proof: "unchanged", accepted: 0, duplicates: 1, conflicts: 0 });
+    expect((await wholeKeys("62001")).length).toBe(before);
+  });
+
+  it("a corrected delivery time withdraws r1 at the observation time and appends r2; A -> unknown -> A gets r3, never reusing a withdrawn key", async () => {
+    await apply("62002", "62002", await begin("62002"), proofA);
+    const corrected = { ...proofA, hash: H("b"), deliveredAt: "2026-11-23T11:00:00Z" };
+    const t0 = Date.now();
+    expect(await apply("62002", "62002", await begin("62002"), corrected)).toMatchObject({ proof: "proven", conflicts: 0 });
+    const withdrawn = (await db.query<{ at: Date }>(`select happened_at at from public.order_timeline_evidence where occurrence_key = 'order:62002:whole-shipped:r1:withdrawn'`)).rows[0];
+    expect(Math.abs(withdrawn.at.getTime() - t0)).toBeLessThan(60_000); // first observation, never backdated
+    expect(Date.parse((await stagesOf("62002")).delivered!.at!)).toBe(Date.parse(corrected.deliveredAt));
+    expect(await apply("62002", "62002", await begin("62002"), null)).toMatchObject({ proof: "withdrawn" });
+    expect((await stagesOf("62002")).shipped?.status).not.toBe("confirmed");
+    // repeated "no proof" on empty state adds no evidence
+    const n = (await wholeKeys("62002")).length;
+    expect(await apply("62002", "62002", await begin("62002"), null)).toMatchObject({ proof: "none", accepted: 0 });
+    expect((await wholeKeys("62002")).length).toBe(n);
+    expect(await apply("62002", "62002", await begin("62002"), proofA)).toMatchObject({ proof: "proven", conflicts: 0 });
+    expect((await state("62002")).s).toBe("order:62002:whole-shipped:r3");
+    expect((await stagesOf("62002")).shipped?.status).toBe("confirmed");
+  });
+
+  it("a stale ticket changes nothing: an older refresh finishing after a newer one cannot replace or erase it", async () => {
+    const t1 = await begin("62003");
+    const t2 = await begin("62003");
+    expect(await apply("62003", "62003", t2, proofA)).toMatchObject({ proof: "proven" });
+    const snap = [await state("62003"), (await db.query("select count(*)::int n from public.order_timeline_evidence")).rows[0]];
+    expect(await apply("62003", "62003", t1, { ...proofA, hash: H("c"), shippedAt: "2026-11-21T08:00:00Z" })).toEqual({ accepted: 0, duplicates: 0, conflicts: 0, route: "none", proof: "stale" });
+    expect(await apply("62003", "62003", t1, null, null)).toMatchObject({ proof: "stale" }); // obsolete failure
+    expect([await state("62003"), (await db.query("select count(*)::int n from public.order_timeline_evidence")).rows[0]]).toEqual(snap);
+    expect((await stagesOf("62003")).shipped?.status).toBe("confirmed");
+  });
+
+  it("a webhook during the fetch withdraws the proof and fences the in-flight refresh; repeated webhooks never resurrect or add evidence", async () => {
+    await apply("62004", "62004", await begin("62004"), proofA);
+    const t = await begin("62004");
+    const hook = async () => {
+      const r = await rpc().rpc("ingest_order_timeline_webhook", base("62004", "62004"));
+      if (r.error) throw new Error(r.error.message);
+      return r.data as Record<string, unknown>;
+    };
+    expect(await hook()).toMatchObject({ proofWithdrawn: true, conflicts: 0 });
+    expect(await apply("62004", "62004", t, proofA)).toMatchObject({ proof: "stale" });
+    expect((await stagesOf("62004")).shipped?.status).not.toBe("confirmed");
+    const n = (await wholeKeys("62004")).length;
+    expect(await hook()).toMatchObject({ proofWithdrawn: false, accepted: 0, duplicates: 1 });
+    expect((await wholeKeys("62004")).length).toBe(n);
+    // a fresh refresh after the webhook may prove again, under a new revision
+    expect(await apply("62004", "62004", await begin("62004"), proofA)).toMatchObject({ proof: "proven" });
+    expect((await state("62004")).s).toBe("order:62004:whole-shipped:r2");
+  });
+
+  it("the latest failed refresh withdraws via its own ticket", async () => {
+    await apply("62005", "62005", await begin("62005"), proofA);
+    expect(await apply("62005", "62005", await begin("62005"), null, null)).toMatchObject({ proof: "withdrawn" });
+    expect((await state("62005")).s).toBeNull();
+  });
+
+  it("no whole proof for an unrouted order or when this read conflicts with the recorded site", async () => {
+    expect(await apply("62006", "62006", await begin("62006"), proofA, base("62006", "62006", null))).toMatchObject({ proof: "none" });
+    expect((await state("62006")).s).toBeNull();
+    await apply("62007", "62007", await begin("62007"), null); // routed to uk
+    expect(await apply("62007", "62007", await begin("62007"), proofA, base("62007", "62007", "au"))).toMatchObject({ route: "conflict", proof: "none" });
+    expect((await state("62007")).s).toBeNull();
+  });
+
+  it("mismatched identities or malformed proofs roll the whole call back", async () => {
+    const t = await begin("62008");
+    const count = async () => (await db.query("select count(*)::int n from public.order_timeline_evidence")).rows[0];
+    const before = [await count(), await state("62008")];
+    const bad = [
+      { p_order: order("62009", "uk", "62009"), p_evidence: [] },
+      { p_order: order("62008", "uk", "62008"), p_evidence: [ev({ key: "order:62009:ordered", shopifyOrderId: "62009", orderNumber: "62009" })] },
+    ];
+    for (const b of bad) await expect(apply("62008", "62008", t, proofA, b)).rejects.toThrow(/mismatch/);
+    await expect(apply("62008", "62008", t, { ...proofA, shippedAt: "yesterday" })).rejects.toThrow(/malformed/);
+    expect([await count(), await state("62008")]).toEqual(before);
+  });
+
+  it("service-only: state table and functions are invisible to browser roles; invoker rights with an empty search_path", async () => {
+    const fns = ["order_timeline_proof_begin", "order_timeline_proof_apply", "ingest_order_timeline_webhook", "order_timeline_proof_lock_", "order_timeline_proof_withdraw_"];
+    for (const role of ["anon", "authenticated"]) {
+      await db.exec(`SET ROLE ${role}`);
+      try {
+        await expect(db.query("select 1 from public.order_timeline_proof_state limit 1")).rejects.toThrow();
+      } finally {
+        await db.exec("RESET ROLE");
+      }
+      for (const fn of fns) {
+        const ok = (await db.query<{ ok: boolean }>(`select has_function_privilege($1, p.oid, 'EXECUTE') ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = $2`, [role, fn])).rows;
+        expect(ok, `${role} ${fn}`).toEqual([{ ok: false }]);
+      }
+    }
+    const f = (await db.query<{ n: string; secdef: boolean; cfg: string[] }>(`select p.proname n, p.prosecdef secdef, p.proconfig cfg from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = any($1) order by 1`, [fns])).rows;
+    expect(f).toHaveLength(fns.length);
+    for (const x of f) expect([x.secdef, x.cfg]).toEqual([false, ['search_path=""']]);
+    expect((await db.query<{ rls: boolean }>("select relrowsecurity rls from pg_class where relname = 'order_timeline_proof_state'")).rows[0].rls).toBe(true);
+  });
+});
+
 describe("0059 grants", () => {
   it("browser roles cannot read tables or execute any timeline RPC", async () => {
     for (const role of ["anon", "authenticated"]) {

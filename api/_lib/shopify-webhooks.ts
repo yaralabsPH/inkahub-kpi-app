@@ -13,7 +13,7 @@
  *   a reconciliation is a duplicate, never a second record). No customer data
  *   is carried into evidence.
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { normalizeShop, ORDER_SITES, strictIso, type EvidenceKind, type OrderSite, type OrderStage } from "../../src/lib/domain/orderTimeline.js";
 
 /** Verified against https://shopify.dev/changelog/release-notes/2026-10 (latest stable on 2026-11-23). */
@@ -184,11 +184,11 @@ export function factsFromWebhookOrder(payload: unknown, shop: string): ShopifyOr
 }
 
 /** A GraphQL Admin order node from ORDER_TIMELINE_QUERY. */
-export function factsFromGraphqlOrder(node: unknown, shop: string): ShopifyOrderFacts {
+export function factsFromGraphqlOrder(node: unknown, shop: string, fulfillmentPage: number = FULFILLMENT_PAGE): ShopifyOrderFacts {
   if (!node || typeof node !== "object") throw new ShopifyPayloadError("order node: not an object");
   const n = node as Record<string, unknown>;
   const fs = Array.isArray(n.fulfillments) ? n.fulfillments : [];
-  if (fs.length >= FULFILLMENT_PAGE) throw new ShopifyPayloadError("order node: fulfillment list may be incomplete");
+  if (fs.length >= fulfillmentPage) throw new ShopifyPayloadError("order node: fulfillment list may be incomplete");
   const ship = n.shippingAddress && typeof n.shippingAddress === "object" ? (n.shippingAddress as Record<string, unknown>) : null;
   return {
     shop,
@@ -293,13 +293,25 @@ export async function readRawBody(req: RawBodyRequest, maxBytes: number): Promis
 }
 
 const FULFILLMENT_PAGE = 50;
-export const ORDER_TIMELINE_QUERY = `query OrderTimeline($q: String!) {
-  orders(first: 2, query: $q) {
-    nodes {
-      legacyResourceId name createdAt cancelledAt tags
-      customAttributes { key value }
-      shippingAddress { countryCodeV2 }
-      fulfillments(first: ${FULFILLMENT_PAGE}) { legacyResourceId createdAt status deliveredAt }
+/** Bounds of the post-ticket snapshot (requested query cost stays well under Shopify's single-query limit). */
+export const PROOF_LINE_PAGE = 50;
+export const PROOF_FULFILLMENT_PAGE = 20;
+export const PROOF_FULFILLMENT_LINE_PAGE = 20;
+
+/** Alias -> immutable id only. Never used as facts or proof (it is read before the proof ticket). */
+export const ORDER_LOOKUP_QUERY = `query OrderTimelineLookup($q: String!) {
+  orders(first: 2, query: $q) { nodes { legacyResourceId name } }
+}`;
+/** The snapshot by immutable id, read AFTER the proof ticket: base facts plus whole-order coverage. */
+export const ORDER_PROOF_QUERY = `query OrderTimelineProof($id: ID!) {
+  order(id: $id) {
+    legacyResourceId name createdAt cancelledAt edited tags
+    customAttributes { key value }
+    shippingAddress { countryCodeV2 }
+    lineItems(first: ${PROOF_LINE_PAGE}) { nodes { id quantity currentQuantity requiresShipping } pageInfo { hasNextPage } }
+    fulfillments(first: ${PROOF_FULFILLMENT_PAGE}) {
+      legacyResourceId createdAt status deliveredAt
+      fulfillmentLineItems(first: ${PROOF_FULFILLMENT_LINE_PAGE}) { nodes { quantity lineItem { id } } pageInfo { hasNextPage } }
     }
   }
 }`;
@@ -307,20 +319,121 @@ export const ORDER_TIMELINE_QUERY = `query OrderTimeline($q: String!) {
 export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 export class ShopifyReadError extends Error {}
 
-/** Read-only: one order by its number. null = not found; several matches or any error throws (never a guess). */
-export async function fetchShopifyOrder(fetchFn: FetchLike, shop: string, token: string, orderNumber: string): Promise<unknown | null> {
+async function shopifyGraphql(fetchFn: FetchLike, shop: string, token: string, query: string, variables: Record<string, string>): Promise<Record<string, unknown>> {
   const r = await fetchFn(`https://${shop}/admin/api/${SHOPIFY_ADMIN_API_VERSION}/graphql.json`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
-    body: JSON.stringify({ query: ORDER_TIMELINE_QUERY, variables: { q: `name:${JSON.stringify(`#${orderNumber}`)}` } }),
+    body: JSON.stringify({ query, variables }),
     signal: AbortSignal.timeout(10_000),
   }).catch(() => {
     throw new ShopifyReadError("Shopify could not be reached");
   });
   if (!r.ok) throw new ShopifyReadError(`Shopify returned HTTP ${r.status}`);
-  const body = (await r.json().catch(() => null)) as { data?: { orders?: { nodes?: unknown[] } }; errors?: unknown } | null;
-  if (!body || body.errors || !Array.isArray(body.data?.orders?.nodes)) throw new ShopifyReadError("Shopify returned an unexpected response");
-  const nodes = body.data.orders.nodes;
-  if (nodes.length > 1) throw new ShopifyReadError("Several Shopify orders match this number");
-  return nodes[0] ?? null;
+  const body = (await r.json().catch(() => null)) as { data?: Record<string, unknown>; errors?: unknown } | null;
+  if (!body || body.errors || !body.data || typeof body.data !== "object") throw new ShopifyReadError("Shopify returned an unexpected response");
+  return body.data;
+}
+
+/**
+ * Read-only: the immutable id of the ONE order with exactly this number. null = not found; several exact
+ * matches or any error throws (never a guess).
+ */
+export async function fetchShopifyOrder(fetchFn: FetchLike, shop: string, token: string, orderNumber: string): Promise<{ id: string } | null> {
+  const data = await shopifyGraphql(fetchFn, shop, token, ORDER_LOOKUP_QUERY, { q: `name:${JSON.stringify(`#${orderNumber}`)}` });
+  const nodes = (data.orders as { nodes?: unknown } | undefined)?.nodes;
+  if (!Array.isArray(nodes)) throw new ShopifyReadError("Shopify returned an unexpected response");
+  const exact = nodes.filter((n) => n && typeof n === "object" && normalizeOrderNumber((n as Record<string, unknown>).name) === orderNumber);
+  if (exact.length > 1) throw new ShopifyReadError("Several Shopify orders match this number");
+  if (exact.length === 0) return null;
+  const id = idText((exact[0] as Record<string, unknown>).legacyResourceId);
+  if (!id) throw new ShopifyReadError("Shopify returned an order without an id");
+  return { id };
+}
+
+/** Read-only: the proof snapshot of one order by immutable id. null = Shopify has no such order. */
+export async function fetchShopifyOrderById(fetchFn: FetchLike, shop: string, token: string, id: string): Promise<unknown | null> {
+  const data = await shopifyGraphql(fetchFn, shop, token, ORDER_PROOF_QUERY, { id: `gid://shopify/Order/${id}` });
+  if (!("order" in data)) throw new ShopifyReadError("Shopify returned an unexpected response");
+  return data.order ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Whole-order proof (pure). One post-ticket snapshot in, "proven" or "unknown" out.
+// ---------------------------------------------------------------------------
+
+export type WholeOrderProof =
+  | { status: "proven"; hash: string; shippedAt: string; deliveredAt: string | null }
+  | { status: "unknown"; reason: string };
+
+/**
+ * The whole order is proven shipped only when Shopify says the order was never edited (`edited === false`,
+ * strictly), is not cancelled, every line has the same positive original and current quantity, the line and
+ * fulfillment lists are complete and well formed, every fulfillment is SUCCESS (any cancelled/failed/pending
+ * fulfillment makes the history ambiguous), and the successful fulfillments' quantities equal EXACTLY the
+ * quantity of every shippable line (never more on any line). Shipped = the latest creation time among the
+ * fulfillments carrying shippable lines; delivered = the latest Shopify-reported deliveredAt among them, only
+ * when every one has a valid one at or after its creation. Shopify's current fulfilled status, updatedAt and
+ * REST payloads are never used. The hash covers the eligible manifest, contributors and their times.
+ */
+export function wholeOrderProof(node: unknown): WholeOrderProof {
+  const no = (reason: string): WholeOrderProof => ({ status: "unknown", reason });
+  const obj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  const posInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+  if (!obj(node)) return no("order unreadable");
+  const orderId = idText(node.legacyResourceId);
+  const orderedAt = strictIso(node.createdAt);
+  if (!orderId || !orderedAt) return no("order unreadable");
+  if (node.edited !== false) return no("order was edited, or its edit state is unknown");
+  if (node.cancelledAt !== null) return no("order is cancelled, or its cancellation state is unknown");
+
+  const li = node.lineItems;
+  if (!obj(li) || !Array.isArray(li.nodes) || !obj(li.pageInfo) || li.pageInfo.hasNextPage !== false) return no("line items incomplete");
+  if (li.nodes.length === 0 || li.nodes.length > PROOF_LINE_PAGE) return no("line items incomplete");
+  const lines = new Map<string, { qty: number; ship: boolean }>();
+  for (const x of li.nodes) {
+    if (!obj(x) || typeof x.id !== "string" || x.id === "" || lines.has(x.id) || typeof x.requiresShipping !== "boolean") return no("line items malformed");
+    if (!posInt(x.quantity) || x.currentQuantity !== x.quantity) return no("line quantities changed or malformed");
+    lines.set(x.id, { qty: x.quantity, ship: x.requiresShipping });
+  }
+  const eligible = [...lines].filter(([, l]) => l.ship).map(([id, l]) => [id, l.qty] as [string, number]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  if (eligible.length === 0) return no("no shippable lines");
+
+  const fs = node.fulfillments;
+  if (!Array.isArray(fs) || fs.length >= PROOF_FULFILLMENT_PAGE) return no("fulfillments incomplete");
+  const covered = new Map<string, number>();
+  const ids = new Set<string>();
+  const contributors: Array<{ id: string; createdAt: string; deliveredAt: string | null; parts: Array<[string, number]> }> = [];
+  for (const f of fs) {
+    if (!obj(f)) return no("fulfillments malformed");
+    const id = idText(f.legacyResourceId);
+    const createdAt = strictIso(f.createdAt);
+    if (!id || ids.has(id) || !createdAt) return no("fulfillments malformed");
+    ids.add(id);
+    if (f.status !== "SUCCESS") return no("a fulfillment is not successful; cancellation/reship history is ambiguous");
+    const deliveredAt = f.deliveredAt == null ? null : strictIso(f.deliveredAt);
+    if (f.deliveredAt != null && !deliveredAt) return no("delivery time malformed");
+    const fli = f.fulfillmentLineItems;
+    if (!obj(fli) || !Array.isArray(fli.nodes) || !obj(fli.pageInfo) || fli.pageInfo.hasNextPage !== false) return no("fulfillment lines incomplete");
+    if (fli.nodes.length === 0 || fli.nodes.length > PROOF_FULFILLMENT_LINE_PAGE) return no("fulfillment lines incomplete");
+    const parts = new Map<string, number>();
+    for (const p of fli.nodes) {
+      const lineId = obj(p) && obj(p.lineItem) ? p.lineItem.id : null;
+      if (typeof lineId !== "string" || !lines.has(lineId) || parts.has(lineId) || !obj(p) || !posInt(p.quantity)) return no("fulfillment lines malformed");
+      parts.set(lineId, p.quantity);
+      covered.set(lineId, (covered.get(lineId) ?? 0) + p.quantity);
+    }
+    const shipParts = [...parts].filter(([l]) => lines.get(l)!.ship).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    if (shipParts.length) contributors.push({ id, createdAt, deliveredAt, parts: shipParts });
+  }
+  for (const [id, l] of lines) {
+    const c = covered.get(id) ?? 0;
+    if (l.ship ? c !== l.qty : c > l.qty) return no("fulfilled quantities do not exactly match the order");
+  }
+  if (contributors.some((c) => Date.parse(c.createdAt) < Date.parse(orderedAt))) return no("a fulfillment precedes the order");
+  contributors.sort((a, b) => (a.id < b.id ? -1 : 1));
+  const shippedAt = new Date(Math.max(...contributors.map((c) => Date.parse(c.createdAt)))).toISOString();
+  const allDelivered = contributors.every((c) => c.deliveredAt !== null && Date.parse(c.deliveredAt) >= Date.parse(c.createdAt));
+  const deliveredAt = allDelivered ? new Date(Math.max(...contributors.map((c) => Date.parse(c.deliveredAt as string)))).toISOString() : null;
+  const canonical = JSON.stringify({ v: 1, order: orderId, lines: eligible, contributors: contributors.map((c) => [c.id, c.createdAt, c.deliveredAt, c.parts]), shippedAt, deliveredAt });
+  return { status: "proven", hash: createHash("sha256").update(canonical).digest("hex"), shippedAt, deliveredAt };
 }
