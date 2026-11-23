@@ -560,6 +560,34 @@ describe("0062 whole-order proof fence", () => {
     expect((await state("62007")).s).toBeNull();
   });
 
+  it("review P2: a previously routed order whose CURRENT read has no routing never gains or keeps proof; history is kept", async () => {
+    const recordedSite = async (id: string) => (await db.query<{ site: string | null; c: number }>(
+      "select site, route_conflicts c from public.order_timeline_orders where shopify_order_id = $1", [id])).rows[0];
+    // (a) routed to UK earlier, no proof yet: a proof read with missing routing creates nothing
+    await apply("62010", "62010", await begin("62010"), null);
+    expect(await apply("62010", "62010", await begin("62010"), proofA, base("62010", "62010", null))).toMatchObject({ route: "unchanged", proof: "none" });
+    expect((await state("62010")).s).toBeNull();
+    expect((await stagesOf("62010")).shipped?.status).not.toBe("confirmed");
+    expect(await recordedSite("62010")).toEqual({ site: "uk", c: 0 }); // immutable historic routing kept
+    // (b) active proof, then a read with missing routing: withdrawn; repeating it is stable (no new evidence)
+    await apply("62011", "62011", await begin("62011"), proofA);
+    expect((await stagesOf("62011")).shipped?.status).toBe("confirmed");
+    expect(await apply("62011", "62011", await begin("62011"), proofA, base("62011", "62011", null))).toMatchObject({ route: "unchanged", proof: "withdrawn" });
+    expect((await state("62011")).s).toBeNull();
+    expect((await stagesOf("62011")).shipped?.status).not.toBe("confirmed");
+    const n = (await wholeKeys("62011")).length;
+    expect(await apply("62011", "62011", await begin("62011"), proofA, base("62011", "62011", null))).toMatchObject({ proof: "none", accepted: 0 });
+    expect((await wholeKeys("62011")).length).toBe(n);
+    expect(await recordedSite("62011")).toEqual({ site: "uk", c: 0 });
+    // (c) a null order (failure path) never creates proof even when a proof object is passed
+    expect(await apply("62012", "62012", await begin("62012"), proofA, null)).toMatchObject({ proof: "none" });
+    expect((await state("62012")).s).toBeNull();
+    // (d) normal known routing still proves, and an unchanged replay stays unchanged
+    await apply("62013", "62013", await begin("62013"), null);
+    expect(await apply("62013", "62013", await begin("62013"), proofA)).toMatchObject({ route: "unchanged", proof: "proven" });
+    expect(await apply("62013", "62013", await begin("62013"), proofA)).toMatchObject({ route: "unchanged", proof: "unchanged" });
+  });
+
   it("mismatched identities or malformed proofs roll the whole call back", async () => {
     const t = await begin("62008");
     const count = async () => (await db.query("select count(*)::int n from public.order_timeline_evidence")).rows[0];

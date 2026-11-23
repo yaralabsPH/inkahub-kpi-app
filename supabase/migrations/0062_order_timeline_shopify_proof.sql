@@ -17,8 +17,10 @@
 --       first observation of the change; never backdated), and a present proof is appended under fresh
 --       immutable revision keys 'order:<id>:whole-shipped:r<N>' / 'order:<id>:whole-delivered:r<N>'.
 --       A -> unknown -> A therefore gets a new revision; a withdrawn key is never reused.
---   A proof is only accepted while the order is routed and this ingestion reported no route conflict;
---   otherwise it is treated as absent (conservative downgrade). Proof null = latest refresh found no proof
+--   A proof is only accepted when THIS apply carries a non-null routed site equal to the recorded site and
+--   the ingestion reported no route conflict; otherwise (including a read whose routing is now missing while
+--   the historic recorded site is kept) it is treated as absent and an active proof is withdrawn. The recorded
+--   routing itself is never changed here. Proof null = latest refresh found no proof
 --   (or failed): withdraws an active proof, adds nothing when already empty.
 -- * ingest_order_timeline_webhook(order, evidence): the webhook path. Ingests base facts and, atomically,
 --   increments the generation (so any refresh fetched before it is stale) and withdraws an active proof.
@@ -166,7 +168,12 @@ BEGIN
     END IF;
     -- a whole proof only for a routed order whose routing this read did not contradict
     SELECT o.site, o.order_number INTO v_site, v_num FROM public.order_timeline_orders o WHERE o.shop = p_shop AND o.shopify_order_id = p_shopify_order_id;
-    IF v_site IS NULL OR v_base ->> 'route' = 'conflict' THEN v_proof := NULL; END IF;
+    -- THIS read must route the order too: a non-null site equal to the recorded one. A read whose routing is
+    -- missing (stored site kept, 0059 says "unchanged"), a null order, or a conflict never creates or keeps proof.
+    IF v_site IS NULL OR v_base ->> 'route' = 'conflict' OR p_order IS NULL
+       OR pg_catalog.jsonb_typeof(p_order -> 'site') IS DISTINCT FROM 'string' OR p_order ->> 'site' IS DISTINCT FROM v_site THEN
+      v_proof := NULL;
+    END IF;
   END IF;
 
   IF v_proof IS NOT NULL AND s.proof_hash = v_proof ->> 'hash' THEN
