@@ -88,6 +88,8 @@ export interface EvidenceDto {
   stage: string; source: EvidenceSource; kind: EvidenceKind; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null;
   /** This record retracts an earlier record of the same source (e.g. a cancelled scan); it is not a stage fact. */
   retraction: boolean;
+  /** F11: the Make run/occurrence id for automation evidence (no secrets); null for other sources. */
+  runId: string | null;
   /** This record was retracted at or before now and no longer counts. */
   revoked: boolean;
 }
@@ -111,6 +113,7 @@ const revokedAt = (rows: readonly StoredEvidence[], nowMs: number) =>
 const evidenceDto = (revoked: ReadonlySet<string>) => (e: StoredEvidence): EvidenceDto => ({
   stage: e.stage, source: e.source, kind: e.kind, at: e.happenedAt, receivedAt: e.receivedAt, fulfillmentId: e.fulfillmentId ?? null, workType: e.workType ?? null, batchId: e.batchId ?? null, caseId: e.caseId ?? null,
   retraction: !!e.retractsKey, revoked: revoked.has(occurrenceKey(e)),
+  runId: e.source === "make" ? e.key.split("|")[0] : null,
 });
 
 function badRequest(m: string): never {

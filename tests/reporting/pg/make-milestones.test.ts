@@ -76,6 +76,8 @@ describe("0060 membership resolution", () => {
       ["make_submitted", "confirmed"], ["make_files_found", "confirmed"], ["make_planned", "confirmed"], ["make_images_ready", "missing"], ["make_packing_ready", "missing"]]);
     expect(t.gaps.find((g) => g.from === "make_submitted")).toMatchObject({ status: "measured", hours: 1 });
     expect(t.gaps.find((g) => g.from === "make_planned")).toMatchObject({ status: "unknown" }); // missing later step: never invented
+    expect(t.evidence.filter((e) => e.source === "make").map((e) => [e.stage, e.batchId, e.runId])).toEqual([
+      ["make_submitted", "B1", "p1:B1:v1"], ["make_files_found", "B1", "p2:B1:v1"], ["make_planned", "B1", "p3:B1:v1"]]);
   });
   it("successful subsets are scoped to their batch/version; a later version never inherits an earlier one; non-members fail closed", async () => {
     await send(env({ occurrenceId: "p1:S:v1", batchId: "S", members: [{ memberKey: "a", orderNumber: "9101" }, { memberKey: "b", orderNumber: "9102" }, { memberKey: "c", orderNumber: "9103" }] }));

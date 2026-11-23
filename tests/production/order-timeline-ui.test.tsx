@@ -1,7 +1,7 @@
 /** F10 UI seams: request scope (no stale order/site), rendered states and labels, role visibility. */
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { effectiveRequest, OrderTimelineView, timelineQuery, type OrderTimelineView as TimelineData, type TimelineRequest } from "../../src/components/OrderTimelineCard";
+import { automationContext, effectiveRequest, OrderTimelineView, timelineQuery, type OrderTimelineView as TimelineData, type TimelineRequest } from "../../src/components/OrderTimelineCard";
 import { flowQuery, flowRequestFor, OrderFlowView, type OrderFlowView as FlowData } from "../../src/components/OrderFlowSection";
 import { createOverviewLoader, type OverviewState } from "../../src/lib/hooks/useReportsOverview";
 import { orderTimelineVisible } from "../../src/pages/Reports";
@@ -129,5 +129,34 @@ describe("visibility", () => {
   it("never for staff or kiosk", () => {
     expect(["owner", "manager", "cs"].map(orderTimelineVisible)).toEqual([true, true, true]);
     expect(["staff", "kiosk", null].map(orderTimelineVisible)).toEqual([false, false, false]);
+  });
+});
+
+describe("F11 automation steps in the card", () => {
+  const base = timeline("au", "9001");
+  const data: TimelineData = {
+    ...base, cancelled: null, deliveries: [], fulfillments: [],
+    stages: [
+      { stage: "ordered", status: "missing", at: null, source: null, kind: null },
+      { stage: "make_submitted", status: "confirmed", at: "2026-11-20T09:00:00.000000Z", source: "make", kind: "confirmed" },
+      { stage: "make_files_found", status: "missing", at: null, source: null, kind: null },
+      { stage: "make_planned", status: "confirmed", at: "2026-11-20T11:00:00.000000Z", source: "make", kind: "confirmed" },
+      { stage: "make_images_ready", status: "missing", at: null, source: null, kind: null },
+      { stage: "make_packing_ready", status: "missing", at: null, source: null, kind: null },
+    ],
+    gaps: [{ from: "make_submitted", to: "make_files_found", status: "unknown", hours: null }, { from: "make_files_found", to: "make_planned", status: "unknown", hours: null }],
+    evidence: [
+      { stage: "make_submitted", source: "make", kind: "confirmed", at: "2026-11-20T09:00:00.000000Z", receivedAt: "2026-11-20T09:00:02.000000Z", fulfillmentId: null, workType: null, batchId: "B1", caseId: null, retraction: false, revoked: false, runId: "p1:B1:v1" },
+      { stage: "make_planned", source: "make", kind: "confirmed", at: "2026-11-20T11:00:00.000000Z", receivedAt: "2026-11-20T11:00:02.000000Z", fulfillmentId: null, workType: null, batchId: "B1", caseId: null, retraction: false, revoked: false, runId: "p3:B1:v1:exec-77" },
+    ],
+  };
+  it("shows the five steps with labels, batch and run context for recorded ones, and missing (never failed) for the rest", () => {
+    const html = renderToStaticMarkup(<OrderTimelineView state={ready(data)} onRetry={() => {}} />);
+    for (const label of ["Submitted to print", "Files found", "Planned", "Images ready", "Packing slips ready"]) expect(html).toContain(label);
+    expect(html).toContain("make · batch B1 · run p1:B1:v1");
+    expect(html).toContain("make · batch B1 · run p3:B1:v1:exec-77");
+    expect(text(html)).not.toMatch(/\bfailed\b|percent|%|printed/i);
+    expect(automationContext(data, data.stages![2])).toBe(""); // missing: no context invented
+    expect(automationContext(data, data.stages![0])).toBe(""); // not an automation step
   });
 });

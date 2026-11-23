@@ -43,7 +43,7 @@ export interface OrderTimelineView {
   /** Per fulfillment: when it was CREATED in Shopify (not when the whole order shipped). */
   fulfillments: Array<{ fulfillmentId: string; at: string; complete: boolean; kind: string }>;
   deliveries: Array<{ fulfillmentId: string | null; at: string; kind: string }>;
-  evidence: Array<{ stage: string; source: string; kind: string; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null; retraction: boolean; revoked: boolean }>;
+  evidence: Array<{ stage: string; source: string; kind: string; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null; retraction: boolean; revoked: boolean; runId?: string | null }>;
 }
 
 export const timelineQuery = (r: TimelineRequest) => `action=order&site=${encodeURIComponent(r.site)}&orderNumber=${encodeURIComponent(r.orderNumber)}`;
@@ -127,6 +127,14 @@ export function OrderTimelineCard({ supabase, scopeKey, site }: { supabase: Supa
   );
 }
 
+/** F11 batch/run context for a recorded automation step (from the evidence that recorded it; never secrets). */
+export function automationContext(d: OrderTimelineView, s: { stage: string; status: string; at: string | null }): string {
+  if (!s.stage.startsWith("make_") || s.status === "missing" || !s.at) return "";
+  const e = d.evidence.find((x) => x.stage === s.stage && x.source === "make" && !x.revoked && !x.retraction && Date.parse(x.at) === Date.parse(s.at as string));
+  if (!e) return "";
+  return [e.batchId ? ` · batch ${e.batchId}` : "", e.runId ? ` · run ${e.runId}` : ""].join("");
+}
+
 export function OrderTimelineView({ state, onRetry }: { state: OverviewState<OrderTimelineView>; onRetry: () => void }) {
   if (state.status === "idle") return <p className="text-[11px] text-slate-500">Shows recorded evidence only: a missing step means nothing was recorded, not that it failed. Times are in the site's time zone.</p>;
   if (state.status === "loading") return <div className="text-xs text-slate-500" role="status">Loading order timeline…</div>;
@@ -157,7 +165,7 @@ export function OrderTimelineView({ state, onRetry }: { state: OverviewState<Ord
                     {STATUS_TEXT[s.status] ?? s.status}{s.kind && s.kind !== "confirmed" ? ` (${s.kind})` : ""}
                   </td>
                   <td className="tabular-nums">{siteTime(s.at, d.site)}</td>
-                  <td>{s.source ?? "—"}</td>
+                  <td>{s.source ?? "—"}{automationContext(d, s)}</td>
                   <td className="tabular-nums">{g ? gapText(g) : ""}</td>
                 </tr>
               );

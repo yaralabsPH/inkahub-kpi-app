@@ -14,6 +14,7 @@ import {
   percentile,
   projectTimeline,
   type OrderEvidence,
+  type OrderStage,
 } from "../src/lib/domain/orderTimeline";
 
 const SHOP = "inka-uk.myshopify.com";
@@ -305,5 +306,23 @@ describe("review task2 P1: delivery is per fulfillment; whole-order delivery nee
     expect(stageGaps(t).find((g) => g.to === "delivered")).toMatchObject({ status: "measured", hours: 3 });
     const inferred = projectTimeline([o, ev({ key: "d", stage: "delivered", kind: "inferred", fulfillmentComplete: true })]);
     expect(inferred.stages.delivered.status).toBe("unconfirmed");
+  });
+});
+
+describe("F11: automation steps are recorded or missing, never invented", () => {
+  const o = ev({ key: "o" });
+  const mk = (stage: OrderEvidence["stage"], h: string, batchId = "B1") => ev({ key: `run-${stage}|m1`, stage, source: "make", batchId, happenedAt: `2026-11-20T${h}:00:00Z` });
+  it("a later step without earlier steps keeps the earlier ones missing; no gap is measured across them", () => {
+    const t = projectTimeline([o, mk("make_planned", "12")]);
+    expect(["make_submitted", "make_files_found", "make_images_ready", "make_packing_ready"].map((s) => t.stages[s as OrderStage].status)).toEqual(["missing", "missing", "missing", "missing"]);
+    expect(t.stages.make_planned).toMatchObject({ status: "confirmed", source: "make", at: "2026-11-20T12:00:00.000Z" });
+    const g = stageGaps(t);
+    expect(g.filter((x) => x.to === "make_planned" || x.from === "make_planned").map((x) => x.status)).toEqual(["unknown", "unknown"]);
+    expect(g.find((x) => x.to === "make_submitted")).toMatchObject({ status: "unknown" });
+  });
+  it("all five recorded: adjacent gaps are measured from actual source times only", () => {
+    const t = projectTimeline([o, mk("make_submitted", "10"), mk("make_files_found", "11"), mk("make_planned", "13"), mk("make_images_ready", "14"), mk("make_packing_ready", "16")]);
+    expect(stageGaps(t).slice(0, 5).map((x) => [x.to, x.status, x.hours])).toEqual([
+      ["make_submitted", "measured", 1], ["make_files_found", "measured", 1], ["make_planned", "measured", 2], ["make_images_ready", "measured", 1], ["make_packing_ready", "measured", 2]]);
   });
 });
