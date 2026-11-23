@@ -64,3 +64,13 @@ Files: src/components/OrderTimelineCard.tsx; docs/releases/make-milestones.md; t
 Part1 knows accepted display order numbers and batch id; Part2 supplies immutable Shopify ids. Persist scoped shop/site/batch membership aliases and the original Part1 occurrence/time, then resolve them atomically from explicit Part2 mappings. A stable member key may connect stages without inventing Shopify ids. Successful subsets must refer to the same batch/membership version. Unresolved or ambiguous members remain durable and cannot attach to an arbitrary order. An existing canonical order mapped to a different site must not be reassigned by Make. Preserve idempotent original-envelope retries and reject conflicting occurrences. Do not add per-order Shopify calls to Part1.
 
 Successful pipeline milestones are confirmed source evidence; missing stages remain missing. The general shared-store location rule is still unconfigured pending clarification; synthetic staging tests use an explicitly synthetic shop and AU scope. This is an implementation clarification within the approved F11 scope.
+
+### Hosted runtime follow-up (2026-11-23, root-authorized staging fix)
+
+The first F10/F11 Preview at 75517a4 is READY, but timeline and reports functions fail at module load: Node ESM cannot resolve extensionless `./productionCounts` from `src/lib/domain/productionReporting.js`. Local build/type checks use bundler resolution and missed this. Production is unchanged.
+
+- [ ] Reproduce the actual server import failure using emitted, unbundled JavaScript under Node ESM; no hosted data writes.
+- [ ] Add explicit `.js` extensions to relative runtime imports in the server-reachable shared modules that need them. Inspect the transitive graph; do not redesign reporting or change feature behavior.
+- [ ] Add a small no-network server import smoke check that catches this deployed-runtime failure, using existing dependencies. Avoid broad test infrastructure or new packages.
+- [ ] Run that check, relevant API/domain tests, API/frontend type checks and build. Commit and push only this feature branch; no main merge or production release.
+- [ ] Root reviews the change and redeploys a Preview. Require actual app JSON responses, then repeat the configured F10/F11 staging acceptance. Existing database migrations and live Make systems stay unchanged.
