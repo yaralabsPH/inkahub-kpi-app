@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { reportsLayoutFor } from "../../src/pages/Reports";
+import { reportsAccessFor, ReportsForAccess, reportsLayoutFor } from "../../src/pages/Reports";
 import { buildOverviewRequest, OverviewBodyView } from "../../src/components/ReportsOverview";
 import { createOverviewLoader, type OverviewState } from "../../src/lib/hooks/useReportsOverview";
 import { effectiveNavAccess } from "../../src/lib/auth/permissions";
@@ -25,12 +25,45 @@ describe("role layout: restricted roles never mount the legacy full-team view", 
   it("owner/manager full, staff/CS overview only, kiosk denied, unknown profile pending", () => {
     expect(["owner", "manager", "staff", "cs", "kiosk", null].map(reportsLayoutFor)).toEqual(["full", "full", "overview_only", "overview_only", "denied", "pending"]);
   });
-  it("the legacy component (staff rates, raw history) is rendered only in the full branch", () => {
+  it("legacy mounts only for a loaded, matching owner/manager session (review r1 #1: session switch with a retained profile)", () => {
+    const owner = { user_id: U1, role: "owner" };
+    const at = (a: Parameters<typeof reportsAccessFor>[0]) =>
+      renderToStaticMarkup(<ReportsForAccess access={reportsAccessFor(a)} overview={(x) => <i>OVERVIEW:{x.scopeKey}</i>} legacy={() => <b>LEGACY</b>} />);
+    const s1 = { id: U1 };
+    // 1. owner signed in: summary + legacy
+    expect(at({ loading: false, session: { user: s1 }, user: s1, profile: owner })).toContain("LEGACY");
+    // 2. session switches to a staff user; AuthProvider still holds the OWNER profile: nothing role-dependent
+    const s2 = { id: U2 };
+    const mid = at({ loading: false, session: { user: s2 }, user: s2, profile: owner });
+    expect(mid).not.toContain("LEGACY");
+    expect(mid).not.toContain("OVERVIEW");
+    expect(mid).toContain("Loading your access");
+    // 3. still loading, or session/user disagree, or no session/profile: closed
+    for (const a of [
+      { loading: true, session: { user: s1 }, user: s1, profile: owner },
+      { loading: false, session: { user: s2 }, user: s1, profile: owner },
+      { loading: false, session: null, user: s1, profile: owner },
+      { loading: false, session: { user: s1 }, user: s1, profile: null },
+    ]) {
+      const html = at(a);
+      expect(html).not.toContain("LEGACY");
+      expect(html).not.toContain("OVERVIEW");
+    }
+    // 4. the staff profile arrives: summary only, self scope
+    const done = at({ loading: false, session: { user: s2 }, user: s2, profile: { user_id: U2, role: "staff" } });
+    expect(done).not.toContain("LEGACY");
+    expect(done).toContain(`OVERVIEW:${U2}|staff|self`);
+    // kiosk refused; CS summary in site scope
+    expect(at({ loading: false, session: { user: s2 }, user: s2, profile: { user_id: U2, role: "kiosk" } })).toContain("not available on kiosk");
+    expect(at({ loading: false, session: { user: s2 }, user: s2, profile: { user_id: U2, role: "cs" } })).toContain(`OVERVIEW:${U2}|cs|site`);
+  });
+  it("the page passes the trusted scope as the summary's key and identity", () => {
     const src = readFileSync("src/pages/Reports.tsx", "utf8");
     const role = src.slice(src.indexOf("function RoleReports()"), src.indexOf("function SupabaseReports()"));
-    expect(role.match(/<SupabaseReports \/>/g)).toHaveLength(1);
-    expect(role.indexOf('if (layout === "overview_only")')).toBeLessThan(role.indexOf("<SupabaseReports />"));
-    expect(src.match(/<SupabaseReports \/>/g)).toHaveLength(1);
+    expect(role).toContain("key={a.scopeKey}");
+    expect(role).toContain("scopeKey={a.scopeKey}");
+    expect(role).toContain("const access = reportsAccessFor(auth)");
+    expect(src.split("<SupabaseReports />").length - 1).toBe(1);
   });
   it("staff get Reports by default; explicit overrides stay authoritative; CS still needs it explicitly", () => {
     expect(effectiveNavAccess({ role: "staff", allowed_nav: null } as never).has("reports")).toBe(true);
@@ -74,6 +107,29 @@ describe("stale-response isolation", () => {
     await tick();
     expect(h.loader.state().data?.totals.normal.orders).toBe(2);
     expect(h.seen.some((s) => s.data?.totals.normal.orders === 99)).toBe(false);
+  });
+  it("review r1 #2: same user CS (Everyone, site scope) -> staff clears site data at once and drops a late CS reply", async () => {
+    const h = harness();
+    const CS = `${U1}|cs|site`;
+    const STAFF = `${U1}|staff|self`;
+    void h.loader.load(CS, AU); // CS "Everyone": no staffId
+    await tick();
+    h.pending[0].resolve({ ok: true, status: 200, body: result("au", 7) });
+    await tick();
+    expect(h.loader.state().data?.totals.normal.orders).toBe(7);
+    void h.loader.load(CS, AU); // a CS refresh is in flight...
+    await tick();
+    void h.loader.load(STAFF, AU); // ...when the role drops to staff (same user, same query string)
+    expect(h.loader.state()).toMatchObject({ status: "loading", data: null });
+    await tick();
+    h.pending[1].resolve({ ok: true, status: 200, body: result("au", 8) }); // the old CS answer lands late
+    await tick();
+    expect(h.loader.state()).toMatchObject({ status: "loading", data: null });
+    h.pending[2].resolve({ ok: true, status: 200, body: result("au", 1) });
+    await tick();
+    expect(h.loader.state().data?.totals.normal.orders).toBe(1);
+    const fromStaff = h.seen.slice(h.seen.findIndex((x) => x.key.startsWith(STAFF)));
+    expect(fromStaff.some((x) => x.data !== null && x.data.totals.normal.orders !== 1)).toBe(false);
   });
   it("an unpublished site is not-ready (no fallback); other failures are errors with retry", async () => {
     const h = harness();

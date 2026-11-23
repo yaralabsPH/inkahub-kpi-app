@@ -40,11 +40,12 @@ export function createOverviewLoader(deps: OverviewLoaderDeps) {
   return {
     state: () => state,
     /** Load (or reload, for Retry) one identity. */
-    async load(userId: string | null, request: OverviewRequest | null): Promise<void> {
+    /** `identity` = trusted user + role + audience scope. */
+    async load(identity: string | null, request: OverviewRequest | null): Promise<void> {
       ac?.abort();
-      const key = overviewKey(userId, request);
+      const key = overviewKey(identity, request);
       const mine = ++seq;
-      if (!request || !userId) {
+      if (!request || !identity) {
         ac = null;
         set(IDLE_OVERVIEW);
         return;
@@ -80,7 +81,8 @@ export function createOverviewLoader(deps: OverviewLoaderDeps) {
 }
 
 /** React binding. `request` null = nothing to load. `refreshKey` forces a reload of the same identity. */
-export function useReportsOverview(supabase: SupabaseClient, userId: string | null, request: OverviewRequest | null, refreshKey: number): OverviewState {
+/** `scopeKey` = trusted user + role + audience; a change is a new identity (data cleared, late replies dropped). */
+export function useReportsOverview(supabase: SupabaseClient, scopeKey: string | null, request: OverviewRequest | null, refreshKey: number): OverviewState {
   const [state, setState] = useState<OverviewState>(IDLE_OVERVIEW);
   const loader = useMemo(
     () =>
@@ -91,13 +93,13 @@ export function useReportsOverview(supabase: SupabaseClient, userId: string | nu
       }),
     [supabase],
   );
-  const key = overviewKey(userId, request);
+  const key = overviewKey(scopeKey, request);
   useEffect(() => {
-    void loader.load(userId, request);
+    void loader.load(scopeKey, request);
     // the key captures every request field
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loader, key, refreshKey]);
   useEffect(() => () => loader.dispose(), [loader]);
   // Render-time guard: never show a state that belongs to another identity.
-  return state.key === key ? state : { ...IDLE_OVERVIEW, key, status: request && userId ? "loading" : "idle" };
+  return state.key === key ? state : { ...IDLE_OVERVIEW, key, status: request && scopeKey ? "loading" : "idle" };
 }

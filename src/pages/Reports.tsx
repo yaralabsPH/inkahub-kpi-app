@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshCw, Search, Trash2 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
@@ -195,21 +195,68 @@ export function reportsLayoutFor(role: string | null): "pending" | "denied" | "o
   return "overview_only";
 }
 
+export interface ReportsAccess {
+  layout: "pending" | "denied" | "overview_only" | "full";
+  userId: string | null;
+  role: string | null;
+  /** Trusted identity of everything shown: user + role + audience. A change remounts the summary. */
+  scopeKey: string;
+}
+
+/**
+ * Fail closed: while auth loads, or when the session, user and profile do not
+ * all belong to the same person (AuthProvider keeps the previous profile until
+ * the new one arrives), nothing role-dependent mounts.
+ */
+export function reportsAccessFor(a: {
+  loading: boolean;
+  session: { user: { id: string } } | null;
+  user: { id: string } | null;
+  profile: { user_id: string; role: string } | null;
+}): ReportsAccess {
+  const pending: ReportsAccess = { layout: "pending", userId: null, role: null, scopeKey: "" };
+  if (a.loading || !a.session || !a.user || !a.profile) return pending;
+  if (a.profile.user_id !== a.user.id || a.session.user.id !== a.user.id) return pending;
+  const role = a.profile.role;
+  const layout = reportsLayoutFor(role);
+  return { layout, userId: a.user.id, role, scopeKey: `${a.user.id}|${role}|${role === "staff" ? "self" : "site"}` };
+}
+
+/** The role-dependent tree for one resolved access (pure; legacy only for a matching owner/manager). */
+export function ReportsForAccess({ access, overview, legacy }: { access: ReportsAccess; overview: (a: ReportsAccess) => ReactNode; legacy: () => ReactNode }) {
+  if (access.layout === "pending") return <div className="p-6 text-sm text-slate-500" role="status">Loading your access…</div>;
+  if (access.layout === "denied") return <div className="p-6 text-sm text-slate-600 dark:text-slate-300">Reports are not available on kiosk accounts.</div>;
+  if (access.layout === "overview_only") return <div className="p-4 md:p-6 space-y-4">{overview(access)}</div>;
+  return (
+    <>
+      <div className="px-4 md:px-6 pt-4 md:pt-6">{overview(access)}</div>
+      {legacy()}
+    </>
+  );
+}
+
 function RoleReports() {
   const auth = useAuth();
   const supabase = getSupabase();
   const location = useAppStore((s) => s.location);
-  const role = auth.profile?.role ?? null;
-  const layout = reportsLayoutFor(role);
-  if (layout === "pending") return <div className="p-6 text-sm text-slate-500" role="status">Loading your access…</div>;
-  if (layout === "denied") return <div className="p-6 text-sm text-slate-600 dark:text-slate-300">Reports are not available on kiosk accounts.</div>;
-  const overview = <ReportsOverview supabase={supabase} site={location} userId={auth.user?.id ?? null} role={role} ownName={auth.profile?.display_name ?? null} detailBelow={layout === "full"} />;
-  if (layout === "overview_only") return <div className="p-4 md:p-6 space-y-4">{overview}</div>;
+  const access = reportsAccessFor(auth);
   return (
-    <>
-      <div className="px-4 md:px-6 pt-4 md:pt-6">{overview}</div>
-      <SupabaseReports />
-    </>
+    <ReportsForAccess
+      access={access}
+      overview={(a) => (
+        <ReportsOverview
+          key={a.scopeKey}
+          supabase={supabase}
+          site={location}
+          scopeKey={a.scopeKey}
+          userId={a.userId}
+          role={a.role}
+          ownName={auth.profile?.display_name ?? null}
+          detailBelow={a.layout === "full"}
+        />
+      )}
+      legacy={() => <SupabaseReports />}
+    />
   );
 }
 

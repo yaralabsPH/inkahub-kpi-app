@@ -26,11 +26,14 @@ import {
   type OverviewResult,
 } from "@/lib/domain/reportsOverview";
 import { useReportsOverview, type OverviewState } from "@/lib/hooks/useReportsOverview";
+import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
 import { PRODUCTION_DEPARTMENT_LABELS, type ProductionDepartment } from "@/lib/domain";
 
 export interface ReportsOverviewProps {
   supabase: SupabaseClient;
   site: string;
+  /** Trusted user + role + audience (from the matching session/profile); the request identity. */
+  scopeKey: string;
   userId: string | null;
   role: string | null;
   ownName: string | null;
@@ -69,7 +72,7 @@ export function buildOverviewRequest(input: {
   }
 }
 
-export function ReportsOverview({ supabase, site, userId, role, ownName, detailBelow }: ReportsOverviewProps) {
+export function ReportsOverview({ supabase, site, scopeKey, userId, role, ownName, detailBelow }: ReportsOverviewProps) {
   const selfOnly = role === "staff";
   const [period, setPeriod] = useState<OverviewPeriodKind>("week");
   const [custom, setCustom] = useState(() => ({ from: "", to: "" }));
@@ -89,7 +92,7 @@ export function ReportsOverview({ supabase, site, userId, role, ownName, detailB
     setStaffId(null);
     setDepartmentId(null);
     setDeptOptions([]);
-  }, [site, userId]);
+  }, [site, scopeKey]);
 
   // Display names for site-wide roles only (no payroll columns).
   useEffect(() => {
@@ -99,9 +102,15 @@ export function ReportsOverview({ supabase, site, userId, role, ownName, detailB
     }
     let cancelled = false;
     void (async () => {
-      const { data, error } = await supabase.from("staff_barcodes").select("user_id, display_name").eq("location", site);
-      if (cancelled || error) return;
-      setNames(new Map(((data ?? []) as Array<{ user_id: string; display_name: string }>).map((r) => [r.user_id, r.display_name])));
+      try {
+        // Active badges only, paged so a large roster is never cut at 1,000 rows.
+        const rows = await fetchAllRows<{ user_id: string; display_name: string }>((from, to) =>
+          supabase.from("staff_barcodes").select("user_id, display_name").eq("location", site).eq("active", true).order("user_id", { ascending: true }).range(from, to),
+        );
+        if (!cancelled) setNames(new Map(rows.map((r) => [r.user_id, r.display_name])));
+      } catch {
+        // names are display only; ids are shown instead
+      }
     })();
     return () => {
       cancelled = true;
@@ -113,7 +122,7 @@ export function ReportsOverview({ supabase, site, userId, role, ownName, detailB
     () => buildOverviewRequest({ site, today, period, custom, staffId: selfOnly ? null : staffId, workType, departmentId }),
     [site, today, period, custom, staffId, selfOnly, workType, departmentId],
   );
-  const state = useReportsOverview(supabase, userId, request, refreshKey);
+  const state = useReportsOverview(supabase, scopeKey || null, request, refreshKey);
   const data = state.status === "ready" ? state.data : null;
 
   // Department choices come from unfiltered results (recorded ids and names).
