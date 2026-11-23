@@ -20,6 +20,8 @@ import { PackageHistoryCard } from "@/components/PackageHistoryCard";
 import { PackagingAttentionCard } from "@/components/PackagingAttentionCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
 import { ReportsOverview } from "@/components/ReportsOverview";
+import { OrderTimelineCard } from "@/components/OrderTimelineCard";
+import { OrderFlowSection } from "@/components/OrderFlowSection";
 import {
   ATTRIBUTION_CSV_HEADERS,
   attributableEventIds,
@@ -195,6 +197,11 @@ export function reportsLayoutFor(role: string | null): "pending" | "denied" | "o
   return "overview_only";
 }
 
+/** F10: whole-order management view. Staff and kiosk never; CS still needs Reports permission + membership (server-enforced). */
+export function orderTimelineVisible(role: string | null): boolean {
+  return role === "owner" || role === "manager" || role === "cs";
+}
+
 export interface ReportsAccess {
   layout: "pending" | "denied" | "overview_only" | "full";
   userId: string | null;
@@ -244,16 +251,24 @@ function RoleReports() {
     <ReportsForAccess
       access={access}
       overview={(a) => (
-        <ReportsOverview
-          key={a.scopeKey}
-          supabase={supabase}
-          site={location}
-          scopeKey={a.scopeKey}
-          userId={a.userId}
-          role={a.role}
-          ownName={auth.profile?.display_name ?? null}
-          detailBelow={a.layout === "full"}
-        />
+        <>
+          <ReportsOverview
+            key={a.scopeKey}
+            supabase={supabase}
+            site={location}
+            scopeKey={a.scopeKey}
+            userId={a.userId}
+            role={a.role}
+            ownName={auth.profile?.display_name ?? null}
+            detailBelow={a.layout === "full"}
+          />
+          {orderTimelineVisible(a.role) ? (
+            <div key={`timeline|${a.scopeKey}`} className="mt-4 space-y-4">
+              <OrderTimelineCard supabase={supabase} scopeKey={a.scopeKey} site={location} />
+              <OrderFlowSection supabase={supabase} scopeKey={a.scopeKey} site={location} />
+            </div>
+          ) : null}
+        </>
       )}
       legacy={() => <SupabaseReports />}
     />
