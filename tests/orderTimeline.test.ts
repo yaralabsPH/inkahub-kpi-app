@@ -264,3 +264,46 @@ describe("durations only: adjacent stage gaps", () => {
     expect(JSON.stringify(m)).not.toMatch(/late|threshold|sla/i);
   });
 });
+
+describe("review task2 P1: scan cancellations retract the exact copied fact", () => {
+  const o = ev({ key: "o" });
+  const framed = ev({ key: "uk/p1", stage: "framed", source: "app", workType: "framed", happenedAt: "2026-11-20T10:00:00Z" });
+  const retract = ev({ key: "uk/p9", stage: "framed", source: "app", retractsKey: "uk/p1", happenedAt: "2026-11-20T11:00:00Z" });
+  it("a retracted fact no longer confirms anything; the retraction itself is never a stage fact or an order cancellation", () => {
+    const t = projectTimeline([o, framed, retract]);
+    expect(t.stages.framed.status).toBe("missing");
+    expect(t.framedByWorkType).toEqual([]);
+    expect(t.cancelled).toBe(false);
+    expect(t.revokedKeys).toEqual(["app|uk/p1"]);
+    expect(projectTimeline([retract, framed, o])).toEqual(t); // arrival order independent
+  });
+  it("the cutoff decides: before the cancellation the scan still counts", () => {
+    expect(projectTimeline([o, framed, retract], "2026-11-20T10:30:00Z").stages.framed.status).toBe("partial");
+    expect(projectTimeline([o, framed, retract], "2026-11-20T11:00:00Z").stages.framed.status).toBe("missing");
+  });
+  it("a retraction only revokes the same source's key; a malformed retraction is rejected", () => {
+    const shopifyKey = ev({ key: "uk/p1", stage: "dispatched", source: "shopify", happenedAt: "2026-11-20T10:00:00Z" });
+    expect(projectTimeline([o, shopifyKey, retract]).stages.dispatched.status).toBe("confirmed");
+    expect(mergeEvidence([], [ev({ key: "x", source: "app", retractsKey: "x" }), ev({ key: "y", source: "app", retractsKey: "" })]).rejected).toHaveLength(2);
+    expect(mergeEvidence([framed], [{ ...framed, retractsKey: "uk/p0" }]).conflicts).toHaveLength(1);
+  });
+});
+
+describe("review task2 P1: delivery is per fulfillment; whole-order delivery needs explicit proof", () => {
+  const o = ev({ key: "o" });
+  const ship = (id: string, h: string) => ev({ key: `s${id}`, stage: "shipped", fulfillmentId: id, fulfillmentComplete: false, happenedAt: `2026-11-21T${h}:00:00Z` });
+  it("F1 delivered and F2 not: delivered is partial, listed per fulfillment, and no shipped->delivered duration exists", () => {
+    const t = projectTimeline([o, ship("F1", "09"), ship("F2", "10"), ev({ key: "d1", stage: "delivered", fulfillmentId: "F1", happenedAt: "2026-11-21T12:00:00Z" })]);
+    expect(t.stages.delivered).toMatchObject({ status: "partial", kind: "confirmed" });
+    expect(t.deliveries).toEqual([{ fulfillmentId: "F1", at: "2026-11-21T12:00:00.000Z", kind: "confirmed" }]);
+    expect(stageGaps(t).find((g) => g.to === "delivered")).toMatchObject({ status: "unknown", hours: null });
+  });
+  it("only an explicit confirmed whole-order delivery record confirms delivered", () => {
+    const t = projectTimeline([o, ev({ key: "s", stage: "shipped", fulfillmentId: "F1", fulfillmentComplete: true, happenedAt: "2026-11-21T09:00:00Z" }),
+      ev({ key: "d", stage: "delivered", fulfillmentId: "F1", fulfillmentComplete: true, happenedAt: "2026-11-21T12:00:00Z" })]);
+    expect(t.stages.delivered.status).toBe("confirmed");
+    expect(stageGaps(t).find((g) => g.to === "delivered")).toMatchObject({ status: "measured", hours: 3 });
+    const inferred = projectTimeline([o, ev({ key: "d", stage: "delivered", kind: "inferred", fulfillmentComplete: true })]);
+    expect(inferred.stages.delivered.status).toBe("unconfirmed");
+  });
+});

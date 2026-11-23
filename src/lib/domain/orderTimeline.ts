@@ -43,13 +43,21 @@ export interface OrderEvidence {
   happenedAt: string;
   receivedAt: string;
   fulfillmentId?: string | null;
-  /** Shopify: this fulfillment completes the order (all required lines fulfilled). */
+  /**
+   * Explicit whole-order proof on a shipped/delivered record: this record's time is when the WHOLE order
+   * was shipped/delivered. Never derived from a later order state (current adapters never set it).
+   */
   fulfillmentComplete?: boolean | null;
   workType?: string | null;
   /** Explicit proof that ALL framing for the order is done (never defaulted to true). */
   framingComplete?: boolean | null;
   caseId?: string | null;
   batchId?: string | null;
+  /**
+   * Retraction: this occurrence revokes the SAME source's occurrence with this key from its own happenedAt
+   * (e.g. a scan later cancelled). It is never a stage fact and never an order cancellation.
+   */
+  retractsKey?: string | null;
 }
 
 export function normalizeShop(shop: string | null | undefined): string | null {
@@ -83,7 +91,7 @@ export const occurrenceKey = (e: Pick<OrderEvidence, "source" | "key">) => `${e.
 
 function content(e: OrderEvidence): string {
   return JSON.stringify([e.site, normalizeShop(e.shop), e.shopifyOrderId, e.orderNumber, e.stage, e.source, e.kind, strictIso(e.happenedAt),
-    e.fulfillmentId ?? null, e.fulfillmentComplete ?? null, e.workType ?? null, e.framingComplete ?? null, e.caseId ?? null, e.batchId ?? null]);
+    e.fulfillmentId ?? null, e.fulfillmentComplete ?? null, e.workType ?? null, e.framingComplete ?? null, e.caseId ?? null, e.batchId ?? null, e.retractsKey ?? null]);
 }
 
 export interface MergeResult {
@@ -100,7 +108,8 @@ export function mergeEvidence(existing: readonly OrderEvidence[], incoming: read
   const out: MergeResult = { records: [...existing], accepted: [], duplicates: [], conflicts: [], rejected: [] };
   for (const e of incoming) {
     if (!e.key || !(ORDER_STAGES as readonly string[]).includes(e.stage) || !SOURCES.includes(e.source) || !KINDS.includes(e.kind)
-        || !(ORDER_SITES as readonly string[]).includes(e.site) || !strictIso(e.happenedAt) || !strictIso(e.receivedAt)) {
+        || !(ORDER_SITES as readonly string[]).includes(e.site) || !strictIso(e.happenedAt) || !strictIso(e.receivedAt)
+        || (e.retractsKey !== undefined && e.retractsKey !== null && (typeof e.retractsKey !== "string" || e.retractsKey === "" || e.retractsKey === e.key))) {
       out.rejected.push(e);
       continue;
     }
@@ -127,7 +136,12 @@ export interface TimelineView {
   site: OrderSite;
   stages: Record<OrderStage, StageView>;
   framedByWorkType: Array<{ workType: string; at: string; kind: EvidenceKind }>;
+  /** Per Shopify fulfillment: time the fulfillment was created in Shopify (not proof the whole order shipped). */
   fulfillments: Array<{ fulfillmentId: string; at: string; complete: boolean; kind: EvidenceKind }>;
+  /** Per-fulfillment deliveries (carrier evidence); never whole-order delivery by themselves. */
+  deliveries: Array<{ fulfillmentId: string | null; at: string; kind: EvidenceKind }>;
+  /** Occurrence keys (source|key) revoked by a retraction at or before the cutoff. */
+  revokedKeys: string[];
   /** First CONFIRMED fulfillment that completed the order; null while partial, unconfirmed or unknown. */
   completeShipmentAt: string | null;
   cancelled: boolean;
@@ -140,12 +154,22 @@ export class TimelineIdentityError extends Error {}
 
 const cmp = (a: OrderEvidence, b: OrderEvidence) => Date.parse(a.happenedAt) - Date.parse(b.happenedAt) || (occurrenceKey(a) < occurrenceKey(b) ? -1 : occurrenceKey(a) > occurrenceKey(b) ? 1 : 0);
 
-/** Project ONE order's evidence (any arrival order). Mixed or unmapped identities are refused. */
-export function projectTimeline(evidence: readonly OrderEvidence[]): TimelineView {
+/**
+ * Project ONE order's evidence (any arrival order). Mixed or unmapped identities are refused.
+ * `cutoffUtc` (optional): retractions after it do not apply yet; without it every recorded retraction applies.
+ */
+export function projectTimeline(evidence: readonly OrderEvidence[], cutoffUtc?: string): TimelineView {
   const ids = new Set(evidence.map((e) => orderIdentityKey(e.site, e.shop, e.shopifyOrderId)));
   if (evidence.length === 0 || ids.size !== 1 || ids.has(null)) throw new TimelineIdentityError("evidence must belong to exactly one mapped site/shop/order identity");
   const identity = [...ids][0] as string;
-  const sorted = [...evidence].filter((e) => strictIso(e.happenedAt)).sort(cmp);
+  const cut = cutoffUtc === undefined ? null : strictIso(cutoffUtc);
+  if (cutoffUtc !== undefined && !cut) throw new RangeError("cutoff must be an explicit UTC/offset instant");
+  const all = [...evidence].filter((e) => strictIso(e.happenedAt)).sort(cmp);
+  const revoked = new Set(all
+    .filter((e) => e.retractsKey && (cut === null || Date.parse(e.happenedAt) <= Date.parse(cut)))
+    .map((e) => occurrenceKey({ source: e.source, key: e.retractsKey as string })));
+  // facts = neither a retraction record nor a revoked occurrence
+  const sorted = all.filter((e) => !e.retractsKey && !revoked.has(occurrenceKey(e)));
   const original = sorted.filter((e) => !e.caseId);
   const missing: StageView = { status: "missing", at: null, source: null, kind: null };
   const view = (e: OrderEvidence, status: StageStatus): StageView => ({ status, at: strictIso(e.happenedAt), source: e.source, kind: e.kind });
@@ -157,7 +181,14 @@ export function projectTimeline(evidence: readonly OrderEvidence[]): TimelineVie
   };
   const stages = Object.fromEntries(ORDER_STAGES.map((s) => [s, missing])) as Record<OrderStage, StageView>;
   for (const s of ORDER_STAGES) if (s !== "shipped" && s !== "delivered" && s !== "framed") stages[s] = byKind((e) => e.stage === s);
-  stages.delivered = byKind((e) => e.stage === "delivered" && e.source === "shopify");
+  // whole-order delivered needs an explicit whole-order record; per-fulfillment deliveries are only partial
+  const deliveredRecords = original.filter((e) => e.stage === "delivered" && e.source === "shopify");
+  const deliveredAll = byKind((e) => e.stage === "delivered" && e.source === "shopify" && e.fulfillmentComplete === true);
+  const deliveredConfirmed = deliveredRecords.find((e) => e.kind === "confirmed");
+  stages.delivered = deliveredAll.status === "confirmed" ? deliveredAll
+    : deliveredConfirmed ? view(deliveredConfirmed, "partial")
+      : deliveredAll.status !== "missing" ? deliveredAll
+        : deliveredRecords[0] ? view(deliveredRecords[0], "unconfirmed") : missing;
   const framedAll = byKind((e) => e.stage === "framed" && e.framingComplete === true);
   // partial means CONFIRMED partial work; inferred/reported-only framing is "unconfirmed"
   const framedConfirmed = original.find((e) => e.stage === "framed" && e.kind === "confirmed");
@@ -198,6 +229,8 @@ export function projectTimeline(evidence: readonly OrderEvidence[]): TimelineVie
     stages,
     framedByWorkType,
     fulfillments,
+    deliveries: deliveredRecords.map((e) => ({ fulfillmentId: e.fulfillmentId ?? null, at: strictIso(e.happenedAt) as string, kind: e.kind })),
+    revokedKeys: [...revoked].sort(),
     completeShipmentAt: complete?.at ?? null,
     cancelled: stages.cancelled.status === "confirmed",
     replacementEvidence: sorted.filter((e) => !!e.caseId),

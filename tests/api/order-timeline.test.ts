@@ -7,6 +7,7 @@ import {
   evidenceFromFacts, factsFromGraphqlOrder, factsFromWebhookOrder, parseRoutingConfig, readRawBody, routeOrder, verifyShopifyHmac, SHOPIFY_ADMIN_API_VERSION,
 } from "../../api/_lib/shopify-webhooks";
 import type { AuthDeps } from "../../api/_lib/production-reporting";
+import { projectTimeline, stageGaps } from "../../src/lib/domain/orderTimeline";
 import type { RpcClient } from "../../api/_lib/reporting-jobs";
 
 const SHOP = "inka-shared.myshopify.com";
@@ -86,7 +87,7 @@ describe("Shopify webhook: verification before any parsing or database work", ()
     expect(fn).toBe("ingest_order_timeline");
     expect(args.p_order).toEqual({ shop: SHOP, shopifyOrderId: "5550001", orderNumber: "10190203", site: "uk", routeReason: null });
     const evs = args.p_evidence as Array<Record<string, unknown>>;
-    expect(evs.map((e) => e.key)).toEqual(["order:5550001:ordered", "fulfillment:77:shipped:partial"]);
+    expect(evs.map((e) => e.key)).toEqual(["order:5550001:ordered", "fulfillment:77:created"]);
     expect(evs.every((e) => e.site === null)).toBe(true);
     expect(JSON.stringify(args)).not.toMatch(/customer@example|Secret Street|A Customer|GB/);
   });
@@ -127,31 +128,64 @@ describe("routing contract (shared shop, fail closed)", () => {
   });
   it("unknown, missing or ambiguous location is unrouted with a reason; the shop alone never implies a site", () => {
     const cfg = parseRoutingConfig(JSON.stringify({ version: 1, shops: { [SHOP]: { kind: "order_tag", map: { "site-au": "au", "site-uk": "uk" } } } }))!;
-    expect(routeOrder(cfg, SHOP, { shippingCountry: "AU", tags: ["site-au"], attributes: [] })).toEqual({ site: "au", reason: null });
-    expect(routeOrder(cfg, SHOP, { shippingCountry: "AU", tags: [], attributes: [] }).site).toBeNull();
-    expect(routeOrder(cfg, SHOP, { shippingCountry: null, tags: ["site-au", "site-uk"], attributes: [] })).toMatchObject({ site: null, reason: expect.stringMatching(/several/) });
-    expect(routeOrder(cfg, "other.myshopify.com", { shippingCountry: null, tags: ["site-au"], attributes: [] }).site).toBeNull();
+    expect(routeOrder(cfg, SHOP, { shippingCountry: "AU", tags: ["site-au"], attributes: [], incomplete: null })).toEqual({ site: "au", reason: null });
+    expect(routeOrder(cfg, SHOP, { shippingCountry: "AU", tags: [], attributes: [], incomplete: null }).site).toBeNull();
+    expect(routeOrder(cfg, SHOP, { shippingCountry: null, tags: ["site-au", "site-uk"], attributes: [], incomplete: null })).toMatchObject({ site: null, reason: expect.stringMatching(/several/) });
+    expect(routeOrder(cfg, "other.myshopify.com", { shippingCountry: null, tags: ["site-au"], attributes: [], incomplete: null }).site).toBeNull();
     const attr = parseRoutingConfig(JSON.stringify({ version: 1, shops: { [SHOP]: { kind: "note_attribute", name: "Fulfil from", map: { Sydney: "au" } } } }))!;
-    expect(routeOrder(attr, SHOP, { shippingCountry: null, tags: [], attributes: [{ name: "Fulfil from", value: "Sydney" }] }).site).toBe("au");
+    expect(routeOrder(attr, SHOP, { shippingCountry: null, tags: [], attributes: [{ name: "Fulfil from", value: "Sydney" }], incomplete: null }).site).toBe("au");
   });
-  it("a fulfillment completes the order only when Shopify reports fulfilled and it is the latest successful one; delivered needs carrier time", () => {
+  it("review task2 P1: Shopify state never backdates completion; fulfillments are recorded per fulfillment at creation, never as whole-order completion", () => {
     const f = factsFromWebhookOrder({ ...ORDER, fulfillment_status: "fulfilled", fulfillments: [
       ORDER.fulfillments[0],
       { id: 78, created_at: "2026-11-22T10:00:00Z", updated_at: "2026-11-24T10:00:00Z", status: "success", shipment_status: "delivered" },
       { id: 79, created_at: "2026-11-23T10:00:00Z", updated_at: "2026-11-23T10:00:00Z", status: "cancelled", shipment_status: null }] }, SHOP);
     const e = evidenceFromFacts(f);
-    expect(e.filter((x) => x.stage === "shipped").map((x) => [x.fulfillmentId, x.fulfillmentComplete])).toEqual([["77", false], ["78", true]]);
-    expect(e.find((x) => x.stage === "delivered")).toMatchObject({ kind: "reported", key: "fulfillment:78:delivered:reported" });
-    const g = factsFromGraphqlOrder({ legacyResourceId: "5550001", name: "#10190203", createdAt: "2026-11-20T09:00:00Z", cancelledAt: null, displayFulfillmentStatus: "FULFILLED", tags: [], customAttributes: [],
-      shippingAddress: { countryCodeV2: "GB" }, fulfillments: [{ legacyResourceId: "77", createdAt: "2026-11-21T10:00:00Z", status: "SUCCESS", deliveredAt: "2026-11-22T08:00:00Z" }] }, SHOP);
-    expect(evidenceFromFacts(g).map((x) => [x.key, x.kind])).toEqual([["order:5550001:ordered", "confirmed"], ["fulfillment:77:shipped:complete", "confirmed"], ["fulfillment:77:delivered:confirmed", "confirmed"]]);
+    expect(e.filter((x) => x.stage === "shipped").map((x) => [x.key, x.fulfillmentComplete])).toEqual([["fulfillment:77:created", false], ["fulfillment:78:created", false]]);
+    expect(e.some((x) => x.fulfillmentComplete === true)).toBe(false);
+    expect(e.find((x) => x.stage === "delivered")).toMatchObject({ kind: "reported", key: "fulfillment:78:delivered:reported", fulfillmentId: "78" });
+    // a pending fulfillment that later succeeds, or lines removed so the order becomes "fulfilled", produces the SAME facts:
+    // nothing is re-timed or promoted to completion
+    const later = evidenceFromFacts(factsFromWebhookOrder({ ...ORDER, fulfillment_status: "partial", fulfillments: [ORDER.fulfillments[0]] }, SHOP));
+    expect(later.find((x) => x.stage === "shipped")).toEqual(e.find((x) => x.stage === "shipped"));
+    const p = projectTimeline(e.map((x) => ({ ...x, site: "uk", receivedAt: "2026-11-25T00:00:00Z" })));
+    expect(p.completeShipmentAt).toBeNull();
+    expect(p.stages.shipped.status).toBe("partial");
+  });
+  it("review task2 P1: carrier delivery is per fulfillment; one of two delivered is partial with no shipped->delivered duration", () => {
+    const g = factsFromGraphqlOrder({ legacyResourceId: "5550001", name: "#10190203", createdAt: "2026-11-20T09:00:00Z", cancelledAt: null, tags: [], customAttributes: [],
+      shippingAddress: { countryCodeV2: "GB" }, fulfillments: [
+        { legacyResourceId: "77", createdAt: "2026-11-21T10:00:00Z", status: "SUCCESS", deliveredAt: "2026-11-22T08:00:00Z" },
+        { legacyResourceId: "78", createdAt: "2026-11-21T11:00:00Z", status: "SUCCESS", deliveredAt: null }] }, SHOP);
+    const e = evidenceFromFacts(g);
+    expect(e.map((x) => [x.key, x.kind])).toEqual([["order:5550001:ordered", "confirmed"], ["fulfillment:77:created", "confirmed"], ["fulfillment:77:delivered:confirmed", "confirmed"], ["fulfillment:78:created", "confirmed"]]);
+    const t = projectTimeline(e.map((x) => ({ ...x, site: "uk", receivedAt: "2026-11-25T00:00:00Z" })));
+    expect(t.stages.delivered.status).toBe("partial");
+    expect(stageGaps(t).find((x) => x.to === "delivered")).toMatchObject({ status: "unknown", hours: null });
     expect(() => factsFromGraphqlOrder({ legacyResourceId: "1", name: "#1", createdAt: "2026-11-20T09:00:00Z", fulfillments: Array.from({ length: 50 }, () => ({})) }, SHOP)).toThrow(/incomplete/);
+  });
+  it("review task2 P2: routing never uses a truncated prefix (tags 250 / attributes 100 boundaries)", () => {
+    const cfg = parseRoutingConfig(JSON.stringify({ version: 1, shops: { [SHOP]: { kind: "note_attribute", name: "site", map: { AU: "au", UK: "uk" } } } }))!;
+    const attrs = (n: number, lastValue: string) => Array.from({ length: n }, (_, i) => ({ name: i === 0 || i === n - 1 ? "site" : `x${i}`, value: i === 0 ? "AU" : i === n - 1 ? lastValue : "y" }));
+    // exactly 100 attributes are read whole: a contradicting last value makes the order ambiguous, not AU
+    expect(routeOrder(cfg, SHOP, factsFromWebhookOrder({ ...ORDER, note_attributes: attrs(100, "UK") }, SHOP).route)).toMatchObject({ site: null, reason: expect.stringMatching(/several/) });
+    // AU first and UK at attribute 101: refused, never routed AU on the first 100
+    expect(routeOrder(cfg, SHOP, factsFromWebhookOrder({ ...ORDER, note_attributes: attrs(101, "UK") }, SHOP).route)).toMatchObject({ site: null, reason: expect.stringMatching(/more than 100 attributes/) });
+    expect(routeOrder(cfg, SHOP, factsFromGraphqlOrder({ legacyResourceId: "1", name: "#1", createdAt: "2026-11-20T09:00:00Z", fulfillments: [],
+      customAttributes: attrs(101, "UK").map((a) => ({ key: a.name, value: a.value })) }, SHOP).route).site).toBeNull();
+    const tagCfg = parseRoutingConfig(JSON.stringify({ version: 1, shops: { [SHOP]: { kind: "order_tag", map: { "site-au": "au", "site-uk": "uk" } } } }))!;
+    const tags = (n: number) => ["site-au", ...Array.from({ length: n - 2 }, (_, i) => `t${i}`), "site-uk"].join(", ");
+    expect(routeOrder(tagCfg, SHOP, factsFromWebhookOrder({ ...ORDER, tags: tags(250) }, SHOP).route)).toMatchObject({ site: null, reason: expect.stringMatching(/several/) });
+    expect(routeOrder(tagCfg, SHOP, factsFromWebhookOrder({ ...ORDER, tags: tags(251) }, SHOP).route)).toMatchObject({ site: null, reason: expect.stringMatching(/more than 250 tags/) });
+    expect(routeOrder(tagCfg, SHOP, factsFromWebhookOrder({ ...ORDER, tags: "site-au" }, SHOP).route).site).toBe("au");
+    // an unreadable attribute entry is refused rather than skipped
+    expect(routeOrder(cfg, SHOP, factsFromWebhookOrder({ ...ORDER, note_attributes: [{ name: "site", value: "AU" }, 7] }, SHOP).route).site).toBeNull();
   });
 });
 
 const row = (over: Partial<Record<string, unknown>> = {}) => {
-  const r = { source: "shopify", key: "order:9:ordered", stage: "ordered", kind: "confirmed", at: "2026-11-20T09:00:00.000000Z", rcv: "2026-11-20T09:00:01.000000Z", fid: null, fc: null, wt: null, frc: null, cs: null, b: null, shop: SHOP, id: "9", num: "10190203", site: null, ...over };
-  return [r.source, r.key, r.stage, r.kind, r.at, r.rcv, r.fid, r.fc, r.wt, r.frc, r.cs, r.b, r.shop, r.id, r.num, r.site];
+  const r = { source: "shopify", key: "order:9:ordered", stage: "ordered", kind: "confirmed", at: "2026-11-20T09:00:00.000000Z", rcv: "2026-11-20T09:00:01.000000Z", fid: null, fc: null, wt: null, frc: null, cs: null, b: null, shop: SHOP, id: "9", num: "10190203", site: null, rk: null, ...over };
+  return [r.source, r.key, r.stage, r.kind, r.at, r.rcv, r.fid, r.fc, r.wt, r.frc, r.cs, r.b, r.shop, r.id, r.num, r.site, r.rk];
 };
 
 describe("GET reads: authorization before any service read", () => {

@@ -8,6 +8,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { PGlite } from "@electric-sql/pglite";
 import { reportingDb } from "./harness";
 import { pgRpc } from "./rpc";
+import { readOrderTimeline } from "../../../api/_lib/order-timeline";
+import type { ReportingPrincipal } from "../../../api/_lib/production-reporting";
 
 const SHOP = "inka-shared.myshopify.com";
 const STAFF = "11111111-1111-4111-8111-111111111111";
@@ -131,11 +133,56 @@ describe("0059 bounded app reconciliation", () => {
     const before = (await db.query("select count(*)::int n from public.production_events")).rows[0];
     const r1 = await rpc().rpc("reconcile_order_timeline_app", { p_site: "uk", p_order_number: "#88" });
     expect(r1.error).toBeNull();
-    expect(r1.data).toMatchObject({ accepted: 2, duplicates: 0, conflicts: 0 });
-    expect((await rpc().rpc("reconcile_order_timeline_app", { p_site: "uk", p_order_number: "#88" })).data).toMatchObject({ accepted: 0, duplicates: 2 });
-    const keys = (await db.query<{ occurrence_key: string; stage: string; work_type: string | null }>("select occurrence_key, stage, work_type from public.order_timeline_evidence where source = 'app' and order_number = '#88' order by 1")).rows;
-    expect(keys).toEqual([{ occurrence_key: "uk/p1", stage: "framed", work_type: "framed" }, { occurrence_key: "uk/p2", stage: "dispatched", work_type: null }]);
+    expect(r1.data).toMatchObject({ accepted: 4, duplicates: 0, conflicts: 0 });
+    expect((await rpc().rpc("reconcile_order_timeline_app", { p_site: "uk", p_order_number: "#88" })).data).toMatchObject({ accepted: 0, duplicates: 4 });
+    const keys = (await db.query("select occurrence_key, stage, work_type, retracts_key from public.order_timeline_evidence where source = 'app' and order_number = '#88' order by 1")).rows;
+    expect(keys).toEqual([
+      { occurrence_key: "uk/p1", stage: "framed", work_type: "framed", retracts_key: null },
+      { occurrence_key: "uk/p2", stage: "dispatched", work_type: null, retracts_key: null },
+      { occurrence_key: "uk/p4", stage: "framed", work_type: "a0_framed", retracts_key: null },
+      { occurrence_key: "uk/p5", stage: "framed", work_type: null, retracts_key: "uk/p4" }, // the cancel retracts exactly p4
+    ]);
     expect((await db.query("select count(*)::int n from public.production_events")).rows[0]).toEqual(before);
+  });
+  it("copy -> cancel -> reconcile -> read: the earlier copy is revoked, never left confirmed, and is not an order cancellation", async () => {
+    await ingest(order("9901", "uk", "99"), [ev({ key: "order:9901:ordered", shopifyOrderId: "9901", orderNumber: "99" })]);
+    const ins = (id: string, dept: string, type: string, at: string, parent: string | null = null) =>
+      db.query(`insert into public.production_events (location, id, staff_id, department, order_number, event_type, created_at, parent_event_id) values ('uk',$1,$2,$3,'99',$4,$5,$6)`, [id, STAFF, dept, type, at, parent]);
+    await ins("q1", "framed", "completed", "2026-11-20T10:00:00Z");
+    await ins("q2", "dispatch", "dispatched", "2026-11-20T12:00:00Z");
+    const owner: ReportingPrincipal = { userId: STAFF, role: "owner", nav: new Set(["reports"]), sites: new Set(["uk"]) };
+    const read = () => readOrderTimeline(owner, { site: "uk", orderNumber: "99" }, { rpc: rpc(), now: () => Date.parse("2026-11-22T00:00:00Z") });
+    expect((await rpc().rpc("reconcile_order_timeline_app", { p_site: "uk", p_order_number: "99" })).data).toMatchObject({ accepted: 2 });
+    const before = await read();
+    expect(before.stages?.find((s) => s.stage === "dispatched")?.status).toBe("confirmed");
+    await ins("q3", "dispatch", "cancelled", "2026-11-20T13:00:00Z", "q2"); // the dispatch scan is cancelled AFTER the copy
+    expect((await rpc().rpc("reconcile_order_timeline_app", { p_site: "uk", p_order_number: "99" })).data).toMatchObject({ accepted: 1, duplicates: 2, conflicts: 0 });
+    const after = await read();
+    expect(after.stages?.find((s) => s.stage === "dispatched")?.status).toBe("missing");
+    expect(after.stages?.find((s) => s.stage === "framed")?.status).toBe("partial"); // the other scan is untouched
+    expect(after.cancelled).toBeNull(); // one scan's cancellation is not an order cancellation
+    expect(after.evidence.filter((e) => e.revoked).map((e) => e.stage)).toEqual(["dispatched"]);
+    expect(after.evidence.filter((e) => e.retraction)).toHaveLength(1);
+    // the original copy is still stored unchanged (history is never edited)
+    expect((await db.query("select count(*)::int n from public.order_timeline_evidence where occurrence_key = 'uk/q2'")).rows[0]).toEqual({ n: 1 });
+  });
+});
+
+describe("0059 flow alias uniqueness is site-wide (review task2 P2)", () => {
+  it("an order number shared with another recorded order at the site (outside the window) never attaches app facts", async () => {
+    await ingest(order("4001", "uk", "55"), [ev({ key: "order:4001:ordered", shopifyOrderId: "4001", orderNumber: "55", happenedAt: "2026-11-25T09:00:00Z" })]);
+    await ingest(order("4002", "uk", "55"), [ev({ key: "order:4002:ordered", shopifyOrderId: "4002", orderNumber: "55", happenedAt: "2026-10-01T09:00:00Z" })]);
+    await ingest(order("4003", "uk", "56"), [ev({ key: "order:4003:ordered", shopifyOrderId: "4003", orderNumber: "56", happenedAt: "2026-11-25T10:00:00Z" })]);
+    await ingest(null, [
+      { source: "app", key: "uk/a55", site: "uk", shop: null, shopifyOrderId: null, orderNumber: "55", stage: "dispatched", kind: "confirmed", happenedAt: "2026-11-25T12:00:00Z" },
+      { source: "app", key: "uk/a56", site: "uk", shop: null, shopifyOrderId: null, orderNumber: "56", stage: "dispatched", kind: "confirmed", happenedAt: "2026-11-25T12:00:00Z" },
+    ]);
+    const r = await rpc().rpc("read_order_flow", { p_site: "uk", p_start: "2026-11-25T00:00:00Z", p_end: "2026-11-26T00:00:00Z", p_order_limit: 100, p_row_limit: 1000 });
+    expect(r.error).toBeNull();
+    const keys = (r.data as { evidence: unknown[][] }).evidence.map((x) => x[1]);
+    expect(keys).toContain("uk/a56");
+    expect(keys).not.toContain("uk/a55");
+    expect((await read("uk", "55")).error?.message).toMatch(/ambiguous/); // consistent with the single-order read
   });
 });
 

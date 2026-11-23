@@ -11,7 +11,7 @@
  */
 import { productionRange, type ReportSite } from "../../src/lib/domain/productionPeriods.js";
 import {
-  flowMetrics, projectTimeline, stageGaps, strictIso, TIMELINE_SEQUENCE,
+  flowMetrics, occurrenceKey, projectTimeline, stageGaps, strictIso, TIMELINE_SEQUENCE,
   type EvidenceKind, type EvidenceSource, type FlowMetrics, type OrderEvidence, type OrderStage, type StageGap, type StageStatus, type TimelineView,
 } from "../../src/lib/domain/orderTimeline.js";
 import { audienceFor, ReportingHttpError, type ReportingPrincipal } from "./production-reporting.js";
@@ -53,8 +53,8 @@ export interface StoredEvidence extends OrderEvidence { receivedAt: string; stor
 export function parseEvidenceRows(v: unknown): StoredEvidence[] {
   if (!Array.isArray(v)) return unavailable("not a list");
   return v.map((r): StoredEvidence => {
-    if (!Array.isArray(r) || r.length !== 16) return unavailable("row shape");
-    const [source, key, stage, kind, happenedAt, receivedAt, fulfillmentId, fulfillmentComplete, workType, framingComplete, caseId, batchId, shop, shopifyOrderId, orderNumber, site] = r as unknown[];
+    if (!Array.isArray(r) || r.length !== 17) return unavailable("row shape");
+    const [source, key, stage, kind, happenedAt, receivedAt, fulfillmentId, fulfillmentComplete, workType, framingComplete, caseId, batchId, shop, shopifyOrderId, orderNumber, site, retractsKey] = r as unknown[];
     if (source !== "shopify" && source !== "app" && source !== "make") return unavailable("source");
     if (typeof key !== "string" || typeof stage !== "string" || !STAGES.includes(stage)) return unavailable("key/stage");
     if (kind !== "confirmed" && kind !== "reported" && kind !== "inferred") return unavailable("kind");
@@ -65,7 +65,7 @@ export function parseEvidenceRows(v: unknown): StoredEvidence[] {
       source, key, stage: stage as OrderStage, kind, happenedAt: h, receivedAt: rcv,
       fulfillmentId: optStr(fulfillmentId), fulfillmentComplete: optBool(fulfillmentComplete), workType: optStr(workType), framingComplete: optBool(framingComplete),
       caseId: optStr(caseId), batchId: optStr(batchId), shop: optStr(shop), shopifyOrderId: optStr(shopifyOrderId), orderNumber: optStr(orderNumber),
-      site: "", storedSite: optStr(site),
+      site: "", storedSite: optStr(site), retractsKey: optStr(retractsKey),
     };
   });
 }
@@ -84,7 +84,13 @@ function bindToIdentity(rows: readonly StoredEvidence[], site: ReportSite, shop:
 // ---------------------------------------------------------------------------
 
 export interface StageDto { stage: string; status: StageStatus; at: string | null; source: EvidenceSource | null; kind: EvidenceKind | null }
-export interface EvidenceDto { stage: string; source: EvidenceSource; kind: EvidenceKind; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null }
+export interface EvidenceDto {
+  stage: string; source: EvidenceSource; kind: EvidenceKind; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null;
+  /** This record retracts an earlier record of the same source (e.g. a cancelled scan); it is not a stage fact. */
+  retraction: boolean;
+  /** This record was retracted at or before now and no longer counts. */
+  revoked: boolean;
+}
 export interface OrderTimelineResult {
   site: ReportSite;
   orderNumber: string;
@@ -95,11 +101,16 @@ export interface OrderTimelineResult {
   cancelled: { at: string | null } | null;
   framedByWorkType: TimelineView["framedByWorkType"];
   fulfillments: TimelineView["fulfillments"];
+  deliveries: TimelineView["deliveries"];
   evidence: EvidenceDto[];
 }
 
-const evidenceDto = (e: StoredEvidence): EvidenceDto => ({
+/** Same rule as projectTimeline: a retraction at or before now revokes the same source's key. */
+const revokedAt = (rows: readonly StoredEvidence[], nowMs: number) =>
+  new Set(rows.filter((r) => r.retractsKey && Date.parse(r.happenedAt) <= nowMs).map((r) => occurrenceKey({ source: r.source, key: r.retractsKey as string })));
+const evidenceDto = (revoked: ReadonlySet<string>) => (e: StoredEvidence): EvidenceDto => ({
   stage: e.stage, source: e.source, kind: e.kind, at: e.happenedAt, receivedAt: e.receivedAt, fulfillmentId: e.fulfillmentId ?? null, workType: e.workType ?? null, batchId: e.batchId ?? null, caseId: e.caseId ?? null,
+  retraction: !!e.retractsKey, revoked: revoked.has(occurrenceKey(e)),
 });
 
 function badRequest(m: string): never {
@@ -127,7 +138,9 @@ export async function readOrderTimeline(p: ReportingPrincipal, q: Record<string,
   if (error) return rpcFailure("read_order_timeline", error.message, deps.audit, site);
   const d = (data ?? {}) as { identity?: { shop?: unknown; shopifyOrderId?: unknown } | null; evidence?: unknown };
   const rows = parseEvidenceRows(d.evidence);
-  const base = { site, orderNumber, gaps: [] as StageGap[], cancelled: null, framedByWorkType: [], fulfillments: [], evidence: rows.map(evidenceDto) };
+  const nowMs = deps.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const base = { site, orderNumber, gaps: [] as StageGap[], cancelled: null, framedByWorkType: [], fulfillments: [], deliveries: [], evidence: rows.map(evidenceDto(revokedAt(rows, nowMs))) };
   if (!d.identity) {
     return { ...base, linked: false, stages: null, note: rows.length ? "Not linked to a Shopify order at this site yet; recorded app events are listed." : "No recorded order with this number at this site." };
   }
@@ -135,8 +148,7 @@ export async function readOrderTimeline(p: ReportingPrincipal, q: Record<string,
   const id = typeof d.identity.shopifyOrderId === "string" ? d.identity.shopifyOrderId : unavailable("identity order id");
   const bound = bindToIdentity(rows, site, shop, id);
   if (bound.length === 0) return { ...base, linked: true, stages: null, note: "The order is recorded but has no evidence yet." };
-  const t = projectTimeline(bound);
-  const nowIso = new Date(deps.now()).toISOString();
+  const t = projectTimeline(bound, nowIso);
   return {
     ...base,
     linked: true,
@@ -146,6 +158,7 @@ export async function readOrderTimeline(p: ReportingPrincipal, q: Record<string,
     cancelled: t.stages.cancelled.status === "missing" ? null : { at: t.stages.cancelled.at },
     framedByWorkType: t.framedByWorkType,
     fulfillments: t.fulfillments,
+    deliveries: t.deliveries,
   };
 }
 
@@ -171,6 +184,7 @@ export async function readOrderFlow(p: ReportingPrincipal, q: Record<string, str
   if (error) return rpcFailure("read_order_flow", error.message, deps.audit, site);
   const d = (data ?? {}) as { orders?: unknown; evidence?: unknown; unroutedOrders?: unknown; latestReceivedAt?: Record<string, unknown> };
   const rows = parseEvidenceRows(d.evidence);
+  const nowIso = new Date(deps.now()).toISOString();
   const byIdentity = new Map<string, StoredEvidence[]>();
   const appByNumber = new Map<string, StoredEvidence[]>();
   for (const r of rows) {
@@ -189,11 +203,11 @@ export async function readOrderFlow(p: ReportingPrincipal, q: Record<string, str
   for (const [k, list] of byIdentity) {
     const [shop, id] = k.split("|");
     const n = numberOf(list);
-    // app evidence attaches by number only when exactly one recorded order at this site uses it
+    // Defence in depth: SQL already attaches app facts only for numbers unique site-wide (any date);
+    // here a number repeated inside the cohort is refused as well.
     const num = n && numberUse.get(n) === 1 ? n : null;
-    timelines.push(projectTimeline(bindToIdentity([...list, ...(num ? appByNumber.get(num) ?? [] : [])], site, shop, id)));
+    timelines.push(projectTimeline(bindToIdentity([...list, ...(num ? appByNumber.get(num) ?? [] : [])], site, shop, id), nowIso));
   }
-  const nowIso = new Date(deps.now()).toISOString();
   const m = flowMetrics(timelines, { startUtc: range.startUtc, endUtcExclusive: range.endUtcExclusive }, nowIso);
   const at = (v: unknown) => (typeof v === "string" ? strictIso(v) : null);
   const lr = d.latestReceivedAt ?? {};

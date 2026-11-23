@@ -14,7 +14,9 @@
 --    (source, occurrence_key). Shopify evidence never carries a site (it comes
 --    only from the routing above); app/make evidence carries its own explicit
 --    site. Same key + same content = duplicate; different content = conflict;
---    the original is kept. No customer data columns exist.
+--    the original is kept. No customer data columns exist. A retraction row
+--    (retracts_key) revokes one exact earlier occurrence of the same source
+--    from its own time; history is never edited.
 -- 3. ingest_order_timeline: atomic (one call = one transaction) service-only
 --    acceptance of an optional order identity and at most 200 occurrences.
 -- 4. read_order_timeline / read_order_flow: bounded, indexed service-only reads
@@ -58,7 +60,10 @@ CREATE TABLE public.order_timeline_evidence (
   framing_complete     boolean,
   case_id              text        CHECK (case_id IS NULL OR pg_catalog.length(case_id) BETWEEN 1 AND 64),
   batch_id             text        CHECK (batch_id IS NULL OR pg_catalog.length(batch_id) BETWEEN 1 AND 100),
+  -- a retraction revokes the SAME source's occurrence with this key from its own happened_at (e.g. a cancelled scan)
+  retracts_key         text        CHECK (retracts_key IS NULL OR pg_catalog.length(retracts_key) BETWEEN 1 AND 200),
   PRIMARY KEY (source, occurrence_key),
+  CHECK (retracts_key IS NULL OR retracts_key <> occurrence_key),
   CHECK ((shop IS NULL) = (shopify_order_id IS NULL)),
   CHECK (shopify_order_id IS NOT NULL OR order_number IS NOT NULL),
   -- Shopify site comes only from routing; app/make name their own site explicitly.
@@ -103,7 +108,7 @@ GRANT EXECUTE ON FUNCTION public.order_timeline_utc(timestamptz) TO service_role
 
 -- Service-only. p_order (optional): {shop, shopifyOrderId, orderNumber, site|null, routeReason|null}.
 -- p_evidence: array (<= 200) of {source, key, site, shop, shopifyOrderId, orderNumber, stage, kind, happenedAt,
--- fulfillmentId, fulfillmentComplete, workType, framingComplete, caseId, batchId}. Any invalid record fails the
+-- fulfillmentId, fulfillmentComplete, workType, framingComplete, caseId, batchId, retractsKey}. Any invalid record fails the
 -- whole call (nothing is written). Returns counts and the routing outcome (none|routed|unrouted|unchanged|conflict).
 CREATE FUNCTION public.ingest_order_timeline(p_order jsonb, p_evidence jsonb)
 RETURNS jsonb
@@ -186,15 +191,16 @@ BEGIN
     n.framing_complete := (e ->> 'framingComplete')::boolean;
     n.case_id := e ->> 'caseId';
     n.batch_id := e ->> 'batchId';
+    n.retracts_key := e ->> 'retractsKey';
     IF n.shop IS NOT NULL AND n.shopify_order_id IS NOT NULL THEN
       -- a fact may arrive before its order: an unrouted identity stub waits for routing
       INSERT INTO public.order_timeline_orders (shop, shopify_order_id, route_reason) VALUES (n.shop, n.shopify_order_id, 'awaiting order routing')
       ON CONFLICT (shop, shopify_order_id) DO NOTHING;
     END IF;
     INSERT INTO public.order_timeline_evidence (source, occurrence_key, site, shop, shopify_order_id, order_number, stage, kind, happened_at,
-                                                fulfillment_id, fulfillment_complete, work_type, framing_complete, case_id, batch_id)
+                                                fulfillment_id, fulfillment_complete, work_type, framing_complete, case_id, batch_id, retracts_key)
     VALUES (n.source, n.occurrence_key, n.site, n.shop, n.shopify_order_id, n.order_number, n.stage, n.kind, n.happened_at,
-            n.fulfillment_id, n.fulfillment_complete, n.work_type, n.framing_complete, n.case_id, n.batch_id)
+            n.fulfillment_id, n.fulfillment_complete, n.work_type, n.framing_complete, n.case_id, n.batch_id, n.retracts_key)
     ON CONFLICT (source, occurrence_key) DO NOTHING;
     IF FOUND THEN
       v_acc := v_acc + 1;
@@ -204,7 +210,8 @@ BEGIN
          AND prev.order_number IS NOT DISTINCT FROM n.order_number AND prev.stage = n.stage AND prev.kind = n.kind AND prev.happened_at = n.happened_at
          AND prev.fulfillment_id IS NOT DISTINCT FROM n.fulfillment_id AND prev.fulfillment_complete IS NOT DISTINCT FROM n.fulfillment_complete
          AND prev.work_type IS NOT DISTINCT FROM n.work_type AND prev.framing_complete IS NOT DISTINCT FROM n.framing_complete
-         AND prev.case_id IS NOT DISTINCT FROM n.case_id AND prev.batch_id IS NOT DISTINCT FROM n.batch_id THEN
+         AND prev.case_id IS NOT DISTINCT FROM n.case_id AND prev.batch_id IS NOT DISTINCT FROM n.batch_id
+         AND prev.retracts_key IS NOT DISTINCT FROM n.retracts_key THEN
         v_dup := v_dup + 1;
       ELSE
         v_conf := v_conf + 1;
@@ -217,7 +224,7 @@ $fn$;
 
 -- Evidence rows as compact arrays:
 -- [source, key, stage, kind, happenedAt, receivedAt, fulfillmentId, fulfillmentComplete, workType, framingComplete, caseId, batchId,
---  shop, shopifyOrderId, orderNumber, site]
+--  shop, shopifyOrderId, orderNumber, site, retractsKey]
 CREATE FUNCTION public.order_timeline_row(x public.order_timeline_evidence)
 RETURNS jsonb
 LANGUAGE sql
@@ -225,7 +232,7 @@ IMMUTABLE
 SET search_path = ''
 AS $fn$
   SELECT pg_catalog.jsonb_build_array(x.source, x.occurrence_key, x.stage, x.kind, public.order_timeline_utc(x.happened_at), public.order_timeline_utc(x.received_at),
-    x.fulfillment_id, x.fulfillment_complete, x.work_type, x.framing_complete, x.case_id, x.batch_id, x.shop, x.shopify_order_id, x.order_number, x.site)
+    x.fulfillment_id, x.fulfillment_complete, x.work_type, x.framing_complete, x.case_id, x.batch_id, x.shop, x.shopify_order_id, x.order_number, x.site, x.retracts_key)
 $fn$;
 REVOKE ALL ON FUNCTION public.order_timeline_row(public.order_timeline_evidence) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.order_timeline_row(public.order_timeline_evidence) TO service_role;
@@ -309,6 +316,10 @@ BEGIN
     UNION
     SELECT x.* FROM public.order_timeline_evidence x JOIN cohort c ON x.order_number = c.order_number
      WHERE x.site = p_site AND x.shopify_order_id IS NULL
+       -- app-only facts attach by number only when exactly ONE recorded order at this site (any date) uses it,
+       -- the same rule as read_order_timeline
+       AND (SELECT count(*) FROM (SELECT 1 FROM public.order_timeline_orders o2
+                                   WHERE o2.site = p_site AND o2.order_number = c.order_number LIMIT 2) z) = 1
   ), lim AS (SELECT count(*) AS c FROM (SELECT 1 FROM ev LIMIT p_row_limit + 1) z)
   SELECT lim.c, CASE WHEN lim.c > p_row_limit THEN NULL ELSE
            (SELECT coalesce(pg_catalog.jsonb_agg(public.order_timeline_row(ev) ORDER BY ev.shopify_order_id, ev.happened_at, ev.source, ev.occurrence_key), '[]'::jsonb) FROM ev) END
@@ -327,7 +338,9 @@ $fn$;
 
 -- Service-only, explicit and bounded: copy ONE order's recorded app evidence for ONE site (event location =
 -- p_site, never a reassignment). Completed framing work (framed / a0_framed) becomes per-work-type framed
--- evidence (never whole-order proof); dispatched becomes dispatched. Scans later cancelled are skipped.
+-- evidence (never whole-order proof); dispatched becomes dispatched. A scan cancellation of one of those events
+-- becomes a RETRACTION of that exact occurrence, timed at the cancellation, so a copy made before the cancel is
+-- revoked by the next reconcile. One scan's cancellation is never an order cancellation.
 -- Idempotent through occurrence keys "<site>/<event id>". Reads production_events only; writes nothing there.
 CREATE FUNCTION public.reconcile_order_timeline_app(p_site text, p_order_number text)
 RETURNS jsonb
@@ -344,19 +357,29 @@ BEGIN
   IF p_order_number IS NULL OR pg_catalog.length(p_order_number) NOT BETWEEN 1 AND 64 THEN RAISE EXCEPTION 'reconcile_order_timeline_app: order number must be 1..64 characters'; END IF;
   SELECT count(*) INTO v_n FROM (SELECT 1 FROM public.production_events pe WHERE pe.location = p_site AND pe.order_number = p_order_number LIMIT 501) z;
   IF v_n > 500 THEN RAISE EXCEPTION 'reconcile_order_timeline_app: more than 500 events exceed the limit 500'; END IF;
-  SELECT coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
-           'source', 'app', 'key', pe.location || '/' || pe.id, 'site', pe.location, 'shop', NULL, 'shopifyOrderId', NULL,
-           'orderNumber', pe.order_number,
-           'stage', CASE WHEN pe.event_type = 'dispatched' THEN 'dispatched' ELSE 'framed' END,
-           'kind', 'confirmed', 'happenedAt', public.order_timeline_utc(pe.created_at),
-           'workType', CASE WHEN pe.event_type = 'completed' THEN pe.department END,
-           'caseId', pe.cs_case_id) ORDER BY pe.created_at, pe.id), '[]'::jsonb)
-    INTO v_list
-    FROM public.production_events pe
-   WHERE pe.location = p_site AND pe.order_number = p_order_number
-     AND ((pe.event_type = 'completed' AND pe.department IN ('framed', 'a0_framed')) OR pe.event_type = 'dispatched')
-     AND NOT EXISTS (SELECT 1 FROM public.production_events c
-                      WHERE c.location = pe.location AND c.event_type = 'cancelled' AND c.parent_event_id = pe.id);
+  WITH facts AS (
+    SELECT pe.location, pe.id, pe.order_number, pe.created_at, pe.cs_case_id,
+           CASE WHEN pe.event_type = 'dispatched' THEN 'dispatched' ELSE 'framed' END AS stage,
+           CASE WHEN pe.event_type = 'completed' THEN pe.department END AS work_type
+      FROM public.production_events pe
+     WHERE pe.location = p_site AND pe.order_number = p_order_number
+       AND ((pe.event_type = 'completed' AND pe.department IN ('framed', 'a0_framed')) OR pe.event_type = 'dispatched')
+  ), items AS (
+    SELECT f.created_at AS at, f.id AS sort_id, pg_catalog.jsonb_build_object(
+             'source', 'app', 'key', f.location || '/' || f.id, 'site', f.location, 'shop', NULL, 'shopifyOrderId', NULL,
+             'orderNumber', f.order_number, 'stage', f.stage, 'kind', 'confirmed', 'happenedAt', public.order_timeline_utc(f.created_at),
+             'workType', f.work_type, 'caseId', f.cs_case_id) AS item
+      FROM facts f
+    UNION ALL
+    SELECT c.created_at, c.id, pg_catalog.jsonb_build_object(
+             'source', 'app', 'key', c.location || '/' || c.id, 'site', c.location, 'shop', NULL, 'shopifyOrderId', NULL,
+             'orderNumber', f.order_number, 'stage', f.stage, 'kind', 'confirmed', 'happenedAt', public.order_timeline_utc(c.created_at),
+             'caseId', f.cs_case_id, 'retractsKey', f.location || '/' || f.id)
+      FROM public.production_events c
+      JOIN facts f ON f.location = c.location AND f.id = c.parent_event_id
+     WHERE c.location = p_site AND c.event_type = 'cancelled'
+  )
+  SELECT coalesce(pg_catalog.jsonb_agg(i.item ORDER BY i.at, i.sort_id), '[]'::jsonb) INTO v_list FROM items i;
   RETURN public.ingest_order_timeline(NULL, v_list);
 END
 $fn$;

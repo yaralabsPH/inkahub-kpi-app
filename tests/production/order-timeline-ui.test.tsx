@@ -29,7 +29,11 @@ const timeline = (site: "uk" | "au", orderNumber: string): TimelineData => ({
   cancelled: { at: "2026-11-22T09:00:00.000000Z" },
   framedByWorkType: [{ workType: "framed", at: "2026-11-20T12:00:00.000000Z", kind: "confirmed" }],
   fulfillments: [{ fulfillmentId: "1", at: "2026-11-21T12:00:00.000000Z", complete: false, kind: "confirmed" }],
-  evidence: [{ stage: "dispatched", source: "app", kind: "confirmed", at: "2026-11-21T09:00:00.000000Z", receivedAt: "2026-11-21T09:00:01.000000Z", fulfillmentId: null, workType: null, batchId: null, caseId: "C-1" }],
+  deliveries: [{ fulfillmentId: "1", at: "2026-11-22T12:00:00.000000Z", kind: "confirmed" }],
+  evidence: [
+    { stage: "dispatched", source: "app", kind: "confirmed", at: "2026-11-21T09:00:00.000000Z", receivedAt: "2026-11-21T09:00:01.000000Z", fulfillmentId: null, workType: null, batchId: null, caseId: "C-1", retraction: false, revoked: true },
+    { stage: "dispatched", source: "app", kind: "confirmed", at: "2026-11-21T10:00:00.000000Z", receivedAt: "2026-11-21T10:00:01.000000Z", fulfillmentId: null, workType: null, batchId: null, caseId: "C-1", retraction: true, revoked: false },
+  ],
 });
 
 describe("request scope: a slow answer for another site or order never paints", () => {
@@ -80,6 +84,14 @@ describe("rendered timeline", () => {
     expect(html).toContain("unknown");
     expect(html).toContain("time anomaly (not measured)");
     expect(html).toContain("never counts as completing the original order");
+    // review task2: fulfillment creation is labelled as such, never as completion; deliveries are per fulfillment; withdrawn scans shown
+    expect(html).toContain("Fulfillments created in Shopify");
+    expect(html).toContain("When the whole order was shipped is not recorded");
+    expect(html).not.toContain("completes order");
+    expect(html).toContain("Deliveries per fulfillment");
+    expect(html).toContain("withdrawn, not counted");
+    expect(html).toContain("scan cancelled (withdraws an earlier scan)");
+    expect(html).toContain("partial (whole order not proven)");
     expect(text(html)).not.toMatch(CLASSIFY);
   });
   it("times are shown in the site's time zone (UK 09:00Z = 09:00 GMT; AU = 20:00 AEDT)", () => {
@@ -90,7 +102,7 @@ describe("rendered timeline", () => {
   it("unlinked orders show the note and evidence, and errors offer a retry", () => {
     const un = renderToStaticMarkup(<OrderTimelineView state={ready({ ...timeline("uk", "1"), linked: false, stages: null, note: "Not linked to a Shopify order at this site yet" })} onRetry={() => {}} />);
     expect(un).toContain("Not linked");
-    expect(un).toContain("Recorded evidence (1)");
+    expect(un).toContain("Recorded evidence (2)");
     const err = renderToStaticMarkup(<OrderTimelineView state={{ key: "k", status: "error", data: null, error: "Order timeline is available to owners", code: "FORBIDDEN" }} onRetry={() => {}} />);
     expect(err).toContain("Retry");
   });

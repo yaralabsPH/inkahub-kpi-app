@@ -28,7 +28,7 @@ export const STAGE_LABELS: Record<string, string> = {
   delivered: "Delivered",
   cancelled: "Cancelled",
 };
-const STATUS_TEXT: Record<string, string> = { confirmed: "recorded", partial: "partial", unconfirmed: "unconfirmed", missing: "missing" };
+const STATUS_TEXT: Record<string, string> = { confirmed: "recorded", partial: "partial (whole order not proven)", unconfirmed: "unconfirmed", missing: "missing" };
 
 export interface TimelineRequest { site: ReportSite; orderNumber: string }
 export interface OrderTimelineView {
@@ -40,8 +40,10 @@ export interface OrderTimelineView {
   gaps: Array<{ from: string; to: string; status: "measured" | "unknown" | "anomaly"; hours: number | null }>;
   cancelled: { at: string | null } | null;
   framedByWorkType: Array<{ workType: string; at: string; kind: string }>;
+  /** Per fulfillment: when it was CREATED in Shopify (not when the whole order shipped). */
   fulfillments: Array<{ fulfillmentId: string; at: string; complete: boolean; kind: string }>;
-  evidence: Array<{ stage: string; source: string; kind: string; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null }>;
+  deliveries: Array<{ fulfillmentId: string | null; at: string; kind: string }>;
+  evidence: Array<{ stage: string; source: string; kind: string; at: string; receivedAt: string; fulfillmentId: string | null; workType: string | null; batchId: string | null; caseId: string | null; retraction: boolean; revoked: boolean }>;
 }
 
 export const timelineQuery = (r: TimelineRequest) => `action=order&site=${encodeURIComponent(r.site)}&orderNumber=${encodeURIComponent(r.orderNumber)}`;
@@ -168,7 +170,13 @@ export function OrderTimelineView({ state, onRetry }: { state: OverviewState<Ord
       ) : null}
       {d.fulfillments.length ? (
         <div className="text-slate-600 dark:text-slate-300">
-          Shipments: {d.fulfillments.map((f) => `${f.complete ? "completes order" : "partial"} ${siteTime(f.at, d.site)}${f.kind !== "confirmed" ? ` (${f.kind})` : ""}`).join("; ")}
+          Fulfillments created in Shopify: {d.fulfillments.map((f) => `${f.complete ? "whole-order proof " : ""}${siteTime(f.at, d.site)}${f.kind !== "confirmed" ? ` (${f.kind})` : ""}`).join("; ")}.
+          {d.stages?.find((s) => s.stage === "shipped")?.status !== "confirmed" ? " When the whole order was shipped is not recorded, so its duration is unknown." : ""}
+        </div>
+      ) : null}
+      {d.deliveries.length ? (
+        <div className="text-slate-600 dark:text-slate-300">
+          Deliveries per fulfillment: {d.deliveries.map((x) => `${x.fulfillmentId ?? "?"} ${siteTime(x.at, d.site)}${x.kind !== "confirmed" ? ` (${x.kind})` : ""}`).join("; ")}
         </div>
       ) : null}
       {d.evidence.some((e) => e.caseId) ? <div className="text-slate-600 dark:text-slate-300">CS/replacement work is listed in the evidence below and never counts as completing the original order.</div> : null}
@@ -179,6 +187,7 @@ export function OrderTimelineView({ state, onRetry }: { state: OverviewState<Ord
             <li key={i} className="tabular-nums text-slate-600 dark:text-slate-300">
               {siteTime(e.at, d.site)} · {STAGE_LABELS[e.stage] ?? e.stage} · {e.source}{e.kind !== "confirmed" ? ` (${e.kind})` : ""}
               {e.workType ? ` · ${e.workType}` : ""}{e.batchId ? ` · batch ${e.batchId}` : ""}{e.caseId ? ` · CS case ${e.caseId}` : ""}
+              {e.retraction ? " · scan cancelled (withdraws an earlier scan)" : ""}{e.revoked ? " · withdrawn, not counted" : ""}
             </li>
           ))}
         </ul>

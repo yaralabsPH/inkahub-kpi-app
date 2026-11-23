@@ -13,7 +13,9 @@ touched. Staging and live acceptance are **pending**.
     increments `route_conflicts` and never reassigns the order.
   - `public.order_timeline_evidence`: immutable occurrences (update/delete
     refused by trigger), unique per (source, occurrence_key). No customer
-    columns.
+    columns. A retraction row (`retracts_key`) withdraws one exact earlier
+    occurrence of the same source from its own time; for example, a scan
+    cancelled after it was copied. History is never edited.
   - Service-only RPCs: `ingest_order_timeline`, `read_order_timeline`,
     `read_order_flow`, `reconcile_order_timeline_app`. RLS is on, and anon and
     authenticated have no table or function access. Over-limit reads are
@@ -38,6 +40,13 @@ touched. Staging and live acceptance are **pending**.
 - Reports: "Order timeline" lookup card and "Order flow durations" for
   owner/manager/CS. Durations only: median/P90, sample/unknown/anomaly counts,
   and a coverage label ("recorded orders, not complete Shopify history").
+- What the Shopify data can and cannot prove:
+  - Each fulfillment is recorded at the time it was created in Shopify. That
+    is not whole-order shipment, so order-to-complete-shipment stays unknown
+    until a source that times whole-order shipment is commissioned.
+  - Delivery is per fulfillment. Whole-order delivered needs explicit proof
+    (none today).
+  - Shopify's current "fulfilled" state is never used to backdate a time.
 
 ## Configuration (server env, Preview/staging only until approved)
 
@@ -71,7 +80,11 @@ small additive extractor is needed first.
    fulfillment before its order (unrouted, then routed), and route it to a
    second site (conflict, site unchanged). Use the same order number at two
    sites and confirm they never merge.
-3. Preview env with the verified routing JSON and a staging webhook secret.
+3. **Routing stays unset** until the user explains which location decides the
+   site (shipping country, Shopify fulfillment location or submitting-form
+   site) and root verifies it. Then set up the Preview env with that routing
+   JSON and a staging webhook secret. Oversized tag (>250) or attribute
+   (>100) lists leave an order unrouted.
    Send signed synthetic payloads. Expect: wrong signature 401, other shop
    403, oversized 413, valid 200. **Confirm the raw body is readable on
    Vercel**: a 503 `CONFIG` "Raw body unavailable" means the runtime parsed
