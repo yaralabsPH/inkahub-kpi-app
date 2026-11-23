@@ -19,6 +19,7 @@ import { PackageUsageCard } from "@/components/PackageUsageCard";
 import { PackageHistoryCard } from "@/components/PackageHistoryCard";
 import { PackagingAttentionCard } from "@/components/PackagingAttentionCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
+import { ReportsOverview } from "@/components/ReportsOverview";
 import {
   ATTRIBUTION_CSV_HEADERS,
   attributableEventIds,
@@ -178,7 +179,38 @@ export function Reports() {
       </div>
     );
   }
-  return <SupabaseReports />;
+  return <RoleReports />;
+}
+
+/**
+ * F8: the role split runs BEFORE any legacy Reports hook mounts. Staff and CS
+ * get only the published overview (their own work / the server-chosen
+ * audience); the legacy full-team view (staff list, hourly rates, raw event
+ * reads) mounts only for owner and manager. Kiosk never sees Reports.
+ */
+export function reportsLayoutFor(role: string | null): "pending" | "denied" | "overview_only" | "full" {
+  if (role === null) return "pending";
+  if (role === "kiosk") return "denied";
+  if (role === "owner" || role === "manager") return "full";
+  return "overview_only";
+}
+
+function RoleReports() {
+  const auth = useAuth();
+  const supabase = getSupabase();
+  const location = useAppStore((s) => s.location);
+  const role = auth.profile?.role ?? null;
+  const layout = reportsLayoutFor(role);
+  if (layout === "pending") return <div className="p-6 text-sm text-slate-500" role="status">Loading your access…</div>;
+  if (layout === "denied") return <div className="p-6 text-sm text-slate-600 dark:text-slate-300">Reports are not available on kiosk accounts.</div>;
+  const overview = <ReportsOverview supabase={supabase} site={location} userId={auth.user?.id ?? null} role={role} ownName={auth.profile?.display_name ?? null} />;
+  if (layout === "overview_only") return <div className="p-4 md:p-6 space-y-4">{overview}</div>;
+  return (
+    <>
+      <div className="px-4 md:px-6 pt-4 md:pt-6">{overview}</div>
+      <SupabaseReports />
+    </>
+  );
 }
 
 function SupabaseReports() {

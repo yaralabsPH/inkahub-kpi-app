@@ -62,6 +62,7 @@ export function effectiveNav(profile: { role: string; allowed_nav: unknown } | n
       case "manager": keys = NAV.filter((k) => k !== "dashboard"); break;
       case "kiosk": keys = ["order_submission"]; break;
       case "cs": keys = ["cs_returns", "cs_cases"]; break;
+      case "staff": keys = ["welcome", "reports"]; break; // F8: own work only (server-enforced)
       default: keys = ["welcome"];
     }
   }

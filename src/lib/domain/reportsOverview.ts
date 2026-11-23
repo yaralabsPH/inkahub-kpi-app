@@ -7,7 +7,7 @@
  * (order, case) identities computed by the database for each group; nothing
  * here adds daily or group Orders together.
  */
-import { isProductionDate, isReportSite, productionDatesBetween, type ReportSite } from "./productionPeriods";
+import { isProductionDate, isReportSite, productionDatesBetween, productionWeekStart, type ReportSite } from "./productionPeriods";
 import type { PublishedMeta } from "./productionReporting";
 
 export const OVERVIEW_MAX_DATES = 731;
@@ -192,4 +192,27 @@ export function overviewCsv(r: OverviewResult, labels: { person: (staffId: strin
   for (const p of r.people) row("person", p.staffId, labels.person(p.staffId), p);
   for (const d of r.departments) row("department", d.departmentId ?? UNKNOWN_DEPARTMENT, departmentLabel(d), d);
   return lines.map((l) => l.map((c) => csvCell(c)).join(",")).join("\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// Periods (site production dates: 04:00 local boundaries, Monday weeks)
+// ---------------------------------------------------------------------------
+
+export type OverviewPeriodKind = "day" | "week" | "month" | "custom";
+
+/**
+ * The production dates of a period ending today (`today` = productionDateAt(now, site)).
+ * Week starts Monday; month starts on the 1st. Custom is validated by the request.
+ */
+export function overviewPeriod(kind: OverviewPeriodKind, today: string, custom?: { from: string; to: string }): { firstDate: string; lastDate: string } {
+  switch (kind) {
+    case "day":
+      return { firstDate: today, lastDate: today };
+    case "week":
+      return { firstDate: productionWeekStart(today), lastDate: today };
+    case "month":
+      return { firstDate: `${today.slice(0, 8)}01`, lastDate: today };
+    case "custom":
+      return custom ? { firstDate: custom.from, lastDate: custom.to } : { firstDate: today, lastDate: today };
+  }
 }

@@ -86,7 +86,7 @@ describe("Task 16: authentication and audience (never client-chosen)", () => {
   });
   const cases: Array<[ReportingPrincipal["role"], string[] | null, "reports" | "welcome", "site" | "self" | 403]> = [
     ["owner", null, "reports", "site"], ["manager", null, "reports", "site"], ["kiosk", null, "reports", 403], ["kiosk", null, "welcome", "site"], ["cs", null, "reports", 403], ["cs", null, "welcome", "site"],
-    ["staff", null, "reports", 403], ["staff", null, "welcome", "self"], ["staff", ["reports"], "reports", "self"], ["kiosk", ["reports"], "reports", "site"], ["manager", ["welcome"], "reports", 403],
+    ["staff", null, "reports", "self"], ["staff", null, "welcome", "self"], ["staff", ["reports"], "reports", "self"], ["kiosk", ["reports"], "reports", "site"], ["manager", ["welcome"], "reports", 403],
   ];
   for (const [role, allowed, view, want] of cases) {
     it(`${role} (${JSON.stringify(allowed)}) ${view} → ${String(want)}`, () => {
