@@ -141,6 +141,21 @@ batch's working rows. Do **not** enable capture on live as part of the bulk rele
   `AuthProvider`; Dexie mode has no provider, so `/settings` renders blank ("useAuth must be used inside
   <AuthProvider>"). Production (Supabase) is not affected. Fix: use `useAuthOptional()` there, as Sidebar does.
 
+## 2c. Review r2 fix, accepted on a deployed Preview (2026-11-25)
+
+Build `f7240d1` deployed as Preview `inka-arthouse-g1on6rg21` on staging-2 (default Vercel region, like
+production), reporting dormant (capture off, processors off, read mode legacy, no generation). Signed in as the
+staging test **owner** and **staff** (session minted with the staging service key; no password used):
+
+| Request | Before the fix (`30eb6e5`, Preview `l5wdaxm3q`) | After the fix (`f7240d1`) |
+|---|---|---|
+| `/api/reports/summary` Reports view, AU / UK / US | 503 `UNAVAILABLE` (page shows an error) | 503 **`READ_MODE_LEGACY`** for owner and staff (page runs its existing reads) |
+| `/api/reports/summary` Welcome view, AU / UK / US | 503 `UNAVAILABLE` | 503 **`READ_MODE_LEGACY`** for owner and staff |
+| `/api/reports/overview` AU | 503 `UNAVAILABLE` (shown as "not ready") | 503 `READ_MODE_LEGACY` (shown as "not ready", unchanged) |
+
+Still for CJ in a browser (G7): open Reports and Welcome on this Preview as owner/manager/staff and see the legacy
+counts (synthetic staging data), the legacy CSV and a dry digest.
+
 ## 3. G5: rollback drill (new app writes, then the old app)
 
 Site `f7race` from `dispatch-flow/01-fixtures.sql` (auto packaging, one rule set). Scripts
