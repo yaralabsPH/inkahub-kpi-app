@@ -79,7 +79,7 @@ Run in the following order; every task depends on all previous gates. Tasks 5–
 - Done when: token values match `wf.css` in both themes, CSS remains inert outside the opted-in scope, no remote fonts/dependencies, and G passes. OS subscription comes in Task 3, not in a pure helper.
 - Tests to add: `appearance.test.ts` only; focused run `npm run test -- --run src/lib/ui/__tests__/appearance.test.ts`.
 
-### [ ] Task 2: Shared primitives, states and opt-in overlays
+### [x] Task 2: Shared primitives, states and opt-in overlays
 
 - Files: modify `src/components/ui/Button.tsx`, `Card.tsx`, `Input.tsx`, `StatusPill.tsx`, `Modal.tsx`, `src/index.css`; create `UiPresentation.tsx`, `PageHeader.tsx`, `DataState.tsx`, `TableContainer.tsx`, `Badge.tsx`, `SideSheet.tsx` in `src/components/ui/`.
 - [ ] Keep current component props/ref forwarding, native input/select semantics, button `type="button"`, disabled behavior and existing domain status labels. Add semantic markers/scoped rules for compact controls, cards, tables and badges; retain legacy styling outside the scope.
@@ -307,3 +307,4 @@ Coder adds one line per completed task with commit, checks and relevant manual e
 
 - 2026-11-24 — Planner created spec and plan from approved wireframes, current source and repository guidance. Documentation only; no application tests, staging run, commit, push or deployment performed in this planner task.
 - Task 1 — scoped --hub-* tokens (light/dark, values from wf.css) + Tailwind colors.hub; shell foundations and a scoped neutral bridge (slate/white utilities resolve to tokens only inside .ui-redesign-shell; :where() keeps real dark:/hover: variants winning); appearance.ts + 8 tests. tsc 0; tests 3403 pass, 6 fail = the known Windows CRLF migration-hash tests (baseline before Task 1: same 6); build ok. Station unaffected (no shell yet). Surprise: none.
+- Task 2 — UiPresentation provider + useOverlayBehavior (focus entry/trap, topmost-only Escape, scroll lock, focus return); Button/Card/Input/Field/StatusPill/Modal pick the hub look only inside the provider and keep their exact legacy classes/behaviour outside (Production's Modal path is the untouched LegacyModal); new PageHeader, DataState, TableContainer (+ scoped .hub-table styles), Badge, SideSheet (460px / full-screen <768px). No new tests (presentation only). tsc 0; tests 3403 pass + 6 baseline CRLF; build ok.

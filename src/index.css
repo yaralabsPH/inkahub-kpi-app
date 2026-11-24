@@ -207,3 +207,13 @@ body {
 .ui-redesign-shell textarea::placeholder { color: rgb(var(--hub-faint)); }
 .ui-redesign-shell input[type="checkbox"],
 .ui-redesign-shell input[type="radio"] { accent-color: rgb(var(--hub-accent-text)); }
+
+/* Tables inside a TableContainer (wf.css .tb). Low specificity: page classes win. */
+:where(.ui-redesign-shell .hub-table) table { border-collapse: collapse; width: 100%; font-size: 13px; }
+:where(.ui-redesign-shell .hub-table) th {
+  text-align: left; font-weight: 500; color: rgb(var(--hub-muted)); background: rgb(var(--hub-sub));
+  padding: 7px 10px; border-bottom: 1px solid rgb(var(--hub-line)); white-space: nowrap; font-size: 12.5px;
+  position: sticky; top: 0; z-index: 1;
+}
+:where(.ui-redesign-shell .hub-table) td { padding: 7px 10px; border-bottom: 1px solid rgb(var(--hub-line)); }
+:where(.ui-redesign-shell .hub-table) tbody tr:hover > td { background: rgb(var(--hub-hover)); }
