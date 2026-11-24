@@ -5,8 +5,16 @@ import type { CsReturn, CsReturnLine, CsReturnStatus } from "@/lib/domain";
 
 /**
  * Drives the real SupabaseRepo return code against an in-memory client.
- * `adjust_on_hand` mirrors 0002_rpc.sql: after = GREATEST(before - p_delta, 0),
- * and the ledger records the actual change.
+ * It checks the calls the adapter makes and their order. It is NOT a
+ * Postgres, RLS or transaction test. What it models:
+ *  - `adjust_on_hand` as in 0002_rpc.sql: after = GREATEST(before - p_delta, 0);
+ *    a missing product is a silent no-op; a zero actual change writes no
+ *    ledger row.
+ *  - cs_return_lines' product FK (0009): inserting a line whose product is
+ *    missing for the location fails the insert.
+ *  - deleting a cs_returns row cascades to its lines.
+ * Not modelled: unique constraints, authorization, write failures other than
+ * the FK, concurrency, rollback.
  */
 type Row = Record<string, any>;
 
@@ -27,10 +35,12 @@ class FakeDb {
         if (name !== "adjust_on_hand") throw new Error(`unexpected rpc ${name}`);
         db.rpcCalls.push({ p_product_id: args.p_product_id, p_delta: args.p_delta });
         const p = db.tables.products.find((x) => x.location === args.p_location && x.id === args.p_product_id);
-        if (!p) return { data: null, error: { message: "product not found" } };
+        if (!p) return { data: null, error: null };
         const before = p.current_on_hand;
         p.current_on_hand = Math.max(before - args.p_delta, 0);
-        db.tables.ledger.push({ product_id: p.id, delta: p.current_on_hand - before, reason: args.p_reason });
+        if (p.current_on_hand !== before) {
+          db.tables.ledger.push({ product_id: p.id, delta: p.current_on_hand - before, reason: args.p_reason });
+        }
         return { data: null, error: null };
       },
     } as unknown as SupabaseClient;
@@ -59,7 +69,13 @@ class FakeQuery {
       return resolve({ data: this.single ? found[0] ?? null : found, error: null });
     }
     if (this.op === "delete") {
+      const gone = rows.filter(match);
       this.db.tables[this.table] = rows.filter((r) => !match(r));
+      if (this.table === "cs_returns") {
+        this.db.tables.cs_return_lines = this.db.tables.cs_return_lines.filter(
+          (l) => !gone.some((g) => g.location === l.location && g.id === l.return_id),
+        );
+      }
       return resolve({ data: null, error: null });
     }
     if (this.op === "upsert") {
@@ -67,6 +83,12 @@ class FakeQuery {
       const i = rows.findIndex((r) => r.location === row.location && r.id === row.id);
       if (i >= 0) rows[i] = { ...row }; else rows.push({ ...row });
       return resolve({ data: null, error: null });
+    }
+    if (this.table === "cs_return_lines") {
+      const bad = this.payload.find(
+        (l) => !this.db.tables.products.some((p) => p.location === l.location && p.id === l.product_id),
+      );
+      if (bad) return resolve({ data: null, error: { message: "violates foreign key constraint (product)" } });
     }
     rows.push(...this.payload.map((r) => ({ ...r })));
     return resolve({ data: null, error: null });
@@ -136,14 +158,71 @@ describe("SupabaseRepo returns: stock through adjust_on_hand", () => {
     expect(db.onHand("p1")).toBe(13);
   });
 
-  it("delete removes the restocked units (positive p_delta)", async () => {
+  it("delete removes the restocked units (positive p_delta) and its lines; a second delete moves nothing", async () => {
     const { db, repo } = setup({ p1: 10 });
     await repo.upsertCsReturn(ret("received"), [line()]);
     await repo.deleteCsReturn("r1");
     expect(db.rpcCalls.at(-1)).toEqual({ p_product_id: "p1", p_delta: 3 });
     expect(db.onHand("p1")).toBe(10);
     expect(db.tables.cs_returns).toEqual([]);
+    expect(db.tables.cs_return_lines).toEqual([]);
+    db.rpcCalls = [];
+    await repo.deleteCsReturn("r1");
+    expect(db.rpcCalls).toEqual([]);
+    expect(db.onHand("p1")).toBe(10);
   });
+
+  it("delete after the units were used stops at zero and the ledger records the actual removal", async () => {
+    const { db, repo } = setup({ p1: 0 });
+    await repo.upsertCsReturn(ret("received"), [line()]);
+    db.tables.products[0].current_on_hand = 1;
+    await repo.deleteCsReturn("r1");
+    expect(db.onHand("p1")).toBe(0);
+    expect(db.tables.ledger.at(-1)).toEqual({ product_id: "p1", delta: -1, reason: "return" });
+  });
+
+  it("a missing SKU on an UNTICKED line is rejected before any stock call or write (new return)", async () => {
+    const { db, repo } = setup({ p1: 10 });
+    await expect(
+      repo.upsertCsReturn(ret("received"), [line(), line({ id: "l2", product_id: "gone", quantity: 1, restock: false })]),
+    ).rejects.toThrow(/no longer exists/);
+    expect(db.rpcCalls).toEqual([]);
+    expect(db.onHand("p1")).toBe(10);
+    expect(db.tables.ledger).toEqual([]);
+    expect(db.tables.cs_returns).toEqual([]);
+    expect(db.tables.cs_return_lines).toEqual([]);
+  });
+
+  it("a missing SKU on an added unticked line keeps an existing return's lines and stock", async () => {
+    const { db, repo } = setup({ p1: 10 });
+    await repo.upsertCsReturn(ret("received"), [line()]);
+    const before = JSON.stringify(db.tables);
+    db.rpcCalls = [];
+    await expect(
+      repo.upsertCsReturn(ret("received"), [line(), line({ id: "l2", product_id: "gone", quantity: 1, restock: false })]),
+    ).rejects.toThrow(/no longer exists/);
+    expect(db.rpcCalls).toEqual([]);
+    expect(JSON.stringify(db.tables)).toBe(before);
+  });
+
+  it("a line whose SKU was deleted from the catalogue can still be removed", async () => {
+    const { db, repo } = setup({ p1: 10, p2: 5 });
+    await repo.upsertCsReturn(ret("received"), [line(), line({ id: "l2", product_id: "p2", restock: false })]);
+    db.tables.products = db.tables.products.filter((p) => p.id !== "p2");
+    await repo.upsertCsReturn(ret("received"), [line()]);
+    expect(db.tables.cs_return_lines.map((l) => l.id)).toEqual(["l1"]);
+    expect(db.onHand("p1")).toBe(13);
+  });
+
+  for (const table of ["cs_returns", "products"]) {
+    it(`a failed ${table} read stops the save before any stock call`, async () => {
+      const { db, repo } = setup({ p1: 10 });
+      db.failRead = table;
+      await expect(repo.upsertCsReturn(ret("received"), [line()])).rejects.toBeTruthy();
+      expect(db.rpcCalls).toEqual([]);
+      expect(db.onHand("p1")).toBe(10);
+    });
+  }
 
   it("a failed read of the saved lines stops the save before any stock call", async () => {
     const { db, repo } = setup({ p1: 10 });

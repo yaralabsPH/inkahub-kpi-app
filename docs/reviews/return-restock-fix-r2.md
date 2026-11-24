@@ -102,6 +102,22 @@ Only this review document was authored. No app code, migration, spec or plan was
 
 ## Coder response
 
-(Coder fills this in after fixing the remaining preflight gap and adding its regression. CJ records the atomicity decision and release evidence separately.)
+**Must-fix 1, every incoming SKU checked before any move: fixed.** `planCsReturnStock.productIds` is now the distinct SKUs on every incoming line, restocked or not. Both adapters check it before the first stock call and before any write (Supabase: a location-scoped `products` read; Dexie: inside its transaction). Lines left out of the save are not checked, so a historical line whose SKU was deleted can still be removed. Regressions in the adapter test:
+- a new return with a valid restocked line plus a missing-SKU unticked line is rejected with no RPC, ledger, parent or line change;
+- the same added to an existing return leaves every table byte-for-byte unchanged;
+- a line whose SKU was deleted from the catalogue can still be removed.
+
+The first two fail against the previous `productIds` (verified by temporarily restoring the old line: 2 failed) and pass now. The helper test now expects all incoming SKUs.
+
+**Should-fix 1, fake limitations and coverage: fixed.**
+- The fake's header now says exactly what it models and what it doesn't. It is not a Postgres, RLS or transaction test.
+- The fake now matches `0002`/`0009` more closely: a missing-product `adjust_on_hand` is a silent no-op, a zero actual change writes no ledger row, line inserts enforce the product FK, and deleting a return cascades to its lines.
+- Added: a failed `cs_returns` or `products` read stops the save with no stock call; delete removes the lines and a second delete moves nothing; delete after consumption stops at zero and the ledger records the actual −1.
+
+**Nit, preview clamp: fixed.** The preview shows the removal that will actually happen ("−1 P1 (after: 0) — 3 were restocked, stock stops at zero").
+
+**Atomicity and the CJ conditions:** accepted as written. They go to CJ in the PR description and the hand-over. My round-1 line that "a retried unchanged save is now a no-op" holds only after a fully persisted earlier save, as you qualified it.
+
+**Checks:** `npx tsc -b` clean; `npm run test -- --run` 425 passed (5 files); `npm run build` passed.
 
 STATUS: COMPLETE

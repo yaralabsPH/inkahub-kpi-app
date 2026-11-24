@@ -55,7 +55,12 @@ export interface CsReturnStockPlan {
   moves: CsReturnStockMove[];
   /** Line id → inventory_credited value to persist. */
   credited: Map<string, boolean>;
-  /** Products credited after the save; each must exist before any move. */
+  /**
+   * Every SKU on an incoming line (credited or not). Each must exist before
+   * any move: Postgres rejects a line whose product is missing, and that
+   * would fail the save after stock had already moved. A historical line
+   * whose SKU was deleted can still be removed (it is not incoming).
+   */
   productIds: string[];
 }
 
@@ -119,7 +124,7 @@ export function planCsReturnStock(
   }
 
   const moves = netMoves(creditedTotals(prevLines), nextTotals);
-  const productIds = [...nextTotals.keys()].sort();
+  const productIds = [...new Set(nextLines.map((l) => l.product_id))].sort();
   return { moves, credited, productIds };
 }
 

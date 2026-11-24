@@ -248,8 +248,8 @@ describe("return restock: input checks happen before any move", () => {
     expect(() => planCsReturnStock([], "received", [line({ product_id: "" })])).toThrow(/SKU/);
   });
 
-  it("lists credited products so the adapters can check they exist", () => {
+  it("lists every incoming line's SKU (restocked or not) so the adapters can check they exist", () => {
     const plan = planCsReturnStock([], "received", [line({ product_id: "p2" }), line({ id: "l2", restock: false })]);
-    expect(plan.productIds).toEqual(["p2"]);
+    expect(plan.productIds).toEqual(["p1", "p2"]);
   });
 });

@@ -1064,11 +1064,15 @@ function ReturnModal({
               <strong>Saving will change stock:</strong>{" "}
               {stockPreview.moves.map((mv, i) => {
                 const p = products.find((pp) => pp.id === mv.productId);
+                const onHand = p?.current_on_hand ?? 0;
+                // Removals stop at zero, so show what will actually move.
+                const actual = p ? Math.max(mv.change, -onHand) : mv.change;
                 return (
                   <span key={mv.productId}>
                     {i > 0 ? ", " : ""}
-                    <strong>{mv.change > 0 ? "+" : "−"}{Math.abs(mv.change)} {p?.code ?? "?"}</strong>
-                    {p ? ` (after: ${fmtNum(Math.max((p.current_on_hand ?? 0) + mv.change, 0))})` : ""}
+                    <strong>{actual > 0 ? "+" : "−"}{Math.abs(actual)} {p?.code ?? "?"}</strong>
+                    {p ? ` (after: ${fmtNum(onHand + actual)})` : ""}
+                    {actual !== mv.change ? ` — ${Math.abs(mv.change)} were restocked, stock stops at zero` : ""}
                   </span>
                 );
               })}
