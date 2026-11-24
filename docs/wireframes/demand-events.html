@@ -1,0 +1,43 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Demand events — wireframe</title><link rel="stylesheet" href="wf.css">
+<style>
+.tl{border:1px solid var(--line);border-radius:8px;background:var(--panel);overflow:hidden}
+.tl .hd,.tl .ln{display:grid;grid-template-columns:220px repeat(12,1fr)}
+.tl .hd div{padding:6px 8px;font-size:11.5px;color:var(--muted);border-right:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--sub)}
+.tl .ln{position:relative;height:40px;border-bottom:1px solid var(--line)}
+.tl .ln>div:first-child{padding:10px;font-size:13px;border-right:1px solid var(--line)}
+.tl .ev{position:absolute;top:8px;height:24px;border-radius:5px;font-size:12px;padding:3px 8px;white-space:nowrap}
+.today{position:absolute;top:0;bottom:0;width:2px;background:var(--bad);opacity:.6}
+</style></head><body>
+<div id="content"><div class="page">
+  <h1 class="t">Demand events</h1><p class="sub">Promos, holidays and launches that change expected demand. They feed into forecasts and order suggestions.</p>
+  <div class="views"><span class="on">Timeline <span class="new">New</span></span><span>Calendar</span><span>Table</span><span class="pin">1</span></div>
+  <div class="tools"><span class="btn sm">Today</span><span class="btn sm">‹ ›</span><span class="chip">Nov 2026 – Jan 2027</span><span class="chip filter">Zoom: Weeks ▾</span><span class="sp"></span><span class="btn pri">+ New event</span></div>
+
+  <div class="tl">
+    <div class="hd"><div>Event</div><div>W46</div><div>W47</div><div>W48</div><div>W49</div><div>W50</div><div>W51</div><div>W52</div><div>W1</div><div>W2</div><div>W3</div><div>W4</div><div>W5</div></div>
+    <div class="ln"><div>Black Friday</div><span class="ev" style="left:calc(220px + (100% - 220px)/12*1.6);width:calc((100% - 220px)/12*1.6);background:var(--bad-bg);color:var(--bad)">×2.5 · all SKUs</span><span class="today" style="left:calc(220px + (100% - 220px)/12*2.3)"></span></div>
+    <div class="ln"><div>Christmas rush</div><span class="ev" style="left:calc(220px + (100% - 220px)/12*3);width:calc((100% - 220px)/12*3.4);background:var(--warn-bg);color:var(--warn)">×1.8 · Frames</span><span class="today" style="left:calc(220px + (100% - 220px)/12*2.3)"></span></div>
+    <div class="ln"><div>Boxing Day sale</div><span class="ev" style="left:calc(220px + (100% - 220px)/12*6.3);width:calc((100% - 220px)/12*1.2);background:var(--info-bg);color:var(--info)">×1.4 · A3, A2</span><span class="today" style="left:calc(220px + (100% - 220px)/12*2.3)"></span></div>
+    <div class="ln"><div class="faint">+ New event</div></div>
+  </div>
+  <p class="small muted">Drag a bar to move it, drag its edge to change dates. <span class="pin">2</span></p>
+
+  <div class="split" style="margin-top:18px">
+    <div class="card"><div class="card-h">Forecast impact · Black Friday <span class="pin">3</span></div><div class="ph" style="height:160px">baseline vs with-event demand (line)</div>
+      <div class="small muted" style="margin-top:8px">+2,890 extra units over 11 days · 6 SKUs would run out before PO-2234 arrives</div></div>
+    <div class="card"><div class="card-h">New event</div>
+      <div class="form" style="grid-template-columns:90px 1fr;gap:10px">
+        <div class="fl">Name</div><div class="field">e.g. Mother's Day</div>
+        <div class="fl">Dates</div><div class="field">Start → End</div>
+        <div class="fl">Multiplier</div><div class="field">×1.0</div>
+        <div class="fl">Apply to</div><div class="field sel">All SKUs</div>
+        <div class="fl">Notes</div><div class="field" style="height:50px"></div>
+      </div><div style="text-align:right;margin-top:10px"><span class="btn pri">Create</span></div></div>
+  </div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"events",title:"Demand events",empty:{title:"No demand events",body:"Add promos, holidays or launches so forecasts can plan for them.",cta:"New event"},crumb:["Planning","Demand events"],notes:[
+ "Timeline view (Notion timeline) shows overlapping events and how long they run. Calendar and Table are other views of the same list.",
+ "Direct manipulation: drag to change dates. A red line marks today.",
+ "Each event shows its forecast impact and the stockouts it would cause, so the multiplier has a visible effect."]});</script>
+</body></html>

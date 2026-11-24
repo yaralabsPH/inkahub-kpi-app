@@ -1,0 +1,55 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sales entry — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <h1 class="t">Sales entry</h1><p class="sub">Units sold per SKU per week · <b>Unframed</b> department. Each cell saves when you leave it and deducts stock if auto-adjust is on.</p>
+
+  <div class="views"><span class="on" onclick="document.getElementById('v-week').hidden=false;document.getElementById('v-grid').hidden=true;this.classList.add('on');this.nextElementSibling.classList.remove('on')">Week <span class="new">New</span></span><span onclick="document.getElementById('v-week').hidden=true;document.getElementById('v-grid').hidden=false;this.classList.add('on');this.previousElementSibling.classList.remove('on')">Grid (weeks × SKUs)</span><span class="pin">1</span></div>
+
+  <div class="row" style="margin:10px 0 14px">
+    <span class="btn">‹</span><span class="btn dark">Week of Mon 23 Nov</span><span class="btn">›</span>
+    <span class="tag g" role="status">All changes saved · 2 s ago</span><span class="pin">2</span>
+    <span class="sp" style="flex:1"></span>
+    <span class="btn ghost">Paste from Notion</span><span class="btn ghost">Import from Shopify</span><span class="btn ghost">Bulk usage entry</span>
+  </div>
+
+  <div class="cards c4" style="margin-bottom:14px">
+    <div class="card"><div class="lbl">Units entered</div><div class="val">1,840</div><div class="dl">of ~2,310 expected</div></div>
+    <div class="card"><div class="lbl">SKUs with sales</div><div class="val">61</div><div class="dl">of 142</div></div>
+    <div class="card"><div class="lbl">vs last week</div><div class="val">−6%</div><div class="dl">week not finished</div></div>
+    <div class="card"><div class="lbl">Cells needing a look</div><div class="val down">1</div><div class="dl">sold more than on hand</div></div>
+  </div>
+
+  <div id="v-week">
+  <div class="tools"><span class="chip filter">Supplier: All ▾</span><span class="chip filter">Size ▾</span><span class="chip filter">Colour ▾</span><span class="chip">Only SKUs with sales</span><span class="sp"></span><span class="small muted">Enter moves down · Tab moves right · Esc cancels a cell</span></div>
+  <div class="grid"><table class="tb">
+    <caption class="small muted" style="text-align:left;padding:6px 10px;caption-side:bottom">Cell edge: blue = saving · green = saved · red = failed (click to retry)</caption>
+    <tr><th scope="col">SKU</th><th scope="col">Size · colour</th><th class="num" scope="col">On hand</th><th class="num" scope="col">Last week</th><th class="num" scope="col" style="width:150px">Units sold <small>int</small></th><th class="num" scope="col">After</th></tr>
+    <tr><td class="mono">A2-WHT</td><td>A2 · White</td><td class="num">120</td><td class="num">92</td><td class="num cs-saving" style="outline:2px solid var(--accent);outline-offset:-2px;background:var(--panel)" aria-label="A2-WHT units sold, saving">88▏</td><td class="num">32</td></tr>
+    <tr><td class="mono">A3-WHT</td><td>A3 · White</td><td class="num">880</td><td class="num">104</td><td class="num cs-saved">110</td><td class="num">770</td></tr>
+    <tr><td class="mono">A3-BLK</td><td>A3 · Black</td><td class="num">210</td><td class="num">81</td><td class="num faint">—</td><td class="num">210</td></tr>
+    <tr><td class="mono">A4-WHT</td><td>A4 · White</td><td class="num">1,240</td><td class="num">131</td><td class="num cs-failed" title="Couldn't save. Click to retry." role="button" tabindex="0" data-toast="Saved A4-WHT · 126">126 <span class="tag r">retry</span></td><td class="num">1,240</td></tr>
+    <tr><td class="mono">CV-60x90</td><td>60×90 · Canvas</td><td class="num">35</td><td class="num">8</td><td class="num cs-saved" style="background:var(--warn-bg)">40 <span class="tag y">&gt; on hand</span></td><td class="num down">−5</td></tr>
+  </table><div class="gridfoot"><span>Total 1,840 units</span><span>61 of 142 SKUs · Unframed</span></div></div>
+  </div>
+
+  <div id="v-grid" hidden>
+  <div class="tools"><span class="chip filter">From: 1 Sep ▾</span><span class="chip filter">To: 23 Nov ▾</span><span class="chip">Show reference weeks</span><span class="sp"></span><span class="chip filter">Footer: Total ▾</span></div>
+  <div class="grid"><table class="tb">
+    <tr><th scope="col" style="position:sticky;left:0">Week starting</th><th class="num">A2-WHT</th><th class="num">A3-WHT</th><th class="num">A3-BLK</th><th class="num">A4-WHT</th><th class="num">CV-60x90</th><th class="num">… 56 more →</th></tr>
+    <tr><td>9 Nov</td><td class="num">90</td><td class="num">101</td><td class="num">79</td><td class="num">128</td><td class="num">7</td><td></td></tr>
+    <tr><td>16 Nov</td><td class="num">92</td><td class="num">104</td><td class="num">81</td><td class="num">131</td><td class="num">8</td><td></td></tr>
+    <tr class="sel"><td><b>23 Nov</b></td><td class="num cs-saving">88</td><td class="num cs-saved">110</td><td class="num faint">—</td><td class="num cs-failed">126</td><td class="num">40</td><td></td></tr>
+  </table><div class="gridfoot"><span>This is today's layout, kept so paste from Notion works the same</span><span>Total row</span></div></div>
+  </div>
+
+  <hr class="sep">
+  <div class="toggle"><div class="th">Split a total across SKUs (weights)</div></div>
+
+  <div class="callout" style="margin-top:16px"><span class="ci"></span><div><b>Why there's no "Save week" button.</b><span class="pin">3</span> Today each cell commits on blur and writes a ledger row. Switching to "review then save" changes when stock is deducted, so it needs its own spec. The wireframe keeps today's behaviour and makes it visible instead: save state per cell, a status pill, and Undo on the last change.</div></div>
+</div></div>
+<div class="toast" role="status" style="bottom:64px"><span>Saved A3-WHT · 110 (−110 on hand)</span><button>Undo</button></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"sales",title:"Sales entry",crumb:["Planning","Sales entry"],dept:true,empty:{title:"No SKUs in Unframed",body:"Switch department in the top bar, or add SKUs first."},notes:[
+ "Two views. <b>Week</b> (new) lists SKUs as rows for one week, which is quicker to type into. <b>Grid</b> is the current weeks × SKUs layout, kept so Paste from Notion and history work as today.",
+ "Each cell saves on blur, as it does now. The status pill and the coloured cell edge show saving, saved or failed. A failed cell keeps its value and can be retried.",
+ "No batch save: that would change how stock is deducted (inventory is money). Instead every save shows a toast with Undo, which writes a reversing ledger entry."]});</script>
+</body></html>

@@ -1,0 +1,65 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shipments — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page has-peek" style="max-width:none;padding-right:500px">
+  <h1 class="t">Shipments</h1><p class="sub">Purchase orders from order placed to delivered and paid</p>
+  <div class="views"><span class="on">Board</span><span>Table</span><span>Timeline <span class="new">New</span></span><span>Unpaid invoices</span><span class="pin">1</span></div>
+  <div class="tools"><span class="chip filter">Supplier: All ▾</span><span class="chip filter">Expected: next 30 days ▾</span><span class="sp"></span><span class="btn pri">+ New shipment</span></div>
+
+  <div class="board">
+    <div class="col"><h4><span class="dot"></span>Draft <span class="n">1</span></h4>
+      <div class="kcard"><div class="kt">Draft · Paper Co</div><div class="km"><span class="tag">2 SKUs</span><span class="tag">Auto-created from shopping list</span></div></div></div>
+    <div class="col"><h4><span class="dot"></span>Ordered <span class="n">2</span></h4>
+      <div class="kcard"><div class="kt">PO-2234 · Paper Co</div><div class="km"><span class="tag">6 SKUs</span><span class="tag">1,400 u</span></div><div class="small muted" style="margin-top:6px">Expected 18 Dec</div></div>
+      <div class="kcard"><div class="kt">PO-2235 · CanvasCo</div><div class="km"><span class="tag">2 SKUs</span><span class="tag">200 u</span></div><div class="small muted" style="margin-top:6px">Expected 22 Dec</div></div></div>
+    <div class="col"><h4><span class="dot y"></span>In Production <span class="n">1</span></h4>
+      <div class="kcard"><div class="kt">PO-2232 · FrameWorks</div><div class="km"><span class="tag">5 SKUs</span><span class="tag">600 u</span></div></div></div>
+    <div class="col"><h4><span class="dot b"></span>In Transit <span class="n">1</span></h4>
+      <div class="kcard" style="outline:2px solid var(--accent)" tabindex="0" role="button" aria-label="Open PO-2231"><div class="kt">PO-2231 · FrameWorks</div><div class="km"><span class="tag">3 SKUs</span><span class="tag">480 u</span><span class="tag r">4 days late</span></div><div class="small muted" style="margin-top:6px">Expected 20 Nov</div></div></div>
+    <div class="col"><h4><span class="dot b"></span>Customs <span class="n">1</span></h4>
+      <div class="kcard"><div class="kt">PO-2229 · Paper Co</div><div class="km"><span class="tag">3 SKUs</span><span class="tag">900 u</span></div></div></div>
+    <div class="col"><h4><span class="dot g"></span>Delivered <span class="n">9</span><span class="pin">2</span></h4>
+      <div class="kcard"><div class="kt">PO-2228 · Paper Co</div><div class="km"><span class="tag g">Stock applied</span><span class="tag y">Unpaid · due 27 Nov</span></div></div>
+      <div class="addc">8 more · Paid ones hidden</div></div>
+    <div class="col"><h4><span class="dot r"></span>Other <span class="n">2</span></h4>
+      <div class="kcard"><div class="kt">PO-2220 · CanvasCo</div><div class="km"><span class="tag y">On hold</span></div></div>
+      <div class="kcard"><div class="kt">PO-2219 · FrameWorks</div><div class="km"><span class="tag">Back-Ordered</span></div></div>
+      <div class="addc">Cancelled (3) hidden</div></div>
+  </div>
+</div>
+
+<aside class="peek">
+  <div class="ptop"><span>⤢ Open as page</span><span class="sp"></span><span>⋯</span><span>✕</span></div>
+  <h1>PO-2231 · FrameWorks</h1>
+  <div class="props">
+    <div class="k">Status</div><div class="v"><span class="tag b">In Transit</span> ▾ <span class="muted small">Draft · Ordered · Back-Ordered · In Production · In Transit · Customs · Delivered · On hold · Cancelled</span></div>
+    <div class="k">Supplier</div><div class="v"><span class="tag">FrameWorks</span></div>
+    <div class="k">Order placed</div><div class="v">14 Oct</div>
+    <div class="k">Transit started</div><div class="v">2 Nov</div>
+    <div class="k">Expected arrival</div><div class="v">20 Nov <span class="tag r">late</span></div>
+    <div class="k">Actual arrival</div><div class="v faint">Empty</div>
+  </div>
+  <h3 class="h">Lines <span class="pin">3</span></h3>
+  <div class="grid"><table class="tb">
+    <tr><th>SKU</th><th class="num">Qty</th><th></th></tr>
+    <tr><td class="mono">FR-OAK-A3</td><td class="num">200</td><td>✕</td></tr>
+    <tr><td class="mono">FR-BLK-A2</td><td class="num">120</td><td>✕</td></tr>
+    <tr><td class="mono">FR-WHT-A3</td><td class="num">160</td><td>✕</td></tr>
+    <tr class="newrow"><td colspan="3">+ Add line</td></tr>
+  </table></div>
+  <div class="toggle open"><div class="th">Invoice &amp; payment</div><div class="tb2"><div class="props">
+    <div class="k">Supplier invoice #</div><div class="v faint">INV-12345</div>
+    <div class="k">Amount</div><div class="v faint">0.00</div>
+    <div class="k">Terms</div><div class="v">Net 30 ▾</div>
+    <div class="k">Due date</div><div class="v muted">auto from terms</div>
+    <div class="k">Payment status</div><div class="v"><span class="tag">Unpaid</span></div>
+    <div class="k">Reference</div><div class="v faint">Wire ref / cheque #</div>
+  </div></div></div>
+  <div class="toggle"><div class="th">Accounts notes</div></div>
+  <div class="toggle"><div class="th">History</div></div>
+  <div class="acts"><span class="btn">Move to Customs</span><span class="btn pri" data-confirm="Mark PO-2231 delivered?|Auto-apply is on, so this adds <b>480 units</b> to 3 SKUs (FR-OAK-A3 +200, FR-BLK-A2 +120, FR-WHT-A3 +160) and writes shipment ledger rows. Moving it back out of Delivered reverses them.|Mark delivered &amp; apply stock">Mark delivered</span></div>
+</aside></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"shipments",title:"Shipments",empty:{title:"No shipments",body:"Create one here, or from the Shopping list.",cta:"New shipment"},crumb:["Planning","Shipments"],notes:[
+ "Board columns are the real statuses. On hold, Back-Ordered and Cancelled collapse into Other so the main flow stays readable. Paid is a payment field, not a column: the Unpaid invoices view filters on it. Timeline is new.",
+ "Delivered cards say whether stock was applied and when the invoice is due, so ops and accounts see the same card.",
+ "The main action is the next step only. Moving to Delivered (by button or drag) always asks first and says exactly how many units it will add, because auto-apply changes stock. Moving out of Delivered reverses it."]});</script>
+</body></html>
