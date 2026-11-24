@@ -247,19 +247,19 @@ export function PaperUsage() {
                           <div className="space-y-2">
                             {giveBack.length > 0 ? (
                               <div>
-                                <p>First, the rolls deducted when this week was last saved go back:</p>
+                                <p>First, it asks to put back the rolls this week's last snapshot recorded as deducted:</p>
                                 <ul className="mt-1 font-mono text-[12.5px]">{giveBack.map((t) => <li key={t}>{t}</li>)}</ul>
                               </div>
                             ) : null}
                             {take.length > 0 ? (
                               <div>
-                                <p>Then these whole rolls are deducted:</p>
+                                <p>Then it asks to deduct these whole rolls:</p>
                                 <ul className="mt-1 font-mono text-[12.5px]">{take.map((t) => <li key={t}>{t}</li>)}</ul>
                               </div>
                             ) : (
                               <p>No new rolls are deducted (no roll SKU mapped, or nothing to print).</p>
                             )}
-                            <p className="text-xs text-hub-muted">Cancel saves nothing and leaves stock as it is.</p>
+                            <p className="text-xs text-hub-muted">These are requested amounts. Stock never goes below zero, a roll SKU that no longer exists is skipped, and the earlier figure is what this snapshot recorded, which may differ from what the ledger actually moved. Cancel saves nothing and leaves stock as it is.</p>
                           </div>
                         ),
                       });

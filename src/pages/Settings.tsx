@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { DataState } from "@/components/ui/DataState";
 import { ReportsSectionNav } from "@/components/ReportsSectionNav";
 import { useQueryClient } from "@tanstack/react-query";
@@ -30,7 +31,8 @@ import { cn } from "@/lib/utils/cn";
 import type { Repository } from "@/lib/repository/Repository";
 
 export function Settings() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const repo = useRepo();
   const m = useMutations();
   const location = useAppStore((s) => s.location);
@@ -46,7 +48,7 @@ export function Settings() {
   const [cleanupMsg, setCleanupMsg] = useState<string | null>(null);
   const [copyMsg, setCopyMsg] = useState<string | null>(null);
 
-  if (!data) return <DataState kind="loading" title="Loading settings…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading settings…" />;
   const s = data.settings;
 
   return (

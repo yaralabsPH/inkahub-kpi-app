@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { DataState } from "@/components/ui/DataState";
 import { DashboardTabs, OwnerOnlyBadge } from "@/components/DashboardTabs";
@@ -25,7 +26,8 @@ import { downloadXlsx } from "@/lib/csv/xlsx";
  * every time it mounts.
  */
 export function StockValue() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const [supplierFilter, setSupplierFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState<"value" | "on_hand" | "code" | "unit_cost">("value");
@@ -76,7 +78,7 @@ export function StockValue() {
     return sorted;
   }, [rows, supplierFilter, search, sortKey, sortDir, hideZero]);
 
-  if (!data) return <div className="mx-auto max-w-hub"><DataState kind="loading" title="Loading stock value…" /></div>;
+  if (!data) return <div className="mx-auto max-w-hub"><DatasetLoadState result={dataset} title="Loading stock value…" /></div>;
 
   const currency = data.settings.currency_symbol;
   const totalValue = filtered.reduce((s, r) => s + r.value, 0);

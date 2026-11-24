@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { DataState } from "@/components/ui/DataState";
 import { DashboardTabs, OwnerOnlyBadge } from "@/components/DashboardTabs";
@@ -28,7 +29,8 @@ import { useState, useEffect, useMemo } from "react";
  * shipments, and the at-risk SKU table.
  */
 export function Dashboard() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { list } = useForecasts();
   const m = useMutations();
   const repo = useRepo();
@@ -78,7 +80,7 @@ export function Dashboard() {
 
   // Loading boundary sits after every hook so the hook order never changes
   // between the first (no data) render and the next one.
-  if (!data) return <div className="mx-auto max-w-hub"><DataState kind="loading" title="Loading dashboard…" /></div>;
+  if (!data) return <div className="mx-auto max-w-hub"><DatasetLoadState result={dataset} title="Loading dashboard…" /></div>;
 
   const today = todayIso();
   const currency = data.settings.currency_symbol;

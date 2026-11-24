@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { Link } from "react-router-dom";
 import {
   Plus, Upload, Trash2, Pencil, GitCompare, GripVertical, Search, X, PanelRightOpen,
@@ -73,7 +74,8 @@ const BULK_FIELDS: { value: BulkField; label: string; kind: "string" | "number" 
 ];
 
 export function Skus() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { byId: forecastById } = useForecasts();
   const m = useMutations();
   const currentLocation = useAppStore((s) => s.location);
@@ -117,7 +119,7 @@ export function Skus() {
     }
   };
 
-  if (!data) return <DataState kind="loading" title="Loading SKUs…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading SKUs…" />;
 
   const sizes = uniq(data.products.map((p) => p.size));
   const colours = uniq(data.products.map((p) => p.colour));
@@ -707,7 +709,7 @@ export function Skus() {
       {comparing ? (
         <CompareModal a={comparing.a} b={comparing.b} onClose={() => setComparing(null)} />
       ) : null}
-      <SkuPeek product={peekId ? data.products.find((x) => x.id === peekId) ?? null : null} onClose={() => setPeekId(null)} />
+      <SkuPeek product={peekId ? data.products.find((x) => x.id === peekId) ?? null : null} forecast={peekId ? forecastById[peekId] : undefined} onClose={() => setPeekId(null)} />
     </div>
   );
 }

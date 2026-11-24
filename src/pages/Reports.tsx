@@ -829,7 +829,7 @@ function SupabaseReports() {
           {staffBoard.length === 0 ? (
             <Empty label={statusState.status === "loading" ? "Loading…" : statusState.status === "error" ? "Counts unavailable." : "No credited items or orders in this range."} />
           ) : (
-            <div style={{ width: "100%", height: 260 }}>
+            <div className="text-hub-accent-text" style={{ width: "100%", height: 260 }}>
               <ResponsiveContainer>
                 <BarChart
                   data={staffBoard.map((s) => ({
@@ -858,8 +858,8 @@ function SupabaseReports() {
                     contentStyle={{ fontSize: 12, borderRadius: 6 }}
                   />
                   <Legend wrapperStyle={{ fontSize: 12 }} />
-                  <Bar dataKey="Items"  fill="#3ecf8e" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="Orders" fill="#94a3b8" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="Items"  fill="currentColor" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="Orders" fill="#64748b" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
@@ -1805,7 +1805,7 @@ function StaffProductivityChart({ staffName, daily, totals }: StaffProductivityP
             <span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-slate-900 dark:bg-slate-100" />Orders</span>
             <span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-slate-400" />Items</span>
           </div>
-          <div style={{ width: "100%", height: 260 }}>
+          <div className="text-hub-accent-text" style={{ width: "100%", height: 260 }}>
             <ResponsiveContainer>
               <LineChart data={rows} margin={{ top: 4, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
@@ -1816,8 +1816,8 @@ function StaffProductivityChart({ staffName, daily, totals }: StaffProductivityP
                   contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #e2e8f0" }}
                   labelStyle={{ fontWeight: 600 }}
                 />
-                <Line yAxisId="orders" type="monotone" dataKey="orders" stroke="#3ecf8e" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} name="Orders" isAnimationActive={false} />
-                <Line yAxisId="items" type="monotone" dataKey="items" stroke="#94a3b8" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} name="Items" isAnimationActive={false} />
+                <Line yAxisId="orders" type="monotone" dataKey="orders" stroke="currentColor" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} name="Orders" isAnimationActive={false} />
+                <Line yAxisId="items" type="monotone" dataKey="items" stroke="#64748b" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} name="Items" isAnimationActive={false} />
               </LineChart>
             </ResponsiveContainer>
           </div>

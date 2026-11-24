@@ -1,4 +1,5 @@
 import { useEffect, useMemo } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, ChevronLeft, ChevronRight } from "lucide-react";
 import { DataState } from "@/components/ui/DataState";
@@ -27,7 +28,8 @@ import type { LedgerEntry, LedgerReason, Product } from "@/lib/domain";
  */
 export function SkuDetail() {
   const { id } = useParams<{ id: string }>();
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { byId } = useForecasts();
   const navigate = useNavigate();
 
@@ -74,7 +76,7 @@ export function SkuDetail() {
     return () => window.removeEventListener("keydown", onKey);
   }, [prevSku, nextSku, navigate]);
 
-  if (!data) return <div className="mx-auto max-w-hub"><DataState kind="loading" title="Loading SKU…" /></div>;
+  if (!data) return <div className="mx-auto max-w-hub"><DatasetLoadState result={dataset} title="Loading SKU…" /></div>;
   const product = data.products.find((p) => p.id === id);
   if (!product) {
     return (

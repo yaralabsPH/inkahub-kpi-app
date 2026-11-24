@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { Download, ShoppingCart, CalendarDays, FileSpreadsheet } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useForecasts } from "@/lib/hooks/useForecasts";
@@ -22,7 +23,8 @@ interface OrderLine {
 }
 
 export function ShoppingList() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { byId } = useForecasts();
   const m = useMutations();
   const [overrides, setOverrides] = useState<Record<string, number>>({});
@@ -51,7 +53,7 @@ export function ShoppingList() {
     return { lines: ls, supplierGroups: groups, totalValue: total };
   }, [data, byId, overrides]);
 
-  if (!data) return <DataState kind="loading" title="Loading shopping list…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading shopping list…" />;
 
   // ---- Restock plan: if all suggested orders went out TODAY, when would
   // each line arrive? Group by ISO-week of expected arrival.

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useDataset } from "@/lib/hooks/useDataset";
+import { DatasetRefreshBanner } from "@/components/DatasetLoadState";
 import { Outlet, useLocation } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
@@ -21,6 +23,8 @@ export function Layout() {
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
   const drawerRef = useRef<HTMLDivElement>(null);
   const location = useLocation();
+  // Same dataset query the sidebar already observes (no extra fetch).
+  const dataset = useDataset();
   useOverlayBehavior(drawerOpen, drawerRef, closeDrawer);
 
   // Close the drawer after navigating.
@@ -81,6 +85,7 @@ export function Layout() {
             tabIndex={-1}
             className="flex-1 overflow-y-auto bg-hub-page px-4 py-5 focus:outline-none md:px-8 md:py-7"
           >
+            <DatasetRefreshBanner result={dataset} />
             <Outlet />
           </main>
         </div>

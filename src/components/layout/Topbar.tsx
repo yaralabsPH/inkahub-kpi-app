@@ -188,16 +188,15 @@ export function Topbar({ onOpenMenu, menuOpen }: { onOpenMenu: () => void; menuO
         />
       </div>
 
-      {backend === "dexie" || envLabel ? (
-        <span
-          className="hidden items-center gap-1 whitespace-nowrap rounded-full border border-hub-accent bg-hub-accent-bg px-2 py-0.5 text-[11.5px] text-hub-accent-text sm:inline-flex"
-          title={backend === "supabase" ? "Data is stored in Supabase" : "Data is stored in this browser"}
-        >
-          <Database size={12} aria-hidden="true" />
-          {backend === "supabase" ? "Supabase" : "Local"}
-          {envLabel ? <> · {envLabel}</> : null}
-        </span>
-      ) : null}
+      {/* Real backend always; the environment label only outside production. */}
+      <span
+        className="hidden items-center gap-1 whitespace-nowrap rounded-full border border-hub-accent bg-hub-accent-bg px-2 py-0.5 text-[11.5px] text-hub-accent-text sm:inline-flex"
+        title={backend === "supabase" ? "Data is stored in Supabase" : "Data is stored in this browser"}
+      >
+        <Database size={12} aria-hidden="true" />
+        {backend === "supabase" ? "Supabase" : "Local"}
+        {envLabel ? <> · {envLabel}</> : null}
+      </span>
 
       <div className="hidden sm:block">
         <ThemeSwitch theme={theme} setTheme={setTheme} />

@@ -827,19 +827,19 @@ function CaseModal({
           <div className="space-y-2">
             {back.length > 0 ? (
               <div>
-                <p>The replacement items deducted when this case was last saved go back to stock:</p>
+                <p>First, it asks to put back the replacement items this case recorded as deducted:</p>
                 <ul className="mt-1 font-mono text-[12.5px]">{back.map((l) => <li key={`b-${l.id}`}>+{l.quantity} {codeOf(l.product_id)}</li>)}</ul>
               </div>
             ) : null}
             {take.length > 0 ? (
               <div>
-                <p>{back.length > 0 ? "Then these" : "These"} replacement items are deducted:</p>
+                <p>{back.length > 0 ? "Then it asks to deduct these" : "It asks to deduct these"} replacement items:</p>
                 <ul className="mt-1 font-mono text-[12.5px]">{take.map((l) => <li key={`t-${l.id}`}>−{l.quantity} {codeOf(l.product_id)}</li>)}</ul>
               </div>
             ) : (
               <p>Nothing new is deducted (the case is not shipped with a tracking number).</p>
             )}
-            <p className="text-xs text-hub-muted">Cancel saves nothing and leaves stock as it is.</p>
+            <p className="text-xs text-hub-muted">These are requested amounts. Stock never goes below zero and a SKU that no longer exists is skipped, so the recorded change can be smaller. Cancel saves nothing and leaves stock as it is.</p>
           </div>
         ),
       });
@@ -893,7 +893,7 @@ function CaseModal({
         danger: true,
         body: (
           <div className="space-y-2">
-            <p>This can't be undone. The replacement items it deducted go back to stock:</p>
+            <p>This can't be undone. It asks to put back the replacement items this case recorded as deducted (requested amounts; stock never goes below zero):</p>
             <ul className="font-mono text-[12.5px]">{initial.lines.map((l) => <li key={l.id}>+{l.quantity} {codeOf(l.product_id)}</li>)}</ul>
           </div>
         ),

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { ClipboardList, Save, Undo2 } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useLedger } from "@/lib/hooks/useLedger";
@@ -52,7 +53,8 @@ const PRESETS: readonly Preset[] = [
 ];
 
 export function Movements() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { data: recent } = useLedger(undefined, 25);
   const m = useMutations();
 
@@ -179,7 +181,7 @@ export function Movements() {
     }
   };
 
-  if (!data) return <DataState kind="loading" title="Loading movements…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading movements…" />;
 
   /** Confirm step before the existing submit: states the requested change. */
   const confirmAndSubmit = async () => {

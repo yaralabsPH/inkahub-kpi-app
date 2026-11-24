@@ -1,4 +1,7 @@
 import { useMemo, useState } from "react";
+import { useAuthOptional } from "@/lib/auth/AuthProvider";
+import { allNavAccess, effectiveNavAccess } from "@/lib/auth/permissions";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { DataState } from "@/components/ui/DataState";
 import { BayMap } from "@/components/BayMap";
 import { Link } from "react-router-dom";
@@ -20,14 +23,17 @@ function fullnessLevel(pct: number): "low" | "ok" | "high" | "over" {
 }
 
 export function Warehouse() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   // The page's other hooks live in WarehouseLoaded so their order never
   // depends on whether the dataset has loaded yet.
-  if (!data) return <DataState kind="loading" title="Loading warehouse…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading warehouse…" />;
   return <WarehouseLoaded data={data} />;
 }
 
 function WarehouseLoaded({ data }: { data: NonNullable<ReturnType<typeof useDataset>["data"]> }) {
+  const auth = useAuthOptional();
+  const canOpenSettings = (auth?.profile ? effectiveNavAccess(auth.profile) : allNavAccess()).has("settings");
   const { byId } = useForecasts();
   const [showBreakdown, setShowBreakdown] = useState(false);
   /** Week the time-scrubber slider is parked on (0 = today). */
@@ -208,7 +214,7 @@ function WarehouseLoaded({ data }: { data: NonNullable<ReturnType<typeof useData
         <CardBody>
           {totalCap === 0 ? (
             <div className="text-sm text-slate-500">
-              No bays defined yet — head to <Link to="/settings" className="font-semibold underline">Settings → Warehouse capacity</Link> and set bay count × pallets-per-bay (default 2/bay) to start tracking fullness.
+              No bays defined yet — {canOpenSettings ? <Link to="/settings" className="font-semibold underline">Settings → Warehouse capacity</Link> : <strong>Settings → Warehouse capacity</strong>} {canOpenSettings ? "" : "(ask an owner) "}and set bay count × pallets-per-bay (default 2/bay) to start tracking fullness.
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-[auto_1fr] gap-8 items-center">

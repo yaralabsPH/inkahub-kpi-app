@@ -23,6 +23,8 @@ function collect(root: HTMLElement): Item[] {
       while (document.getElementById(id)) id = `${slug(label)}-${n++}`;
       el.id = id;
     }
+    // Land below the sticky section bar.
+    if (!el.style.scrollMarginTop) el.style.scrollMarginTop = "56px";
     if (seen.has(el.id)) return;
     seen.add(el.id);
     out.push({ id: el.id, label: label.length > 40 ? `${label.slice(0, 38)}…` : label });
@@ -74,7 +76,8 @@ export function ReportsSectionNav({ containerId, label = "Report sections" }: { 
           onClick={(e) => {
             e.preventDefault();
             const el = document.getElementById(it.id);
-            el?.scrollIntoView({ behavior: "smooth", block: "start" });
+            const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+            el?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
             el?.setAttribute("tabindex", "-1");
             el?.focus({ preventScroll: true });
           }}

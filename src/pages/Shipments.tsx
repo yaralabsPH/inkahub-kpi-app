@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { useSearchParams } from "react-router-dom";
 import {
   Plus, CalendarDays, KanbanSquare, Trash2, X as XIcon, ShoppingCart,
@@ -17,6 +18,7 @@ import { fmtNum, fmtShortDate } from "@/lib/utils/format";
 import { cn } from "@/lib/utils/cn";
 import { DataState } from "@/components/ui/DataState";
 import { useConfirm, type ConfirmOptions } from "@/components/ui/ConfirmDialog";
+import { shipmentStockConfirm } from "@/components/ShipmentStockConfirm";
 import { shipmentDeleteStockChange, shipmentStatusStockChange, type ShipmentStockChange } from "@/lib/ui/shipmentStockChange";
 import {
   type IncomingShipment, type ShipmentLine,
@@ -37,7 +39,8 @@ const COLUMNS = [
 ] as const;
 
 export function Shipments() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const m = useMutations();
   // === accounts tracking ===
   const auth = useAuthOptional();
@@ -175,37 +178,22 @@ export function Shipments() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
-  if (!data) return <DataState kind="loading" title="Loading shipments…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading shipments…" />;
 
   const autoApply = data.settings.auto_apply_shipments_on_delivery ?? true;
   const codeOf = (id: string) => data.products.find((p) => p.id === id)?.code ?? id;
-  /** Confirm text for a stock change the existing save/delete is about to make. */
-  const stockConfirm = (change: ShipmentStockChange, po: string, what: string): ConfirmOptions => ({
-    title: change.kind === "credit" ? `Add stock for ${po}?` : `Remove stock for ${po}?`,
-    confirmLabel: change.kind === "credit" ? "Mark delivered and add stock" : what,
-    danger: change.kind === "reverse",
-    body: (
-      <div className="space-y-2">
-        <p>
-          {change.kind === "credit"
-            ? `${what} adds these units to stock now (auto-apply on delivery is on):`
-            : `${what} takes back the units its delivery added to stock:`}
-        </p>
-        {change.lines.length === 0 ? (
-          <p className="text-hub-muted">No lines with a quantity.</p>
-        ) : (
-          <ul className="space-y-0.5 font-mono text-[12.5px]">
-            {change.lines.map((l) => (
-              <li key={l.productId}>
-                {change.kind === "credit" ? "+" : "−"}{l.quantity} {codeOf(l.productId)}
-              </li>
-            ))}
-          </ul>
-        )}
-        <p className="text-xs text-hub-muted">Cancel leaves the shipment and stock as they are.</p>
-      </div>
-    ),
-  });
+  const backend = getBackendMode();
+  /** Confirm text for a stock change the existing save/delete is about to request. */
+  const stockConfirm = (change: ShipmentStockChange, po: string, what: string, label?: string): ConfirmOptions =>
+    shipmentStockConfirm(change, po, what, codeOf, label);
+  /**
+   * Archive/unarchive is a save too, and on some records it requests a stock
+   * change. Asks first when it does; the caller then makes its original call.
+   */
+  const confirmArchive = async (sh: IncomingShipment): Promise<boolean> => {
+    const change = shipmentStatusStockChange(sh, sh, autoApply, backend); // status and lines are unchanged by archiving
+    return !change || ask(stockConfirm(change, sh.po_number, `${sh.archived ? "Unarchiving" : "Archiving"} ${sh.po_number}`));
+  };
 
   // Distinct supplier list, derived from existing shipments + SKUs.
   const allSuppliers = Array.from(new Set([
@@ -477,7 +465,7 @@ export function Shipments() {
           shipments={visibleShipments}
           products={data.products}
           onSelect={setEditing}
-          onToggleArchive={(s) => m.upsertShipment.mutate({ ...s, archived: !s.archived })}
+          onToggleArchive={(s) => { void confirmArchive(s).then((ok) => { if (ok) m.upsertShipment.mutate({ ...s, archived: !s.archived }); }); }}
         />
       ) : view === "kanban" ? (
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -497,7 +485,7 @@ export function Shipments() {
                     updated.actual_arrival_date = todayIso();
                   }
                   setDraggingId(null);
-                  const change = shipmentStatusStockChange(ship, updated, autoApply);
+                  const change = shipmentStatusStockChange(ship, updated, autoApply, backend);
                   if (change && !(await ask(stockConfirm(change, ship.po_number, change.kind === "credit" ? `Marking ${ship.po_number} Delivered` : `Moving ${ship.po_number} to ${col}`)))) return;
                   m.upsertShipment.mutate(updated);
                 }}>
@@ -536,7 +524,7 @@ export function Shipments() {
         onClose={() => { setCreating(false); setEditing(null); }}
         onSave={async (s) => {
           const prev = editing ? data.shipments.find((x) => x.id === editing.id) ?? editing : null;
-          const change = shipmentStatusStockChange(prev, s, autoApply);
+          const change = shipmentStatusStockChange(prev, s, autoApply, backend);
           if (change && !(await ask(stockConfirm(change, s.po_number, change.kind === "credit" ? `Saving ${s.po_number} as Delivered` : `Saving ${s.po_number} as ${s.status}`)))) return;
           await m.upsertShipment.mutateAsync(s);
           setCreating(false); setEditing(null);
@@ -544,12 +532,13 @@ export function Shipments() {
         onDelete={editing ? async () => {
           const change = shipmentDeleteStockChange(editing);
           if (change) {
-            if (!(await ask({ ...stockConfirm(change, editing.po_number, "Delete and remove stock"), title: `Delete ${editing.po_number}?` }))) return;
+            if (!(await ask({ ...stockConfirm(change, editing.po_number, `Deleting ${editing.po_number}`, "Delete and take back stock"), title: `Delete ${editing.po_number}?` }))) return;
           } else if (!window.confirm(`Delete ${editing.po_number}?`)) return;
           await m.deleteShipment.mutateAsync(editing.id);
           setEditing(null);
         } : undefined}
         onToggleArchive={editing && ARCHIVABLE_STATUSES.has(editing.status) ? async () => {
+          if (!(await confirmArchive(editing))) return;
           await m.upsertShipment.mutateAsync({ ...editing, archived: !editing.archived });
           setEditing(null);
         } : undefined}

@@ -154,6 +154,18 @@ The user and Implementation log identify six pre-existing Windows CRLF migration
 
 ## Coder response
 
-(Coder fills this in after fixing, with each M-number, commit, fresh verification and outstanding CJ evidence. Do not treat completion of this review as approval of the implementation.)
+Coder (Claude Opus), 2026-11-25. All nine Must-fix and four Should-fix items addressed; details and evidence in the
+plan's Implementation log ("Review r1 fixes").
 
-STATUS: COMPLETE
+- **M1** Order Builder (both Shipments and SKUs mounts) and list/form archive now confirm before a save that requests a
+  stock change; original calls unchanged (list `mutate`, form/builder `mutateAsync`). Browser: builder Delivered →
+  confirm over the inert builder; Cancel → no shipment.
+- **M2** helper takes the backend; Dexie and Supabase rules mirrored separately; tests include the review's sequence.
+  Approach recorded in the plan as presentation-only (planner to confirm).
+- **M3** copy now states requested amounts with the zero-floor / missing-SKU / recorded-figure caveats.
+- **M4** read error + Retry (existing refetch) on 11 pages; shell banner for background failures. Browser check of the
+  failure path still open (cannot force a safe read failure locally).
+- **M5** peek uses the parent's forecast. **M6** inert background (ref-counted), real scroll container locked, focus
+  pulled back. **M7** accessible focus colour and chart colours. **M8** reduced-motion scroll.
+- **M9** Task 15 un-ticked; Task 19 open for CJ's role matrix and the read-error/screen-reader checks.
+- Should-fix 1–4 done (Settings link gated, visible collapsed tooltip, backend badge always shown, log reconciled).

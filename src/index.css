@@ -93,8 +93,10 @@ body {
 }
 .dark .ui-redesign-shell { color-scheme: dark; }
 .ui-redesign-shell :focus { outline: none; }
+/* Focus ring uses the darker accent in light mode (>= 3:1 on page, panel
+   and sidebar); dark mode's accent-text is the bright green. */
 .ui-redesign-shell :focus-visible {
-  outline: 2px solid rgb(var(--hub-accent));
+  outline: 2px solid rgb(var(--hub-accent-text));
   outline-offset: 2px;
   border-radius: 4px;
 }

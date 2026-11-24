@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { DataState } from "@/components/ui/DataState";
 import { Plus, Trash2 } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
@@ -21,13 +22,14 @@ const MONTHS = [
 ];
 
 export function Events() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const m = useMutations();
   const [editing, setEditing] = useState<DemandChangeEvent | null>(null);
   const [creating, setCreating] = useState(false);
   const [year, setYear] = useState(() => Number(todayIso().slice(0, 4)));
 
-  if (!data) return <DataState kind="loading" title="Loading demand events…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading demand events…" />;
 
   // Each event becomes a band that spans calendar cells.
   const eventsThisYear = data.events.filter((e) => {

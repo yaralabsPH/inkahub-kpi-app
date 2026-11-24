@@ -28,6 +28,50 @@ const FOCUSABLE =
 const overlayStack: symbol[] = [];
 let scrollLocks = 0;
 let savedOverflow = "";
+let savedMainOverflow = "";
+
+/** Elements we made inert, with how many open overlays need them inert. */
+const inertCounts = new Map<Element, number>();
+
+/**
+ * Make everything outside the overlay inert: the siblings of the overlay's
+ * container and of each of its ancestors up to <body>. The overlay's own
+ * scrim (a sibling of the panel inside the container) stays usable. Returns
+ * the elements this call made inert, for release.
+ */
+function isolate(panel: HTMLElement): Element[] {
+  const mine: Element[] = [];
+  let node: Element | null = panel.parentElement;
+  while (node && node !== document.body && node.parentElement) {
+    for (const sib of Array.from(node.parentElement.children)) {
+      if (sib === node) continue;
+      const n = inertCounts.get(sib);
+      if (n !== undefined) {
+        inertCounts.set(sib, n + 1);
+        mine.push(sib);
+      } else if (!sib.hasAttribute("inert")) {
+        sib.setAttribute("inert", "");
+        inertCounts.set(sib, 1);
+        mine.push(sib);
+      }
+    }
+    node = node.parentElement;
+  }
+  return mine;
+}
+
+function release(els: Element[]) {
+  for (const el of els) {
+    const n = inertCounts.get(el);
+    if (n === undefined) continue;
+    if (n <= 1) {
+      inertCounts.delete(el);
+      el.removeAttribute("inert");
+    } else {
+      inertCounts.set(el, n - 1);
+    }
+  }
+}
 
 function focusables(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
@@ -56,13 +100,20 @@ export function useOverlayBehavior(
     overlayStack.push(id);
     const previouslyFocused = document.activeElement as HTMLElement | null;
 
+    // The shell scrolls in <main>, not <body>: lock both.
+    const main = document.getElementById("main-content");
     if (scrollLocks === 0) {
       savedOverflow = document.body.style.overflow;
       document.body.style.overflow = "hidden";
+      if (main) {
+        savedMainOverflow = main.style.overflow;
+        main.style.overflow = "hidden";
+      }
     }
     scrollLocks += 1;
 
     const panel = panelRef.current;
+    const isolated = panel ? isolate(panel) : [];
     const focusFirst = () => {
       const target = initialRef?.current ?? (panel ? focusables(panel)[0] ?? panel : null);
       target?.focus({ preventScroll: true });
@@ -97,13 +148,30 @@ export function useOverlayBehavior(
     };
     document.addEventListener("keydown", onKey, true);
 
+    // Focus moved outside by other means (script, assistive tech): bring it back.
+    const onFocusIn = (e: FocusEvent) => {
+      if (overlayStack[overlayStack.length - 1] !== id || !panelRef.current) return;
+      const t = e.target as Node | null;
+      if (t && !panelRef.current.contains(t)) {
+        const first = focusables(panelRef.current)[0] ?? panelRef.current;
+        first.focus({ preventScroll: true });
+      }
+    };
+    document.addEventListener("focusin", onFocusIn, true);
+
     return () => {
       cancelAnimationFrame(raf);
       document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("focusin", onFocusIn, true);
+      release(isolated);
       const i = overlayStack.indexOf(id);
       if (i >= 0) overlayStack.splice(i, 1);
       scrollLocks -= 1;
-      if (scrollLocks === 0) document.body.style.overflow = savedOverflow;
+      if (scrollLocks === 0) {
+        document.body.style.overflow = savedOverflow;
+        const m = document.getElementById("main-content");
+        if (m) m.style.overflow = savedMainOverflow;
+      }
       if (previouslyFocused && document.contains(previouslyFocused)) {
         previouslyFocused.focus({ preventScroll: true });
       }

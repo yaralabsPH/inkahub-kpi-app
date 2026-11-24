@@ -1,10 +1,10 @@
 import { type ReactNode } from "react";
+import type { ForecastResult } from "@/lib/forecasting/engine";
 import { Link } from "react-router-dom";
 import { ArrowLeftRight, Maximize2 } from "lucide-react";
 import { SideSheet } from "@/components/ui/SideSheet";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { PRODUCT_TYPE_LABELS, shortCode, type Product } from "@/lib/domain";
-import { useForecasts } from "@/lib/hooks/useForecasts";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { allNavAccess, effectiveNavAccess } from "@/lib/auth/permissions";
 import { fmtFloat, fmtNum } from "@/lib/utils/format";
@@ -31,11 +31,11 @@ function Prop({ k, children }: { k: string; children: ReactNode }) {
  * No fetching, no saving: on hand is shown, not edited; changes stay in the
  * existing editors, the SKU page and Movements.
  */
-export function SkuPeek({ product, onClose }: { product: Product | null; onClose: () => void }) {
-  const { byId } = useForecasts();
+export function SkuPeek({ product, forecast, onClose }: { product: Product | null; forecast?: ForecastResult; onClose: () => void }) {
   const auth = useAuthOptional();
   const allowed = auth?.profile ? effectiveNavAccess(auth.profile) : allNavAccess();
-  const r = product ? byId[product.id] : undefined;
+  // The parent (Skus) already owns the forecast; the peek computes nothing.
+  const r = product ? forecast : undefined;
 
   return (
     <SideSheet open={product !== null} title={product?.code ?? ""} onClose={onClose}>

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { DataState } from "@/components/ui/DataState";
 import { CalendarPlus, Plus, Trash2, Star, StarOff, Upload, ClipboardPaste, CheckSquare, Square, PackageMinus, FileSpreadsheet } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
@@ -37,7 +38,8 @@ const METRICS: { value: FooterMetric; label: string }[] = [
 ];
 
 export function SalesEntry() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const m = useMutations();
   // Active department from app state — drives product filtering, entry
   // filtering, mutations, and import routing. Switching the topbar toggle
@@ -165,7 +167,7 @@ export function SalesEntry() {
 
   // Loading boundary after every hook so the hook order is the same on the
   // first (no data) render and later ones.
-  if (!data) return <DataState kind="loading" title="Loading sales entry…" />;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading sales entry…" />;
 
   const today = todayIso();
   const currentWeekStart = snapToWeekStart(today, data.settings.week_start_day);

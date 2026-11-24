@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { NavLink } from "react-router-dom";
 import {
   Home, LayoutDashboard, Package, ClipboardList, Truck,
@@ -65,6 +66,15 @@ export function Sidebar({ variant, onClose }: { variant: "rail" | "drawer"; onCl
   const auth = useAuthOptional();
   const allowed = auth?.profile ? effectiveNavAccess(auth.profile) : allNavAccess();
   const groups = visibleNavGroups(allowed);
+
+  // Collapsed rail: one visible tooltip, fixed-positioned so the rail's scroll
+  // clipping cannot hide it. Shown on hover and on keyboard focus.
+  const [tip, setTip] = useState<{ label: string; top: number; left: number } | null>(null);
+  const showTip = (el: HTMLElement, label: string) => {
+    const r = el.getBoundingClientRect();
+    setTip({ label, top: r.top + r.height / 2, left: r.right + 8 });
+  };
+  const hideTip = () => setTip(null);
 
   const email = auth?.session?.user?.email ?? "";
   const displayName = auth?.profile?.display_name || email || "";
@@ -153,8 +163,12 @@ export function Sidebar({ variant, onClose }: { variant: "rail" | "drawer"; onCl
                     <NavLink
                       to={to}
                       end={end}
-                      title={label}
+                      title={collapsed ? undefined : label}
                       aria-label={collapsed ? label : undefined}
+                      onMouseEnter={collapsed ? (e) => showTip(e.currentTarget, label) : undefined}
+                      onFocus={collapsed ? (e) => showTip(e.currentTarget, label) : undefined}
+                      onMouseLeave={collapsed ? hideTip : undefined}
+                      onBlur={collapsed ? hideTip : undefined}
                       className={({ isActive }) =>
                         cn(
                           "mx-1.5 flex items-center rounded-[5px] text-[13.5px] transition-colors",
@@ -207,6 +221,15 @@ export function Sidebar({ variant, onClose }: { variant: "rail" | "drawer"; onCl
           >
             <LogOut size={15} />
           </button>
+        </div>
+      ) : null}
+      {collapsed && tip ? (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none fixed z-[60] -translate-y-1/2 whitespace-nowrap rounded-hub bg-hub-text px-2 py-1 text-xs text-hub-panel shadow-hub-pop"
+          style={{ top: tip.top, left: tip.left }}
+        >
+          {tip.label}
         </div>
       ) : null}
     </aside>
