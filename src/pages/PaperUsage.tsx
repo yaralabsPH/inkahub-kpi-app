@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { Printer, Save, Trash2, Upload as LoadIcon } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useMutations } from "@/lib/hooks/useMutations";
@@ -87,6 +88,8 @@ export function PaperUsage() {
   const [notes, setNotes] = useState<string>("");
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
+  // Confirm step before the existing stock-changing save (presentation only).
+  const { ask, dialog: confirmDialog } = useConfirm();
 
   // Sum weekly sales by paper size. Every framed variant (A1N, A1B, A1W,
   // …) starts life as an A1 print on the roll, so we count ALL SKUs whose
@@ -170,13 +173,13 @@ export function PaperUsage() {
   const totalRolls42 = breakdown[42].totalMM / ROLL_LENGTH_MM;
 
   return (
-    <div className="space-y-5 max-w-4xl">
+    <div className="mx-auto max-w-hub space-y-5">
       <div className="flex items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight inline-flex items-center gap-2">
-            <Printer size={18} /> Paper usage
+          <h1 className="inline-flex items-center gap-2 text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">
+            <Printer size={24} aria-hidden="true" /> Paper usage
           </h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
+          <p className="mt-1 max-w-3xl text-sm text-hub-muted">
             Roll consumption from the chosen week's print counts. Auto-fills from <strong>all A-size sales</strong>
             (framed + unframed — every framed print still consumes one roll-print at its size). Override any line to model
             what-ifs. <strong>Save snapshot</strong> deducts the computed rolls from inventory if you've mapped roll SKUs in
@@ -221,6 +224,48 @@ export function PaperUsage() {
                 size="sm"
                 disabled={saveBusy}
                 onClick={async () => {
+                  // What the save below is about to do to stock, from the same values and
+                  // expressions the handler uses. Nothing here writes.
+                  {
+                    const codeOf = (id: string) => data?.products.find((p) => p.id === id)?.code ?? id;
+                    const prior = data?.paperUsage.find((p) => p.iso_week_start === weekStart);
+                    const giveBack: string[] = [];
+                    if (prior?.deducted_sku_24_id && prior.deducted_rolls_24 > 0) giveBack.push(`+${prior.deducted_rolls_24} ${codeOf(prior.deducted_sku_24_id)} (24″)`);
+                    if (prior?.deducted_sku_42_id && prior.deducted_rolls_42 > 0) giveBack.push(`+${prior.deducted_rolls_42} ${codeOf(prior.deducted_sku_42_id)} (42″)`);
+                    const sku24 = data?.settings.paper_roll_24_sku_id ?? null;
+                    const sku42 = data?.settings.paper_roll_42_sku_id ?? null;
+                    const r24 = Math.ceil(breakdown[24].totalMM / ROLL_LENGTH_MM);
+                    const r42 = Math.ceil(breakdown[42].totalMM / ROLL_LENGTH_MM);
+                    const take: string[] = [];
+                    if (sku24 && r24 > 0) take.push(`−${r24} ${codeOf(sku24)} (24″)`);
+                    if (sku42 && r42 > 0) take.push(`−${r42} ${codeOf(sku42)} (42″)`);
+                    if (giveBack.length + take.length > 0) {
+                      const ok = await ask({
+                        title: `Save week ${weekStart} and update roll stock?`,
+                        confirmLabel: "Save snapshot",
+                        body: (
+                          <div className="space-y-2">
+                            {giveBack.length > 0 ? (
+                              <div>
+                                <p>First, the rolls deducted when this week was last saved go back:</p>
+                                <ul className="mt-1 font-mono text-[12.5px]">{giveBack.map((t) => <li key={t}>{t}</li>)}</ul>
+                              </div>
+                            ) : null}
+                            {take.length > 0 ? (
+                              <div>
+                                <p>Then these whole rolls are deducted:</p>
+                                <ul className="mt-1 font-mono text-[12.5px]">{take.map((t) => <li key={t}>{t}</li>)}</ul>
+                              </div>
+                            ) : (
+                              <p>No new rolls are deducted (no roll SKU mapped, or nothing to print).</p>
+                            )}
+                            <p className="text-xs text-hub-muted">Cancel saves nothing and leaves stock as it is.</p>
+                          </div>
+                        ),
+                      });
+                      if (!ok) return;
+                    }
+                  }
                   setSaveBusy(true); setSaveMsg(null);
                   try {
                     const finalCounts: PaperUsageEntry["counts"] = {
@@ -695,6 +740,7 @@ export function PaperUsage() {
         Line mm = ⌈count / per-row⌉ × (row mm + {ROW_GAP_MM} mm), so an odd count of 2-per-row prints correctly costs the extra row's full length + gap.
         Use the waste-buffer % above for anything the gap doesn't cover (start-of-roll leader, end-of-job trim, etc).
       </p>
+      {confirmDialog}
     </div>
   );
 }
