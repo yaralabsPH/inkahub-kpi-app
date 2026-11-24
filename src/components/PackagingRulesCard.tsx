@@ -5,7 +5,7 @@ import {
   type DraftEditorState,
   type ProductOption,
 } from "@/components/packaging/PackagingRulesView";
-import { useAuth } from "@/lib/auth/AuthProvider";
+import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { LOCATION_LABELS, type LocationKey } from "@/lib/domain";
 import {
   addCatalogueItem,
@@ -40,7 +40,9 @@ import { useAppStore } from "@/lib/state/appStore";
  * the same rule on every write.
  */
 export function PackagingRulesCard() {
-  const { profile } = useAuth();
+  // Optional: local (Dexie) mode has no AuthProvider, and the card renders
+  // nothing there anyway (the backend check below).
+  const profile = useAuthOptional()?.profile ?? null;
   if (getBackendMode() !== "supabase") return null;
   if (!canManagePackagingRules(profile?.role)) return null;
   return <PackagingRulesCardInner />;

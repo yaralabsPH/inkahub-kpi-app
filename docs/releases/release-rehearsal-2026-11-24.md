@@ -101,9 +101,42 @@ upsert; staff reading clock events; frame A2 500 → 499 and package 200 → 199
 A Preview of the old build on the upgraded database is also up for a click-through:
 `https://inka-arthouse-ntaglszob-inka-arthouse-s-projects.vercel.app` (Vercel login or share link needed).
 
-## 2. G4: reporting at live size
+## 2. G4: reporting at live size — **not passed (capacity finding)**
 
-_(filled in below once the AU publication finishes)_
+Release build `30eb6e5` as a Preview on staging-2 with throwaway `CRON_SECRET`, `REPORTING_OPERATOR_SECRET` and
+`REPORTING_CURSOR_SECRET` (the last one was missing from older notes). Operator steps exactly as the runbook:
+`enable-capture` (all sites, epoch 2), `set-mode au processorEnabled`, then `rebuild au` repeatedly. AU at live size
+has **15,087 owners** to materialise.
+
+| Phase | Where the function ran | Owners done per 4-minute call | Notes |
+|---|---|---|---|
+| Copy + first owners | Vercel default region (US East) | 348, then 408 | 98 source pages copied in call 1. Only ~17 s of each 241 s call was database time: the worker is **latency-bound** (about 1,300 sequential RPCs per call). |
+| Light owners | **sin1** (same region as the staging DB; preview-only `regions` setting, not committed) | **2,070** | 5× faster than US East: confirms the latency diagnosis. |
+| Heavy owners | sin1 | 64, 63, 55 | Each order's input journal carries the events of every staff member on that order (6–15 members, up to **2,960 events**), written in pages through `checkpoint_reporting_owner_input` (0046): 679 calls, mean 408 ms. Live staff carry similar per-person volumes (AU framed: 23 people, ~100k events), so production should behave the same. |
+
+- **Duty cycle:** each call uses its 4-minute budget and the lease runs 6 minutes past the last heartbeat, so a
+  site gets ~4 minutes of work every ~6 minutes, whether driven by the operator or the 15-minute crons.
+- **Progress when stopped (~45 minutes of work):** about 2,900 of 15,087 AU owners. At the heavy-phase rate the
+  first AU publication would need **well over a day** of continuous calls; UK and US come after it.
+- **Storage:** database 74.5 MB → **329 MB** at the stop (+255 MB for ~19% of AU): `source_candidate` 119 MB,
+  `owner_input_pieces` 71 MB, `owner_input_events` 60 MB; WAL 240 MB. After `abandon` + `cleanup` nothing was
+  released (the abandoned batch is kept as evidence until retention), so a failed first build keeps its space.
+- **Staging left in release-day state:** batch `f0861b99…` abandoned with a reason, AU processor off, **capture off**
+  (epoch 3), every site read mode `legacy`. Nothing published.
+
+**What this means for the release.** Published reports (F8/F9 summaries) cannot be commissioned on live with this
+worker as it is. The release plan already ships reporting **dormant** (capture off, processors off, read mode
+legacy), and that remains safe: the legacy Reports/Welcome paths are unchanged and exercised by the old-app smoke.
+Before anyone runs `enable-capture` on live, the planner needs to decide on: (1) the owner-input journal cost for
+orders whose members have thousands of events; (2) running the report functions next to the database
+(`"regions": ["hnd1"]` for live in Tokyo, ~5× on the light phase); (3) storage headroom and releasing an abandoned
+batch's working rows. Do **not** enable capture on live as part of the bulk release.
+
+## 2b. Other defects found during the rehearsal
+
+- **Local (Dexie) mode: Settings crashes.** `PackagingRulesCard` calls `useAuth()`, which throws outside
+  `AuthProvider`; Dexie mode has no provider, so `/settings` renders blank ("useAuth must be used inside
+  <AuthProvider>"). Production (Supabase) is not affected. Fix: use `useAuthOptional()` there, as Sidebar does.
 
 ## 3. G5: rollback drill (new app writes, then the old app)
 

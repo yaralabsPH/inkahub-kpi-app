@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
-import { useAuth } from "@/lib/auth/AuthProvider";
+import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { canManagePackagingRules } from "@/lib/domain/packaging/editing";
 import { completionsWithoutPick, type CompletionEvent, type MissingPick, type PickKey } from "@/lib/domain/packaging/usage";
 import { usePackagingCatalogue } from "@/lib/hooks/usePackagingCatalogue";
@@ -105,7 +105,9 @@ export function PackagingAttentionView(props: AttentionViewProps) {
 }
 
 export function PackagingAttentionCard(props: { fromIso: string; toIso: string }) {
-  const { profile } = useAuth();
+  // Optional: local (Dexie) mode has no AuthProvider, and the card renders
+  // nothing there anyway (the backend check below).
+  const profile = useAuthOptional()?.profile ?? null;
   if (getBackendMode() !== "supabase") return null;
   if (!canManagePackagingRules(profile?.role)) return null;
   return <PackagingAttentionCardInner {...props} />;
