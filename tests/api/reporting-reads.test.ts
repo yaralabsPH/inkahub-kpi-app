@@ -31,12 +31,13 @@ const body = (): SummaryBody => ({
   peoplePage: { rows: [{} as never], nextCursor: null, pageComplete: true, totalRows: 1 }, activeStaff: 1, staffDays: 1, avgOrdersPerStaffDay: 1, skuBoard: [{ sku: "X", weight: 1, durationMin: 1, avgMin: 1 }],
   welcome: { today: "2026-11-16", coverage: { issueCounts: {}, notes: {}, visibility: { kind: "site" }, incomplete: false, issueRows: 0 }, todayCoverage: { issueCounts: {}, notes: {}, visibility: { kind: "site" }, incomplete: false, issueRows: 0 } } as never,
 });
-function fakeReader(g: GenerationMeta | null = gen(), detailRows = 3): PublishedReader & { scopes: ReaderScope[]; generations: Array<string | null> } {
+function fakeReader(g: GenerationMeta | null = gen(), detailRows = 3, siteMode: GenerationMeta["readMode"] | Error = "summary"): PublishedReader & { scopes: ReaderScope[]; generations: Array<string | null> } {
   const scopes: ReaderScope[] = [];
   const generations: Array<string | null> = [];
   return {
     scopes, generations,
     async generation(_s, id) { generations.push(id); return g; },
+    async siteReadMode() { if (siteMode instanceof Error) throw siteMode; return siteMode; },
     async summary(scope) { scopes.push(scope); return body(); },
     async detail(scope, kind, _o, after, limit) {
       scopes.push(scope);
@@ -117,8 +118,15 @@ describe("Task 16: generations, freshness and the Welcome shape", () => {
     expect(freshness(v, 0).freshUntilUtc).toBe("2026-11-16T10:30:00.000Z");
   });
   it("missing → 503, incomplete/building/failed → 503, expired/past expiry → 410, a missing PINNED generation → 410, another site → 400", async () => {
-    await expect(resolveGeneration(fakeReader(null), "uk", null, NOW)).rejects.toMatchObject({ status: 503 });
+    await expect(resolveGeneration(fakeReader(null), "uk", null, NOW)).rejects.toMatchObject({ status: 503, code: "UNAVAILABLE" });
     await expect(resolveGeneration(fakeReader(null), "uk", "g-9", NOW)).rejects.toMatchObject({ status: 410, code: "GENERATION_EXPIRED" });
+    // R2-1: no publication yet, but the site is explicitly on legacy/shadow reads -> that signal, not UNAVAILABLE.
+    await expect(resolveGeneration(fakeReader(null, 3, "legacy"), "uk", null, NOW)).rejects.toMatchObject({ status: 503, code: "READ_MODE_LEGACY" });
+    await expect(resolveGeneration(fakeReader(null, 3, "shadow"), "uk", null, NOW)).rejects.toMatchObject({ status: 503, code: "READ_MODE_SHADOW" });
+    // A pinned generation that is gone is still 410 even for a legacy site (the view must reload).
+    await expect(resolveGeneration(fakeReader(null, 3, "legacy"), "uk", "g-9", NOW)).rejects.toMatchObject({ status: 410, code: "GENERATION_EXPIRED" });
+    // Site state unreadable: fail closed with the reader's 503, never a legacy answer.
+    await expect(resolveGeneration(fakeReader(null, 3, new ReportingHttpError(503, "UNAVAILABLE", "site reporting state is missing")), "uk", null, NOW)).rejects.toMatchObject({ status: 503, code: "UNAVAILABLE" });
     for (const g of [gen({ complete: false }), gen({ state: "building" }), gen({ state: "failed" })]) await expect(resolveGeneration(fakeReader(g), "uk", null, NOW)).rejects.toMatchObject({ status: 503 });
     await expect(resolveGeneration(fakeReader(gen({ state: "expired" })), "uk", "g-1", NOW)).rejects.toMatchObject({ status: 410 });
     await expect(resolveGeneration(fakeReader(gen({ state: "superseded", expiresAtUtc: "2026-11-16T11:59:59Z" })), "uk", "g-1", NOW)).rejects.toMatchObject({ status: 410 });

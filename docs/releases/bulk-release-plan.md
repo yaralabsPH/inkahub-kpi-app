@@ -80,8 +80,23 @@ Preview keeps pointing at staging with its own throwaway secrets.
 | Box auto-pick (F4) | every site in **scan mode** | Settings: box rules, then switch the site to automatic |
 | Departments (F5) | tracking **off** | owner enters the real roster, then turns on "Save the department on new work" |
 | Shared scanners (F6/F7) | not turned on at any station | Station settings, after the real scanner prefix/suffix test |
-| Published reports (F8/F9) | read mode **legacy**, capture **off** | commission with the operator endpoint: enable capture once, rebuild each site until published, check against the old numbers, then set read mode to summary |
+| Published reports (F8/F9) | **all three dormant controls**: global capture **off**, every site's processor **off**, every site's read mode **legacy** (the fresh 0037 state; leave it) | **Not a routine switch-on.** G4 showed the first publication at live size does not finish in a usable time and grows storage ~4× ([evidence](release-rehearsal-2026-11-24.md) §2). Commissioning needs a **planner-approved prerequisite** (worker capacity fix, region, storage headroom) and its own acceptance. Do not run `enable-capture` on live until then. |
 | Order timeline (F10), Make (F11) | env unset, dormant | own commissioning |
+
+**Refresh crons while reporting is dormant.** The three 15-minute refresh crons are deployed but do no
+publication work while processors are off. They are **not silent no-ops**: each run reads the site state, tries to
+write a run-log row and answers **HTTP 500 with `processor_disabled`** (about 288 a day across the three sites).
+That 500 is the expected dormant result. Owner: **CJ** watches the Vercel cron log after release; any *other* error
+from `/api/reports/refresh-summaries` (401, "configuration missing", a database error) is a real problem. The run log
+(`reporting_private.worker_runs`) is trimmed by the 30-day retention pass only when someone runs `cleanup`; check its
+size monthly while dormant.
+
+**Reports and Welcome while dormant.** Before review r2 they would have shown an error instead of their numbers:
+with no published generation, the summary API answered `UNAVAILABLE`, so the page never selected its existing
+(legacy) reads. Fixed in the review-r2 commit: the API now reads the site's mode from its site state and answers
+`READ_MODE_LEGACY` for a legacy site with nothing published, and the page then runs its existing reads. Regression:
+`tests/reporting/pg/dormant-legacy.test.ts` (real schema, AU/UK/US, Reports and Welcome, fail-closed cases). The
+old-app smoke does **not** cover this path (old SQL calls never touch the new API); the final Preview check below does.
 
 Visible on day one even with switches off: the new station screen (#10), one count rule for
 Items and Orders everywhere (#7; **older days are recalculated and unframed work now counts, so past totals look higher**),
@@ -133,6 +148,14 @@ allowance and the growth of the new reporting tables are still to be checked in 
 
 ## If it goes wrong: the way back (CJ)
 
+0. **Rollback target and the public digest (read this before choosing a target).** The current live build
+   (`79a0031`) predates digest-auth: its `/api/reports/daily-digest` is **unauthenticated** and accepts a recipient
+   override. Rolling back to it re-opens that endpoint; `CRON_SECRET` does not protect code that never checks it
+   (see `docs/RELEASING.md` "Rollback exposure"). Before using `79a0031` as a rollback target, CJ must have a
+   verified way to block external access to that endpoint on every deployment URL, **or** use a separately
+   validated safe rollback build instead. Recommended: deploy today's `main` (`8519ac9`: digest-auth + order display,
+   no migrations) as its own small release first, verify the digest with `CRON_SECRET`, and use **that** deployment
+   as the bulk release's rollback target. Prefer fixing forward over rolling back.
 1. **Switches first.** Packaging back to "Scan the box", F5 tracking off, shared scanners back to classic,
    every reporting site to read mode legacy with the processor off. Do not clear browser data on a scanner
    device while anything is queued, and never rescan an order whose first save is unknown.
@@ -148,5 +171,5 @@ allowance and the growth of the new reporting tables are still to be checked in 
 ## After release (not part of release day)
 
 Commission one feature at a time, each with its own acceptance: roster then F5; real box rules then F4
-automatic; real scanner programming and an interleaving test then F6/F7; reporting capture then publication
-then summary reads, with a named person watching disk and the first scheduled runs; order timeline and Make last.
+automatic; real scanner programming and an interleaving test then F6/F7; order timeline and Make last.
+Published reporting (capture, publication, summary reads) waits for the planner-approved capacity prerequisite above.

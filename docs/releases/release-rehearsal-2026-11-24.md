@@ -126,7 +126,10 @@ has **15,087 owners** to materialise.
 
 **What this means for the release.** Published reports (F8/F9 summaries) cannot be commissioned on live with this
 worker as it is. The release plan already ships reporting **dormant** (capture off, processors off, read mode
-legacy), and that remains safe: the legacy Reports/Welcome paths are unchanged and exercised by the old-app smoke.
+legacy). Correction after review r2: that is only safe with the r2 fix. Before it, a dormant site with no
+publication made the summary API answer `UNAVAILABLE`, so the new Reports/Welcome never selected their legacy reads.
+The old-app smoke does not exercise that path (it replays old SQL calls, not the new API). See the r2 fix and
+`tests/reporting/pg/dormant-legacy.test.ts`.
 Before anyone runs `enable-capture` on live, the planner needs to decide on: (1) the owner-input journal cost for
 orders whose members have thousands of events; (2) running the report functions next to the database
 (`"regions": ["hnd1"]` for live in Tokyo, ~5× on the light phase); (3) storage headroom and releasing an abandoned

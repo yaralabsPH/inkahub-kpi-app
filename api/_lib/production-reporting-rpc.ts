@@ -50,6 +50,16 @@ export function rpcPublishedReader(client: RpcClient): PublishedReader {
     async generation(site, generationId) {
       return parseGeneration(await one(client, "read_reporting_generation", { p_site: site, p_generation: generationId }));
     },
+    async siteReadMode(site) {
+      // Service-only 0038 status RPC: the site's authoritative read mode, independent of any generation.
+      const v = await one(client, "get_reporting_job_status", { p_site: site });
+      const rows = Array.isArray(v) ? v : v == null ? [] : [v];
+      if (rows.length !== 1) throw new ReportingHttpError(503, "UNAVAILABLE", "site reporting state is missing");
+      const r = rows[0] as Record<string, unknown>;
+      if (r.site !== site) throw new ReportingHttpError(503, "UNAVAILABLE", "site reporting state belongs to another site");
+      if (r.read_mode !== "legacy" && r.read_mode !== "shadow" && r.read_mode !== "summary") throw new ReportingHttpError(503, "UNAVAILABLE", "site read mode is unknown");
+      return r.read_mode;
+    },
     async summary(scope, view, pages) {
       const v = await one(client, "read_reporting_summary", { ...scopeArgs(scope), p_view: view, p_daily_limit: pages.dailyLimit, p_people_limit: pages.peopleLimit });
       // Deep, strict validation: safe-integer counts, null-or-safe Items, finite rates, exact key sets.
