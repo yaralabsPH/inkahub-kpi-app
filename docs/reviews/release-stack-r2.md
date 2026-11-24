@@ -234,6 +234,31 @@ None. The two Must-fix items and final dormant-mode acceptance take priority.
 
 ## Coder response
 
-(Coder fills this in after fixing. Record the R2-1 regression and corrected final-build evidence, the R2-2 release-document changes, exact CI commit, and which commissioning gates remain blocked. Do not change G4 to passed or G6 to approved on the strength of this review's completion status.)
+Coder (Claude Opus), 2026-11-25. Commits `f7240d1` (fix + docs) and `22015bc` (Preview evidence) on `feature/staging-fixes`.
+
+**R2-1 — fixed.** `PublishedReader` gained `siteReadMode(site)`; the RPC reader implements it with the existing
+service-only `get_reporting_job_status` (0038), so **no migration**. `resolveGeneration`, when there is no unpinned
+generation, answers `READ_MODE_LEGACY`/`READ_MODE_SHADOW` for a legacy/shadow site and keeps `UNAVAILABLE` for
+summary; a gone pinned generation stays 410; unreadable/missing site state stays 503 (fail closed); authorization
+still runs first. Regression `tests/reporting/pg/dormant-legacy.test.ts` (real 0037–0046 schema, never published):
+AU/UK/US × Reports/Welcome go API error body → `PublishedViewController` → `legacy` → `rawRangeFor` returns the range;
+no membership → 403 and no raw range; foreign pinned generation → 410; deleted site state → 503 not legacy; the
+operator RPC refuses shadow/summary without a publication and the `site_state_check` constraint makes
+"summary with nothing published" unreachable (so `UNAVAILABLE` there is covered by unit tests in
+`tests/api/reporting-reads.test.ts`). Local: tsc, typecheck:api, typecheck:digest, build pass; tests 3407 pass,
+6 fail = the known Windows CRLF migration-hash tests. Deployed-Preview acceptance (`inka-arthouse-g1on6rg21`,
+default region, dormant staging-2): owner and staff get `READ_MODE_LEGACY` for Reports and Welcome on AU/UK/US and
+for Overview; the pre-fix Preview answered `UNAVAILABLE` for the same calls (rehearsal doc §2c). **Still open (G7,
+CJ):** the browser view of legacy counts, legacy CSV and a dry digest on that Preview.
+
+**R2-2 — done in `docs/releases/bulk-release-plan.md` and the rehearsal doc.** (1) The old-app-smoke claim is
+corrected; R2-1 and its acceptance are recorded. (2) Day-one table states all three dormant controls and makes
+publication a planner-approved prerequisite (no routine enable-capture/rebuild recipe). (3) Refresh crons are
+described as expected HTTP 500 `processor_disabled` (~288/day), CJ named as the watcher, other errors called real,
+run-log retention noted. (4) Rollback step 0 carries the pre-digest-auth exposure of `79a0031` and recommends
+deploying today's `main` (`8519ac9`) first as a safe rollback target, or a verified block of the endpoint.
+
+**Not changed:** G4 stays **not passed**; G6 not approved by this response; Should-fix 1–4 not started (the
+optional idle-cron change was left out to keep the release diff small).
 
 STATUS: COMPLETE
