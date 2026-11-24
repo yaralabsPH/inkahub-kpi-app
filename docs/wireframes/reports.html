@@ -1,0 +1,49 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reports — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page" style="max-width:1260px">
+  <div class="twocol" style="display:grid;grid-template-columns:200px 1fr;gap:28px">
+    <nav class="subnav"><span class="pin">1</span>
+      <div class="sg">Production</div>
+      <a class="on" aria-current="page" href="#">Overview</a><a href="#">Staff leaderboard</a><a href="#">Slowest variants</a><a href="#">Live completions</a><a href="#">Order lookup</a>
+      <div class="sg">Raw data</div>
+      <a href="#">Event log (CSV)</a>
+      <div class="sg">Elsewhere</div><a href="dashboard.html" data-roles="owner">Stock value → Dashboard</a>
+    </nav>
+    <div>
+      <div class="between"><h1 class="t">Production overview</h1>
+        <div class="row"><span class="chip filter">Last 7 days ▾</span><span class="chip filter">Dept: A0 Framed · Framed · Unframed · Dispatch ▾</span><span class="btn ghost">↻</span><span class="btn">Download CSV</span></div></div>
+      <p class="sub">Updated live from the kiosk. <span class="pin">2</span></p>
+
+      <div data-st><div class="cards c4">
+        <div class="card"><div class="lbl">Orders completed</div><div class="val">1,204</div><div class="dl"><span class="up">▲ 8%</span> vs previous 7d</div></div>
+        <div class="card"><div class="lbl">Units completed</div><div class="val">4,016</div><div class="dl"><span class="up">▲ 5%</span></div></div>
+        <div class="card"><div class="lbl">Avg min / unit</div><div class="val">4.3</div><div class="dl"><span class="up">▼ 0.2</span> faster</div></div>
+        <div class="card"><div class="lbl">Avg orders / staff-day</div><div class="val">38</div><div class="dl">—</div></div>
+      </div>
+      <div class="card" style="margin-top:12px"><div class="card-h">Units per day by department<span class="muted small" style="margin-left:auto">Stacked bar · ⋯</span></div><div class="ph" style="height:190px">stacked bars · Printing / Framing / Packing</div></div>
+
+      <div class="cards c2" style="margin-top:12px">
+        <div class="card"><div class="card-h">Staff leaderboard <span class="small muted">View all →</span></div>
+          <table class="tb"><tr><th>Staff</th><th class="num">Hours</th><th class="num">U/day</th><th class="num">Min/unit</th></tr>
+          <tr><td>Ana L.</td><td class="num">38.5</td><td class="num">142</td><td class="num">3.8</td></tr>
+          <tr><td>Jane S.</td><td class="num">36.0</td><td class="num">128</td><td class="num">4.1</td></tr>
+          <tr><td>Mark K.</td><td class="num">31.2</td><td class="num">96</td><td class="num">4.9</td></tr></table></div>
+        <div class="card"><div class="card-h">Slowest variants <span class="small muted">View all →</span></div>
+          <table class="tb"><tr><th>Size / variant</th><th class="num">Units</th><th class="num">Avg min</th></tr>
+          <tr><td>60×90 · Oak float</td><td class="num">22</td><td class="num">14.2</td></tr>
+          <tr><td>A1 · Black frame</td><td class="num">48</td><td class="num">9.8</td></tr>
+          <tr><td>A2 · Canvas wrap</td><td class="num">61</td><td class="num">8.1</td></tr></table></div>
+      </div>
+
+      </div>
+      <h2 class="h">Order lookup <span class="pin">3</span></h2>
+      <div class="row"><span class="input" style="flex:1">e.g. 10190203 or 190203</span><span class="btn">Look up</span></div>
+      <div class="small muted" style="margin-top:6px">Shows the timeline of every scan on that order: who, when, which department, lines checked.</div>
+    </div>
+  </div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"reports",title:"Reports",empty:{title:"No production in this range",body:"Pick a longer date range."},crumb:["Insights","Reports","Production overview"],notes:[
+ "The long Reports page (today: collapsible sections) becomes named reports with their own URLs. Only reports that exist today are listed. Stock value stays on the owner-only Dashboard.",
+ "One shared date range and department filter in the header, with refresh and CSV export.",
+ "Order lookup stays one search box and opens a timeline. Removing an event becomes a row action in that timeline."]});</script>
+</body></html>

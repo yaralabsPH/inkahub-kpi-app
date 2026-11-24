@@ -1,0 +1,36 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Paper usage — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <h1 class="t">Paper usage</h1><p class="sub">Roll paper used per week, worked out from print sizes and row layout</p>
+  <div class="views"><span class="on">This week</span><span>Snapshots</span><span>Trend</span><span class="pin">1</span></div>
+
+  <div class="split">
+    <div>
+      <div class="row" style="margin:10px 0 14px"><span class="btn">‹</span><span class="btn dark">Week of Mon 23 Nov</span><span class="btn">›</span><span class="tag">Draft</span><span style="flex:1"></span><span class="small muted">Buffer</span><span class="field" style="width:80px">8 %</span></div>
+      <div class="grid"><table class="tb">
+        <tr><th>Size</th><th>Printer / roll</th><th>Row layout</th><th class="num">Prints <small>from sales</small></th><th class="num">Rows</th><th class="num">Line mm</th><th class="num">Avg mm / print</th></tr>
+        <tr><td>A2</td><td><span class="tag">42″</span></td><td>2 across</td><td class="num">88</td><td class="num">44</td><td class="num">594</td><td class="num">297</td></tr>
+        <tr><td>A3</td><td><span class="tag">24″</span></td><td>2 across</td><td class="num">236</td><td class="num">118</td><td class="num">420</td><td class="num">210</td></tr>
+        <tr><td>A4</td><td><span class="tag">24″</span></td><td>3 across</td><td class="num">126</td><td class="num">42</td><td class="num">297</td><td class="num">99</td></tr>
+        <tr><td>60×90</td><td><span class="tag">42″</span></td><td>1 across</td><td class="num">40</td><td class="num">40</td><td class="num">900</td><td class="num">900</td></tr>
+      </table><div class="gridfoot"><span>Prints pulled from Sales entry · edit to override <span class="pin">2</span></span><span>4 sizes</span></div></div>
+      <div class="field" style="margin-top:12px;height:56px">Notes for this snapshot…</div>
+    </div>
+    <div>
+      <div class="card"><div class="card-h">Result <span class="pin">3</span></div>
+        <div class="lbl small muted">42″ roll used</div><div class="val">62.2 m</div><div class="bar" style="margin-bottom:12px"><i style="width:62%"></i></div>
+        <div class="lbl small muted">24″ roll used</div><div class="val">66.0 m</div><div class="bar" style="margin-bottom:12px"><i style="width:66%"></i></div>
+        <div class="small muted">Includes 8% cutter/waste buffer · Deducted from stock: <b>No</b></div>
+        <hr class="sep" style="margin:14px 0">
+        <span class="btn" style="width:100%;justify-content:center;margin-bottom:6px">Save snapshot</span>
+        <span class="btn pri" style="width:100%;justify-content:center" data-confirm="Save and deduct paper?|Deducts <b>62.2 m</b> from the 42″ roll SKU and <b>66.0 m</b> from the 24″ roll SKU as usage ledger rows. A snapshot can only be deducted once.|Save &amp; deduct">Save &amp; deduct rolls</span>
+      </div>
+      <div class="card" style="margin-top:12px"><div class="card-h">Last 8 weeks</div><div class="ph" style="height:110px">bars · 24″ vs 42″</div></div>
+    </div>
+  </div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"paper",title:"Paper usage",empty:{title:"No prints this week",body:"Enter sales for this week first; prints are pulled from Sales entry."},crumb:["Inventory","Paper usage"],notes:[
+ "The editor (This week) and saved snapshots become views instead of one long page. 'Load snapshot' becomes opening a row in Snapshots.",
+ "Prints are pre-filled from Sales entry, with an override per cell.",
+ "Live result panel on the right, like a Supabase SQL result pane. Two clear actions: save only, or save and deduct, which asks first and can only happen once per snapshot (the existing Deducted flag)."]});</script>
+</body></html>

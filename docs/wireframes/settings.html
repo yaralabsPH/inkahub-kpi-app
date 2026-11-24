@@ -1,0 +1,53 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page" style="max-width:1100px">
+  <div class="twocol" style="display:grid;grid-template-columns:200px 1fr;gap:28px">
+    <nav class="subnav"><span class="pin">1</span>
+      <div class="sg">Workspace</div><a class="on" aria-current="page" href="#">General</a><a href="#">Appearance</a><a href="#">Sidebar labels</a>
+      <div class="sg">Inventory</div><a href="#">Automation</a><a href="#">Warehouse &amp; containers</a><a href="#">Carton sizes</a><a href="#">Paper rolls</a><a href="#">Suppliers &amp; payment terms</a>
+      <div class="sg">Planning</div><a href="#">Scenario start</a><a href="#">Supplier filter</a>
+      <div class="sg">Data</div><a href="#">Backup &amp; import</a><a href="#" style="color:var(--bad)">Danger zone</a>
+    </nav>
+    <div>
+      <h1 class="t">General</h1><p class="sub">Settings for Inka Arthouse · AU</p>
+
+      <div class="section"><div class="sh"><b>Regional</b><span>Used across forecasts, reports and digests</span></div>
+        <div class="sb"><div class="form">
+          <div class="fl">Currency symbol</div><div class="field" style="width:100px;color:var(--txt)">$</div>
+          <div class="fl">Week starts on</div><div class="field sel" style="width:200px;color:var(--txt)">Monday</div>
+          <div class="fl">Theme<small>Per device</small></div><div class="field sel" style="width:200px;color:var(--txt)">System</div>
+          <div class="fl">Working days per week<small>Used for per-day averages</small></div><div class="field" style="width:100px;color:var(--txt)">5</div>
+        </div></div><div class="sf"><span class="btn ghost">Cancel</span><span class="btn pri">Save</span></div></div>
+
+      <div class="section"><div class="sh"><b>Automation <span class="pin">2</span></b><span>What happens to stock without a manual step</span></div>
+        <div class="sb">
+          <div class="between" style="padding:6px 0"><div><b>Auto-adjust inventory on sale</b><div class="small muted">Deduct stock when a sales week is saved</div></div><span class="sw on"></span></div>
+          <hr class="sep" style="margin:10px 0">
+          <div class="between" style="padding:6px 0"><div><b>Auto-apply shipments on delivery</b><div class="small muted">Add stock when a PO is marked delivered</div></div><span class="sw on"></span></div>
+        </div></div>
+
+      <div class="section"><div class="sh"><b>Warehouse</b><span>Bay layout for the Warehouse page</span></div>
+        <div class="sb"><div class="form">
+          <div class="fl">Number of bays</div><div class="field" style="width:100px;color:var(--txt)">24</div>
+          <div class="fl">Max pallets per bay</div><div class="field" style="width:100px;color:var(--txt)">10</div>
+          <div class="fl">Container CBM</div><div class="field" style="width:100px;color:var(--txt)">67</div>
+        </div></div><div class="sf"><span class="btn pri">Save</span></div></div>
+
+      <div class="section"><div class="sh"><b>Sidebar labels</b><span>Rename pages for your team. Long names are cut off with “…” in the sidebar.</span></div>
+        <div class="sb"><div class="form">
+          <div class="fl">Shopping list</div><div class="field" style="color:var(--txt)">Purchase planner</div>
+          <div class="fl">CS cases</div><div class="field">CS cases</div>
+        </div></div><div class="sf"><span class="btn ghost">Reset all</span><span class="btn pri">Save</span></div></div>
+
+      <div class="section" style="border-color:var(--bad)"><div class="sh"><b style="color:var(--bad)">Danger zone <span class="pin">3</span></b><span>These can't be undone</span></div>
+        <div class="sb">
+          <div class="between"><div><b>Reset local database</b><div class="small muted">Only for the Dexie (local) backend. Type the database name to confirm.</div></div><span class="btn" style="color:var(--bad);border-color:var(--bad)" data-confirm="Reset the local database?|Deletes every SKU, sale, shipment and ledger row in <b>this browser</b> (Dexie backend only). Download a backup first. Type <span class=mono>inka-hub</span> to confirm.|Reset database|danger">Reset…</span></div>
+        </div></div>
+    </div>
+  </div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"settings",title:"Settings",crumb:["Workspace","Settings","General"],notes:[
+ "Supabase project-settings layout: grouped secondary nav, one topic per page. The list covers every setting the app has today, including sidebar labels, paper rolls, scenario start and supplier filter.",
+ "Each settings group is a card with a header, a body laid out as label | control, and its own Save footer. Toggles have a one-line explanation.",
+ "Destructive actions are kept in a red Danger zone with typed confirmation, the same pattern Supabase uses."]});</script>
+</body></html>

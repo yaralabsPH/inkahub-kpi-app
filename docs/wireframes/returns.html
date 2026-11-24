@@ -1,0 +1,30 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Returns — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <div class="between"><div><h1 class="t">Returns</h1><p class="sub">Parcels coming back: New → Received → RTS / Closed</p></div>
+    <div class="row"><span class="btn">Dispatch: log arrived parcel <span class="pin">1</span></span><span class="btn pri">+ New return</span></div></div>
+
+  <div class="cards c4">
+    <div class="card"><div class="lbl">New this week</div><div class="val">9</div></div>
+    <div class="card"><div class="lbl">Received, not closed</div><div class="val">4</div></div>
+    <div class="card" style="border-color:var(--bad)"><div class="lbl">Overdue expected</div><div class="val down">2</div><div class="dl">click to filter</div></div>
+    <div class="card"><div class="lbl">Refunds pending</div><div class="val">3</div><div class="dl">$412</div></div>
+  </div>
+  <p class="small muted">Each stat card is a one-click filter for the table below. <span class="pin">2</span></p>
+
+  <div class="views"><span class="on">Active</span><span>Received</span><span>Refunds pending</span><span>All</span></div>
+  <div class="tools"><span class="input">Search by order #, customer, SKU…</span><span class="chip">+ Filter</span><span class="sp"></span></div>
+  <div class="grid"><table class="tb">
+    <tr><th>Order #</th><th>Customer</th><th>Items · restock per line</th><th>Status</th><th>Expected</th><th>Refund</th><th>Created</th></tr>
+    <tr><td class="mono">#10189950</td><td>Sam Lee</td><td><span class="tag">A3-WHT ×1</span> <label class="small"><span class="sw on" role="switch" aria-checked="true" aria-label="Restock A3-WHT"></span> restock</label> <span class="pin">3</span></td><td><span class="tag y">Received</span></td><td>Arrived 22 Nov</td><td><span class="tag y">Expected</span></td><td class="muted">18 Nov</td></tr>
+    <tr><td class="mono">#10189871</td><td>Ben O.</td><td><span class="tag">FR-OAK-A3 ×1</span></td><td><span class="tag b">New</span></td><td><span class="tag r">Overdue 3d</span></td><td><span class="tag y">Expected</span></td><td class="muted">10 Nov</td></tr>
+    <tr><td class="mono">#10189802</td><td>Mia T.</td><td><span class="tag">A2-WHT ×2</span> <span class="tag g">restocked +2</span></td><td><span class="tag">RTS</span></td><td>Arrived 20 Nov</td><td><span class="tag g">Received</span></td><td class="muted">8 Nov</td></tr>
+  </table><div class="gridfoot"><span>3 of 9 active</span><span>Click a row to open it</span></div></div>
+
+  <div class="callout ok" style="margin-top:18px" data-roles="owner manager cs"><span class="ci"></span><div><b>Dispatch mode</b>: a big search box for the order # on the label, then one tap for "arrived". Built for the packing bench and a scanner. Same data, simpler screen.</div></div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"cs_returns",title:"Returns",empty:{title:"No active returns",body:"Log one when a customer says they're sending something back.",cta:"New return"},crumb:["Customer service","Returns"],notes:[
+ "Dispatch gets its own quick-log flow (scan or type the order #, mark arrived) so packers don't need the full form.",
+ "Stat cards are clickable filters, a Supabase dashboard habit.",
+ "Restock is per line, as in the data model. Saving a Received return credits ticked lines back to stock as a return ledger row; done lines become a tag linking to that movement. Refund shows the two existing flags: expected and received."]});</script>
+</body></html>

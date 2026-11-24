@@ -1,0 +1,43 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Team — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <div class="between"><div><h1 class="t">Team</h1><p class="sub">People, roles, locations and what each role can see</p></div>
+    <div class="row"><span class="btn ghost">Print all lanyards</span><span class="btn ghost">Download lanyards (ZIP)</span><span class="btn pri">+ Add member</span></div></div>
+  <div class="views"><span class="on">Members</span><span>Access</span><span>Payroll rates</span><span class="pin">1</span></div>
+  <div class="tools"><span class="input">Search name…</span><span class="chip filter">Role ▾</span><span class="chip filter">Location ▾</span></div>
+  <div class="grid"><table class="tb">
+    <tr><th>Name</th><th>Role</th><th>Locations</th><th class="num">Hourly rate</th><th>Lanyard</th><th>Status</th><th></th></tr>
+    <tr><td><div class="row"><span class="av lt">CJ</span>CJ Gomba</div></td><td><span class="tag g">Owner</span></td><td><span class="tag">AU</span> <span class="tag">UK</span> <span class="tag">US</span></td><td class="num">—</td><td class="faint">—</td><td><span class="dot g"></span>Active</td><td>⋯</td></tr>
+    <tr><td><div class="row"><span class="av lt">AL</span>Ana L.</div></td><td><span class="tag b">Manager</span> ▾</td><td><span class="tag">AU</span></td><td class="num">$32.00</td><td class="mono">▮▯▮▮▯ 00417</td><td><span class="dot g"></span>Clocked in</td><td>⋯</td></tr>
+    <tr><td><div class="row"><span class="av lt">JS</span>Jane S.</div></td><td><span class="tag">Staff</span> ▾</td><td><span class="tag">AU</span></td><td class="num">$28.50</td><td class="mono">▮▮▯▮▯ 00422</td><td><span class="dot g"></span>Clocked in</td><td>⋯</td></tr>
+    <tr><td><div class="row"><span class="av lt">KS</span>Kiosk · Bench 1</div></td><td><span class="tag y">Kiosk</span></td><td><span class="tag">AU</span></td><td class="num">—</td><td class="faint">—</td><td><span class="dot"></span>Order submission only</td><td>⋯</td></tr>
+    <tr><td><div class="row"><span class="av lt">RT</span>Rita T.</div></td><td><span class="tag">CS</span> ▾</td><td><span class="tag">UK</span></td><td class="num">£14.00</td><td class="mono">▮▯▯▮▮ 00431</td><td><span class="dot g"></span>Active</td><td>⋯</td></tr>
+  </table></div>
+
+  <h2 class="h">Access · Jane S. <span class="tag">Staff</span><span class="pin">2</span></h2>
+  <p class="small muted" style="margin-top:-4px">Staff default to Home only. Ticks here override the role default for this person.</p>
+  <div class="grid" style="max-width:640px"><table class="tb">
+    <tr><th>Page</th><th class="chk">Role default</th><th class="chk">This person</th></tr>
+    <tr><td>Home</td><td class="chk"><span class="box x"></span></td><td class="chk"><span class="box x"></span> <span class="small muted">always</span></td></tr>
+    <tr><td>Dashboard</td><td class="chk"><span class="box"></span></td><td class="chk"><span class="owner-only" title="Owner only">locked</span> <span class="small muted">owner only</span></td></tr>
+    <tr><td>SKUs</td><td class="chk"><span class="box"></span></td><td class="chk"><span class="box x"></span></td></tr>
+    <tr><td>Sales entry</td><td class="chk"><span class="box"></span></td><td class="chk"><span class="box x"></span></td></tr>
+    <tr><td>CS cases</td><td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td></tr>
+    <tr><td>Settings</td><td class="chk"><span class="box"></span></td><td class="chk"><span class="box"></span></td></tr>
+  </table><div class="gridfoot"><span>3 pages (default 1)</span><span><span class="btn ghost sm">Reset to role default</span></span></div></div>
+
+  <div class="section" style="margin-top:22px"><div class="sh"><b>Add member <span class="pin">3</span></b><span>Two steps, as today. A one-step invite needs a server endpoint (open question).</span></div>
+    <div class="sb"><div class="form">
+      <div class="fl">Step 1<small>Supabase dashboard</small></div><div class="small muted" style="padding-top:6px">Authentication → Add user → copy the user's UID. <a class="btn ghost sm" href="#">Open Supabase ↗</a></div>
+      <div class="fl">Supabase UID</div><div class="field">a1b2c3d4-…</div>
+      <div class="fl">Display name</div><div class="field">Jane Smith</div>
+      <div class="fl">Role</div><div class="field sel">Staff</div>
+      <div class="fl">Locations they can access</div><div class="field"><span class="tag">AU ✕</span> +</div>
+      <div class="fl">Hourly rate</div><div class="field">0.00</div>
+    </div></div><div class="sf"><span class="btn ghost">Cancel</span><span class="btn pri">Add member</span></div></div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"team",title:"Team",empty:{title:"No members yet",body:"Add the first member to give someone access.",cta:"Add member"},crumb:["Workspace","Team"],notes:[
+ "Members, access and pay rates are views of one Team page. Roles are owner, manager, staff, CS and kiosk. Change a role from its tag in the row.",
+ "Access is per person, as in the app: allowed_nav overrides the role default. The editor shows the default next to the override. Dashboard can't be granted to non-owners (it's stripped in code), so its row is locked.",
+ "Adding a member is the real two-step flow (create the user in Supabase, paste the UID), laid out as one form. A one-step email invite would need a server endpoint with the service-role key: open question."]});</script>
+</body></html>
