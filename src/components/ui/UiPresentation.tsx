@@ -39,25 +39,46 @@ const inertCounts = new Map<Element, number>();
  * scrim (a sibling of the panel inside the container) stays usable. Returns
  * the elements this call made inert, for release.
  */
-function isolate(panel: HTMLElement): Element[] {
+/** Another modal overlay (opening above this one) isolates itself; never inert it from here. */
+const isModalOverlay = (el: Element) =>
+  el.matches('[role="dialog"][aria-modal="true"]') || el.querySelector('[role="dialog"][aria-modal="true"]') !== null;
+
+function isolate(panel: HTMLElement): { els: Element[]; stop: () => void } {
   const mine: Element[] = [];
+  const path = new Set<Element>();
+  const parents: Element[] = [];
+  const make = (sib: Element) => {
+    if (path.has(sib) || mine.includes(sib)) return;
+    const n = inertCounts.get(sib);
+    if (n !== undefined) {
+      inertCounts.set(sib, n + 1);
+      mine.push(sib);
+    } else if (!sib.hasAttribute("inert")) {
+      sib.setAttribute("inert", "");
+      inertCounts.set(sib, 1);
+      mine.push(sib);
+    }
+  };
   let node: Element | null = panel.parentElement;
   while (node && node !== document.body && node.parentElement) {
-    for (const sib of Array.from(node.parentElement.children)) {
-      if (sib === node) continue;
-      const n = inertCounts.get(sib);
-      if (n !== undefined) {
-        inertCounts.set(sib, n + 1);
-        mine.push(sib);
-      } else if (!sib.hasAttribute("inert")) {
-        sib.setAttribute("inert", "");
-        inertCounts.set(sib, 1);
-        mine.push(sib);
-      }
-    }
+    path.add(node);
+    parents.push(node.parentElement);
     node = node.parentElement;
   }
-  return mine;
+  for (const parent of parents) {
+    for (const sib of Array.from(parent.children)) make(sib);
+  }
+  // Keep isolation current for the whole open lifetime: anything mounted
+  // later beside the overlay's path (e.g. an error banner) becomes inert too.
+  const mo = new MutationObserver((records) => {
+    for (const r of records) {
+      r.addedNodes.forEach((n) => {
+        if (n instanceof Element && !isModalOverlay(n)) make(n);
+      });
+    }
+  });
+  for (const parent of parents) mo.observe(parent, { childList: true });
+  return { els: mine, stop: () => mo.disconnect() };
 }
 
 function release(els: Element[]) {
@@ -113,7 +134,7 @@ export function useOverlayBehavior(
     scrollLocks += 1;
 
     const panel = panelRef.current;
-    const isolated = panel ? isolate(panel) : [];
+    const isolation = panel ? isolate(panel) : null;
     const focusFirst = () => {
       const target = initialRef?.current ?? (panel ? focusables(panel)[0] ?? panel : null);
       target?.focus({ preventScroll: true });
@@ -163,7 +184,8 @@ export function useOverlayBehavior(
       cancelAnimationFrame(raf);
       document.removeEventListener("keydown", onKey, true);
       document.removeEventListener("focusin", onFocusIn, true);
-      release(isolated);
+      isolation?.stop();
+      if (isolation) release(isolation.els);
       const i = overlayStack.indexOf(id);
       if (i >= 0) overlayStack.splice(i, 1);
       scrollLocks -= 1;

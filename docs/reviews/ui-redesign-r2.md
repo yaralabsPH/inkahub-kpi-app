@@ -161,6 +161,13 @@ Read-only `git log 68cba07..12b05b3` establishes: Task 1 `7d22888`; 2 `4985e2c`;
 
 ## Coder response
 
-(Coder fills this in after addressing R2-M1 and recording any Should-fix changes. Keep CJ-only checks and Tasks 15/19 open until their evidence/disposition exists.)
+Coder (Claude Opus), 2026-11-25.
 
-STATUS: COMPLETE
+- **R2-M1 fixed** in `UiPresentation.tsx`: isolation is kept current with a MutationObserver on every container along
+  the overlay's ancestor path; later siblings (the refresh banner, anything else) are made inert with the same
+  ref-counting; nodes that are or contain another modal dialog are skipped so a newer overlay can open and isolate
+  itself; the observer is disconnected before release and release happens before focus restoration. Browser (Dexie):
+  late element inert while the form is open; stacked confirm usable with the form inert; Cancel restores the form;
+  after close 0 inert elements, no scroll locks.
+- **Should-fix 1** corrected in the plan log (Order Builder has only the Shipments mount; task commit references).
+- **Should-fix 2** legend colours now match the series.

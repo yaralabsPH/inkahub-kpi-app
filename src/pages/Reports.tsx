@@ -1802,8 +1802,8 @@ function StaffProductivityChart({ staffName, daily, totals }: StaffProductivityP
         {/* Chart */}
         <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 p-3">
           <div className="flex items-center gap-3 text-[11px] text-slate-500 mb-2">
-            <span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-slate-900 dark:bg-slate-100" />Orders</span>
-            <span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-slate-400" />Items</span>
+            <span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-hub-accent-text" />Orders</span>
+            <span className="inline-flex items-center gap-1.5"><span className="inline-block w-3 border-t-2 border-dashed border-[#64748b]" />Items</span>
           </div>
           <div className="text-hub-accent-text" style={{ width: "100%", height: 260 }}>
             <ResponsiveContainer>
