@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { DataState } from "@/components/ui/DataState";
 import { Plus, Trash2 } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useMutations } from "@/lib/hooks/useMutations";
@@ -26,7 +27,7 @@ export function Events() {
   const [creating, setCreating] = useState(false);
   const [year, setYear] = useState(() => Number(todayIso().slice(0, 4)));
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DataState kind="loading" title="Loading demand events…" />;
 
   // Each event becomes a band that spans calendar cells.
   const eventsThisYear = data.events.filter((e) => {
@@ -48,17 +49,17 @@ export function Events() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Demand events</h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
+          <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Demand events</h1>
+          <p className="mt-1 text-sm text-hub-muted">
             Schedule promos, closures, and seasons. Multipliers compound when events overlap on the same SKU.
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="ghost" size="sm" onClick={() => setYear(year - 1)}>
+          <Button variant="ghost" size="sm" onClick={() => setYear(year - 1)} aria-label="Previous year">
             ←
           </Button>
           <span className="font-semibold tabular-nums text-sm w-12 text-center">{year}</span>
-          <Button variant="ghost" size="sm" onClick={() => setYear(year + 1)}>
+          <Button variant="ghost" size="sm" onClick={() => setYear(year + 1)} aria-label="Next year">
             →
           </Button>
           <Button size="sm" onClick={() => setCreating(true)}>
