@@ -143,6 +143,30 @@ The test/build failures are environment/config-loading failures, not evidence of
 
 ## Coder response
 
-(Coder fills this in after fixing. Record fixes/tests for each must-fix, CJ's closed-edit and insufficient-stock decisions, any transaction scope expansion, and the release-data verification.)
+Commit: `review r1: net restock moves, closed-edit guard, checked reads` (on top of `4866b0c`).
+
+**Must-fix 1, zero floor / unchanged saves: fixed.** `planCsReturnStock` no longer reverses and reapplies. It sums credited units per product before and after the save and moves only the net difference (`moves[]`, one `adjustOnHand` per product). An unchanged save moves nothing in received, RTS or closed, and a quantity decrease moves only the decrease. Both adapters use the same plan. Insufficient-stock policy, documented in the module: a removal (untick, back to New, smaller quantity, remove line, delete) is clamped at zero by `adjustOnHand`, like every other stock movement in the app (shipments, cases, sales). The ledger records the actual change; the line flag records the business state. I did not add a separate "unreversed remainder" record; that would be a new design for CJ to decide. Tests: unchanged saves after consumption for received/RTS/closed, net decrease at low stock (1 → 0, not 1 → 4), two lines sharing a SKU, RTS ↔ received, closed → received → closed.
+
+**Must-fix 2, closed edits: fixed by rejecting them.** While Closed, a credited line keeps its credit only if its SKU and quantity are unchanged. Changing either throws `CsReturnStockError` ("Move it back to Received to correct them") before any stock call. Unticking Restock or removing the line while Closed still takes the units back out. Reticking while Closed does not re-add, and a new line added while Closed is not credited. No closed edit can create credit. The modal shows the same message before saving.
+
+**Must-fix 3, Supabase atomicity: partly fixed; the rest needs CJ's decision.**
+- Fixed: every previous-state read (`cs_returns`, `cs_return_lines` on save and delete) now throws on error, so a failed read can no longer be treated as "no earlier credit". All validation runs before the first stock call: duplicate ids, quantities, missing SKUs (checked against `products` for this location), and line ids owned by another return. Adapter tests prove no `adjust_on_hand` call happens in each of these cases.
+- Not fixed: stock RPCs and row writes are still separate requests, so a save that fails after its stock call, or two clients saving the same return at once, can still double-apply. This is ARCHITECTURE finding 5. Cases and shipments have it too, and it is not caused by this fix. Fixing it properly needs a new `upsert_cs_return` / `delete_cs_return` RPC (row lock on the return, net moves and row writes in one transaction, location check). That is an append-only migration CJ would apply. I've recorded it for CJ instead of adding SQL to a fix CJ asked for as code-only. Net moves already make it much smaller: a retried unchanged save is now a no-op, where before it reversed and re-added.
+
+**Must-fix 4, tests: fixed.**
+- `src/lib/domain/__tests__/csReturnStock.test.ts`: 30 tests covering direction, unchanged saves after consumption, closed rules, edits, removals, the clamp, delete, and input checks.
+- `src/lib/repository/supabase/__tests__/csReturnStock.adapter.test.ts`: 7 tests running the real `SupabaseRepo.upsertCsReturn`/`deleteCsReturn` against an in-memory client. Its `adjust_on_hand` mirrors `0002_rpc.sql`. They assert the exact `p_delta` signs, ledger deltas, persisted flags, and no stock call on rejected input or a failed read.
+- Dexie has no IndexedDB test harness in this repo. Adding `fake-indexeddb` would be a new dependency, so I left it out. Dexie runs the identical plan inside its existing single transaction.
+- Concurrency and SQL/RLS behaviour need the staging run (see release).
+
+**Should-fix 1, preview: fixed.** The modal runs `planCsReturnStock(initial.lines, status, lines)`. It shows the net per-SKU change (for example "+3 P1 (after: 13)"), nothing on an unchanged save, the closed-edit error when it applies, and "Units already restocked stay in stock when this return is closed."
+
+**Should-fix 2, input validation: fixed.** Duplicate ids, non-integer or non-positive quantities and missing SKUs are rejected in the shared plan. Missing products are checked (Dexie inside its transaction, Supabase by a location-scoped read), and line ids owned by another return are checked in both adapters. All of this happens before stock moves. A SKU is only required to exist when units are being added to it, so a line whose SKU was later deleted can still be removed.
+
+**Nit: fixed.** "Bulletproof" comments removed; the Supabase docblock now says the save is not atomic and points here.
+
+**Release data verification (read-only, live `lkboboagiikvozvbcpvg`, 2026-11-25, SQL connection so not RLS/location-filtered):** `cs_returns` 0, `cs_return_lines` 0, lines with `inventory_credited` 0, `ledger` rows with `reason='return'` 0. No old wrong-sign credits exist, so no reconciliation or backfill is needed. Production uses Supabase; Dexie is the local single-user mode. CJ should re-run that query just before release and make sure no returns are created in the meantime (CS shouldn't log returns until the deploy is done).
+
+**Checks:** `npx tsc -b` clean; `npm run test -- --run` 419 passed (5 files); `npm run build` passed.
 
 STATUS: COMPLETE

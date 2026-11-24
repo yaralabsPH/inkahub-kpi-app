@@ -23,7 +23,7 @@ import {
   type CsReturnLine,
   type CsReturnWithLines,
 } from "@/lib/domain";
-import { planCsReturnStock, csReturnDeleteMoves } from "@/lib/domain/csReturnStock";
+import { planCsReturnStock, csReturnDeleteMoves, CsReturnStockError } from "@/lib/domain/csReturnStock";
 
 /**
  * Sortable ledger ID: unix-ms prefix + 6-char random suffix. Reads back in
@@ -1078,18 +1078,14 @@ export class DexieRepo implements Repository {
    * Preserves existing values so reverting + re-advancing the status
    * doesn't keep rewriting the timestamps.
    *
-   * Inventory model (per-line restock):
-   *   1. Compute "should-be-credited NOW" set via planCsReturnStock:
-   *      restock=true AND status received/rts, or status closed with the
-   *      line already credited (closing keeps stock already added).
-   *   2. Reverse any previously-credited line whose row is no longer in the
-   *      should-credit set (or whose qty changed — handled implicitly).
-   *   3. Apply credit for any should-credit line that wasn't already credited
-   *      (or whose qty changed).
-   *   4. Persist new line state with inventory_credited flag set correctly.
-   *
-   * We use the simple "reverse-all-then-reapply" pattern (matches CsCase) —
-   * slightly more ledger rows in edge cases but conceptually bulletproof.
+   * Inventory model (planCsReturnStock, shared with SupabaseRepo):
+   *   1. Work out which lines count as restocked now: Restock ticked and
+   *      status received/rts, or status closed with the line already
+   *      credited and unchanged (closing keeps stock, never adds it).
+   *   2. Compare credited totals per product before and after, and move only
+   *      the net difference, so an unchanged save moves nothing.
+   *   3. Persist new line state with inventory_credited set accordingly.
+   * The whole save is one Dexie transaction.
    */
   async upsertCsReturn(r: CsReturn, lines: CsReturnLine[]): Promise<void> {
     await this.db.transaction(
@@ -1101,29 +1097,33 @@ export class DexieRepo implements Repository {
           ? await this.db.csReturnLines.where("return_id").equals(r.id).toArray()
           : [];
 
-        // 1) Reverse every previously-credited line. We always reverse then
-        //    re-apply; the net delta is correct even if quantities or
-        //    product_ids changed in this save.
-        //    Signs and rules live in planCsReturnStock (shared with SupabaseRepo).
+        // 1) Rules, signs and input checks live in planCsReturnStock (shared
+        //    with SupabaseRepo); it throws before any stock moves.
         const plan = planCsReturnStock(prevLines, r.status, lines);
-        for (const mv of plan.reversals) {
+        for (const l of lines) {
           // eslint-disable-next-line no-await-in-loop
-          await this.adjustOnHand(mv.productId, mv.delta, {
-            reason: "return",
-            source_id: `cs-return:${r.id}:line:${mv.lineId}:reverse`,
-            parent_event_id: `cs-return:${r.id}`,
-            note: `Return ${r.id} previous restock reversed`,
-          });
+          const owner = await this.db.csReturnLines.get(l.id);
+          if (owner && owner.return_id !== r.id) {
+            throw new CsReturnStockError(`Return line ${l.id} belongs to another return.`);
+          }
+        }
+        for (const pid of plan.productIds) {
+          // eslint-disable-next-line no-await-in-loop
+          if (!(await this.db.products.get(pid))) {
+            throw new CsReturnStockError(`SKU no longer exists: ${pid}. Remove that line and save again.`);
+          }
         }
 
-        // 2) Apply credit for every line that should be credited now (adds stock).
-        for (const mv of plan.credits) {
+        // 2) Net per-product movements: an unchanged save moves nothing.
+        for (const mv of plan.moves) {
           // eslint-disable-next-line no-await-in-loop
           await this.adjustOnHand(mv.productId, mv.delta, {
             reason: "return",
-            source_id: `cs-return:${r.id}:line:${mv.lineId}`,
+            source_id: `cs-return:${r.id}:product:${mv.productId}`,
             parent_event_id: `cs-return:${r.id}`,
-            note: `Return ${r.id} restocked to inventory`,
+            note: mv.change > 0
+              ? `Return ${r.id} restocked ${mv.change} to inventory`
+              : `Return ${r.id} restock reduced by ${-mv.change}`,
           });
         }
         const linesWithFlag: CsReturnLine[] = lines.map((l) => ({
@@ -1163,9 +1163,9 @@ export class DexieRepo implements Repository {
           // eslint-disable-next-line no-await-in-loop
           await this.adjustOnHand(mv.productId, mv.delta, {
             reason: "return",
-            source_id: `cs-return:${id}:line:${mv.lineId}:delete`,
+            source_id: `cs-return:${id}:product:${mv.productId}:delete`,
             parent_event_id: `cs-return:${id}`,
-            note: `Return ${id} deleted — restock credit reversed`,
+            note: `Return ${id} deleted — ${-mv.change} restocked units removed`,
           });
         }
         await this.db.csReturnLines.where("return_id").equals(id).delete();

@@ -30,7 +30,7 @@ import {
   type CsReturnLine,
   type CsReturnWithLines,
 } from "@/lib/domain";
-import { planCsReturnStock, csReturnDeleteMoves } from "@/lib/domain/csReturnStock";
+import { planCsReturnStock, csReturnDeleteMoves, CsReturnStockError } from "@/lib/domain/csReturnStock";
 
 /**
  * Client-side adapter implementing the same `Repository` interface as
@@ -1185,51 +1185,59 @@ export class SupabaseRepo implements Repository {
    *   - Per-line restock credit/reverse (planCsReturnStock): lines with
    *     restock=true ADD stock when parent is 'received' or 'rts'; 'closed'
    *     keeps credits already applied; otherwise earlier credits are reversed.
-   *     `reverse-all-then-reapply` pattern for bulletproof correctness.
+   *     Stock moves net per product, so an unchanged save moves nothing.
+   *   - Not atomic: stock RPCs and row writes are separate requests (see
+   *     docs/reviews/return-restock-fix-r1.md, must-fix 3).
    */
   async upsertCsReturn(r: CsReturn, lines: CsReturnLine[]): Promise<void> {
     const loc = this.location;
 
-    // Fetch previous state.
-    const { data: prevRaw } = await this.supabase
+    // Fetch previous state. A failed read must stop the save: treating it as
+    // "no previous credit" would add the units a second time.
+    const { data: prevRaw, error: prevErr } = await this.supabase
       .from("cs_returns")
       .select("*")
       .eq("location", loc)
       .eq("id", r.id)
       .maybeSingle();
+    if (prevErr) throw prevErr;
     const prev = prevRaw ? (stripLocation(prevRaw) as CsReturn) : null;
     let prevLines: CsReturnLine[] = [];
     if (prev) {
-      const { data: prevLinesRaw } = await this.supabase
+      const { data: prevLinesRaw, error: prevLinesErr } = await this.supabase
         .from("cs_return_lines")
         .select("*")
         .eq("location", loc)
         .eq("return_id", r.id);
+      if (prevLinesErr) throw prevLinesErr;
       prevLines = (prevLinesRaw ?? []).map((row) => stripLocation(row) as CsReturnLine);
     }
 
-    // Signs and rules live in planCsReturnStock (shared with DexieRepo).
+    // Rules, signs and input checks live in planCsReturnStock (shared with
+    // DexieRepo). It throws before any stock moves on invalid input.
     const plan = planCsReturnStock(prevLines, r.status, lines);
-
-    // 1) Reverse all previously-credited lines (removes stock).
-    for (const mv of plan.reversals) {
-      // eslint-disable-next-line no-await-in-loop
-      await this.adjustOnHand(mv.productId, mv.delta, {
-        reason: "return",
-        source_id: `cs-return:${r.id}:line:${mv.lineId}:reverse`,
-        parent_event_id: `cs-return:${r.id}`,
-        note: `Return ${r.id} previous restock reversed`,
-      });
+    await this.assertReturnProductsExist(plan.productIds);
+    if (lines.length > 0) {
+      const { data: owners, error: ownerErr } = await this.supabase
+        .from("cs_return_lines")
+        .select("id, return_id")
+        .eq("location", loc)
+        .in("id", lines.map((l) => l.id));
+      if (ownerErr) throw ownerErr;
+      const foreign = (owners ?? []).find((o: { return_id: string }) => o.return_id !== r.id);
+      if (foreign) throw new CsReturnStockError(`Return line ${foreign.id} belongs to another return.`);
     }
 
-    // 2) Apply credit for every line that should be credited now (adds stock).
-    for (const mv of plan.credits) {
+    // Net per-product movements: an unchanged save moves nothing.
+    for (const mv of plan.moves) {
       // eslint-disable-next-line no-await-in-loop
       await this.adjustOnHand(mv.productId, mv.delta, {
         reason: "return",
-        source_id: `cs-return:${r.id}:line:${mv.lineId}`,
+        source_id: `cs-return:${r.id}:product:${mv.productId}`,
         parent_event_id: `cs-return:${r.id}`,
-        note: `Return ${r.id} restocked to inventory`,
+        note: mv.change > 0
+          ? `Return ${r.id} restocked ${mv.change} to inventory`
+          : `Return ${r.id} restock reduced by ${-mv.change}`,
       });
     }
     const linesWithFlag: CsReturnLine[] = lines.map((l) => ({
@@ -1268,23 +1276,41 @@ export class SupabaseRepo implements Repository {
     }
   }
 
+  /** Throws before any stock moves if a return line's SKU is missing here. */
+  private async assertReturnProductsExist(productIds: string[]): Promise<void> {
+    if (productIds.length === 0) return;
+    const { data, error } = await this.supabase
+      .from("products")
+      .select("id")
+      .eq("location", this.location)
+      .in("id", productIds);
+    if (error) throw error;
+    const found = new Set((data ?? []).map((p: { id: string }) => p.id));
+    const missing = productIds.filter((id) => !found.has(id));
+    if (missing.length > 0) {
+      throw new CsReturnStockError(`SKU no longer exists: ${missing.join(", ")}. Remove that line and save again.`);
+    }
+  }
+
   async deleteCsReturn(id: string): Promise<void> {
     const loc = this.location;
 
-    // Reverse any active restock credits before deleting the rows.
-    const { data: prevLinesRaw } = await this.supabase
+    // Reverse any active restock credits before deleting the rows. A failed
+    // read must stop the delete, or the credited units would stay in stock.
+    const { data: prevLinesRaw, error: readErr } = await this.supabase
       .from("cs_return_lines")
       .select("*")
       .eq("location", loc)
       .eq("return_id", id);
+    if (readErr) throw readErr;
     const prevLines = (prevLinesRaw ?? []).map((r) => stripLocation(r) as CsReturnLine);
     for (const mv of csReturnDeleteMoves(prevLines)) {
       // eslint-disable-next-line no-await-in-loop
       await this.adjustOnHand(mv.productId, mv.delta, {
         reason: "return",
-        source_id: `cs-return:${id}:line:${mv.lineId}:delete`,
+        source_id: `cs-return:${id}:product:${mv.productId}:delete`,
         parent_event_id: `cs-return:${id}`,
-        note: `Return ${id} deleted — restock credit reversed`,
+        note: `Return ${id} deleted — ${-mv.change} restocked units removed`,
       });
     }
 
