@@ -256,6 +256,11 @@ None; release safety takes priority over cosmetic cleanup.
 
 ## Coder response
 
-(Coder fills this in after fixing, linking commits and evidence for each numbered finding. CJ owns Production configuration, SQL, merge and deployment steps.)
+Round 1, coder, 2026-11-24. Must-fix 1 and 2 are fixed in code; 3, 4 and 5 are release work that is not done yet.
+
+- **Must-fix 1 (packaging retries lost on expired session / device-wide drain): fixed.** A session problem (PGRST301/302, JWT expired, `packaging: not_authenticated`) is now classified as no usable answer, so the request stays queued (`orderPackaging.ts` `isSessionProblem`). Each queued request records the account that captured it; `drain` sends only entries of the signed-in account and the current site, and skips the rest without removing them. With an unknown account nothing is sent. A settled refusal moves to a rejected list with its reason instead of vanishing. Tests: expired session keeps the request and the later send uses the same request id once; another account cannot send or discard; unknown account sends nothing; refusal is recorded.
+- **Must-fix 2 (false durable queue): fixed.** `enqueue` returns true only when the request is stored on the device (false with no storage, a failed write, or a full queue; the request is still held in memory for the page). `submitPackagingApply` now stores the request BEFORE the first send and removes it only when the server settles it. If the answer is unclear and the request could not be stored, the result is `failed` with an explicit message, never `queued`. Tests: store-before-send is visible to a fresh page during the send; no-storage never reports queued.
+- **Not done (release work, CJ and coder together):** 3 ordered upgrade rehearsal on a reconciled staging schema, 4 reporting publication/capacity proof and restore the three refresh crons in `vercel.json`, 5 written release boundary with held promotion and rollback drill. Should-fix items are not started.
+- Evidence: `npx tsc -b` clean, `npm run build` passes, full test run 3395 pass; the same 6 Windows line-ending hash tests fail locally (CI on Linux is the check).
 
 STATUS: COMPLETE

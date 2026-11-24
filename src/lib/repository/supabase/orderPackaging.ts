@@ -112,8 +112,22 @@ const REJECTION_TEXT: Record<string, string> = {
 /** Transient Postgres classes: connection, transaction rollback, resources, operator intervention. */
 const TRANSIENT_SQLSTATE = /^(08|40|53|57)/;
 
+/**
+ * A sign-in problem is not an answer about the request: the session expired
+ * or the person is signed out, and signing in again can complete it. Treat it
+ * like "no answer" so the queued request is kept, not discarded.
+ */
+function isSessionProblem(error: RpcError): boolean {
+  const code = error.code ?? "";
+  const message = error.message ?? "";
+  return code === "PGRST301" || code === "PGRST302" || /jwt (is )?expired|invalid jwt|packaging: not_authenticated/i.test(message);
+}
+
 export function classifyError(error: RpcError): Rejected | NetworkError {
   const message = error.message ?? "";
+  if (isSessionProblem(error)) {
+    return { outcome: "network_error", message: "You are signed out or your session expired. Sign in again; this will be sent then." };
+  }
   const m = /packaging: ([a-z_]+)/.exec(message);
   if (m) {
     const code = m[1];

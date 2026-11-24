@@ -6,10 +6,12 @@ function memoryStorage(initial?: string): OutboxStorage & { value: string | null
   const s = {
     value: initial ?? null,
     failWrites: false,
-    getItem: () => s.value,
-    setItem: (_k: string, v: string) => {
+    other: new Map<string, string>(),
+    getItem: (k: string) => (k === "inka.packagingOutbox.v1" ? s.value : s.other.get(k) ?? null),
+    setItem: (k: string, v: string) => {
       if (s.failWrites) throw new Error("quota");
-      s.value = v;
+      if (k === "inka.packagingOutbox.v1") s.value = v;
+      else s.other.set(k, v);
     },
   };
   return s;
@@ -108,10 +110,56 @@ describe("packaging outbox", () => {
     const storage = memoryStorage();
     storage.failWrites = true;
     expect(createPackagingOutbox(storage, fixedNow).enqueue(entry(1))).toBe(false);
+    // No storage at all: held in memory for this page only, and enqueue says so (false).
     const mem = createPackagingOutbox(null, fixedNow);
-    expect(mem.enqueue(entry(1))).toBe(true);
+    expect(mem.enqueue(entry(1))).toBe(false);
     expect(mem.pendingCount()).toBe(1);
     mem.remove("apply:ev-1");
     expect(mem.pendingCount()).toBe(0);
+  });
+
+  it("a failed write still keeps the request in memory for this page", () => {
+    const storage = memoryStorage();
+    storage.failWrites = true;
+    const box = createPackagingOutbox(storage, fixedNow);
+    expect(box.enqueue(entry(1))).toBe(false);
+    expect(box.pendingCount()).toBe(1);
+  });
+
+  it("only sends entries of the signed-in account and site, and keeps the others", async () => {
+    const box = createPackagingOutbox(memoryStorage(), fixedNow);
+    box.enqueue({ ...entry(1), userId: "u-a" });
+    box.enqueue({ ...entry(2), userId: "u-b" });
+    box.enqueue({ ...entry(3), userId: "u-a", args: { ...entry(3).args, location: "uk" } });
+    const sent: string[] = [];
+    const settled = await box.drain(async (e) => {
+      sent.push(e.args.requestId);
+      return "done";
+    }, { userId: "u-a", location: "au" });
+    expect(settled).toBe(1);
+    expect(sent).toEqual(["apply:ev-1"]);
+    expect(box.list().map((e) => e.args.requestId)).toEqual(["apply:ev-2", "apply:ev-3"]);
+  });
+
+  it("an entry from before accounts were recorded may be sent by anyone", async () => {
+    const box = createPackagingOutbox(memoryStorage(), fixedNow);
+    box.enqueue(entry(1));
+    expect(await box.drain(async () => "done", { userId: "u-x" })).toBe(1);
+  });
+
+  it("moves a settled refusal to the rejected list with its reason", async () => {
+    const box = createPackagingOutbox(memoryStorage(), fixedNow);
+    box.enqueue({ ...entry(1), userId: "u-a" });
+    await box.drain(async () => ({ rejected: "The completion was not found." }), { userId: "u-a" });
+    expect(box.pendingCount()).toBe(0);
+    expect(box.listRejected().map((e) => [e.args.requestId, e.reason])).toEqual([["apply:ev-1", "The completion was not found."]]);
+  });
+
+  it("keeps the entry and stops when there is no usable answer", async () => {
+    const box = createPackagingOutbox(memoryStorage(), fixedNow);
+    box.enqueue({ ...entry(1), userId: "u-a" });
+    box.enqueue({ ...entry(2), userId: "u-a" });
+    expect(await box.drain(async () => "retry", { userId: "u-a" })).toBe(0);
+    expect(box.list().map((e) => [e.args.requestId, e.attempts])).toEqual([["apply:ev-1", 1], ["apply:ev-2", 0]]);
   });
 });

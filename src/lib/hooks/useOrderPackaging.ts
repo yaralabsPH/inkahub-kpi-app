@@ -137,9 +137,10 @@ export function useOrderPackaging(opts: Options): OrderPackaging {
 
   const drain = useCallback(async () => {
     if (outbox.pendingCount() === 0) return;
-    await drainPackagingOutbox(client, outbox);
+    // Only this site's requests, and only those this signed-in account captured.
+    await drainPackagingOutbox(client, outbox, { location });
     refreshPending();
-  }, [client, outbox, refreshPending]);
+  }, [client, outbox, location, refreshPending]);
 
   useEffect(() => {
     refreshPending();

@@ -8,13 +8,14 @@ import { drainPackagingOutbox, submitPackagingApply } from "../packagingSubmit";
 
 type Answer = { data: unknown; error: { message?: string; code?: string } | null };
 
-function fakeClient(answer: () => Answer): { client: SupabaseClient; calls: Array<Record<string, unknown>> } {
+function fakeClient(answer: () => Answer, userId: string | null = "u-1"): { client: SupabaseClient; calls: Array<Record<string, unknown>> } {
   const calls: Array<Record<string, unknown>> = [];
   const client = {
     rpc: async (_fn: string, params: Record<string, unknown>) => {
       calls.push(params);
       return answer();
     },
+    auth: { getSession: async () => ({ data: { session: userId ? { user: { id: userId } } : null } }) },
   };
   return { client: client as unknown as SupabaseClient, calls };
 }
@@ -27,6 +28,13 @@ const pick = {
 };
 const applied: Answer = { data: { status: "applied", pick, deltas: { "box-a": 1 }, unposted: [], negative: [] }, error: null };
 const offline: Answer = { data: null, error: { message: "Failed to fetch" } };
+const expired: Answer = { data: null, error: { message: "JWT expired", code: "PGRST301" } };
+
+/** A working device store, so a request really is kept across reloads. */
+function deviceStorage() {
+  const m = new Map<string, string>();
+  return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v) };
+}
 
 const args: ApplyArgs = {
   location: "au", requestId: "apply:ev-1", eventId: "ev-1", ruleSetId: "prs-1",
@@ -55,7 +63,7 @@ describe("submitPackagingApply", () => {
 
   it("queues on no answer, with the same request id", async () => {
     const { client } = fakeClient(() => offline);
-    const outbox = createPackagingOutbox(null);
+    const outbox = createPackagingOutbox(deviceStorage());
     expect(await submitPackagingApply(client, outbox, args, "F4T-1")).toEqual({ kind: "queued" });
     expect(outbox.list().map((e) => [e.args.requestId, e.orderNumber])).toEqual([["apply:ev-1", "F4T-1"]]);
   });
@@ -65,7 +73,66 @@ describe("submitPackagingApply", () => {
     const storage = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
     const res = await submitPackagingApply(client, createPackagingOutbox(storage), args, "F4T-1");
     expect(res.kind).toBe("failed");
-    expect(res.kind === "failed" && res.message).toMatch(/#F4T-1 could not be saved or kept/);
+    expect(res.kind === "failed" && res.message).toMatch(/#F4T-1 was not confirmed and could not be kept on this device/);
+  });
+
+  it("without device storage, an unanswered request is reported as not safely kept (never 'queued')", async () => {
+    const { client } = fakeClient(() => offline);
+    const res = await submitPackagingApply(client, createPackagingOutbox(null), args, "F4T-1");
+    expect(res.kind).toBe("failed");
+  });
+
+  it("stores the request BEFORE the first send, so closing the page mid-send loses nothing", async () => {
+    const storage = deviceStorage();
+    const outbox = createPackagingOutbox(storage);
+    let seenDuringSend = -1;
+    const { client } = fakeClient(() => {
+      seenDuringSend = createPackagingOutbox(storage).pendingCount(); // a fresh page reading the same device
+      return applied;
+    });
+    await submitPackagingApply(client, outbox, args, "F4T-1");
+    expect(seenDuringSend).toBe(1);
+    expect(outbox.pendingCount()).toBe(0); // settled, so removed
+  });
+
+  it("an expired session keeps the request; signing in again sends the SAME request id once", async () => {
+    const storage = deviceStorage();
+    const outbox = createPackagingOutbox(storage);
+    const down = fakeClient(() => expired);
+    expect(await submitPackagingApply(down.client, outbox, args, "F4T-1")).toEqual({ kind: "queued" });
+    expect(await drainPackagingOutbox(down.client, outbox, { location: "au" })).toBe(0);
+    expect(outbox.pendingCount()).toBe(1);
+    const up = fakeClient(() => applied);
+    expect(await drainPackagingOutbox(up.client, outbox, { location: "au" })).toBe(1);
+    expect(up.calls.map((c) => c.p_request_id)).toEqual(["apply:ev-1"]);
+    expect(outbox.pendingCount()).toBe(0);
+  });
+
+  it("another account signing in cannot send or discard the request", async () => {
+    const outbox = createPackagingOutbox(deviceStorage());
+    await submitPackagingApply(fakeClient(() => offline, "u-1").client, outbox, args, "F4T-1");
+    const other = fakeClient(() => ({ data: null, error: { message: "packaging: forbidden_role", code: "P0001" } }), "u-2");
+    expect(await drainPackagingOutbox(other.client, outbox, { location: "au" })).toBe(0);
+    expect(other.calls).toHaveLength(0);
+    expect(outbox.pendingCount()).toBe(1);
+  });
+
+  it("nothing is sent when the signed-in account is unknown", async () => {
+    const outbox = createPackagingOutbox(deviceStorage());
+    await submitPackagingApply(fakeClient(() => offline, "u-1").client, outbox, args, "F4T-1");
+    const anon = fakeClient(() => applied, null);
+    expect(await drainPackagingOutbox(anon.client, outbox, { location: "au" })).toBe(0);
+    expect(anon.calls).toHaveLength(0);
+    expect(outbox.pendingCount()).toBe(1);
+  });
+
+  it("a settled refusal for the right account moves to the rejected list with its reason", async () => {
+    const outbox = createPackagingOutbox(deviceStorage());
+    await submitPackagingApply(fakeClient(() => offline, "u-1").client, outbox, args, "F4T-1");
+    const refuse = fakeClient(() => ({ data: null, error: { message: "packaging: event_not_found", code: "P0001" } }), "u-1");
+    expect(await drainPackagingOutbox(refuse.client, outbox, { location: "au" })).toBe(1);
+    expect(outbox.pendingCount()).toBe(0);
+    expect(outbox.listRejected().map((e) => e.reason)).toEqual(["The completion was not found."]);
   });
 
   it("does not queue a refusal", async () => {
@@ -80,9 +147,9 @@ describe("submitPackagingApply", () => {
 
 describe("drainPackagingOutbox", () => {
   it("resends queued requests unchanged and clears them on any definitive answer", async () => {
-    const outbox = createPackagingOutbox(null);
-    outbox.enqueue({ args, orderNumber: "F4T-1" });
-    outbox.enqueue({ args: { ...args, requestId: "apply:ev-2", eventId: "ev-2" }, orderNumber: "F4T-2" });
+    const outbox = createPackagingOutbox(deviceStorage());
+    outbox.enqueue({ args, orderNumber: "F4T-1", userId: "u-1" });
+    outbox.enqueue({ args: { ...args, requestId: "apply:ev-2", eventId: "ev-2" }, orderNumber: "F4T-2", userId: "u-1" });
 
     const down = fakeClient(() => offline);
     expect(await drainPackagingOutbox(down.client, outbox)).toBe(0);
