@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ReportsSectionNav } from "@/components/ReportsSectionNav";
 import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshCw, Search, Trash2 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
@@ -181,7 +182,12 @@ export function Reports() {
       </div>
     );
   }
-  return <RoleReports />;
+  return (
+    <div id="reports-root" className="mx-auto max-w-[1440px]">
+      <ReportsSectionNav containerId="reports-root" />
+      <RoleReports />
+    </div>
+  );
 }
 
 /**
@@ -578,7 +584,7 @@ function SupabaseReports() {
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 flex-wrap">
           <BarChart3 size={20} className="text-slate-600 dark:text-slate-400" />
-          <h1 className="text-lg font-semibold tracking-tight">Production Reports</h1>
+          <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Production Reports</h1>
           {selectedStaffName && (
             <span className="ml-1 inline-flex items-center gap-1 rounded-full bg-slate-900 text-white text-xs font-medium px-2 py-0.5 dark:bg-slate-100 dark:text-slate-900">
               {selectedStaffName}
@@ -852,7 +858,7 @@ function SupabaseReports() {
                     contentStyle={{ fontSize: 12, borderRadius: 6 }}
                   />
                   <Legend wrapperStyle={{ fontSize: 12 }} />
-                  <Bar dataKey="Items"  fill="#0f172a" radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="Items"  fill="#3ecf8e" radius={[4, 4, 0, 0]} />
                   <Bar dataKey="Orders" fill="#94a3b8" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
@@ -1810,7 +1816,7 @@ function StaffProductivityChart({ staffName, daily, totals }: StaffProductivityP
                   contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #e2e8f0" }}
                   labelStyle={{ fontWeight: 600 }}
                 />
-                <Line yAxisId="orders" type="monotone" dataKey="orders" stroke="#0f172a" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} name="Orders" isAnimationActive={false} />
+                <Line yAxisId="orders" type="monotone" dataKey="orders" stroke="#3ecf8e" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} name="Orders" isAnimationActive={false} />
                 <Line yAxisId="items" type="monotone" dataKey="items" stroke="#94a3b8" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} name="Items" isAnimationActive={false} />
               </LineChart>
             </ResponsiveContainer>
@@ -1872,7 +1878,7 @@ function CollapsibleSection({
     });
   };
   return (
-    <div className="rounded-xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900/40 overflow-hidden">
+    <div data-report-section={title} className="rounded-xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900/40 overflow-hidden">
       <button
         type="button"
         onClick={toggle}
