@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import {
   LifeBuoy, Plus, ExternalLink, Trash2, Pencil, Search, Download, BarChart3,
   LayoutGrid, List as ListIcon,
@@ -252,7 +253,7 @@ export function CsCases() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight inline-flex items-center gap-2">
+          <h1 className="inline-flex items-center gap-2 text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">
             <LifeBuoy size={18} /> CS Cases
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -578,6 +579,8 @@ function CaseModal({
   const auth = useAuthOptional();
   const userId = auth?.profile?.user_id ?? null;
   const isEdit = !!initial;
+  // Confirm step before the existing stock-changing save/delete (presentation only).
+  const { ask, dialog: confirmDialog } = useConfirm();
   const now = new Date().toISOString();
 
   // Form state — initialise from `initial` if editing, blank for new.
@@ -811,15 +814,36 @@ function CaseModal({
     setError(null);
     if (!orderNumber.trim()) { setError("Order number is required."); return; }
     if (lines.length === 0) { setError("Add at least one replacement line."); return; }
-    if (deductionChanging && wasDeducted) {
-      if (!window.confirm(
-        "This change will reverse the previous inventory deduction. Continue?",
-      )) return;
-    }
-    if (deductionChanging && willDeduct) {
-      if (!window.confirm(
-        `Saving will deduct ${lines.reduce((s, l) => s + l.quantity, 0)} item(s) from inventory. Continue?`,
-      )) return;
+    // The repository gives back the previously deducted lines (if any) and then
+    // deducts the current lines (if the case now ships). Show both before saving.
+    if (wasDeducted || willDeduct) {
+      const codeOf = (id: string) => products.find((pp) => pp.id === id)?.code ?? id;
+      const back = wasDeducted ? (initial?.lines ?? []) : [];
+      const take = willDeduct ? lines : [];
+      const ok = await ask({
+        title: "Save this case and update stock?",
+        confirmLabel: "Save case",
+        body: (
+          <div className="space-y-2">
+            {back.length > 0 ? (
+              <div>
+                <p>The replacement items deducted when this case was last saved go back to stock:</p>
+                <ul className="mt-1 font-mono text-[12.5px]">{back.map((l) => <li key={`b-${l.id}`}>+{l.quantity} {codeOf(l.product_id)}</li>)}</ul>
+              </div>
+            ) : null}
+            {take.length > 0 ? (
+              <div>
+                <p>{back.length > 0 ? "Then these" : "These"} replacement items are deducted:</p>
+                <ul className="mt-1 font-mono text-[12.5px]">{take.map((l) => <li key={`t-${l.id}`}>−{l.quantity} {codeOf(l.product_id)}</li>)}</ul>
+              </div>
+            ) : (
+              <p>Nothing new is deducted (the case is not shipped with a tracking number).</p>
+            )}
+            <p className="text-xs text-hub-muted">Cancel saves nothing and leaves stock as it is.</p>
+          </div>
+        ),
+      });
+      if (!ok) return;
     }
     setBusy(true);
     try {
@@ -861,7 +885,21 @@ function CaseModal({
 
   const handleDelete = async () => {
     if (!initial) return;
-    if (!window.confirm(`Delete case for order ${initial.order_number}? This can't be undone.`)) return;
+    if (initial.inventory_deducted) {
+      const codeOf = (id: string) => products.find((pp) => pp.id === id)?.code ?? id;
+      const ok = await ask({
+        title: `Delete case for order ${initial.order_number}?`,
+        confirmLabel: "Delete and return stock",
+        danger: true,
+        body: (
+          <div className="space-y-2">
+            <p>This can't be undone. The replacement items it deducted go back to stock:</p>
+            <ul className="font-mono text-[12.5px]">{initial.lines.map((l) => <li key={l.id}>+{l.quantity} {codeOf(l.product_id)}</li>)}</ul>
+          </div>
+        ),
+      });
+      if (!ok) return;
+    } else if (!window.confirm(`Delete case for order ${initial.order_number}? This can't be undone.`)) return;
     setBusy(true);
     try {
       await m.deleteCsCase.mutateAsync(initial.id);
@@ -1227,6 +1265,7 @@ function CaseModal({
           </div>
         </div>
       </div>
+      {confirmDialog}
     </div>
   );
 }
