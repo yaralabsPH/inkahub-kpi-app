@@ -27,9 +27,9 @@ while merging, so no half-finished combination reaches staff; promote one final 
 |---|---|---|---|
 | G1 | Packaging retry bugs (review Must-fix 1 and 2) | coder | **fixed** (commit 774d69e), re-review pending |
 | G2 | The three 15-minute refresh schedules back in `vercel.json` | coder | **done** (commit 206ea68) |
-| G3 | **Ordered upgrade rehearsal**: apply the exact files below, in order, to a staging copy that has the same schema as live and realistic (sanitised) data volume. Record lock time per file, disk headroom and any failure. Use a bounded lock/statement timeout and stop on the first error. Then smoke-test the OLD app against the new schema | CJ and coder | **open** |
-| G4 | Reporting proof at real size: one full first publication and one incremental refresh on representative data, with measured disk and time. Never repeat "raise the timeout and hope" | CJ and coder | **open** |
-| G5 | Rollback drill on staging: write with the new app, switch back to the previous build, run the smoke test, check stock and queues | CJ | **open** |
+| G3 | **Ordered upgrade rehearsal**: apply the exact files below, in order, to a staging copy that has the same schema as live and realistic (sanitised) data volume. Record lock time per file, disk headroom and any failure. Use a bounded lock/statement timeout and stop on the first error. Then smoke-test the OLD app against the new schema | CJ and coder | **done 2026-11-24** ([evidence](release-rehearsal-2026-11-24.md) §1): fingerprint-identical copy of live, live-sized data, all 25 files passed, longest write block 123 ms, old app 9/9 |
+| G4 | Reporting proof at real size: one full first publication and one incremental refresh on representative data, with measured disk and time. Never repeat "raise the timeout and hope" | CJ and coder | see [evidence](release-rehearsal-2026-11-24.md) §2 |
+| G5 | Rollback drill on staging: write with the new app, switch back to the previous build, run the smoke test, check stock and queues | CJ | **done 2026-11-24** ([evidence](release-rehearsal-2026-11-24.md) §3): only the documented second-box edge, visible in the ledger |
 | G6 | Planner re-review (round 2) says "approved" | planner | **open** |
 | G7 | Staging smoke test as owner, manager, staff, kiosk and CS (docs/RELEASING.md section 2) on the final build | CJ | **open** |
 
@@ -52,14 +52,22 @@ Preview keeps pointing at staging with its own throwaway secrets.
 
 ## Release-day sequence (CJ, in a quiet window, not at a shift start or digest time)
 
-1. Write down the **current production deployment** and its commit (Vercel, Deployments). That is the rollback target.
+1. Write down the **current production deployment**. As of 2026-11-24 it is
+   `dpl_4r1s2fBXEdhNdUzooNN4BNHaWyZf` (`inka-arthouse-pkdt9gaoa-…`), whose code equals git `79a0031`
+   (checked file by file). That is the rollback target. The Vercel project has **no Git connection**:
+   merging does not deploy, so nothing reaches staff until step 6.
 2. Take a Supabase backup and note the recovery point. Check free disk space.
 3. Check the Production settings table above.
 4. Apply the migrations below **in numeric order, one file at a time, stopping at the first error**.
-   0046 has no BEGIN/COMMIT: run it as one atomic unit. Do not run 0001-0033 and do not use the
+   Start each file with `set lock_timeout = '10s'; set statement_timeout = '600s';` (as rehearsed).
+   0046 has no BEGIN/COMMIT: run it as one atomic unit (one SQL editor run). Do not run 0001-0033 and do not use the
    consolidated staging baseline. If a file fails, earlier files stay; leave the old app live and diagnose.
-5. Merge the 13 pull requests in the order above, with Production promotion held. Wait for CI on the final `main`.
-6. Promote the single final build to Production. Check the function durations (300 s) and the six cron entries.
+   Rehearsed on a fingerprint-identical copy of live: all 25 files ≈ 0.7 s in total, longest write block 123 ms (0055).
+5. Merge the 13 pull requests in the order above. Wait for CI on the final `main`.
+   Note: `main` already holds PR #6 (digest auth) and PR #9 (order display), which were never deployed;
+   they go live in this release too. PR #6 needs `CRON_SECRET` set in Production first.
+6. Deploy the final `main` to Production (one CLI deploy, or deploy as Preview and promote it).
+   Check the function durations (300 s) and the six cron entries.
 7. Smoke test on production (read-only where possible): log in as each role, kiosk clock in and out
    (**one** clock-in per scan), complete and dispatch one real order and check stock moved **once**, Shopify lookup,
    shipments, CS cases and returns, Welcome and Reports, the daily digest endpoint.
