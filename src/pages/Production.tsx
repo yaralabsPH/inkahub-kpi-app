@@ -1895,7 +1895,7 @@ function ProductionStation({
             <Modal
               open
               onClose={() => setEditOrderWarning(null)}
-              title={"Edit Order â€” #" + editOrderWarning.orderNumber}
+              title={"Edit Order — #" + editOrderWarning.orderNumber}
               width="max-w-md"
             >
               <div className="mb-4 rounded-md ring-1 ring-amber-200 dark:ring-amber-900/40 bg-amber-50/60 dark:bg-amber-900/20 px-3 py-3">

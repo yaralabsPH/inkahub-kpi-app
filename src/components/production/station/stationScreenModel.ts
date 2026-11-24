@@ -85,7 +85,7 @@ export interface StationProgress {
   allDone: boolean;
   /** First unchecked required line, in on-screen order. */
   currentKey: string | null;
-  /** Sum of quantities over the lines this station must check. */
+  /** Pieces to work on: quantity x set size (a 2-piece set counts 2) over the lines this station must check. */
   pieces: number;
   toFrame: number;
   packFlat: number;
@@ -104,7 +104,7 @@ export function buildStationProgress(
     remaining: required.length - checked,
     allDone: required.length > 0 && checked === required.length,
     currentKey: current?.key ?? null,
-    pieces: required.reduce((n, l) => n + safeQty(l.quantity), 0),
+    pieces: required.reduce((n, l) => n + safeQty(l.quantity) * (l.setCount && l.setCount > 1 ? l.setCount : 1), 0),
     toFrame: required.filter((l) => l.group === "frame").length,
     packFlat: required.filter((l) => l.group === "flat").length,
   };

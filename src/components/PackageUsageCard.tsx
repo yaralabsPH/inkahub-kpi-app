@@ -143,12 +143,12 @@ export function PackageUsageCard({
           <Package size={16} /> Packages used
         </CardTitle>
         <span className="text-xs text-slate-500 dark:text-slate-400">
-          Boxes + mail tubes deducted from stock â€” {rangeLabel}
+          Boxes + mail tubes deducted from stock — {rangeLabel}
         </span>
       </CardHeader>
       <CardBody className="p-0">
         {loading ? (
-          <div className="p-6 text-sm text-slate-500">Loadingâ€¦</div>
+          <div className="p-6 text-sm text-slate-500">Loading…</div>
         ) : error ? (
           <div className="p-6 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
             {error}
@@ -180,7 +180,7 @@ export function PackageUsageCard({
                     <td className="px-4 py-2 font-medium">{r.label}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{r.qty.toLocaleString()}</td>
                     <td className="px-3 py-2 text-right tabular-nums text-slate-500">
-                      {r.unitCost == null ? "â€”" : `${summary.currency}${r.unitCost.toFixed(2)}`}
+                      {r.unitCost == null ? "—" : `${summary.currency}${r.unitCost.toFixed(2)}`}
                     </td>
                     <td className="px-4 py-2 text-right tabular-nums">
                       {r.cost == null
@@ -198,7 +198,7 @@ export function PackageUsageCard({
                   <td className="px-4 py-2 text-right tabular-nums">
                     {summary.hasCost
                       ? `${summary.currency}${summary.totalCost.toFixed(2)}`
-                      : <span className="text-slate-400 italic">â€”</span>}
+                      : <span className="text-slate-400 italic">—</span>}
                   </td>
                 </tr>
               </tbody>

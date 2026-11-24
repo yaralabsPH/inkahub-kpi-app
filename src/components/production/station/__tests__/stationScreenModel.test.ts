@@ -91,6 +91,15 @@ describe("buildStationProgress", () => {
     expect(p.packFlat).toBe(1);
   });
 
+  it("counts every piece of a set (two 2-piece sets and one print = 5)", () => {
+    const setLines = [
+      line("INKA-LOV0285-A0-UN"),
+      line("INKA-S2JAP0006-A2-FN"),
+      line("INKA-S2JAP0009-A2-FN"),
+    ].map(getStationLineView);
+    expect(buildStationProgress(setLines, new Set()).pieces).toBe(5);
+  });
+
   it("makes the first unchecked line current, in group order", () => {
     expect(buildStationProgress(lines, new Set()).currentKey).toBe("INKA-DIV0147-A2-FN");
     expect(

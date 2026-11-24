@@ -154,7 +154,10 @@ export function Dashboard() {
   const daysSinceBackup = lastBackup
     ? Math.floor((Date.now() - new Date(lastBackup).getTime()) / 86_400_000)
     : null;
+  // The reminder is about browser-only (Dexie) data. With Supabase the data
+  // lives in the database, so the text is wrong there (CJ, 2026-11-24).
   const showBackupBanner =
+    import.meta.env.VITE_BACKEND !== "supabase" &&
     !dismissedBackup &&
     (lastBackup === null || (daysSinceBackup !== null && daysSinceBackup >= reminderDays));
 

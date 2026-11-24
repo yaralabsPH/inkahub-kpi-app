@@ -149,7 +149,7 @@ function CurrentlyClockedInCardInner() {
               <div key={r.staff_id} className="flex items-center justify-between text-sm">
                 <span className="font-medium text-slate-900 dark:text-slate-100">{r.display_name}</span>
                 <span className="text-xs text-slate-500 tabular-nums">
-                  since {renderSince(r.since)} <span className="text-slate-400">{"Â·"}</span> {renderElapsed(r.since)}
+                  since {renderSince(r.since)} <span className="text-slate-400">{"·"}</span> {renderElapsed(r.since)}
                 </span>
               </div>
             ))}
