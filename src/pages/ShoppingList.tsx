@@ -5,6 +5,7 @@ import { useForecasts } from "@/lib/hooks/useForecasts";
 import { useMutations } from "@/lib/hooks/useMutations";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
+import { DataState } from "@/components/ui/DataState";
 import { fmtMoney, fmtNum } from "@/lib/utils/format";
 import { addDays, isoWeekStart, todayIso } from "@/lib/utils/dates";
 import { downloadCsv, toCsv } from "@/lib/csv/csv";
@@ -50,7 +51,7 @@ export function ShoppingList() {
     return { lines: ls, supplierGroups: groups, totalValue: total };
   }, [data, byId, overrides]);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DataState kind="loading" title="Loading shopping list…" />;
 
   // ---- Restock plan: if all suggested orders went out TODAY, when would
   // each line arrive? Group by ISO-week of expected arrival.
@@ -180,23 +181,31 @@ export function ShoppingList() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Shopping list</h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
+          <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Shopping list</h1>
+          <p className="mt-1 text-sm text-hub-muted">
             Auto-generated from current forecasts. Group by supplier.
             {lines.length} line{lines.length === 1 ? "" : "s"} · estimated{" "}
             {fmtMoney(totalValue, data.settings.currency_symbol)}
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap justify-end gap-2">
           <Button variant="secondary" size="sm" onClick={exportCsv} disabled={lines.length === 0}>
             <Download size={14} /> Export CSV
           </Button>
           <Button variant="secondary" size="sm" onClick={exportExcel} disabled={lines.length === 0}>
             <FileSpreadsheet size={14} /> Export Excel
           </Button>
-          <Button size="sm" onClick={placeOrders} disabled={lines.length === 0 || busy}>
-            <ShoppingCart size={14} /> {busy ? "Creating…" : "Mark all as ordered"}
+          <Button
+            size="sm"
+            onClick={placeOrders}
+            disabled={lines.length === 0 || busy}
+            aria-describedby="shopping-create-help"
+          >
+            <ShoppingCart size={14} /> {busy ? "Creating…" : "Create draft shipments"}
           </Button>
+          <p id="shopping-create-help" className="basis-full text-right text-xs text-hub-muted">
+            Creates one shipment per line, each with status <strong>Ordered</strong>.
+          </p>
         </div>
       </div>
 
