@@ -1,6 +1,9 @@
 import { useMemo, useState } from "react";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { DataState } from "@/components/ui/DataState";
+import { DashboardTabs, OwnerOnlyBadge } from "@/components/DashboardTabs";
 import { Link } from "react-router-dom";
-import { ArrowLeft, Coins, Download } from "lucide-react";
+import { Download } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { Card, CardBody } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -73,7 +76,7 @@ export function StockValue() {
     return sorted;
   }, [rows, supplierFilter, search, sortKey, sortDir, hideZero]);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading...</div>;
+  if (!data) return <div className="mx-auto max-w-hub"><DataState kind="loading" title="Loading stock value…" /></div>;
 
   const currency = data.settings.currency_symbol;
   const totalValue = filtered.reduce((s, r) => s + r.value, 0);
@@ -113,27 +116,26 @@ export function StockValue() {
   };
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
-          <Link
-            to="/dashboard"
-            className="inline-flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 mb-1">
-            <ArrowLeft size={12} /> Back to dashboard
-          </Link>
-          <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2">
-            <Coins size={20} className="text-amber-600" /> Stock value
-          </h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1 max-w-2xl">
+    <div className="mx-auto max-w-hub space-y-4">
+      <PageHeader
+        title="Stock value"
+        description={
+          <span className="block max-w-2xl">
             Per-SKU breakdown of stock value: <strong>current on hand x unit cost</strong>.
             Excludes shipments in transit. Includes 0-stock rows so this is a
             complete catalogue snapshot. URL is shareable.
-          </p>
-        </div>
-        <Button onClick={exportXlsx} size="sm" variant="primary">
-          <Download size={14} /> Export to Excel
-        </Button>
-      </div>
+          </span>
+        }
+        actions={
+          <>
+            <OwnerOnlyBadge />
+            <Button onClick={exportXlsx} size="sm" variant="primary">
+              <Download size={14} /> Export to Excel
+            </Button>
+          </>
+        }
+      />
+      <DashboardTabs />
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <SummaryTile label="Total value" value={fmtMoney(totalValue, currency)} sub="sum of value column" />
