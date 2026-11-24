@@ -15,6 +15,9 @@ import { Field, Input, Select } from "@/components/ui/Input";
 import { addDays, diffDays, todayIso } from "@/lib/utils/dates";
 import { fmtNum, fmtShortDate } from "@/lib/utils/format";
 import { cn } from "@/lib/utils/cn";
+import { DataState } from "@/components/ui/DataState";
+import { useConfirm, type ConfirmOptions } from "@/components/ui/ConfirmDialog";
+import { shipmentDeleteStockChange, shipmentStatusStockChange, type ShipmentStockChange } from "@/lib/ui/shipmentStockChange";
 import {
   type IncomingShipment, type ShipmentLine,
   IncomingShipmentSchema, ShipmentStatus, shipmentTotalUnits,
@@ -118,6 +121,8 @@ export function Shipments() {
   const [editing, setEditing] = useState<IncomingShipment | null>(null);
   const [creating, setCreating] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  // Confirm step before an existing save/delete that changes stock (presentation only).
+  const { ask, dialog: confirmDialog } = useConfirm();
   const [orderBuilderOpen, setOrderBuilderOpen] = useState(false);
   const [orderBuilderShipmentId, setOrderBuilderShipmentId] = useState<string | null>(null);
   const [supplierFilter, setSupplierFilter] = useState<string>("all");
@@ -170,7 +175,37 @@ export function Shipments() {
     setSearchParams(next, { replace: true });
   }, [searchParams, setSearchParams]);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DataState kind="loading" title="Loading shipments…" />;
+
+  const autoApply = data.settings.auto_apply_shipments_on_delivery ?? true;
+  const codeOf = (id: string) => data.products.find((p) => p.id === id)?.code ?? id;
+  /** Confirm text for a stock change the existing save/delete is about to make. */
+  const stockConfirm = (change: ShipmentStockChange, po: string, what: string): ConfirmOptions => ({
+    title: change.kind === "credit" ? `Add stock for ${po}?` : `Remove stock for ${po}?`,
+    confirmLabel: change.kind === "credit" ? "Mark delivered and add stock" : what,
+    danger: change.kind === "reverse",
+    body: (
+      <div className="space-y-2">
+        <p>
+          {change.kind === "credit"
+            ? `${what} adds these units to stock now (auto-apply on delivery is on):`
+            : `${what} takes back the units its delivery added to stock:`}
+        </p>
+        {change.lines.length === 0 ? (
+          <p className="text-hub-muted">No lines with a quantity.</p>
+        ) : (
+          <ul className="space-y-0.5 font-mono text-[12.5px]">
+            {change.lines.map((l) => (
+              <li key={l.productId}>
+                {change.kind === "credit" ? "+" : "−"}{l.quantity} {codeOf(l.productId)}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-hub-muted">Cancel leaves the shipment and stock as they are.</p>
+      </div>
+    ),
+  });
 
   // Distinct supplier list, derived from existing shipments + SKUs.
   const allSuppliers = Array.from(new Set([
@@ -258,7 +293,7 @@ export function Shipments() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Shipments</h1>
+          <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Shipments</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
             {visibleShipments.length} of {data.shipments.length} shown
             {archivedHiddenCount > 0 ? ` · ${archivedHiddenCount} archived hidden` : ""}.
@@ -451,9 +486,9 @@ export function Shipments() {
             return (
               <div
                 key={col}
-                className="rounded-xl bg-slate-100 dark:bg-slate-900/40 ring-1 ring-slate-200 dark:ring-slate-800 min-h-[200px] flex flex-col"
+                className="flex min-h-[200px] flex-col rounded-hub-card bg-hub-sub ring-1 ring-hub-line"
                 onDragOver={(e) => e.preventDefault()}
-                onDrop={() => {
+                onDrop={async () => {
                   if (!draggingId) return;
                   const ship = data.shipments.find((s) => s.id === draggingId);
                   if (!ship || ship.status === col) return;
@@ -461,10 +496,12 @@ export function Shipments() {
                   if (col === "Delivered" && !ship.actual_arrival_date) {
                     updated.actual_arrival_date = todayIso();
                   }
-                  m.upsertShipment.mutate(updated);
                   setDraggingId(null);
+                  const change = shipmentStatusStockChange(ship, updated, autoApply);
+                  if (change && !(await ask(stockConfirm(change, ship.po_number, change.kind === "credit" ? `Marking ${ship.po_number} Delivered` : `Moving ${ship.po_number} to ${col}`)))) return;
+                  m.upsertShipment.mutate(updated);
                 }}>
-                <div className="px-3 py-2 text-[11px] uppercase tracking-wide text-slate-600 dark:text-slate-400 font-semibold flex items-center justify-between">
+                <div className="flex items-center justify-between px-3 py-2 text-[13px] font-medium text-hub-text">
                   <span>{col}</span>
                   <span className="rounded-full px-1.5 bg-slate-200 dark:bg-slate-800 text-[10px]">
                     {cards.length}
@@ -498,11 +535,17 @@ export function Shipments() {
         shipment={editing}
         onClose={() => { setCreating(false); setEditing(null); }}
         onSave={async (s) => {
+          const prev = editing ? data.shipments.find((x) => x.id === editing.id) ?? editing : null;
+          const change = shipmentStatusStockChange(prev, s, autoApply);
+          if (change && !(await ask(stockConfirm(change, s.po_number, change.kind === "credit" ? `Saving ${s.po_number} as Delivered` : `Saving ${s.po_number} as ${s.status}`)))) return;
           await m.upsertShipment.mutateAsync(s);
           setCreating(false); setEditing(null);
         }}
         onDelete={editing ? async () => {
-          if (!window.confirm(`Delete ${editing.po_number}?`)) return;
+          const change = shipmentDeleteStockChange(editing);
+          if (change) {
+            if (!(await ask({ ...stockConfirm(change, editing.po_number, "Delete and remove stock"), title: `Delete ${editing.po_number}?` }))) return;
+          } else if (!window.confirm(`Delete ${editing.po_number}?`)) return;
           await m.deleteShipment.mutateAsync(editing.id);
           setEditing(null);
         } : undefined}
@@ -527,6 +570,8 @@ export function Shipments() {
         onClose={() => { setOrderBuilderOpen(false); setOrderBuilderShipmentId(null); }}
         editingShipmentId={orderBuilderShipmentId}
       />
+      {/* Last, so it stacks above the shipment form when both are open. */}
+      {confirmDialog}
     </div>
   );
 }
