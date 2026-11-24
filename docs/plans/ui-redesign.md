@@ -70,7 +70,7 @@ Only create helpers below when assigned by their task; their contracts are fixed
 
 Run in the following order; every task depends on all previous gates. Tasks 5–18 use the shared interfaces above. File lists identify allowed implementation surfaces, not permission to rewrite business code in those files. `src/index.css` may receive scoped page styles in each page task; do not scatter global overrides.
 
-### [ ] Task 1: Scoped design tokens and theme helpers
+### [x] Task 1: Scoped design tokens and theme helpers
 
 - Files: modify `tailwind.config.js`, `src/index.css`; create `src/lib/ui/appearance.ts`, `src/lib/ui/__tests__/appearance.test.ts`.
 - [ ] Add prefixed `--hub-*` variables for all applicable `wf.css` light/dark semantic tokens; `.dark` remains the app convention. Extend Tailwind `colors.hub` with `page`, `panel`, `sidebar`, `line`, `text`, `muted`, `faint`, `fill`, `accent`, `accent-text`, status backgrounds/text; add radii/spacing only without replacing existing defaults. Use CSS variables for rgba tokens; choose opaque token utilities where opacity modifiers are unsupported.
@@ -306,3 +306,4 @@ Coder writes here when it hits something the plan did not foresee. Planner/CJ an
 Coder adds one line per completed task with commit, checks and relevant manual evidence; mark staging-only checks pending until run. No implementation task has been completed by writing this plan.
 
 - 2026-11-24 — Planner created spec and plan from approved wireframes, current source and repository guidance. Documentation only; no application tests, staging run, commit, push or deployment performed in this planner task.
+- Task 1 — scoped --hub-* tokens (light/dark, values from wf.css) + Tailwind colors.hub; shell foundations and a scoped neutral bridge (slate/white utilities resolve to tokens only inside .ui-redesign-shell; :where() keeps real dark:/hover: variants winning); appearance.ts + 8 tests. tsc 0; tests 3403 pass, 6 fail = the known Windows CRLF migration-hash tests (baseline before Task 1: same 6); build ok. Station unaffected (no shell yet). Surprise: none.
