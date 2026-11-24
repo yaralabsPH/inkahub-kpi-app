@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { looksLikeScanner, nextTrace, type TypingTrace } from "@/lib/domain/scanTyping";
 import { Layers, LogOut, Menu, Settings as SettingsIcon, Undo2 } from "lucide-react";
 import { detectOrientation, skuTypeBadge } from "@/lib/domain/skuRouting";
 import {
@@ -700,6 +701,32 @@ function LineCard({
 
 function IdleView(props: StationOrderScreenProps) {
   const [value, setValue] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const traceRef = useRef<TypingTrace | null>(null);
+  const submitRef = useRef(props.onManualOrderSubmit);
+  submitRef.current = props.onManualOrderSubmit;
+
+  // Focus the Order number box so a person can type at once. A scan typed
+  // into a focused box is not seen by the page-wide scan listener, so the
+  // box submits by itself when text arrived at scanner speed (a scanner
+  // that sends no Enter still works; a person typing is never auto-sent).
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+  useEffect(() => {
+    if (!value) {
+      traceRef.current = null;
+      return;
+    }
+    if (!looksLikeScanner(traceRef.current)) return;
+    const timer = window.setTimeout(() => {
+      const v = value.trim();
+      if (!v) return;
+      submitRef.current(v);
+      setValue("");
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [value]);
   return (
     <main className="st-layout">
       <aside className="st-sidebar idle" aria-label="Today">
@@ -747,12 +774,17 @@ function IdleView(props: StationOrderScreenProps) {
           <label htmlFor="st-manual-order">No barcode?</label>
           <input
             id="st-manual-order"
+            ref={inputRef}
             type="text"
             inputMode="numeric"
             autoComplete="off"
             placeholder="Order number"
             value={value}
-            onChange={(e) => setValue(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value;
+              traceRef.current = nextTrace(traceRef.current, next.length - value.length, performance.now());
+              setValue(next);
+            }}
           />
           <button type="submit" className="st-btn-primary" disabled={!value.trim()}>Open order</button>
         </form>
