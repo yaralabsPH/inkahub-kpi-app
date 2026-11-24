@@ -197,7 +197,7 @@ Run in the following order; every task depends on all previous gates. Tasks 5–
 - Done when: exact state/validation/action parity, no new route/query/table, notes and failed-form inputs retained, mobile/keyboard usable, G passes.
 - Tests to add: none beyond optional pure confirmation formatting; existing suites and staged replacement-transition parity in Task 19.
 
-### [ ] Task 15: Returns
+### [x] Task 15: Returns
 
 - Files: modify `src/pages/CsReturns.tsx`, `src/index.css`.
 - [ ] Restyle existing board/list, quick arrival, lookup, status/filter/form/refund controls; keep New/Received/RTS/Closed, existing per-line restock flags and save timing. Do not move restock writes into the table or add unsupported source links.
@@ -301,6 +301,16 @@ Coder writes here when it hits something the plan did not foresee. Planner/CJ an
 - **Known copy mismatch, resolved for implementation:** ShoppingList `placeOrders` creates one `Ordered` shipment per line today. Task 9 changes the requested label only, retains Ordered and adds truthful explanation. CJ may choose different copy; a Draft status change is a separate behavior proposal.
 - **Release ownership:** staging preview is a required deliverable of implementation, obtained through CJ's release workflow under AGENTS.md. This two-file planner task does not push/deploy. Missing preview access must be reported explicitly in Task 19.
 
+- **Task 15 stopped on a baseline defect (coder, 2026-11-25): return restocking moves stock the wrong way.**
+  `upsertCsReturn` (both adapters) "restocks" a Received/RTS line with `adjustOnHand(product, +quantity)`, but
+  `adjustOnHand`/`adjust_on_hand` subtract a positive delta; the reversal/delete path passes negatives. So saving a
+  return as Received with Restock ticked currently **removes** that quantity from stock, and undoing it adds it.
+  This is `docs/ARCHITECTURE.md` finding 4, unchanged on live (`79a0031`) and `main`. Live has **0** `cs_returns`
+  rows (read-only check 2026-11-24), so no live stock has been affected yet. Per this plan no restock confirmation was
+  added (it would have had to claim "+N back to stock" while the code subtracts) and no backend fix was made here.
+  **CJ/planner:** decide a separate inventory spec (fix the sign with tests, ledger-checked) and, until then, tell CS
+  not to tick Restock on returns. Returns were restyled only (Task 15 acceptance claim for restock withheld).
+
 ## Implementation log
 
 Coder adds one line per completed task with commit, checks and relevant manual evidence; mark staging-only checks pending until run. No implementation task has been completed by writing this plan.
@@ -320,3 +330,4 @@ Coder adds one line per completed task with commit, checks and relevant manual e
 - Task 12 — Movements: filterProductsForPicker (src/lib/ui/productSearch.ts, 6 tests: blank/trim/case/code/short code/no match/duplicates/no mutation); labelled search narrows the existing native select, the selected SKU always stays listed, nothing auto-selected; 'Log movement' asks first (requested change, explicitly not a guaranteed balance) then runs the unchanged submit once; reversal keeps its existing window.confirm; hub header/loading. Browser (Dexie): 'a2-n' lists A2-Natural/A2-Natural-bulk; Cancel left the ledger at 2 rows; Confirm made exactly 1 row (-3 A2-Natural). tsc 0; tests 3445 + 6 baseline CRLF; build ok.
 - Task 13 — PaperUsage: confirm before the existing save whenever it changes stock, listing the give-back of the prior deduction (stored SKU/rolls) and the fresh whole-roll deduction, computed with the handler's own expressions (data.paperUsage, mapped roll SKUs, ceil(totalMM/ROLL_LENGTH_MM)); the handler body is unchanged and runs once on confirm; a save with no stock effect saves directly as before. Hub header. Browser (Dexie, roll SKUs mapped locally): dialog -1 A0-Black (24"), -2 A0-Natural (42") matches the page's 'Save will deduct'; Cancel 0 writes; Confirm 2 ledger rows; re-save lists the give-back first. tsc 0; tests 3445 + 6 baseline CRLF; build ok.
 - Task 14 — CsCases: the two window.confirms became one confirm that lists both repository steps per line (give back the previously deducted lines, then deduct the current lines) and now also covers the case that was NOT confirmed before: re-saving an already-deducted case with edited lines; delete of a deducted case lists the give-back (plain delete keeps its window.confirm). Same upsertCsCase/deleteCsCase calls once on confirm; statuses/notes/lookup/board unchanged; hub header. Browser (Dexie): new Shipped case with tracking + 2x A0-Black -> dialog '-2 A0-Black'; Cancel: 0 cases, ledger unchanged, form still open; Confirm: 1 case, 1 ledger row. tsc 0; tests 3445 + 6 baseline CRLF; build ok.
+- Task 15 — CsReturns: hub header only; existing delete confirm kept. STOPPED the restock-confirmation part on a baseline defect (Open questions): upsertCsReturn restocks with a positive delta that adjustOnHand subtracts, so 'restock' removes stock (ARCHITECTURE finding 4; live has 0 returns). No misleading confirm added, no backend change. tsc 0; tests 3445 + 6 baseline CRLF; build ok.
