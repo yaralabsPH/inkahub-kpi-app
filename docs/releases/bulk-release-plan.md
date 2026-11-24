@@ -1,10 +1,12 @@
 # Bulk release plan: F1 and F4-F11 (draft for CJ and the planner)
 
-- Status: **DRAFT, not approved.** Written by the coder from the planner's release review
-  ([release-stack-r1.md](../reviews/release-stack-r1.md), verdict "changes required") and the
+- Status: **approved with conditions for a DORMANT release** by the planner in
+  [release-stack-r3.md](../reviews/release-stack-r3.md) (2026-11-25). That review's "CJ's complete release
+  conditions" (1–14) take precedence over any older wording in this file. Written by the coder from rounds 1–3 and the
   per-feature release notes in this folder. Every step marked **CJ** is a human step: agents never
   merge to `main`, deploy to production or apply SQL.
-- Built from branch `feature/staging-fixes` at `206ea68` (PR #22, top of the stack).
+- Built from branch `feature/staging-fixes` (PR #22, top of the stack); reviewed at `5ff0668`, final review
+  committed at `5e831c5`.
 - Goal: put everything built so far on the live app in one planned release, with every risky
   feature **switched off at first** and a short, tested way back.
 
@@ -30,7 +32,7 @@ while merging, so no half-finished combination reaches staff; promote one final 
 | G3 | **Ordered upgrade rehearsal**: apply the exact files below, in order, to a staging copy that has the same schema as live and realistic (sanitised) data volume. Record lock time per file, disk headroom and any failure. Use a bounded lock/statement timeout and stop on the first error. Then smoke-test the OLD app against the new schema | CJ and coder | **done 2026-11-24** ([evidence](release-rehearsal-2026-11-24.md) §1): fingerprint-identical copy of live, live-sized data, all 25 files passed, longest write block 123 ms, old app 9/9 |
 | G4 | Reporting proof at real size: one full first publication and one incremental refresh on representative data, with measured disk and time. Never repeat "raise the timeout and hope" | CJ and coder | **not passed** ([evidence](release-rehearsal-2026-11-24.md) §2): AU first publication at live size is far too slow and grows storage ~4×; ship reporting dormant, do not enable capture on live until the planner resolves it |
 | G5 | Rollback drill on staging: write with the new app, switch back to the previous build, run the smoke test, check stock and queues | CJ | **done 2026-11-24** ([evidence](release-rehearsal-2026-11-24.md) §3): only the documented second-box edge, visible in the ledger |
-| G6 | Planner re-review (round 2) says "approved" | planner | **open** |
+| G6 | Planner re-review says "approved" | planner | **approved with conditions** in round 3 (dormant release only) |
 | G7 | Staging smoke test as owner, manager, staff, kiosk and CS (docs/RELEASING.md section 2) on the final build | CJ | **open** |
 
 ## Production settings to check in Vercel (CJ)
@@ -54,7 +56,8 @@ Preview keeps pointing at staging with its own throwaway secrets.
 
 1. Write down the **current production deployment**. As of 2026-11-24 it is
    `dpl_4r1s2fBXEdhNdUzooNN4BNHaWyZf` (`inka-arthouse-pkdt9gaoa-…`), whose code equals git `79a0031`
-   (checked file by file). That is the rollback target. The Vercel project has **no Git connection**:
+   (checked file by file). It is **not automatically a safe rollback target**: see step 0 of the way back and
+   review r3 condition 4 (pre-digest-auth exposure). The Vercel project has **no Git connection**:
    merging does not deploy, so nothing reaches staff until step 6.
 2. Take a Supabase backup and note the recovery point. Check free disk space.
 3. Check the Production settings table above.
