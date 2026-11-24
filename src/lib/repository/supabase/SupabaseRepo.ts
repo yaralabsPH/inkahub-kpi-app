@@ -30,6 +30,7 @@ import {
   type CsReturnLine,
   type CsReturnWithLines,
 } from "@/lib/domain";
+import { planCsReturnStock, csReturnDeleteMoves } from "@/lib/domain/csReturnStock";
 
 /**
  * Client-side adapter implementing the same `Repository` interface as
@@ -1181,8 +1182,9 @@ export class SupabaseRepo implements Repository {
    * Upsert a return + its lines. Mirrors DexieRepo:
    *   - status='received' first time → set received_at
    *   - status='closed' first time → set closed_at
-   *   - Per-line restock credit/reverse: lines with restock=true are
-   *     credited to inventory when parent is 'received'; reversed otherwise.
+   *   - Per-line restock credit/reverse (planCsReturnStock): lines with
+   *     restock=true ADD stock when parent is 'received' or 'rts'; 'closed'
+   *     keeps credits already applied; otherwise earlier credits are reversed.
    *     `reverse-all-then-reapply` pattern for bulletproof correctness.
    */
   async upsertCsReturn(r: CsReturn, lines: CsReturnLine[]): Promise<void> {
@@ -1206,39 +1208,35 @@ export class SupabaseRepo implements Repository {
       prevLines = (prevLinesRaw ?? []).map((row) => stripLocation(row) as CsReturnLine);
     }
 
-    // 1) Reverse all previously-credited lines.
-    for (const l of prevLines) {
-      if (l.inventory_credited) {
-        // eslint-disable-next-line no-await-in-loop
-        await this.adjustOnHand(l.product_id, -l.quantity, {
-          reason: "return",
-          source_id: `cs-return:${r.id}:line:${l.id}:reverse`,
-          parent_event_id: `cs-return:${r.id}`,
-          note: `Return ${r.id} previous restock reversed`,
-        });
-      }
-    }
+    // Signs and rules live in planCsReturnStock (shared with DexieRepo).
+    const plan = planCsReturnStock(prevLines, r.status, lines);
 
-    // 2) Apply credit for every line that should be credited now.
-    const shouldCredit = r.status === "received" || r.status === "rts";
-    const linesWithFlag: CsReturnLine[] = [];
-    for (const l of lines) {
-      const willCredit = shouldCredit && l.restock;
-      if (willCredit) {
-        // eslint-disable-next-line no-await-in-loop
-        await this.adjustOnHand(l.product_id, l.quantity, {
-          reason: "return",
-          source_id: `cs-return:${r.id}:line:${l.id}`,
-          parent_event_id: `cs-return:${r.id}`,
-          note: `Return ${r.id} restocked to inventory`,
-        });
-      }
-      linesWithFlag.push({
-        ...l,
-        return_id: r.id,
-        inventory_credited: willCredit,
+    // 1) Reverse all previously-credited lines (removes stock).
+    for (const mv of plan.reversals) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.adjustOnHand(mv.productId, mv.delta, {
+        reason: "return",
+        source_id: `cs-return:${r.id}:line:${mv.lineId}:reverse`,
+        parent_event_id: `cs-return:${r.id}`,
+        note: `Return ${r.id} previous restock reversed`,
       });
     }
+
+    // 2) Apply credit for every line that should be credited now (adds stock).
+    for (const mv of plan.credits) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.adjustOnHand(mv.productId, mv.delta, {
+        reason: "return",
+        source_id: `cs-return:${r.id}:line:${mv.lineId}`,
+        parent_event_id: `cs-return:${r.id}`,
+        note: `Return ${r.id} restocked to inventory`,
+      });
+    }
+    const linesWithFlag: CsReturnLine[] = lines.map((l) => ({
+      ...l,
+      return_id: r.id,
+      inventory_credited: plan.credited.get(l.id) ?? false,
+    }));
 
     // 3) Persist parent.
     const now = new Date().toISOString();
@@ -1280,16 +1278,14 @@ export class SupabaseRepo implements Repository {
       .eq("location", loc)
       .eq("return_id", id);
     const prevLines = (prevLinesRaw ?? []).map((r) => stripLocation(r) as CsReturnLine);
-    for (const l of prevLines) {
-      if (l.inventory_credited) {
-        // eslint-disable-next-line no-await-in-loop
-        await this.adjustOnHand(l.product_id, -l.quantity, {
-          reason: "return",
-          source_id: `cs-return:${id}:line:${l.id}:delete`,
-          parent_event_id: `cs-return:${id}`,
-          note: `Return ${id} deleted — restock credit reversed`,
-        });
-      }
+    for (const mv of csReturnDeleteMoves(prevLines)) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.adjustOnHand(mv.productId, mv.delta, {
+        reason: "return",
+        source_id: `cs-return:${id}:line:${mv.lineId}:delete`,
+        parent_event_id: `cs-return:${id}`,
+        note: `Return ${id} deleted — restock credit reversed`,
+      });
     }
 
     // Lines cascade-delete via Postgres FK ON DELETE CASCADE.
