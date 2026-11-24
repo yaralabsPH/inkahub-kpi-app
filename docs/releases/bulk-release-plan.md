@@ -115,6 +115,14 @@ Known lock risks to measure in G3: 0054 (adds eleven nullable columns and builds
 live events table in one transaction), 0047 (unique index on the ledger), 0055 (index on the ledger).
 Ordinary index builds block writes while they run.
 
+**Size of the live database (read-only check, 2026-11-24, by the coder through the Supabase connector).**
+PostgreSQL 17.6 (the "16 or newer" prerequisite is met). Whole database 78 MB.
+`production_events` about 112,500 rows (49 MB), `ledger` about 34,000 rows (13 MB), `products` 209, `profiles` 46.
+At this size each index build should take about a second or less, so the write block in 0047, 0054 and 0055
+should be brief. That is an estimate, not a measurement: G3 still has to record the real time per file on a copy
+of this size. The old disk-full incident happened on a tiny free staging project, not on live; the live disk
+allowance and the growth of the new reporting tables are still to be checked in G4.
+
 ## If it goes wrong: the way back (CJ)
 
 1. **Switches first.** Packaging back to "Scan the box", F5 tracking off, shared scanners back to classic,
