@@ -1,3 +1,4 @@
+import { shouldDropRepeatScan } from "@/lib/domain/scanDedupe";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Settings as SettingsIcon, LogOut, ScanLine,
@@ -338,6 +339,9 @@ function ProductionStation({
   );
   const [scanBuffer, setScanBuffer] = useState("");
   const [busy, setBusy] = useState(false);
+  // Synchronous guards for processScan (see the comment there).
+  const scanInFlightRef = useRef(false);
+  const lastScanRef = useRef<{ value: string; at: number } | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   // In-flight guard against duplicate line_verified writes. Records line
   // keys whose insertEvent is currently awaiting. Synchronous check at
@@ -1280,12 +1284,25 @@ function ProductionStation({
    * vanishingly small).
    */
   const processScan = useCallback(async (raw: string) => {
-    if (busy) return;
+    // `busy` is React state, so two calls in the same tick both see false.
+    // A lanyard is submitted at its 8th character AND again by the scanner's
+    // Enter key before the buffer is cleared; that wrote two clock_in rows.
+    // The ref lock and the repeat check below are synchronous.
+    const scanValue = raw.trim();
+    if (!scanValue) return;
+    if (scanInFlightRef.current) return;
+    if (shouldDropRepeatScan(lastScanRef.current, scanValue, Date.now())) return;
+    lastScanRef.current = { value: scanValue, at: Date.now() };
+    scanInFlightRef.current = true;
+    if (busy) {
+      scanInFlightRef.current = false;
+      return;
+    }
     setBusy(true);
     onScanError(null);
     setDispatchFlash(null);
     try {
-      const value = raw.trim();
+      const value = scanValue;
       if (!value) return;
       lastActivityRef.current = Date.now();
       // eslint-disable-next-line no-console
@@ -1332,7 +1349,26 @@ function ProductionStation({
               // eslint-disable-next-line no-console
               console.log("[clock-in] confirmed?", ok);
               if (!ok) return;
-              const clockInId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+              // The confirm box blocks the page. Look again right before
+              // writing, in case a clock-in landed meanwhile.
+              const recheck = await supabase
+                .from("production_events")
+                .select("event_type")
+                .eq("location", location)
+                .eq("staff_id", staff.user_id)
+                .in("event_type", ["clock_in", "clock_out"])
+                .gte("created_at", dayStart.toISOString())
+                .order("created_at", { ascending: false })
+                .limit(1);
+              if (recheck.error) {
+                onScanError(`Clock-state check failed: ${recheck.error.message}. Not signing in.`);
+                return;
+              }
+              if (recheck.data?.[0]?.event_type === "clock_in") {
+                onSetActiveStaff(staff);
+                return;
+              }
+              const clockInId =`evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
               const payload = {
                 location,
                 id: clockInId,
@@ -1507,6 +1543,7 @@ function ProductionStation({
 
 
     } finally {
+      scanInFlightRef.current = false;
       setBusy(false);
     }
   }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location, packagingMode, scanLegacyBarcode]);
