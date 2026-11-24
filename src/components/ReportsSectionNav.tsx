@@ -36,7 +36,7 @@ function collect(root: HTMLElement): Item[] {
  * role/feature gate decides what appears. Anchors only: no routes, no state,
  * nothing is remounted or refetched.
  */
-export function ReportsSectionNav({ containerId }: { containerId: string }) {
+export function ReportsSectionNav({ containerId, label = "Report sections" }: { containerId: string; label?: string }) {
   const [items, setItems] = useState<Item[]>([]);
 
   useEffect(() => {
@@ -64,7 +64,7 @@ export function ReportsSectionNav({ containerId }: { containerId: string }) {
   if (items.length < 2) return null;
   return (
     <nav
-      aria-label="Report sections"
+      aria-label={label}
       className="sticky top-0 z-[5] -mx-1 mb-3 flex gap-1 overflow-x-auto border-b border-hub-line bg-hub-page/95 px-1 py-1.5 backdrop-blur"
     >
       {items.map((it) => (

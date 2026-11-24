@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { DataState } from "@/components/ui/DataState";
+import { ReportsSectionNav } from "@/components/ReportsSectionNav";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useMutations } from "@/lib/hooks/useMutations";
@@ -44,17 +46,18 @@ export function Settings() {
   const [cleanupMsg, setCleanupMsg] = useState<string | null>(null);
   const [copyMsg, setCopyMsg] = useState<string | null>(null);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DataState kind="loading" title="Loading settings…" />;
   const s = data.settings;
 
   return (
-    <div className="space-y-5 max-w-3xl">
-      <div className="flex items-end justify-between">
-        <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
-        <span className="text-xs text-slate-500 dark:text-slate-400">
+    <div id="settings-root" className="mx-auto max-w-[860px] space-y-5">
+      <div className="flex flex-wrap items-end justify-between gap-2">
+        <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Settings</h1>
+        <span className="text-xs text-hub-muted">
           Editing <strong>{LOCATION_LABELS[location]}</strong> · each location has its own settings.
         </span>
       </div>
+      <ReportsSectionNav containerId="settings-root" label="Settings sections" />
 
       <Card>
         <CardHeader>
