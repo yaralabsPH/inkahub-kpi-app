@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
-  Plus, Upload, Trash2, Pencil, GitCompare, GripVertical, Search, X,
+  Plus, Upload, Trash2, Pencil, GitCompare, GripVertical, Search, X, PanelRightOpen,
   CheckSquare, Square, Wand2,
 } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
@@ -22,6 +22,9 @@ import { fmtFloat, fmtNum } from "@/lib/utils/format";
 import { detectCsvDelimiter, parseCsv } from "@/lib/csv/csv";
 import { CompareModal } from "@/components/CompareModal";
 import { cn } from "@/lib/utils/cn";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { DataState } from "@/components/ui/DataState";
+import { SkuPeek } from "@/components/SkuPeek";
 import { useAppStore } from "@/lib/state/appStore";
 import { DexieRepo } from "@/lib/repository/dexie/DexieRepo";
 import { getDb } from "@/lib/repository/dexie/db";
@@ -76,6 +79,8 @@ export function Skus() {
   const currentLocation = useAppStore((s) => s.location);
   const [filter, setFilter] = useState<FilterState>({ size: "", colour: "", supplier: "", q: "" });
   const [editing, setEditing] = useState<Product | null>(null);
+  // Read-only side peek (presentation only; never saves).
+  const [peekId, setPeekId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [comparing, setComparing] = useState<{ a: string; b: string } | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
@@ -112,7 +117,7 @@ export function Skus() {
     }
   };
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DataState kind="loading" title="Loading SKUs…" />;
 
   const sizes = uniq(data.products.map((p) => p.size));
   const colours = uniq(data.products.map((p) => p.colour));
@@ -370,13 +375,11 @@ export function Skus() {
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight">SKUs</h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
-            {data.products.length} total · {filtered.length} shown · drag the handle to reorder · tick rows to bulk-edit · double-click any number to edit it.
-          </p>
-        </div>
-        <div className="flex gap-2">
+        <PageHeader
+          title="SKUs"
+          description={<>{data.products.length} total · {filtered.length} shown · drag the handle to reorder · tick rows to bulk-edit · double-click any number to edit it.</>}
+        />
+        <div className="mb-5 flex gap-2">
           <Button variant="secondary" size="sm" onClick={() => fileRef.current?.click()}>
             <Upload size={14} /> Import CSV
           </Button>
@@ -498,7 +501,7 @@ export function Skus() {
         <CardBody className="p-0">
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead className="bg-slate-50 dark:bg-slate-900/60 text-slate-600 dark:text-slate-400 text-xs uppercase tracking-wide">
+              <thead className="sticky top-0 z-[1] border-b border-hub-line bg-hub-sub text-[12.5px] text-hub-muted">
                 <tr>
                   <th className="w-8 text-center">
                     <button
@@ -623,6 +626,13 @@ export function Skus() {
                       })()}
                       <td className="px-4 py-2 whitespace-nowrap text-right">
                         <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center rounded text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                          onClick={() => setPeekId(p.id)}
+                          aria-label={`Preview ${p.code}`} title="Preview">
+                          <PanelRightOpen size={14} />
+                        </button>
+                        <button
                           className="inline-flex h-7 w-7 items-center justify-center rounded text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
                           onClick={() => setEditing(p)}
                           aria-label={`Edit ${p.code}`} title="Edit">
@@ -697,6 +707,7 @@ export function Skus() {
       {comparing ? (
         <CompareModal a={comparing.a} b={comparing.b} onClose={() => setComparing(null)} />
       ) : null}
+      <SkuPeek product={peekId ? data.products.find((x) => x.id === peekId) ?? null : null} onClose={() => setPeekId(null)} />
     </div>
   );
 }
