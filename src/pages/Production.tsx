@@ -1,4 +1,5 @@
 import { shouldDropRepeatScan } from "@/lib/domain/scanDedupe";
+import { missingStockMessage } from "@/lib/domain/deductResult";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Settings as SettingsIcon, LogOut, ScanLine,
@@ -1165,6 +1166,9 @@ function ProductionStation({
           console.error("[auto-deduct] RPC error:", deductErr);
         } else {
           console.log("[auto-deduct] result:", deductResult);
+          // A missing stock item used to skip silently. Say so on the screen.
+          const missingMsg = missingStockMessage(deductResult);
+          if (missingMsg) onScanError(missingMsg);
         }
       } else {
         console.log("[auto-deduct] no components to deduct for this event");
@@ -1183,7 +1187,7 @@ function ProductionStation({
       setCurrentOrder((now) => (now === completedOrder ? null : now));
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent, refreshCounter]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent, refreshCounter, onScanError]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
