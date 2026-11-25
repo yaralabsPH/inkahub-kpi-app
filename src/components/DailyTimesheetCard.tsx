@@ -1,8 +1,10 @@
 import { useState } from "react";
-import { CalendarDays, Download, FileSpreadsheet } from "lucide-react";
-import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
+import { ArrowRight, Download, FileSpreadsheet } from "lucide-react";
+import { Section } from "@/components/ui/Section";
+import { Callout } from "@/components/ui/Callout";
+import { nField } from "@/components/ui/nStyles";
+import { cn } from "@/lib/utils/cn";
 import { Button } from "@/components/ui/Button";
-import { Input } from "@/components/ui/Input";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
@@ -285,53 +287,44 @@ function DailyTimesheetCardInner() {
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="inline-flex items-center gap-2">
-          <CalendarDays size={16} /> Timesheet export
-        </CardTitle>
-        <span className="text-xs text-slate-500">
-          Per-shift breakdown for the selected date range: clock-in/out, breaks deducted, billable hours, cost at each staff member's hourly rate.
-        </span>
-      </CardHeader>
-      <CardBody className="space-y-3">
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="space-y-1">
-            <label className="text-[10px] uppercase tracking-wide text-slate-500 dark:text-slate-400 font-semibold">
-              From
-            </label>
-            <Input
-              type="date"
-              value={fromDate}
-              onChange={(e) => setFromDate(e.target.value)}
-              className="h-9 w-44 text-sm"
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="text-[10px] uppercase tracking-wide text-slate-500 dark:text-slate-400 font-semibold">
-              To
-            </label>
-            <Input
-              type="date"
-              value={toDate}
-              onChange={(e) => setToDate(e.target.value)}
-              className="h-9 w-44 text-sm"
-            />
-          </div>
-          <Button onClick={onDownloadCsv} disabled={busy !== null} className="inline-flex items-center gap-2">
-            <Download size={14} /> {busy === "csv" ? "Generating..." : "Download CSV"}
-          </Button>
-          <Button onClick={onDownloadXlsx} disabled={busy !== null} className="inline-flex items-center gap-2">
-            <FileSpreadsheet size={14} /> {busy === "xlsx" ? "Generating..." : "Download Excel"}
-          </Button>
-        </div>
-        {msg ? (
-          <div className="text-xs text-slate-600 dark:text-slate-300">{msg}</div>
-        ) : null}
-        <div className="text-[11px] text-slate-500">
-          Break rule: any gap of 30+ minutes between orders is deducted. Time within an order (between started and completed) is always paid. Forgotten clock-outs: shift ends at the last meaningful event if silent for 2+ hours. Single-day exports use the file name <code>timesheet_2026-06-09</code>; ranges use <code>timesheet_2026-06-01_to_2026-06-07</code>.
-        </div>
-      </CardBody>
-    </Card>
+    <Section
+      title="Timesheet export"
+      subtitle="Per-shift breakdown for the selected date range: clock-in/out, breaks deducted, billable hours and cost at each person’s hourly rate."
+      storageKey="inka-reports-collapse:timesheet-export"
+    >
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="flex flex-col gap-[5px]">
+          <span className="text-[12.5px] text-hub-muted">From</span>
+          <input
+            type="date"
+            value={fromDate}
+            onChange={(e) => setFromDate(e.target.value)}
+            className={cn(nField, "w-44")}
+          />
+        </label>
+        <ArrowRight size={16} strokeWidth={1.6} className="mb-2 text-hub-faint" aria-hidden />
+        <label className="flex flex-col gap-[5px]">
+          <span className="text-[12.5px] text-hub-muted">To</span>
+          <input
+            type="date"
+            value={toDate}
+            onChange={(e) => setToDate(e.target.value)}
+            className={cn(nField, "w-44")}
+          />
+        </label>
+        <Button variant="secondary" onClick={onDownloadCsv} disabled={busy !== null}>
+          <Download size={15} strokeWidth={1.6} aria-hidden /> {busy === "csv" ? "Generating…" : "Download CSV"}
+        </Button>
+        <Button variant="primary" onClick={onDownloadXlsx} disabled={busy !== null}>
+          <FileSpreadsheet size={15} strokeWidth={1.6} aria-hidden /> {busy === "xlsx" ? "Generating…" : "Download Excel"}
+        </Button>
+      </div>
+      {msg ? (
+        <div className="mt-2.5 text-[13px] text-hub-muted">{msg}</div>
+      ) : null}
+      <Callout className="mt-3.5">
+        <b>Break rule.</b> Any gap of 30+ minutes between orders is deducted. Time within an order (started → completed) is always paid. Forgotten clock-outs end the shift at the last meaningful event after 2+ hours of silence. Files are named <code>timesheet_2026-06-09</code> for single days and <code>timesheet_2026-06-01_to_2026-06-07</code> for ranges.
+      </Callout>
+    </Section>
   );
 }

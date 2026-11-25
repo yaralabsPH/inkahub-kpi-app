@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { ClipboardList, RefreshCw } from "lucide-react";
-import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
+import { Inbox, RefreshCw } from "lucide-react";
+import { Section } from "@/components/ui/Section";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Tag } from "@/components/ui/Tag";
 import { Button } from "@/components/ui/Button";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
@@ -173,82 +175,62 @@ function LiveOrderCompletionsCardInner() {
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between gap-2">
-          <CardTitle className="inline-flex items-center gap-2">
-            <ClipboardList size={16} /> Live order completions
-          </CardTitle>
-          <Button
-            onClick={() => { void fetchOnce(); }}
-            disabled={loading}
-            className="inline-flex items-center gap-1 text-xs h-7"
-          >
-            <RefreshCw size={12} className={loading ? "animate-spin" : ""} /> Refresh
+    <Section
+      title="Live order completions"
+      subtitle="Last 7 days. Snapshot: data is frozen until you hit Refresh."
+      storageKey="inka-reports-collapse:live-completions"
+      actions={
+        <>
+          {fetchedAt ? (
+            <span className="flex items-center gap-1.5 text-xs text-hub-faint">
+              <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-hub-faint" />
+              Snapshot · fetched {fmtFetchedAt(fetchedAt)}
+            </span>
+          ) : null}
+          <Button variant="ghost" size="sm" onClick={() => { void fetchOnce(); }} disabled={loading}>
+            <RefreshCw size={14} strokeWidth={1.6} className={loading ? "animate-spin" : ""} aria-hidden /> Refresh
           </Button>
-        </div>
-        <span className="text-xs text-slate-500">
-          Last 7 days. Snapshot - data is frozen until you hit Refresh.
-          {fetchedAt ? ` Fetched at ${fmtFetchedAt(fetchedAt)}.` : ""}
-        </span>
-      </CardHeader>
-      <CardBody className="p-0">
-        {err && rows.length === 0 ? (
-          <div className="px-4 py-3 text-xs text-red-600 dark:text-red-400">Couldnt load: {err}</div>
-        ) : loading && rows.length === 0 ? (
-          <div className="px-4 py-3 text-sm text-slate-500">Loading...</div>
-        ) : rows.length === 0 ? (
-          <div className="px-4 py-3 text-sm text-slate-500">No completions in the last 7 days.</div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="bg-slate-50 dark:bg-slate-900/60 text-slate-600 dark:text-slate-400 text-xs uppercase tracking-wide">
-                <tr>
-                  <th className="text-left font-medium px-4 py-2 w-px">Time</th>
-                  <th className="text-left font-medium px-3 py-2">Worker</th>
-                  <th className="text-left font-medium px-3 py-2">Order #</th>
-                  <th className="text-left font-medium px-3 py-2">Dept</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {rows.map((r) => (
-                  <tr key={r.id}>
-                    <td className="px-4 py-1.5 tabular-nums text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                      {fmtTime(r.created_at)}
-                    </td>
-                    <td className="px-3 py-1.5 font-medium text-slate-900 dark:text-slate-100">
-                      {r.display_name}
-                    </td>
-                    <td className="px-3 py-1.5 font-mono text-slate-700 dark:text-slate-300">
-                      #{r.order_number}
-                    </td>
-                    <td className="px-3 py-1.5">
-                      <span className={
-                        r.event_type === "dispatched"
-                          ? "text-[11px] uppercase tracking-wide px-2 py-0.5 rounded ring-1 ring-blue-300 bg-blue-50 text-blue-800 dark:bg-blue-900/30 dark:text-blue-200"
-                          : "text-[11px] uppercase tracking-wide px-2 py-0.5 rounded ring-1 ring-slate-300 text-slate-600 dark:text-slate-300"
-                      }>
-                        {PRODUCTION_DEPARTMENT_LABELS[r.department] ?? r.department}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <div className="px-4 py-2 text-xs text-slate-500 flex items-center gap-2" role="status">
-              {hasMore
-                ? `Showing the newest ${rows.length.toLocaleString()} completions; older ones in the last 7 days are not loaded yet.`
-                : `All ${rows.length.toLocaleString()} completions in the last 7 days (to the snapshot time).`}
-              {hasMore ? (
-                <Button onClick={() => { void loadOlder(); }} disabled={loading} className="text-xs h-7">
-                  Load older
-                </Button>
-              ) : null}
-              {err ? <span className="text-red-600 dark:text-red-400">Couldnt load older rows: {err}</span> : null}
-            </div>
+        </>
+      }
+    >
+      {err && rows.length === 0 ? (
+        <div className="text-[13px] text-hub-bad">Couldn't load: {err}</div>
+      ) : loading && rows.length === 0 ? (
+        <div className="text-[13px] text-hub-faint">Loading…</div>
+      ) : rows.length === 0 ? (
+        <EmptyState icon={Inbox} title="No completions in the last 7 days" hint="Hit Refresh to pull the latest." />
+      ) : (
+        <>
+          <div className="max-h-[420px] overflow-y-auto">
+            {rows.map((r) => (
+              <div
+                key={r.id}
+                className="grid grid-cols-[minmax(64px,auto)_minmax(90px,auto)_1fr_auto] items-center gap-3 border-b border-hub-line px-1.5 py-2 text-[13.5px]"
+              >
+                <span className="whitespace-nowrap text-[12.5px] tabular-nums text-hub-faint">{fmtTime(r.created_at)}</span>
+                <code className="whitespace-nowrap font-mono text-[12.5px] text-hub-muted">#{r.order_number}</code>
+                <span>
+                  <Tag color={r.event_type === "dispatched" ? "blue" : "gray"}>
+                    {PRODUCTION_DEPARTMENT_LABELS[r.department] ?? r.department}
+                  </Tag>
+                </span>
+                <span className="text-[13px] text-hub-muted">{r.display_name}</span>
+              </div>
+            ))}
           </div>
-        )}
-      </CardBody>
-    </Card>
+          <div className="flex flex-wrap items-center gap-2 pt-2.5 text-xs text-hub-faint" role="status">
+            {hasMore
+              ? `Showing the newest ${rows.length.toLocaleString()} completions; older ones in the last 7 days are not loaded yet.`
+              : `All ${rows.length.toLocaleString()} completions in the last 7 days (to the snapshot time).`}
+            {hasMore ? (
+              <Button variant="secondary" size="sm" onClick={() => { void loadOlder(); }} disabled={loading}>
+                Load older
+              </Button>
+            ) : null}
+            {err ? <span className="text-hub-bad">Couldn't load older rows: {err}</span> : null}
+          </div>
+        </>
+      )}
+    </Section>
   );
 }
