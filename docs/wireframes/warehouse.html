@@ -1,0 +1,46 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Warehouse — wireframe</title><link rel="stylesheet" href="wf.css">
+<style>
+.bays{display:grid;grid-template-columns:repeat(10,1fr);gap:6px}
+.bay{border:1px solid var(--line-2);border-radius:5px;height:64px;padding:4px;font-size:10.5px;color:var(--muted);display:flex;flex-direction:column;justify-content:space-between;background:var(--panel)}
+.bay i{display:block;height:6px;border-radius:2px;background:var(--fill-2)}
+.bay.f1 i{background:var(--accent)}.bay.f2 i{background:#e0b100}.bay.f3 i{background:var(--bad)}
+.bay.on{outline:2px solid var(--txt)}
+</style></head><body>
+<div id="content"><div class="page">
+  <h1 class="t">Warehouse</h1><p class="sub">Pallet space now and over the coming weeks</p>
+  <div class="cards c4">
+    <div class="card"><div class="lbl">Capacity</div><div class="val">240</div><div class="dl">pallet slots · 24 bays</div></div>
+    <div class="card"><div class="lbl">In use</div><div class="val">176</div><div class="bar y" style="margin-top:8px"><i style="width:73%"></i></div></div>
+    <div class="card"><div class="lbl">Free now</div><div class="val">64</div><div class="dl">27%</div></div>
+    <div class="card"><div class="lbl">Headroom at week peak</div><div class="val down">−12</div><div class="dl">W50, when PO-2234 lands</div></div>
+  </div>
+
+  <h2 class="h">Week to inspect <span class="pin">1</span></h2>
+  <div class="row" style="margin-bottom:12px"><span class="small muted">W48</span><div style="flex:1;position:relative;height:28px"><div class="bar" style="height:4px;margin-top:12px"><i style="width:30%"></i></div><span style="position:absolute;left:30%;top:4px;width:18px;height:18px;border-radius:50%;background:var(--panel);border:2px solid var(--txt)"></span></div><span class="small muted">W60</span><span class="btn sm">W50 · 18 Dec</span></div>
+
+  <div class="split" data-st>
+    <div class="card"><div class="card-h">Bay map · W50 <span class="pin">2</span><span class="row small muted" style="margin-left:auto;gap:8px"><span><span class="dot g"></span>&lt;70%</span><span><span class="dot y"></span>70–95%</span><span><span class="dot r"></span>full</span><span>· F floor · R rack · C cold</span></span></div>
+      <div class="bays">
+        <div class="bay f3 " role="button" tabindex="0" aria-label="Bay B1"><b>B1</b><span>R</span><i></i></div><div class="bay f3 " role="button" tabindex="0" aria-label="Bay B2"><b>B2</b><span>F</span><i></i></div><div class="bay f2 " role="button" tabindex="0" aria-label="Bay B3"><b>B3</b><span>C</span><i></i></div><div class="bay f2 on" role="button" tabindex="0" aria-label="Bay B4"><b>B4</b><span>R</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B5"><b>B5</b><span>R</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B6"><b>B6</b><span>F</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B7"><b>B7</b><span>C</span><i></i></div><div class="bay" role="button" tabindex="0"><b>B8</b><i></i></div><div class="bay" role="button" tabindex="0"><b>B9</b><i></i></div><div class="bay" role="button" tabindex="0"><b>B10</b><i></i></div>
+        <div class="bay f3 " role="button" tabindex="0" aria-label="Bay B11"><b>B11</b><span>C</span><i></i></div><div class="bay f2 " role="button" tabindex="0" aria-label="Bay B12"><b>B12</b><span>R</span><i></i></div><div class="bay f2 " role="button" tabindex="0" aria-label="Bay B13"><b>B13</b><span>R</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B14"><b>B14</b><span>F</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B15"><b>B15</b><span>C</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B16"><b>B16</b><span>R</span><i></i></div><div class="bay" role="button" tabindex="0"><b>B17</b><i></i></div><div class="bay" role="button" tabindex="0"><b>B18</b><i></i></div><div class="bay" role="button" tabindex="0"><b>B19</b><i></i></div><div class="bay" role="button" tabindex="0"><b>B20</b><i></i></div>
+        <div class="bay f1 " role="button" tabindex="0" aria-label="Bay B21"><b>B21</b><span>R</span><i></i></div><div class="bay f1 " role="button" tabindex="0" aria-label="Bay B22"><b>B22</b><span>F</span><i></i></div><div class="bay" role="button" tabindex="0"><b>B23</b><i></i></div><div class="bay" role="button" tabindex="0"><b>B24</b><i></i></div>
+      </div></div>
+    <div class="card"><div class="card-h">Bay B4 <span class="tag">Rack</span></div>
+      <div class="props" style="grid-template-columns:110px 1fr"><div class="k">Pallets</div><div class="v">8 / 10</div><div class="k">Position</div><div class="v">Row 1 · Col 4</div><div class="k">SKUs</div><div class="v"><span class="tag">A3-WHT</span> <span class="tag">A3-BLK</span></div><div class="k">Frees up</div><div class="v">~W52</div></div></div>
+  </div>
+
+  <h2 class="h">Stockout schedule <span class="pin">3</span></h2>
+  <div class="tools"><span class="chip filter">Supplier: All ▾</span><span class="chip">Sort: Stockout date ↑</span></div>
+  <div class="grid"><table class="tb">
+    <tr><th>SKU</th><th class="num">On hand</th><th class="num">Units / pallet</th><th class="num">Pallets</th><th>% of cap</th><th>Runs out</th></tr>
+    <tr><td class="mono">A2-WHT</td><td class="num">120</td><td class="num">1,200</td><td class="num">0.1</td><td><div class="bar"><i style="width:2%"></i></div></td><td><span class="tag r">W49</span></td></tr>
+    <tr><td class="mono">A3-BLK</td><td class="num">210</td><td class="num">1,000</td><td class="num">0.2</td><td><div class="bar"><i style="width:4%"></i></div></td><td><span class="tag r">W50</span></td></tr>
+    <tr><td class="mono">A4-WHT</td><td class="num">1,240</td><td class="num">1,500</td><td class="num">0.8</td><td><div class="bar"><i style="width:12%"></i></div></td><td><span class="tag g">W57</span></td></tr>
+  </table></div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"warehouse",title:"Warehouse",empty:{title:"No bays defined yet",body:"Set bay count and pallets per bay in Settings → Warehouse to start tracking fullness.",cta:"Open Settings"},crumb:["Inventory","Warehouse"],notes:[
+ "One week scrubber drives the whole page. Pick a future week and the KPIs, bay map and schedule all show that week.",
+ "Bay map is drawn from each bay's row and column, with type (floor, rack, cold) and its own max pallets. Click a bay to see what is in it. With no bays defined, the existing empty state points to Settings → Warehouse (try State: Empty).",
+ "Stockout schedule stays a sortable grid, with the run-out week as a coloured tag."]});</script>
+</body></html>

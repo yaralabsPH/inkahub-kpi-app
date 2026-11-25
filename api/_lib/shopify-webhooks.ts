@@ -1,0 +1,439 @@
+/**
+ * F10 Shopify adapter (server only, read-only towards Shopify).
+ *
+ * - verifyShopifyHmac: base64 HMAC-SHA256 of the RAW body with the webhook
+ *   secret, constant-time compared. Runs before any JSON parsing.
+ * - Routing contract (ORDER_TIMELINE_ROUTING): one shared store routes each
+ *   order to a site by an explicitly configured, verified predicate. The shop
+ *   itself never implies a site. Unknown, unmapped or ambiguous => unrouted
+ *   with a reason (fail closed). The predicate's facts (country/tags/
+ *   attributes) are used transiently and never stored or returned.
+ * - Order facts from a REST webhook payload or a GraphQL node become source
+ *   occurrences with deterministic keys (the same fact from a webhook replay or
+ *   a reconciliation is a duplicate, never a second record). No customer data
+ *   is carried into evidence.
+ */
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { normalizeShop, ORDER_SITES, strictIso, type EvidenceKind, type OrderSite, type OrderStage } from "../../src/lib/domain/orderTimeline.js";
+
+/** Verified against https://shopify.dev/changelog/release-notes/2026-10 (latest stable on 2026-11-23). */
+export const SHOPIFY_ADMIN_API_VERSION = "2026-10";
+export const WEBHOOK_MAX_BYTES = 1024 * 1024;
+export const ORDER_TOPICS = ["orders/create", "orders/updated", "orders/cancelled", "orders/fulfilled", "orders/partially_fulfilled"] as const;
+
+export function verifyShopifyHmac(raw: Buffer, header: string | undefined, secret: string | undefined): boolean {
+  if (typeof secret !== "string" || secret.trim() === "" || typeof header !== "string" || header === "") return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(header)) return false;
+  const want = createHmac("sha256", secret).update(raw).digest();
+  const got = Buffer.from(header, "base64");
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+// ---------------------------------------------------------------------------
+// Routing contract
+// ---------------------------------------------------------------------------
+
+export type RoutingRule =
+  | { kind: "shipping_country"; map: Record<string, OrderSite> }
+  | { kind: "order_tag"; map: Record<string, OrderSite> }
+  | { kind: "note_attribute"; name: string; map: Record<string, OrderSite> };
+export interface RoutingConfig { version: 1; shops: Record<string, RoutingRule> }
+export class RoutingConfigError extends Error {}
+
+/** null when not configured; RoutingConfigError when present but malformed (never guessed). */
+export function parseRoutingConfig(raw: string | undefined): RoutingConfig | null {
+  if (raw === undefined || raw.trim() === "") return null;
+  let o: unknown;
+  try {
+    o = JSON.parse(raw);
+  } catch {
+    throw new RoutingConfigError("routing config is not JSON");
+  }
+  const obj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  if (!obj(o) || o.version !== 1 || !obj(o.shops) || Object.keys(o.shops).length === 0) throw new RoutingConfigError("routing config needs version 1 and at least one shop");
+  const shops: Record<string, RoutingRule> = {};
+  for (const [shopRaw, r] of Object.entries(o.shops)) {
+    const shop = normalizeShop(shopRaw);
+    if (!shop || shop !== shopRaw) throw new RoutingConfigError("routing shop must be a normalized *.myshopify.com domain");
+    if (!obj(r) || !obj(r.map) || Object.keys(r.map).length === 0 || Object.keys(r.map).length > 500) throw new RoutingConfigError("routing rule needs a non-empty map");
+    const map: Record<string, OrderSite> = {};
+    for (const [k, v] of Object.entries(r.map)) {
+      if (k.trim() === "" || k.length > 100 || !(ORDER_SITES as readonly unknown[]).includes(v)) throw new RoutingConfigError("routing map values must be au, uk or us");
+      map[k] = v as OrderSite;
+    }
+    if (r.kind === "shipping_country") {
+      if (!Object.keys(map).every((k) => /^[A-Z]{2}$/.test(k))) throw new RoutingConfigError("country keys must be ISO alpha-2 upper case");
+      shops[shop] = { kind: "shipping_country", map };
+    } else if (r.kind === "order_tag") shops[shop] = { kind: "order_tag", map };
+    else if (r.kind === "note_attribute") {
+      if (typeof r.name !== "string" || r.name.trim() === "" || r.name.length > 100) throw new RoutingConfigError("note_attribute rule needs a name");
+      shops[shop] = { kind: "note_attribute", name: r.name, map };
+    } else throw new RoutingConfigError("unsupported routing rule kind");
+  }
+  return { version: 1, shops };
+}
+
+/** Transient routing facts (never stored). */
+/** Transient routing facts (never stored). `incomplete` = the inputs could not be read whole: never route on a prefix. */
+export interface RouteFacts { shippingCountry: string | null; tags: string[]; attributes: Array<{ name: string; value: string }>; incomplete: string | null }
+export const MAX_ROUTE_TAGS = 250;
+export const MAX_ROUTE_ATTRIBUTES = 100;
+export type RouteResult = { site: OrderSite; reason: null } | { site: null; reason: string };
+
+export function routeOrder(cfg: RoutingConfig, shop: string, f: RouteFacts): RouteResult {
+  const rule = cfg.shops[shop];
+  if (!rule) return { site: null, reason: "shop has no routing rule" };
+  if (f.incomplete) return { site: null, reason: f.incomplete };
+  let hits: OrderSite[];
+  if (rule.kind === "shipping_country") {
+    if (!f.shippingCountry) return { site: null, reason: "order has no shipping country" };
+    hits = rule.map[f.shippingCountry.toUpperCase()] ? [rule.map[f.shippingCountry.toUpperCase()]] : [];
+  } else if (rule.kind === "order_tag") {
+    hits = f.tags.map((t) => rule.map[t.trim()]).filter((s): s is OrderSite => !!s);
+  } else {
+    hits = f.attributes.filter((a) => a.name === rule.name).map((a) => rule.map[a.value.trim()]).filter((s): s is OrderSite => !!s);
+  }
+  const sites = [...new Set(hits)];
+  if (sites.length === 0) return { site: null, reason: "order location is not mapped to a site" };
+  if (sites.length > 1) return { site: null, reason: "order location maps to several sites" };
+  return { site: sites[0], reason: null };
+}
+
+// ---------------------------------------------------------------------------
+// Order facts -> evidence
+// ---------------------------------------------------------------------------
+
+export interface FulfillmentFact { id: string; createdAt: string; success: boolean; deliveredAt: string | null; deliveredReportedAt: string | null }
+export interface ShopifyOrderFacts {
+  shop: string;
+  shopifyOrderId: string;
+  orderNumber: string;
+  createdAt: string;
+  cancelledAt: string | null;
+  fulfillments: FulfillmentFact[];
+  route: RouteFacts;
+}
+export class ShopifyPayloadError extends Error {}
+
+/** The order name as an alias: trimmed, one leading "#" removed (app scans use the bare number). */
+export function normalizeOrderNumber(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim().replace(/^#/, "").trim();
+  return s.length >= 1 && s.length <= 64 && !/[\u0000-\u001f]/.test(s) ? s : null;
+}
+
+const str = (v: unknown) => (typeof v === "string" ? v : null);
+const gidId = (v: unknown, type: string) => {
+  const m = typeof v === "string" ? new RegExp(`^gid://shopify/${type}/(\\d{1,20})$`).exec(v) : null;
+  return m ? m[1] : null;
+};
+const idText = (v: unknown) => (typeof v === "string" && /^\d{1,20}$/.test(v) ? v : typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? String(v) : null);
+const need = <T>(v: T | null | undefined, what: string): T => {
+  if (v === null || v === undefined) throw new ShopifyPayloadError(`order payload: ${what}`);
+  return v;
+};
+const MAX_FULFILLMENTS = 100;
+
+/** Whole routing inputs or an explicit "incomplete" reason; lists are never cut to a prefix. */
+function routeFacts(shippingCountry: string | null, tags: string[], rawAttributes: unknown[], nameKey: "name" | "key"): RouteFacts {
+  if (tags.length > MAX_ROUTE_TAGS) return { shippingCountry, tags: [], attributes: [], incomplete: `order has more than ${MAX_ROUTE_TAGS} tags; routing input refused` };
+  if (rawAttributes.length > MAX_ROUTE_ATTRIBUTES) return { shippingCountry, tags: [], attributes: [], incomplete: `order has more than ${MAX_ROUTE_ATTRIBUTES} attributes; routing input refused` };
+  const attributes: RouteFacts["attributes"] = [];
+  for (const a of rawAttributes) {
+    const o = a && typeof a === "object" ? (a as Record<string, unknown>) : null;
+    const name = o ? str(o[nameKey]) : null;
+    const value = o ? str(o.value) : null;
+    if (name === null || value === null) return { shippingCountry, tags: [], attributes: [], incomplete: "order has an unreadable attribute; routing input refused" };
+    attributes.push({ name, value });
+  }
+  return { shippingCountry, tags, attributes, incomplete: null };
+}
+
+/** A REST order webhook payload (orders/* topics). */
+export function factsFromWebhookOrder(payload: unknown, shop: string): ShopifyOrderFacts {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new ShopifyPayloadError("order payload: not an object");
+  const p = payload as Record<string, unknown>;
+  const id = need(gidId(p.admin_graphql_api_id, "Order") ?? idText(p.id), "id");
+  const fs = Array.isArray(p.fulfillments) ? p.fulfillments : [];
+  if (fs.length > MAX_FULFILLMENTS) throw new ShopifyPayloadError("order payload: too many fulfillments");
+  const ship = p.shipping_address && typeof p.shipping_address === "object" ? (p.shipping_address as Record<string, unknown>) : null;
+  return {
+    shop,
+    shopifyOrderId: id,
+    orderNumber: need(normalizeOrderNumber(p.name), "name"),
+    createdAt: need(strictIso(p.created_at), "created_at"),
+    cancelledAt: p.cancelled_at == null ? null : need(strictIso(p.cancelled_at), "cancelled_at"),
+    fulfillments: fs.map((f) => {
+      const o = (f && typeof f === "object" ? f : {}) as Record<string, unknown>;
+      const delivered = o.shipment_status === "delivered";
+      return {
+        id: need(gidId(o.admin_graphql_api_id, "Fulfillment") ?? idText(o.id), "fulfillment id"),
+        createdAt: need(strictIso(o.created_at), "fulfillment created_at"),
+        success: o.status === "success",
+        deliveredAt: null, // REST payloads carry no carrier delivery time
+        deliveredReportedAt: delivered ? need(strictIso(o.updated_at), "fulfillment updated_at") : null,
+      };
+    }),
+    route: routeFacts(
+      ship ? str(ship.country_code) : null,
+      typeof p.tags === "string" ? p.tags.split(",").map((t) => t.trim()).filter(Boolean) : [],
+      Array.isArray(p.note_attributes) ? p.note_attributes : [],
+      "name",
+    ),
+  };
+}
+
+/** A GraphQL Admin order node from ORDER_TIMELINE_QUERY. */
+export function factsFromGraphqlOrder(node: unknown, shop: string, fulfillmentPage: number = FULFILLMENT_PAGE): ShopifyOrderFacts {
+  if (!node || typeof node !== "object") throw new ShopifyPayloadError("order node: not an object");
+  const n = node as Record<string, unknown>;
+  const fs = Array.isArray(n.fulfillments) ? n.fulfillments : [];
+  if (fs.length >= fulfillmentPage) throw new ShopifyPayloadError("order node: fulfillment list may be incomplete");
+  const ship = n.shippingAddress && typeof n.shippingAddress === "object" ? (n.shippingAddress as Record<string, unknown>) : null;
+  return {
+    shop,
+    shopifyOrderId: need(idText(n.legacyResourceId), "legacyResourceId"),
+    orderNumber: need(normalizeOrderNumber(n.name), "name"),
+    createdAt: need(strictIso(n.createdAt), "createdAt"),
+    cancelledAt: n.cancelledAt == null ? null : need(strictIso(n.cancelledAt), "cancelledAt"),
+    fulfillments: fs.map((f) => {
+      const o = (f && typeof f === "object" ? f : {}) as Record<string, unknown>;
+      return {
+        id: need(idText(o.legacyResourceId), "fulfillment legacyResourceId"),
+        createdAt: need(strictIso(o.createdAt), "fulfillment createdAt"),
+        success: o.status === "SUCCESS",
+        deliveredAt: o.deliveredAt == null ? null : need(strictIso(o.deliveredAt), "fulfillment deliveredAt"),
+        deliveredReportedAt: null,
+      };
+    }),
+    route: routeFacts(
+      ship ? str(ship.countryCodeV2) : null,
+      Array.isArray(n.tags) ? n.tags.filter((t): t is string => typeof t === "string") : [],
+      Array.isArray(n.customAttributes) ? n.customAttributes : [],
+      "key",
+    ),
+  };
+}
+
+/** The ingestion record shape (0059 ingest_order_timeline). Shopify evidence never names a site. */
+export interface EvidenceInput {
+  source: "shopify" | "app" | "make";
+  key: string;
+  site: OrderSite | null;
+  shop: string | null;
+  shopifyOrderId: string | null;
+  orderNumber: string | null;
+  stage: OrderStage;
+  kind: EvidenceKind;
+  happenedAt: string;
+  fulfillmentId?: string | null;
+  fulfillmentComplete?: boolean | null;
+}
+
+/**
+ * Deterministic occurrence keys per fact. Each successful fulfillment is
+ * recorded at the time it was CREATED in Shopify, per fulfillment, and never
+ * as whole-order completion: Shopify's current "fulfilled" state does not say
+ * when the order became completely shipped, so completion stays unknown (no
+ * backdating). Delivery is per fulfillment only: carrier time from GraphQL is
+ * confirmed, a REST "delivered" status (time = last update) is reported.
+ * Neither proves whole-order delivery. Cancelled/failed fulfillments are not
+ * shipments.
+ */
+export function evidenceFromFacts(f: ShopifyOrderFacts): EvidenceInput[] {
+  const base = { source: "shopify" as const, site: null, shop: f.shop, shopifyOrderId: f.shopifyOrderId, orderNumber: f.orderNumber };
+  const out: EvidenceInput[] = [{ ...base, key: `order:${f.shopifyOrderId}:ordered`, stage: "ordered", kind: "confirmed", happenedAt: f.createdAt }];
+  if (f.cancelledAt) out.push({ ...base, key: `order:${f.shopifyOrderId}:cancelled`, stage: "cancelled", kind: "confirmed", happenedAt: f.cancelledAt });
+  const ok = f.fulfillments.filter((x) => x.success).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || (a.id < b.id ? -1 : 1));
+  ok.forEach((x) => {
+    out.push({ ...base, key: `fulfillment:${x.id}:created`, stage: "shipped", kind: "confirmed", happenedAt: x.createdAt, fulfillmentId: x.id, fulfillmentComplete: false });
+    if (x.deliveredAt) out.push({ ...base, key: `fulfillment:${x.id}:delivered:confirmed`, stage: "delivered", kind: "confirmed", happenedAt: x.deliveredAt, fulfillmentId: x.id });
+    else if (x.deliveredReportedAt) out.push({ ...base, key: `fulfillment:${x.id}:delivered:reported`, stage: "delivered", kind: "reported", happenedAt: x.deliveredReportedAt, fulfillmentId: x.id });
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Raw body and read-only GraphQL lookup
+// ---------------------------------------------------------------------------
+
+export class BodyError extends Error {
+  constructor(readonly code: "TOO_LARGE" | "RAW_BODY_UNAVAILABLE", message: string) {
+    super(message);
+  }
+}
+
+export interface RawBodyRequest {
+  body?: unknown;
+  readableEnded?: boolean;
+  [Symbol.asyncIterator]?: () => AsyncIterator<unknown>;
+}
+
+/**
+ * The exact request bytes. Prefers the unread stream; accepts a Buffer/string
+ * body. An already-parsed object cannot be verified and is refused (fail closed).
+ */
+export async function readRawBody(req: RawBodyRequest, maxBytes: number): Promise<Buffer> {
+  if (typeof req[Symbol.asyncIterator] === "function" && req.readableEnded === false) {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const c of req as AsyncIterable<unknown>) {
+      const b = Buffer.isBuffer(c) ? c : Buffer.from(String(c));
+      size += b.length;
+      if (size > maxBytes) throw new BodyError("TOO_LARGE", "request body is too large");
+      chunks.push(b);
+    }
+    return Buffer.concat(chunks);
+  }
+  const body = req.body;
+  const b = Buffer.isBuffer(body) ? body : typeof body === "string" ? Buffer.from(body, "utf8") : null;
+  if (!b) throw new BodyError("RAW_BODY_UNAVAILABLE", "the raw request body is unavailable");
+  if (b.length > maxBytes) throw new BodyError("TOO_LARGE", "request body is too large");
+  return b;
+}
+
+const FULFILLMENT_PAGE = 50;
+/** Bounds of the post-ticket snapshot (requested query cost stays well under Shopify's single-query limit). */
+export const PROOF_LINE_PAGE = 50;
+export const PROOF_FULFILLMENT_PAGE = 20;
+export const PROOF_FULFILLMENT_LINE_PAGE = 20;
+
+/** Alias -> immutable id only. Never used as facts or proof (it is read before the proof ticket). */
+export const ORDER_LOOKUP_QUERY = `query OrderTimelineLookup($q: String!) {
+  orders(first: 2, query: $q) { nodes { legacyResourceId name } }
+}`;
+/** The snapshot by immutable id, read AFTER the proof ticket: base facts plus whole-order coverage. */
+export const ORDER_PROOF_QUERY = `query OrderTimelineProof($id: ID!) {
+  order(id: $id) {
+    legacyResourceId name createdAt cancelledAt edited tags
+    customAttributes { key value }
+    shippingAddress { countryCodeV2 }
+    lineItems(first: ${PROOF_LINE_PAGE}) { nodes { id quantity currentQuantity requiresShipping } pageInfo { hasNextPage } }
+    fulfillments(first: ${PROOF_FULFILLMENT_PAGE}) {
+      legacyResourceId createdAt status deliveredAt
+      fulfillmentLineItems(first: ${PROOF_FULFILLMENT_LINE_PAGE}) { nodes { quantity lineItem { id } } pageInfo { hasNextPage } }
+    }
+  }
+}`;
+
+export type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export class ShopifyReadError extends Error {}
+
+async function shopifyGraphql(fetchFn: FetchLike, shop: string, token: string, query: string, variables: Record<string, string>): Promise<Record<string, unknown>> {
+  const r = await fetchFn(`https://${shop}/admin/api/${SHOPIFY_ADMIN_API_VERSION}/graphql.json`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+    body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => {
+    throw new ShopifyReadError("Shopify could not be reached");
+  });
+  if (!r.ok) throw new ShopifyReadError(`Shopify returned HTTP ${r.status}`);
+  const body = (await r.json().catch(() => null)) as { data?: Record<string, unknown>; errors?: unknown } | null;
+  if (!body || body.errors || !body.data || typeof body.data !== "object") throw new ShopifyReadError("Shopify returned an unexpected response");
+  return body.data;
+}
+
+/**
+ * Read-only: the immutable id of the ONE order with exactly this number. null = not found; several exact
+ * matches or any error throws (never a guess).
+ */
+export async function fetchShopifyOrder(fetchFn: FetchLike, shop: string, token: string, orderNumber: string): Promise<{ id: string } | null> {
+  const data = await shopifyGraphql(fetchFn, shop, token, ORDER_LOOKUP_QUERY, { q: `name:${JSON.stringify(`#${orderNumber}`)}` });
+  const nodes = (data.orders as { nodes?: unknown } | undefined)?.nodes;
+  if (!Array.isArray(nodes)) throw new ShopifyReadError("Shopify returned an unexpected response");
+  const exact = nodes.filter((n) => n && typeof n === "object" && normalizeOrderNumber((n as Record<string, unknown>).name) === orderNumber);
+  if (exact.length > 1) throw new ShopifyReadError("Several Shopify orders match this number");
+  if (exact.length === 0) return null;
+  const id = idText((exact[0] as Record<string, unknown>).legacyResourceId);
+  if (!id) throw new ShopifyReadError("Shopify returned an order without an id");
+  return { id };
+}
+
+/** Read-only: the proof snapshot of one order by immutable id. null = Shopify has no such order. */
+export async function fetchShopifyOrderById(fetchFn: FetchLike, shop: string, token: string, id: string): Promise<unknown | null> {
+  const data = await shopifyGraphql(fetchFn, shop, token, ORDER_PROOF_QUERY, { id: `gid://shopify/Order/${id}` });
+  if (!("order" in data)) throw new ShopifyReadError("Shopify returned an unexpected response");
+  return data.order ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Whole-order proof (pure). One post-ticket snapshot in, "proven" or "unknown" out.
+// ---------------------------------------------------------------------------
+
+export type WholeOrderProof =
+  | { status: "proven"; hash: string; shippedAt: string; deliveredAt: string | null }
+  | { status: "unknown"; reason: string };
+
+/**
+ * The whole order is proven shipped only when Shopify says the order was never edited (`edited === false`,
+ * strictly), is not cancelled, every line has the same positive original and current quantity, the line and
+ * fulfillment lists are complete and well formed, every fulfillment is SUCCESS (any cancelled/failed/pending
+ * fulfillment makes the history ambiguous), and the successful fulfillments' quantities equal EXACTLY the
+ * quantity of every shippable line (never more on any line). Shipped = the latest creation time among the
+ * fulfillments carrying shippable lines; delivered = the latest Shopify-reported deliveredAt among them, only
+ * when every one has a valid one at or after its creation. Shopify's current fulfilled status, updatedAt and
+ * REST payloads are never used. The hash covers the eligible manifest, contributors and their times.
+ */
+export function wholeOrderProof(node: unknown): WholeOrderProof {
+  const no = (reason: string): WholeOrderProof => ({ status: "unknown", reason });
+  const obj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  const posInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+  if (!obj(node)) return no("order unreadable");
+  const orderId = idText(node.legacyResourceId);
+  const orderedAt = strictIso(node.createdAt);
+  if (!orderId || !orderedAt) return no("order unreadable");
+  if (node.edited !== false) return no("order was edited, or its edit state is unknown");
+  if (node.cancelledAt !== null) return no("order is cancelled, or its cancellation state is unknown");
+
+  const li = node.lineItems;
+  if (!obj(li) || !Array.isArray(li.nodes) || !obj(li.pageInfo) || li.pageInfo.hasNextPage !== false) return no("line items incomplete");
+  if (li.nodes.length === 0 || li.nodes.length > PROOF_LINE_PAGE) return no("line items incomplete");
+  const lines = new Map<string, { qty: number; ship: boolean }>();
+  for (const x of li.nodes) {
+    if (!obj(x) || typeof x.id !== "string" || x.id === "" || lines.has(x.id) || typeof x.requiresShipping !== "boolean") return no("line items malformed");
+    if (!posInt(x.quantity) || x.currentQuantity !== x.quantity) return no("line quantities changed or malformed");
+    lines.set(x.id, { qty: x.quantity, ship: x.requiresShipping });
+  }
+  const eligible = [...lines].filter(([, l]) => l.ship).map(([id, l]) => [id, l.qty] as [string, number]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  if (eligible.length === 0) return no("no shippable lines");
+
+  const fs = node.fulfillments;
+  if (!Array.isArray(fs) || fs.length >= PROOF_FULFILLMENT_PAGE) return no("fulfillments incomplete");
+  const covered = new Map<string, number>();
+  const ids = new Set<string>();
+  const contributors: Array<{ id: string; createdAt: string; deliveredAt: string | null; parts: Array<[string, number]> }> = [];
+  for (const f of fs) {
+    if (!obj(f)) return no("fulfillments malformed");
+    const id = idText(f.legacyResourceId);
+    const createdAt = strictIso(f.createdAt);
+    if (!id || ids.has(id) || !createdAt) return no("fulfillments malformed");
+    ids.add(id);
+    if (f.status !== "SUCCESS") return no("a fulfillment is not successful; cancellation/reship history is ambiguous");
+    const deliveredAt = f.deliveredAt == null ? null : strictIso(f.deliveredAt);
+    if (f.deliveredAt != null && !deliveredAt) return no("delivery time malformed");
+    const fli = f.fulfillmentLineItems;
+    if (!obj(fli) || !Array.isArray(fli.nodes) || !obj(fli.pageInfo) || fli.pageInfo.hasNextPage !== false) return no("fulfillment lines incomplete");
+    if (fli.nodes.length === 0 || fli.nodes.length > PROOF_FULFILLMENT_LINE_PAGE) return no("fulfillment lines incomplete");
+    const parts = new Map<string, number>();
+    for (const p of fli.nodes) {
+      const lineId = obj(p) && obj(p.lineItem) ? p.lineItem.id : null;
+      if (typeof lineId !== "string" || !lines.has(lineId) || parts.has(lineId) || !obj(p) || !posInt(p.quantity)) return no("fulfillment lines malformed");
+      parts.set(lineId, p.quantity);
+      covered.set(lineId, (covered.get(lineId) ?? 0) + p.quantity);
+    }
+    const shipParts = [...parts].filter(([l]) => lines.get(l)!.ship).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    if (shipParts.length) contributors.push({ id, createdAt, deliveredAt, parts: shipParts });
+  }
+  for (const [id, l] of lines) {
+    const c = covered.get(id) ?? 0;
+    if (l.ship ? c !== l.qty : c > l.qty) return no("fulfilled quantities do not exactly match the order");
+  }
+  if (contributors.some((c) => Date.parse(c.createdAt) < Date.parse(orderedAt))) return no("a fulfillment precedes the order");
+  contributors.sort((a, b) => (a.id < b.id ? -1 : 1));
+  const shippedAt = new Date(Math.max(...contributors.map((c) => Date.parse(c.createdAt)))).toISOString();
+  const allDelivered = contributors.every((c) => c.deliveredAt !== null && Date.parse(c.deliveredAt) >= Date.parse(c.createdAt));
+  const deliveredAt = allDelivered ? new Date(Math.max(...contributors.map((c) => Date.parse(c.deliveredAt as string)))).toISOString() : null;
+  const canonical = JSON.stringify({ v: 1, order: orderId, lines: eligible, contributors: contributors.map((c) => [c.id, c.createdAt, c.deliveredAt, c.parts]), shippedAt, deliveredAt });
+  return { status: "proven", hash: createHash("sha256").update(canonical).digest("hex"), shippedAt, deliveredAt };
+}

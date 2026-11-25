@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
+import { DataState } from "@/components/ui/DataState";
 import { CalendarPlus, Plus, Trash2, Star, StarOff, Upload, ClipboardPaste, CheckSquare, Square, PackageMinus, FileSpreadsheet } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useMutations } from "@/lib/hooks/useMutations";
@@ -36,7 +38,8 @@ const METRICS: { value: FooterMetric; label: string }[] = [
 ];
 
 export function SalesEntry() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const m = useMutations();
   // Active department from app state — drives product filtering, entry
   // filtering, mutations, and import routing. Switching the topbar toggle
@@ -130,12 +133,6 @@ export function SalesEntry() {
     return out;
   }, [data]);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
-
-  const today = todayIso();
-  const currentWeekStart = snapToWeekStart(today, data.settings.week_start_day);
-  const autoAdjust = data.settings.auto_adjust_inventory_on_sale ?? true;
-
   const totalFrames = (weekStart: string): number => {
     const row = salesIndex[weekStart] ?? {};
     let total = 0;
@@ -167,6 +164,15 @@ export function SalesEntry() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [metric, metricScope, visibleEntries, visibleSkus, salesIndex]);
+
+  // Loading boundary after every hook so the hook order is the same on the
+  // first (no data) render and later ones.
+  if (!data) return <DatasetLoadState result={dataset} title="Loading sales entry…" />;
+
+  const today = todayIso();
+  const currentWeekStart = snapToWeekStart(today, data.settings.week_start_day);
+  const autoAdjust = data.settings.auto_adjust_inventory_on_sale ?? true;
+
 
   const flash = (msg: string) => {
     setActionMsg(msg);
@@ -722,12 +728,12 @@ export function SalesEntry() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Sales entry</h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
+          <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Sales entry</h1>
+          <p className="mt-1 text-sm text-hub-muted">
             {visibleEntries.length} row{visibleEntries.length === 1 ? "" : "s"} ·{" "}
             {visibleSkus.length} SKU{visibleSkus.length === 1 ? "" : "s"} ·
             {autoAdjust ? " inventory auto-adjusts on sale " : " manual inventory "}·
-            click any date to edit.
+            click any date to edit. Each cell saves when you leave it.
           </p>
         </div>
         <div className="flex flex-wrap items-end gap-2">
@@ -880,7 +886,7 @@ export function SalesEntry() {
         <CardBody className="p-0">
           <div className="overflow-x-auto">
             <table className="text-sm border-separate border-spacing-0">
-              <thead className="bg-slate-50 dark:bg-slate-900/60 text-slate-600 dark:text-slate-400 text-xs uppercase tracking-wide">
+              <thead className="bg-hub-sub text-[12.5px] text-hub-muted">
                 <tr>
                   <Th sticky left={0} minW={32}>
                     <button

@@ -18,7 +18,14 @@ const h = vi.hoisted(() => {
   const state = {
     tables: {} as Record<string, Row[]>,
     tableErrors: {} as Record<string, { message: string }>,
+    /** Server row cap per request (PostgREST max-rows). */
+    maxRows: 1000,
+    /** Replace one page's response (failure injection). */
+    pageHook: null as null | ((table: string, win: [number, number] | null) => { data: unknown; error: unknown; count?: number | null } | null),
     queries: [] as QueryRecord[],
+    rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
+    /** Evidence RPC implementation, set after imports (see below). */
+    rpcImpl: null as null | ((name: string, args: Record<string, unknown>) => { data: unknown; error: unknown }),
   };
 
   function applyFilters(rows: Row[], ops: Op[]): Row[] {
@@ -30,6 +37,7 @@ const h = vi.hoisted(() => {
           case "eq": return v === args[1];
           case "gte": return String(v) >= String(args[1]);
           case "lt": return typeof args[1] === "number" ? Number(v) < args[1] : String(v) < String(args[1]);
+          case "lte": return String(v) <= String(args[1]);
           case "in": return (args[1] as unknown[]).includes(v);
           default: return true;
         }
@@ -41,17 +49,25 @@ const h = vi.hoisted(() => {
     const rec: QueryRecord = { table, ops: [] };
     state.queries.push(rec);
     const q: Record<string, unknown> = {};
-    for (const m of ["select", "eq", "gte", "lt", "in"]) {
+    let window: [number, number] | null = null;
+    let counted = false;
+    for (const m of ["select", "eq", "gte", "lt", "lte", "in", "order"]) {
       q[m] = (...args: unknown[]) => {
-        if (m !== "select") rec.ops.push([m, args]);
+        if (m === "select") counted = (args[1] as { count?: string } | undefined)?.count === "exact";
+        else if (m !== "order") rec.ops.push([m, args]);
         return q;
       };
     }
+    q.range = (from: number, to: number) => {
+      window = [from, to];
+      return q;
+    };
     q.then = (resolve: (v: unknown) => unknown, reject: (e: unknown) => unknown) => {
       const err = state.tableErrors[table];
+      const rows = applyFilters(state.tables[table] ?? [], rec.ops);
       const result = err
         ? { data: null, error: err }
-        : { data: applyFilters(state.tables[table] ?? [], rec.ops), error: null };
+        : { data: window ? rows.slice(window[0], Math.min(window[1] + 1, window[0] + state.maxRows)) : rows, error: null, count: counted ? rows.length : null };
       return Promise.resolve(result).then(resolve, reject);
     };
     return q;
@@ -59,6 +75,12 @@ const h = vi.hoisted(() => {
 
   const createClient = vi.fn((_url: string, _key: string) => ({
     from: vi.fn((table: string) => makeQuery(table)),
+    rpc: vi.fn((name: string, args: Record<string, unknown>) => {
+      state.rpcCalls.push({ name, args });
+      const err = state.tableErrors.production_events;
+      const result = err ? { data: null, error: err } : state.rpcImpl ? state.rpcImpl(name, args) : { data: null, error: { message: "no rpc" } };
+      return { then: (ok: (v: unknown) => unknown, bad: (e: unknown) => unknown) => Promise.resolve(result).then(ok, bad) };
+    }),
   }));
 
   const utils = {
@@ -77,6 +99,35 @@ vi.mock("@supabase/supabase-js", () => ({ createClient: h.createClient }));
 vi.mock("xlsx", () => ({ utils: h.utils, write: h.write }));
 
 import handler from "../../api/reports/daily-digest";
+import { encodeV2, fakeEvidence, type FakeRpcArgs } from "../fixtures/fakeSupabaseEvents";
+import type { ProductionEvidenceEvent } from "../../src/lib/domain/productionCounts";
+
+/** The site's reporting status as get_reporting_job_status returns it: the existing (legacy) read path. */
+const legacyStatus = (site: unknown) => ({
+  data: [{ site, processor_enabled: false, read_mode: "legacy", capture_enabled: false, capture_epoch: 0, source_epoch: null, active_generation_id: null, active_batch_id: null, active_batch_state: null, active_batch_kind: null, lease_fence: 0, lease_expires_at: null, heartbeat_at: null, last_verified_cutoff: null, pending_changes: 0, oldest_pending_captured_at: null }],
+  error: null,
+});
+/** The digest's evidence RPC, served from the mocked production_events table (service role: no RLS). */
+h.state.rpcImpl = (name, raw) => {
+  if (name === "get_reporting_job_status") return legacyStatus((raw as { p_site?: unknown }).p_site);
+  if (name !== "load_production_evidence_v2") return { data: null, error: { message: `unexpected rpc ${name}` } };
+  const args = raw as unknown as FakeRpcArgs;
+  // Saved rows as the database returns them: absent columns are NULL.
+  const rows = (h.state.tables.production_events ?? []).map((r) => ({
+    id: r.id, location: r.location, staff_id: r.staff_id ?? null, department: r.department ?? null,
+    order_number: r.order_number ?? null, line_sku: r.line_sku ?? null, line_quantity: r.line_quantity ?? null,
+    event_type: r.event_type, created_at: r.created_at, parent_event_id: r.parent_event_id ?? null, cs_case_id: r.cs_case_id ?? null,
+  })) as unknown as ProductionEvidenceEvent[];
+  const evidence = fakeEvidence(rows, args, () => true);
+  const enc = encodeV2(evidence);
+  return {
+    data: {
+      version: 2, site: args.p_site, startUtc: args.p_start_utc, endUtcExclusive: args.p_end_utc_exclusive,
+      asOfUtc: args.p_as_of_utc, complete: true, rowCount: enc.rows.length, staffIds: enc.staffIds, skus: enc.skus, rows: enc.rows,
+    },
+    error: null,
+  };
+};
 
 /* ------------------------------------------------------------------
  * Harness
@@ -153,6 +204,7 @@ beforeEach(() => {
   h.state.tables = {};
   h.state.tableErrors = {};
   h.state.queries = [];
+  h.state.rpcCalls = [];
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -168,6 +220,7 @@ afterEach(() => {
 function expectNoWork() {
   expect(h.createClient).not.toHaveBeenCalled();
   expect(h.state.queries).toHaveLength(0);
+  expect(h.state.rpcCalls).toHaveLength(0);
   expect(fetchMock).not.toHaveBeenCalled();
   expect(h.utils.aoa_to_sheet).not.toHaveBeenCalled();
   expect(h.utils.book_new).not.toHaveBeenCalled();
@@ -566,6 +619,12 @@ function expectLocationFilters(loc: string) {
   for (const q of h.state.queries) {
     expect(q.ops).toContainEqual(["eq", ["location", loc]]);
   }
+  // One evidence read (legacy mode), after exactly one read-mode lookup for the same site.
+  const evidence = h.state.rpcCalls.filter((c) => c.name === "load_production_evidence_v2");
+  expect(evidence.length).toBe(1);
+  expect(evidence[0].args.p_site).toBe(loc);
+  expect(h.state.rpcCalls.filter((c) => c.name === "get_reporting_job_status").map((c) => c.args.p_site)).toEqual([loc]);
+  expect(h.state.rpcCalls.map((c) => c.name)).toEqual(["get_reporting_job_status", "load_production_evidence_v2"]);
 }
 
 function sheetNames(): string[] {
@@ -759,7 +818,8 @@ describe("vercel.json schedules are unchanged", () => {
   it("keeps the AU, UK and US cron entries exactly, with no secret in any path", () => {
     const raw = readFileSync(new URL("../../vercel.json", import.meta.url), "utf-8");
     const cfg = JSON.parse(raw) as { crons: Array<{ path: string; schedule: string }> };
-    expect(cfg.crons).toEqual([
+    // Task 15 adds only the reporting refresh schedules (pinned in tests/api/reporting-worker.test.ts); the digest entries are unchanged.
+    expect(cfg.crons.filter((c) => !c.path.startsWith("/api/reports/refresh-summaries?"))).toEqual([
       { path: "/api/reports/daily-digest?location=au", schedule: "55 13 * * *" },
       { path: "/api/reports/daily-digest?location=uk", schedule: "55 22 * * *" },
       { path: "/api/reports/daily-digest?location=us", schedule: "55 4 * * *" },

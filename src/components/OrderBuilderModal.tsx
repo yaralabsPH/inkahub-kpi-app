@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import { getBackendMode } from "@/lib/repository/supabase/client";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
+import { shipmentStockConfirm } from "@/components/ShipmentStockConfirm";
+import { shipmentStatusStockChange } from "@/lib/ui/shipmentStockChange";
 import { Sparkles, Save, BookmarkPlus, BookOpen, Download, Trash2, Eye, EyeOff, FileSpreadsheet } from "lucide-react";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
@@ -64,6 +68,8 @@ interface Props {
 
 export function OrderBuilderModal({ open, onClose, editingShipmentId, defaultSupplier }: Props) {
   const { data } = useDataset();
+  // Confirm step before a save that requests a stock change (presentation only).
+  const { ask, dialog: confirmDialog } = useConfirm();
   const { byId } = useForecasts();
   const m = useMutations();
 
@@ -500,6 +506,14 @@ export function OrderBuilderModal({ open, onClose, editingShipmentId, defaultSup
         estimated_ship_date: estimatedShipDate || null,
         customs_days: Number(customsDays) || 0,
       });
+      // Saving here as Delivered (or out of an applied Delivered on a top-up)
+      // requests a stock change, exactly as the shipment form does: ask first.
+      const change = shipmentStatusStockChange(editing ?? null, ship, data?.settings.auto_apply_shipments_on_delivery ?? true, getBackendMode());
+      if (change) {
+        const codeOf = (id: string) => data?.products.find((p) => p.id === id)?.code ?? id;
+        const ok = await ask(shipmentStockConfirm(change, ship.po_number, `Saving ${ship.po_number} as ${ship.status}`, codeOf));
+        if (!ok) return;
+      }
       await m.upsertShipment.mutateAsync(ship);
       onClose();
     } catch (e) {
@@ -512,6 +526,7 @@ export function OrderBuilderModal({ open, onClose, editingShipmentId, defaultSup
   const matchingTemplates = templates.filter((t) => !supplier || t.supplier === supplier);
 
   return (
+    <>
     <Modal open={open} onClose={onClose} title={editing ? `Top-up order: ${editing.po_number}` : "Place supplier order"} width="max-w-6xl">
       <div className="space-y-4">
         {/* ---- Header form ---- */}
@@ -1033,6 +1048,9 @@ export function OrderBuilderModal({ open, onClose, editingShipmentId, defaultSup
         </div>
       </div>
     </Modal>
+    {/* After the order modal so it stacks on top. */}
+    {confirmDialog}
+    </>
   );
 }
 

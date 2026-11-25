@@ -1,0 +1,65 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inka Arthouse Hub — UI/UX redesign wireframes</title><link rel="stylesheet" href="wf.css">
+<style>.tile{display:block;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px}.tile:hover{border-color:var(--txt)}.tile b{display:block;margin-bottom:4px}.tile span{font-size:12.5px;color:var(--muted)}</style></head><body>
+<div class="page" style="max-width:1000px">
+  <div class="index-top"><img src="assets/inka-arthouse-logo.png" alt="Inka Arthouse"></div>
+  <h1 class="t">UI/UX redesign: wireframes</h1>
+  <p class="sub">Inka Arthouse Hub · Notion + Supabase direction · 15 screens (Order submission is not included) · Round 2, checked against the app · 24 Nov 2026</p>
+
+  <div class="callout"><span class="ci"></span><div>Grey, mid-fidelity wireframes. Layout, hierarchy and interaction patterns only; colours, icons and copy are placeholders. Use the sun/moon switch (or Ctrl Shift L) for light and dark mode. Every screen has a <b>Design notes</b> panel (bottom right) explaining the numbered pins. Press <b>Ctrl K</b> on any screen to see the command palette.</div></div>
+
+  <h2 class="h">Round 2: checked against the real app</h2>
+  <p>Every screen was compared with the code on <span class="mono">main</span>. The full list is in <a href="REVIEW.md" style="text-decoration:underline">REVIEW.md</a>. The main changes:</p>
+  <div class="grid"><table class="tb">
+    <tr><th>What changed</th><th>Why</th></tr>
+    <tr><td>Framed / Unframed toggle, Scenario select and the alerts bell added to the top bar</td><td>They exist today and filter most pages</td></tr>
+    <tr><td><b>Preview as</b> role switcher (wireframe bar at the bottom)</td><td>Nav and Home now follow the real permission rules. Dashboard is owner-only</td></tr>
+    <tr><td>Real statuses on Shipments, CS cases, Returns; real ledger reasons on Movements</td><td>Round 1 used made-up ones</td></tr>
+    <tr><td>Sales entry keeps per-cell auto-save, adds a Week view</td><td>Batch save would change stock math</td></tr>
+    <tr><td>Confirm step on every action that changes stock</td><td>Inventory is money</td></tr>
+    <tr><td><b>State</b> switch: loading, empty, error on every page</td><td>Hardening</td></tr>
+    <tr><td>Phone layout: drawer menu, full-screen panels, stacked cards</td><td>The app has no phone navigation today</td></tr>
+    <tr><td>Contrast raised to WCAG AA, focus rings, skip link, labelled icon buttons, keyboard palette</td><td>Accessibility</td></tr>
+    <tr><td><span class="new">New</span> tags on anything the app can't do yet</td><td>So nobody mistakes a wireframe idea for an existing feature</td></tr>
+  </table></div>
+
+  <h2 class="h">The direction in one line</h2>
+  <p>Supabase's dark grouped sidebar, data grid and settings forms, combined with Notion's calm pages, database views, side peek, properties and toggle blocks.</p>
+
+  <h2 class="h">Patterns used everywhere</h2>
+  <div class="grid"><table class="tb">
+    <tr><th>Pattern</th><th>From</th><th>Where</th></tr>
+    <tr><td>Grouped dark sidebar (Inventory / Planning / CS / Insights / Workspace) with counts</td><td><span class="tag">Supabase</span></td><td>All</td></tr>
+    <tr><td>Breadcrumb top bar + env pill (staging/live) + sync status</td><td><span class="tag">Supabase</span></td><td>All</td></tr>
+    <tr><td>Ctrl K command palette: jump, create, search records</td><td><span class="tag">Both</span></td><td>All</td></tr>
+    <tr><td>Database views as tabs (Table / Board / Timeline / Gallery) + filter chips</td><td><span class="tag">Notion</span></td><td>SKUs, Shipments, Events, CS, Returns, Movements</td></tr>
+    <tr><td>Side peek with page properties + toggle blocks</td><td><span class="tag">Notion</span></td><td>SKUs, Shipments, CS cases</td></tr>
+    <tr><td>Grid table: type hints, sticky header, footer totals, inline + new row</td><td><span class="tag">Supabase</span></td><td>All tables</td></tr>
+    <tr><td>Pending-changes bar (review, then save once)</td><td><span class="tag">Supabase</span></td><td>Sales entry</td></tr>
+    <tr><td>Secondary nav + section cards + danger zone</td><td><span class="tag">Supabase</span></td><td>Reports, Settings</td></tr>
+    <tr><td>Callouts for alerts, comments thread, activity feed</td><td><span class="tag">Notion</span></td><td>Home, CS cases</td></tr>
+  </table></div>
+
+  <h2 class="h">Screens</h2>
+  <h3 class="h muted">Overview</h3>
+  <div class="cards c3"><a class="tile" href="welcome.html" data-icon="home"><b>Home (Welcome)</b><span>Attention inbox, today's floor stats, who's clocked in</span></a><a class="tile" href="dashboard.html" data-icon="layout-dashboard"><b>Dashboard</b><span>Cover charts + "Order now" database view</span></a></div>
+  <h3 class="h muted">Inventory</h3>
+  <div class="cards c3"><a class="tile" href="skus.html" data-icon="package"><b>SKUs</b><span>Grouped grid + side peek</span></a><a class="tile" href="warehouse.html" data-icon="warehouse"><b>Warehouse</b><span>Week scrubber + bay heatmap</span></a><a class="tile" href="movements.html" data-icon="arrow-left-right"><b>Movements</b><span>Quick-add bar + ledger</span></a><a class="tile" href="paper-usage.html" data-icon="printer"><b>Paper usage</b><span>Editor + live result pane</span></a></div>
+  <h3 class="h muted">Planning</h3>
+  <div class="cards c3"><a class="tile" href="sales-entry.html" data-icon="clipboard-list"><b>Sales entry</b><span>Keyboard grid + pending-changes bar</span></a><a class="tile" href="demand-events.html" data-icon="calendar-days"><b>Demand events</b><span>Timeline view + forecast impact</span></a><a class="tile" href="shopping-list.html" data-icon="shopping-cart"><b>Shopping list</b><span>Per-supplier sections → create shipment</span></a><a class="tile" href="shipments.html" data-icon="truck"><b>Shipments</b><span>Status board + PO peek</span></a></div>
+  <h3 class="h muted">Customer service</h3>
+  <div class="cards c3"><a class="tile" href="cs-cases.html" data-icon="life-buoy"><b>CS cases</b><span>Kanban + case peek with comments</span></a><a class="tile" href="returns.html" data-icon="package-open"><b>Returns</b><span>Clickable stats + dispatch quick-log</span></a></div>
+  <h3 class="h muted">Insights &amp; workspace</h3>
+  <div class="cards c3"><a class="tile" href="reports.html" data-icon="bar-chart-3"><b>Reports</b><span>Report sub-nav, shared filters</span></a><a class="tile" href="team.html" data-icon="users"><b>Team</b><span>Members + role access matrix</span></a><a class="tile" href="settings.html" data-icon="settings"><b>Settings</b><span>Supabase-style settings pages</span></a></div>
+
+  <h2 class="h">Open questions for CJ</h2>
+  <div class="toggle open"><div class="th">Decisions before a spec</div><div class="tb2">
+    <p>1. Sales entry: keep per-cell auto-save (as shown), or move to "review then save"? The second changes stock math and needs its own spec.</p>
+    <p>2. Shopping list: one draft shipment per supplier instead of one per line?</p>
+    <p>3. CS cases: are threaded comments worth a new table?</p>
+    <p>4. Team: one-step email invite? It needs a server endpoint with the service-role key.</p>
+    <p>5. Sidebar: light in light mode and dark in dark mode (as shown), or always dark?</p>
+    <p>6. Rename "Welcome" to "Home"? Owners can already rename it under Settings → Sidebar labels.</p>
+  </div></div>
+</div>
+<script src="icons.js"></script><script src="wf.js"></script><script>WF_index()</script>
+</body></html>

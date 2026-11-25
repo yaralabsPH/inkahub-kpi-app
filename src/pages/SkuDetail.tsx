@@ -1,6 +1,8 @@
 import { useEffect, useMemo } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, ChevronLeft, ChevronRight } from "lucide-react";
+import { DataState } from "@/components/ui/DataState";
 import {
   ResponsiveContainer, LineChart, Line, BarChart, Bar,
   XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine,
@@ -26,7 +28,8 @@ import type { LedgerEntry, LedgerReason, Product } from "@/lib/domain";
  */
 export function SkuDetail() {
   const { id } = useParams<{ id: string }>();
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { byId } = useForecasts();
   const navigate = useNavigate();
 
@@ -73,7 +76,7 @@ export function SkuDetail() {
     return () => window.removeEventListener("keydown", onKey);
   }, [prevSku, nextSku, navigate]);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <div className="mx-auto max-w-hub"><DatasetLoadState result={dataset} title="Loading SKU…" /></div>;
   const product = data.products.find((p) => p.id === id);
   if (!product) {
     return (
@@ -81,7 +84,7 @@ export function SkuDetail() {
         <Link to="/skus" className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline">
           <ArrowLeft size={14} /> Back to SKUs
         </Link>
-        <div className="text-sm text-slate-500">SKU not found.</div>
+        <DataState kind="empty" title="SKU not found." message="It may have been deleted, or the link is for another location." />
       </div>
     );
   }
@@ -110,14 +113,14 @@ export function SkuDetail() {
     <div className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <Link to="/skus" className="inline-flex items-center gap-1 text-xs text-slate-500 hover:underline">
-            <ArrowLeft size={12} /> Back to SKUs
+          <Link to="/skus" className="inline-flex items-center gap-1 text-[13px] text-hub-muted hover:text-hub-text">
+            <ArrowLeft size={12} /> SKUs
           </Link>
-          <h1 className="mt-1 text-xl font-semibold tracking-tight flex items-center gap-2">
-            {product.code}
+          <h1 className="mt-1 flex flex-wrap items-center gap-2 text-[26px] font-bold tracking-[-0.01em] text-hub-text md:text-[32px]">
+            <span className="font-mono">{product.code}</span>
             {r ? <StatusPill status={r.status} /> : null}
           </h1>
-          <p className="text-sm text-slate-500 dark:text-slate-400">
+          <p className="mt-1 text-sm text-hub-muted">
             {product.size} · {product.colour} · {product.supplier}
           </p>
         </div>

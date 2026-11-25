@@ -1,12 +1,27 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { shouldDropRepeatScan } from "@/lib/domain/scanDedupe";
+import { missingStockMessage } from "@/lib/domain/deductResult";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Settings as SettingsIcon, LogOut, ScanLine,
   Play, Check, X as XIcon,
 } from "lucide-react";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
+import { useOrderPackaging } from "@/lib/hooks/useOrderPackaging";
+import { packagingLinesFromOrder, type PackagingLineInput } from "@/lib/domain/packaging/contents";
+import { PackagingPanel, PackagingPendingNotice } from "@/components/production/PackagingPanel";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
+import { OrderLineDisplay } from "@/components/production/OrderLineDisplay";
+import { StationOrderScreen } from "@/components/production/station/StationOrderScreen";
+import {
+  completeBlockReason,
+  packagingBlocksComplete,
+  readTabOverride,
+  resolveStationUi,
+  stationNeedsPackaging,
+  type StationPackagingMode,
+} from "@/components/production/station/stationScreenModel";
 import {
   loadStationConfig, saveStationConfig, clearStationConfig,
   type StationConfig,
@@ -16,14 +31,11 @@ import {
   isSkuProductionRelevant,
   isSkuVerifiable,
   isLineMyDept,
-  describeSku,
   skuTypeBadge,
+  parseSku,
   variantChipClass,
   friendlySize,
   friendlyVariant,
-  parseSku,
-  kpiUnitMultiplier,
-  isKpiEligibleSku,
   detectOrientation,
   shouldDeductAtDept,
   routeShopifyLineToCatalogueLines,
@@ -41,8 +53,20 @@ import {
   type ProductionDepartment,
 } from "@/lib/domain";
 import { cn } from "@/lib/utils/cn";
+import { ProductionCountStatus } from "@/components/ProductionCountStatus";
+import { useProductionEvidence, type ProductionEvidenceState } from "@/lib/hooks/useProductionSummary";
+import { isReportSite, productionDateAt, productionRange } from "@/lib/domain/productionPeriods";
+import { buildProductionCounterView, type ProductionCounterView } from "@/lib/domain/productionCounterView";
+import { snapshotCovers, type WorkType } from "@/lib/domain/productionCounts";
 import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { Modal } from "@/components/ui/Modal";
+import { SharedScannerSetup, SharedScannerStation } from "@/components/production/scanners/SharedScannerStation";
+import {
+  browserStorage,
+  loadSharedScannerConfig,
+  saveSharedScannerConfig,
+  type SharedScannerConfig,
+} from "@/lib/scanners/config";
 
 /**
  * Production / Order Submission tablet page.
@@ -98,6 +122,8 @@ interface CurrentOrder {
   lines: OrderLine[];
   /** Total lines on the order across all departments — to show "3 of 5 lines for your department". */
   total_lines: number;
+  /** F4: every line as packaging input, including blank-SKU lines that `lines` drops. */
+  packaging_lines: PackagingLineInput[];
   /** Shopify cancelledAt (ISO) when the order is cancelled; null otherwise. */
   cancelled_at: string | null;
   /** Cancellation reason if cancelled; null otherwise. */
@@ -161,6 +187,20 @@ function lineKey(order: string, sku: string): string {
   return `${order}__${sku}`;
 }
 
+/**
+ * Station screen redesign: per-tab override for side-by-side testing.
+ * Visit with ?ui=classic or ?ui=new; the choice sticks for the tab.
+ */
+function readStationUiTabOverride(): string | null {
+  let storage: Storage | null = null;
+  try {
+    storage = window.sessionStorage;
+  } catch {
+    storage = null; // storage blocked: the URL choice still applies
+  }
+  return readTabOverride(window.location.search, storage);
+}
+
 /** Compact human duration: "12s" / "3m 27s" / "1h 4m". */
 function fmtDuration(ms: number): string {
   if (ms < 0) ms = 0;
@@ -199,10 +239,46 @@ export function Production() {
   const [scanError, setScanError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
+  // F6: opt-in Shared scanners mode, saved on this device. Off = the
+  // classic station below, unchanged. Turning it off keeps its queue.
+  const [shared, setShared] = useState<SharedScannerConfig | null>(() => loadSharedScannerConfig(browserStorage()));
+  const [sharedSetup, setSharedSetup] = useState(false);
+
   const handlePickStation = (cfg: StationConfig) => {
     saveStationConfig(cfg);
     setStation(cfg);
   };
+
+  if (sharedSetup) {
+    return (
+      <SharedScannerSetup
+        current={shared}
+        onCancel={() => setSharedSetup(false)}
+        onSave={(cfg) => {
+          saveSharedScannerConfig(browserStorage(), cfg);
+          setShared(cfg);
+          setSharedSetup(false);
+          setShowSettings(false);
+        }}
+      />
+    );
+  }
+  if (shared?.enabled) {
+    return (
+      <SharedScannerStation
+        config={shared}
+        onChangeConfig={(cfg) => {
+          saveSharedScannerConfig(browserStorage(), cfg);
+          setShared(cfg);
+        }}
+        onExit={() => {
+          const off = { ...shared, enabled: false };
+          saveSharedScannerConfig(browserStorage(), off);
+          setShared(off);
+        }}
+      />
+    );
+  }
 
   // Department wasn't set, or operator clicked the gear → show the picker.
   if (!station || showSettings) {
@@ -211,6 +287,7 @@ export function Production() {
         current={station}
         onPick={(cfg) => { handlePickStation(cfg); setShowSettings(false); }}
         onClose={station ? () => setShowSettings(false) : undefined}
+        onSharedScanners={() => setSharedSetup(true)}
         onReset={station ? () => {
           clearStationConfig();
           setStation(null);
@@ -251,8 +328,21 @@ function ProductionStation({
   const location = useAppStore((s) => s.location);
   const auth = useAuthOptional();
   const { data: dataset } = useDataset();
+  // Station screen redesign: new screen by default, classic via
+  // VITE_STATION_UI=classic (rollback) or ?ui=classic (per tab).
+  const stationUi = useMemo(
+    () => resolveStationUi({
+      department: station.department,
+      envValue: import.meta.env.VITE_STATION_UI ?? null,
+      tabOverride: readStationUiTabOverride(),
+    }),
+    [station.department],
+  );
   const [scanBuffer, setScanBuffer] = useState("");
   const [busy, setBusy] = useState(false);
+  // Synchronous guards for processScan (see the comment there).
+  const scanInFlightRef = useRef(false);
+  const lastScanRef = useRef<{ value: string; at: number } | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   // In-flight guard against duplicate line_verified writes. Records line
   // keys whose insertEvent is currently awaiting. Synchronous check at
@@ -275,9 +365,65 @@ function ProductionStation({
   const [lineStates, setLineStates] = useState<Map<string, LineRecord>>(new Map());
   /** A 1-second tick to drive live timers on started lines. */
   const [tick, setTick] = useState(0);
-  /** Today's completed-line count for the active staff, for the header chip. */
-  const [todayCount, setTodayCount] = useState<number | null>(null);
-  const [todayLineUnits, setTodayLineUnits] = useState<number | null>(null);
+  /**
+   * Today's counter for the active worker (F1): read from saved evidence for
+   * the site's production day, never incremented locally. Every successful
+   * save calls refreshCounter() without awaiting it, so capture and stock
+   * deduction never wait on reporting.
+   */
+  const counterSite = isReportSite(location) ? location : null;
+  const [dayTick, setDayTick] = useState(0);
+  const counterDate = useMemo(
+    () => (counterSite ? productionDateAt(new Date(), counterSite) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [counterSite, dayTick],
+  );
+  const counterRange = useMemo(
+    () => (counterSite && counterDate ? productionRange(counterSite, counterDate, counterDate) : null),
+    [counterSite, counterDate],
+  );
+  // Roll over at the next site-local 04:00 (re-checked at most every 5 minutes).
+  useEffect(() => {
+    if (!counterRange) return;
+    const ms = Math.max(1_000, Math.min(Date.parse(counterRange.endUtcExclusive) - Date.now() + 1_000, 5 * 60_000));
+    const t = setTimeout(() => setDayTick((n) => n + 1), ms);
+    return () => clearTimeout(t);
+  }, [counterRange, dayTick]);
+  // Returning to the page re-derives the production date first, then refreshes it.
+  useEffect(() => {
+    const onReturn = () => {
+      if (document.visibilityState === "visible") setDayTick((n) => n + 1);
+    };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, []);
+  const counterEvidence = useProductionEvidence({ client: supabase, site: location, range: counterRange, refreshKey: dayTick });
+  const refreshCounter = counterEvidence.refresh;
+  // A worker/station/day switch only shows counts read after the switch:
+  // the previous worker's numbers are never shown for the next one.
+  const counterKey = activeStaff && counterDate ? `${activeStaff.user_id}|${station.department}|${counterDate}` : "";
+  const counterSince = useRef<{ key: string; at: number }>({ key: "", at: 0 });
+  if (counterSince.current.key !== counterKey) counterSince.current = { key: counterKey, at: Date.now() };
+  const counterSinceAt = counterSince.current.at;
+  useEffect(() => {
+    if (counterKey) refreshCounter();
+  }, [counterKey, refreshCounter]);
+  const counter = useMemo(() => {
+    const snap = counterEvidence.snapshot;
+    if (!activeStaff || !counterSite || !counterDate || !counterEvidence.prepared || !snap) return null;
+    if (!snapshotCovers(snap, counterRange)) return null;
+    if (Date.parse(snap.asOfUtc) < counterSinceAt) return null;
+    return buildProductionCounterView(counterEvidence.prepared, {
+      site: counterSite,
+      date: counterDate,
+      staffId: activeStaff.user_id,
+      workType: station.department as WorkType,
+    });
+  }, [counterEvidence.prepared, counterEvidence.snapshot, activeStaff, counterSite, counterDate, counterRange, station.department, counterSinceAt]);
   /** Dispatch confirmation flash — order # that was just dispatched. */
   const [dispatchFlash, setDispatchFlash] = useState<string | null>(null);
   /**
@@ -327,11 +473,54 @@ function ProductionStation({
     } | null;
   } | null>(null);
 
+  // F4 box-auto-pick. In scan mode (default) this only reads the site
+  // setting; every packaging path below behaves exactly as before.
+  const packagingOrder = useMemo(
+    () => (currentOrder ? { number: currentOrder.number, lines: currentOrder.packaging_lines } : null),
+    [currentOrder],
+  );
+  const packaging = useOrderPackaging({
+    client: supabase,
+    location,
+    department: station.department,
+    order: packagingOrder,
+    csCaseId: activeCase?.caseId ?? null,
+    staffId: activeStaff?.user_id ?? null,
+    onError: onScanError,
+  });
+  const packagingMode = packaging.mode;
+  const scanLegacyBarcode = packaging.scanLegacyBarcode;
+  const currentOrderRef = useRef(currentOrder);
+  currentOrderRef.current = currentOrder;
+  /** The auto-pick panel for either station screen; null in scan mode. */
+  const renderPackagingSlot = (variant: "station" | "classic") => {
+    if (packagingMode !== "auto") return null;
+    const v = packaging.view;
+    if (!v) return <PackagingPendingNotice variant={variant} count={packaging.pendingCount} />;
+    return (
+      <PackagingPanel
+        variant={variant}
+        status={v.status}
+        chosen={v.chosen}
+        predicted={v.prediction.evaluation.packages}
+        reason={v.prediction.evaluation.reason}
+        alternatives={v.alternatives}
+        pendingCount={packaging.pendingCount}
+        onTap={packaging.tap}
+        onAdd={packaging.add}
+        onAdjust={packaging.adjust}
+        onReset={packaging.reset}
+        saved={packaging.saved}
+      />
+    );
+  };
+
   // Auto-assign mail tube at unframed station based on order contents.
   // Runs whenever the current order changes. Cleared when order clears.
   useEffect(() => {
     if (!currentOrder) return;
     if (station.department !== "unframed") return;
+    if (packagingMode === "auto") return; // F4: the rules pick the tube
     const skus = currentOrder.lines.map((l) => l.sku);
     const tubeId = autoMailTubeForUnframedOrder(skus);
     if (tubeId) {
@@ -342,7 +531,7 @@ function ProductionStation({
         return next;
       });
     }
-  }, [currentOrder, station.department]);
+  }, [currentOrder, station.department, packagingMode]);
   // Phase 5: when an order loads, fetch line_verified + cancelled events,
   // filter out verifies that have been cancelled, and resolve the verifier
   // display names via staff_barcodes.
@@ -420,68 +609,11 @@ function ProductionStation({
   }, [currentOrder, location, supabase, station.department]);
 
   // When the active staff changes, reset all order state (different worker,
-  // different in-progress lines). Also fetch today's count.
+  // different in-progress lines). The counter refreshes through counterKey.
   useEffect(() => {
     setCurrentOrder(null);
     setLineStates(new Map());
     setDispatchFlash(null);
-    if (!activeStaff) {
-      setTodayCount(null);
-      setTodayLineUnits(null);
-      return;
-    }
-    // Load today's completed count for this staff.
-    void (async () => {
-      const now = new Date();
-      const reset = new Date();
-      reset.setHours(4, 0, 0, 0);
-      if (now < reset) { reset.setDate(reset.getDate() - 1); }
-      const completedEvType = station.department === "dispatch" ? "dispatched" : "completed";
-      // Two queries: orders completed today (for order count), and
-      // line_verified +/- cancelled events today (for items count).
-      const [ordersRes, itemsRes] = await Promise.all([
-        supabase
-          .from("production_events")
-          .select("order_number")
-          .eq("location", location)
-          .eq("staff_id", activeStaff.user_id)
-          .eq("department", station.department)
-          .eq("event_type", completedEvType)
-          .gte("created_at", reset.toISOString()),
-        supabase
-          .from("production_events")
-          .select("event_type, line_quantity, line_sku, parent_event_id")
-          .eq("location", location)
-          .eq("staff_id", activeStaff.user_id)
-          .eq("department", station.department)
-          .in("event_type", ["line_verified", "cancelled"])
-          .gte("created_at", reset.toISOString()),
-      ]);
-      // Count completed / dispatched events instead of unique order
-      // numbers so a legitimate resend of a previously-processed order
-      // adds another point to the worker's KPI. Under normal flow the
-      // filter (staff + dept + type + today) already means one row per
-      // completion, so this doesn't double-count.
-      const orderRows = (ordersRes.data ?? []) as Array<{ order_number: string | null }>;
-      const itemRows = (itemsRes.data ?? []) as Array<{
-        event_type: string; line_quantity: number | null; line_sku: string | null; parent_event_id: string | null;
-      }>;
-      let lineUnits = 0;
-      for (const r of itemRows) {
-        const qty = typeof r.line_quantity === "number" ? r.line_quantity : 0;
-        // Set SKUs multiply: a 3-set verify with line_quantity=1 scores
-        // as 3 items. Non-set SKUs return 1 so nothing changes.
-        const mult = kpiUnitMultiplier(r.line_sku);
-        if (r.event_type === "line_verified") {
-          lineUnits += qty * mult;
-        } else if (r.event_type === "cancelled" && r.parent_event_id) {
-          // Cancellation of a verify - credit back the items (also set-aware).
-          lineUnits -= qty * mult;
-        }
-      }
-      setTodayCount(orderRows.length);
-      setTodayLineUnits(Math.max(0, lineUnits));
-    })();
   }, [activeStaff, supabase, location, station.department]);
 
   // Live timer — re-render every second while any line is "started" so
@@ -612,6 +744,7 @@ function ProductionStation({
         display_name: body.order_name ?? `#${orderNumber}`,
         lines: matched,
         total_lines: allLines.length,
+        packaging_lines: packagingLinesFromOrder(allLines),
         cancelled_at: body.cancelled_at ?? null,
         cancel_reason: body.cancel_reason ?? null,
       };
@@ -680,12 +813,10 @@ function ProductionStation({
       verifiedLinesRef.current = next as unknown as Map<string, unknown>;
       return next;
     });
-    // Credit back the items live when a verification is undone.
-    if (isKpiEligibleSku(line.sku)) {
-      setTodayLineUnits((n) => Math.max(0, (n ?? 0) - line.quantity * kpiUnitMultiplier(line.sku)));
-    }
+    // Saved: re-read the counter (the saved parent's value is removed by the shared rules).
+    refreshCounter();
     lastActivityRef.current = Date.now();
-  }, [activeStaff, currentOrder, verifiedLines, insertEvent]);
+  }, [activeStaff, currentOrder, verifiedLines, insertEvent, refreshCounter]);
 
   // Phase 4: tap-to-verify. Writes a line_verified event tagged with
   // activeCaseId (when present) and updates local map for instant UI.
@@ -730,12 +861,10 @@ function ProductionStation({
       next.set(activeStaff.user_id, activeStaff.display_name);
       return next;
     });
-    // Live update: items count tracks every verification for KPI-eligible SKUs only.
-    if (isKpiEligibleSku(line.sku)) {
-      setTodayLineUnits((n) => (n ?? 0) + line.quantity * kpiUnitMultiplier(line.sku));
-    }
+    // Saved: re-read the counter from saved evidence (no local +quantity).
+    refreshCounter();
     lastActivityRef.current = Date.now();
-  }, [activeStaff, currentOrder, verifiedLines, insertEvent, activeCase, station.department]);
+  }, [activeStaff, currentOrder, verifiedLines, insertEvent, activeCase, station.department, refreshCounter]);
 
   /** Worker tapped Start on a line. Insert event, transition state. */
   const handleStartLine = useCallback(async (line: OrderLine) => {
@@ -911,9 +1040,9 @@ function ProductionStation({
       });
       return next;
     });
-    setTodayCount((n) => (n ?? 0) + 1);
+    refreshCounter();
     lastActivityRef.current = Date.now();
-  }, [activeStaff, currentOrder, insertEvent]);
+  }, [activeStaff, currentOrder, insertEvent, refreshCounter]);
 
   /** Worker tapped Cancel mid-progress. Insert cancel event, reset to idle. */
   const handleCancelLine = useCallback(async (line: OrderLine) => {
@@ -957,13 +1086,32 @@ function ProductionStation({
     // actually meant to scrap. Dispatch is a one-tap finalise so it's
     // exempt. Read from the ref so a fast "verify -> click Complete"
     // never sees a stale empty map from a not-yet-rebuilt closure.
-    if (station.department !== "dispatch") {
-      const verifiedCount = Math.max(verifiedLinesRef.current.size, verifiedLines.size);
-      if (verifiedCount === 0) {
-        onScanError("Verify at least one item before completing the order.");
+    // Station screen redesign: the Complete rule lives in the tested
+    // completeBlockReason(). Dispatch is exempt; classic needs at least one
+    // verified line; the new screen (CJ decision A) needs every line this
+    // station must check. Ref and state can each lag the other by a render,
+    // so a line counts as verified if either has it.
+    {
+      const blockReason = completeBlockReason({
+        department: station.department,
+        stationUi,
+        verifiedCount: Math.max(verifiedLinesRef.current.size, verifiedLines.size),
+        lines: currentOrder.lines.map((l) => ({
+          key: lineKey(currentOrder.number, l.sku),
+          sku: l.sku,
+          belongsToThisDept: l.belongsToThisDept,
+        })),
+        isVerified: (key) => verifiedLinesRef.current.has(key) || verifiedLines.has(key),
+      });
+      if (blockReason) {
+        onScanError(blockReason);
         return;
       }
     }
+    // F4: take this order's packaging now, before any await, so loading or
+    // clearing an order while the event saves cannot change what is recorded.
+    const packagingCapture = packagingMode === "auto" ? packaging.capture() : null;
+    const completedOrder = currentOrder;
     const totalItems = currentOrder.lines.reduce(
       (s, l) => s + (typeof l.quantity === "number" ? l.quantity : 1),
       0,
@@ -980,8 +1128,8 @@ function ProductionStation({
       cs_case_id: activeCase?.caseId ?? null,
     });
     if (!inserted) return;
-    // Order count tracks completions; items already counted per-verify.
-    setTodayCount((n) => (n ?? 0) + 1);
+    // Saved: re-read the counter. Not awaited, so deduction below never waits on reporting.
+    refreshCounter();
     lastActivityRef.current = Date.now();
 
     // Phase A: auto-deduct catalogue components for lines this dept owns.
@@ -999,8 +1147,12 @@ function ProductionStation({
       // Add packages to the deduction list. They deduct from the same RPC -
       // the cache key is the product code (for scanned packages) or product
       // id (for auto-assigned mail tubes); the RPC handles both.
-      for (const [pkgKey, qty] of packages.entries()) {
-        componentMap.set(pkgKey, (componentMap.get(pkgKey) ?? 0) + qty);
+      // F4: in auto mode packaging goes through packaging_apply below, never
+      // through this call.
+      if (packagingMode !== "auto") {
+        for (const [pkgKey, qty] of packages.entries()) {
+          componentMap.set(pkgKey, (componentMap.get(pkgKey) ?? 0) + qty);
+        }
       }
       if (componentMap.size > 0) {
         const componentArray = Array.from(componentMap.entries()).map(
@@ -1014,6 +1166,9 @@ function ProductionStation({
           console.error("[auto-deduct] RPC error:", deductErr);
         } else {
           console.log("[auto-deduct] result:", deductResult);
+          // A missing stock item used to skip silently. Say so on the screen.
+          const missingMsg = missingStockMessage(deductResult);
+          if (missingMsg) onScanError(missingMsg);
         }
       } else {
         console.log("[auto-deduct] no components to deduct for this event");
@@ -1021,11 +1176,18 @@ function ProductionStation({
     } catch (e) {
       console.error("[auto-deduct] exception:", e);
     }
+    // F4: record and deduct the packaging for this completion. A no-op in
+    // scan mode. Not awaited: a slow or failed save queues on the device and
+    // never holds up the bench.
+    if (packagingCapture) void packaging.applyAfterEvent(inserted, packagingCapture);
+    // Only clear the order that was completed: another order may have been
+    // scanned while this one saved.
     window.setTimeout(() => {
-      setCurrentOrder(null);
+      if (currentOrderRef.current !== completedOrder) return;
+      setCurrentOrder((now) => (now === completedOrder ? null : now));
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent, refreshCounter, onScanError]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
@@ -1126,12 +1288,25 @@ function ProductionStation({
    * vanishingly small).
    */
   const processScan = useCallback(async (raw: string) => {
-    if (busy) return;
+    // `busy` is React state, so two calls in the same tick both see false.
+    // A lanyard is submitted at its 8th character AND again by the scanner's
+    // Enter key before the buffer is cleared; that wrote two clock_in rows.
+    // The ref lock and the repeat check below are synchronous.
+    const scanValue = raw.trim();
+    if (!scanValue) return;
+    if (scanInFlightRef.current) return;
+    if (shouldDropRepeatScan(lastScanRef.current, scanValue, Date.now())) return;
+    lastScanRef.current = { value: scanValue, at: Date.now() };
+    scanInFlightRef.current = true;
+    if (busy) {
+      scanInFlightRef.current = false;
+      return;
+    }
     setBusy(true);
     onScanError(null);
     setDispatchFlash(null);
     try {
-      const value = raw.trim();
+      const value = scanValue;
       if (!value) return;
       lastActivityRef.current = Date.now();
       // eslint-disable-next-line no-console
@@ -1178,7 +1353,26 @@ function ProductionStation({
               // eslint-disable-next-line no-console
               console.log("[clock-in] confirmed?", ok);
               if (!ok) return;
-              const clockInId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+              // The confirm box blocks the page. Look again right before
+              // writing, in case a clock-in landed meanwhile.
+              const recheck = await supabase
+                .from("production_events")
+                .select("event_type")
+                .eq("location", location)
+                .eq("staff_id", staff.user_id)
+                .in("event_type", ["clock_in", "clock_out"])
+                .gte("created_at", dayStart.toISOString())
+                .order("created_at", { ascending: false })
+                .limit(1);
+              if (recheck.error) {
+                onScanError(`Clock-state check failed: ${recheck.error.message}. Not signing in.`);
+                return;
+              }
+              if (recheck.data?.[0]?.event_type === "clock_in") {
+                onSetActiveStaff(staff);
+                return;
+              }
+              const clockInId =`evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
               const payload = {
                 location,
                 id: clockInId,
@@ -1233,6 +1427,17 @@ function ProductionStation({
       const pkgMatch = value.match(/\+\d+=/);
       if (pkgMatch) {
         const pkgBarcode = pkgMatch[0];
+        // F4 auto mode: a printed box barcode is a manual pick for the
+        // current order. It is never required and never pre-staged.
+        if (packagingMode === "auto") {
+          if (scanLegacyBarcode(pkgBarcode)) return;
+          onScanError(
+            currentOrderRef.current
+              ? `Box barcode "${pkgBarcode}" is not in this site's packaging list. Tap the packaging you used instead.`
+              : "Scan the order first. The packaging is picked automatically.",
+          );
+          return;
+        }
         const pkg = packageFromBarcode(pkgBarcode, station.department);
         // eslint-disable-next-line no-console
         console.log("[package] match?", pkgBarcode, "(from value", JSON.stringify(value) + ")", station.department, "->", pkg ? pkg.key : "NO MATCH");
@@ -1342,9 +1547,10 @@ function ProductionStation({
 
 
     } finally {
+      scanInFlightRef.current = false;
       setBusy(false);
     }
-  }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location]);
+  }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location, packagingMode, scanLegacyBarcode]);
 
   /**
    * Global keystroke capture. USB barcode scanners type the value as
@@ -1446,8 +1652,122 @@ function ProductionStation({
     return () => clearInterval(interval);
   }, [activeStaff, onSetActiveStaff]);
 
+  // Station screen redesign: same clock_out write as the classic Sign out
+  // and Clock out buttons. A failed write still idles the station.
+  const clockOutAndIdle = async (note: string) => {
+    if (activeStaff) {
+      try {
+        const clockOutId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const { error: coErr } = await supabase
+          .from("production_events")
+          .insert({
+            location,
+            id: clockOutId,
+            staff_id: activeStaff.user_id,
+            department: station.department,
+            event_type: "clock_out",
+            note,
+          });
+        if (coErr) {
+          onScanError(`Clock-out write failed: ${coErr.message}. Idling station anyway.`);
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("[clock-out] write failed:", e);
+      }
+    }
+    onSetActiveStaff(null);
+  };
+  const findLineByKey = (key: string): OrderLine | undefined =>
+    currentOrder?.lines.find((l) => lineKey(currentOrder.number, l.sku) === key);
+  const useNewScreen = !!activeStaff && stationUi === "new";
+
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950">
+    <div className={useNewScreen ? "h-screen flex flex-col" : "min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950"}>
+      {useNewScreen && activeStaff ? (
+        <StationOrderScreen
+          departmentLabel={PRODUCTION_DEPARTMENT_LABELS[station.department]}
+          locationCode={location}
+          locationLabel={LOCATION_LABELS[location as LocationKey] ?? location}
+          staff={activeStaff}
+          todayCount={counter ? counter.normal.orders : null}
+          todayItems={counter ? counter.normal.items : null}
+          todayState={counterEvidence.status}
+          todayRework={counter ? counter.rework : null}
+          onRetryCount={refreshCounter}
+          countStatus={
+            <ProductionCountStatus
+              className="max-w-[16rem] text-left"
+              state={counterEvidence}
+              range={counter?.range ?? null}
+              coverage={counter?.coverage ?? null}
+              compact
+            />
+          }
+          order={currentOrder ? {
+            number: currentOrder.number,
+            displayName: currentOrder.display_name,
+            totalLines: currentOrder.total_lines,
+            lines: currentOrder.lines.map((l) => ({
+              key: lineKey(currentOrder.number, l.sku),
+              sku: l.sku,
+              title: l.title,
+              quantity: l.quantity,
+              variantTitle: l.variantTitle ?? null,
+              belongsToThisDept: l.belongsToThisDept,
+              otherDeptLabel: l.dept ? PRODUCTION_DEPARTMENT_LABELS[l.dept] : null,
+            })),
+          } : null}
+          verified={verifiedLines}
+          staffNames={staffNames}
+          scanBuffer={scanBuffer}
+          error={scanError}
+          notes={currentOrder ? (
+            <OrderNotesPanel
+              supabase={supabase}
+              location={location}
+              orderNumber={currentOrder.number}
+              author={null}
+              variant="loud"
+            />
+          ) : null}
+          activeCase={activeCase}
+          packages={
+            stationNeedsPackaging(station.department, packagingMode)
+              ? {
+                  required: true,
+                  auto: station.department === "unframed",
+                  rows: Array.from(packages.entries()).map(([key, qty]) => ({
+                    key,
+                    qty,
+                    label: PACKAGE_TYPES.find((p) => p.key === key)?.label ?? MAIL_TUBE_LABELS[key] ?? key,
+                  })),
+                }
+              : null
+          }
+          packagingSlot={renderPackagingSlot("station")}
+          onVerify={(key) => { const l = findLineByKey(key); if (l) void handleVerifyLine(l); }}
+          onUnverify={(key) => { const l = findLineByKey(key); if (l) void handleUnverifyLine(l); }}
+          onCompleteOrder={() => void handleCompleteOrder()}
+          onScrapOrder={() => void handleScrapOrder()}
+          onClearOrder={handleClearOrder}
+          onManualOrderSubmit={(n) => void processScan(n)}
+          onRemovePackage={(key) =>
+            setPackages((m) => {
+              const next = new Map(m);
+              const cur = next.get(key) ?? 0;
+              if (cur <= 1) next.delete(key);
+              else next.set(key, cur - 1);
+              return next;
+            })
+          }
+          onClearPackages={() => setPackages(new Map())}
+          onClockOut={() => void clockOutAndIdle("Sign out via prominent button")}
+          onSignOut={() => void clockOutAndIdle("Sign out via Sign out button")}
+          onOpenSettings={onOpenSettings}
+          backHref="/returns"
+        />
+      ) : (<>
       {/* Top bar — brand left, station/location middle, controls right. */}
       <header className="h-14 px-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80">
         <div className="font-serif tracking-[0.2em] text-sm text-slate-700 dark:text-slate-300 select-none">
@@ -1522,7 +1842,8 @@ function ProductionStation({
             department={station.department}
             scanBuffer={scanBuffer}
             error={scanError}
-            todayCount={todayCount}
+            counter={counter}
+            counterState={counterEvidence}
             currentOrder={currentOrder}
             lineStates={lineStates}
             dispatchFlash={dispatchFlash}
@@ -1530,7 +1851,6 @@ function ProductionStation({
             onCompleteLine={(line) => void handleCompleteLine(line)}
             onCancelLine={(line) => void handleCancelLine(line)}
             onClearOrder={handleClearOrder}
-            todayLineUnits={todayLineUnits}
             onCompleteOrder={() => void handleCompleteOrder()}
             onScrapOrder={() => void handleScrapOrder()}
             onManualOrderSubmit={(n) => void processScan(n)}
@@ -1545,6 +1865,8 @@ function ProductionStation({
               })
             }
             onClearPackages={() => setPackages(new Map())}
+            packagingMode={packagingMode}
+            packagingSlot={renderPackagingSlot("classic")}
             verifiedLines={verifiedLines}
             onVerifyLine={(line) => void handleVerifyLine(line)}
             onUnverifyLine={(line) => void handleUnverifyLine(line)}
@@ -1568,11 +1890,12 @@ function ProductionStation({
         <span>Scanner active · type Esc to clear the buffer</span>
         <span><LiveClock /></span>
       </footer>
+      </>)}
           {editOrderWarning ? (
             <Modal
               open
               onClose={() => setEditOrderWarning(null)}
-              title={"Edit Order â€” #" + editOrderWarning.orderNumber}
+              title={"Edit Order — #" + editOrderWarning.orderNumber}
               width="max-w-md"
             >
               <div className="mb-4 rounded-md ring-1 ring-amber-200 dark:ring-amber-900/40 bg-amber-50/60 dark:bg-amber-900/20 px-3 py-3">
@@ -1704,11 +2027,11 @@ function IdleScreen({
 // ============================================================
 
 function ActiveScreen({
-  staff, department, scanBuffer, error, todayCount,
+  staff, department, scanBuffer, error, counter, counterState,
   currentOrder, lineStates, dispatchFlash,
-  onStartLine, onCompleteLine, onCancelLine, onClearOrder, onCompleteOrder, onScrapOrder, todayLineUnits,
+  onStartLine, onCompleteLine, onCancelLine, onClearOrder, onCompleteOrder, onScrapOrder,
   onManualOrderSubmit,
-  packages, onRemovePackage, onClearPackages,
+  packages, onRemovePackage, onClearPackages, packagingMode, packagingSlot,
   verifiedLines, onVerifyLine, onUnverifyLine, staffNames, activeCase,
   supabase, location, onSetActiveStaff,
 }: {
@@ -1716,7 +2039,8 @@ function ActiveScreen({
   department: ProductionDepartment;
   scanBuffer: string;
   error: string | null;
-  todayCount: number | null;
+  counter: ProductionCounterView | null;
+  counterState: ProductionEvidenceState;
   currentOrder: CurrentOrder | null;
   lineStates: Map<string, LineRecord>;
   dispatchFlash: string | null;
@@ -1724,13 +2048,16 @@ function ActiveScreen({
   onCompleteLine: (line: OrderLine) => void;
   onCancelLine: (line: OrderLine) => void;
   onClearOrder: () => void;
-  todayLineUnits: number | null;
   onCompleteOrder: () => void;
   onScrapOrder: () => void;
   onManualOrderSubmit: (orderNum: string) => void;
   packages: Map<string, number>;
   onRemovePackage: (key: string) => void;
   onClearPackages: () => void;
+  /** F4: "auto" hides the box-scan panels and never blocks Complete on packaging. */
+  packagingMode: StationPackagingMode;
+  /** F4: the auto-pick panel, shown in place of the scan panels in auto mode. */
+  packagingSlot: ReactNode;
   verifiedLines: Map<string, { event_id: string; staff_id: string; dept: string; time: string }>;
   onVerifyLine: (line: OrderLine) => void;
   onUnverifyLine: (line: OrderLine) => void;
@@ -1764,17 +2091,29 @@ function ActiveScreen({
         </div>
         <div className="flex items-center gap-3">
           <div className="rounded-lg ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 px-4 py-2 text-center">
-            <div className="text-2xl font-semibold tabular-nums">
-              {todayCount === null ? "—" : todayCount}
+            <div className={cn("text-2xl font-semibold tabular-nums", counterState.updating && "opacity-60")}>
+              {counter ? counter.normal.orders : "—"}
               <span className="text-base font-normal text-slate-500 ml-1">orders</span>
             </div>
-            <div className="text-2xl font-semibold tabular-nums">
-              {todayLineUnits === null ? "—" : todayLineUnits}
+            <div className={cn("text-2xl font-semibold tabular-nums", counterState.updating && "opacity-60")}>
+              {counter ? (counter.normal.items === null ? "too many" : counter.normal.items) : "—"}
               <span className="text-base font-normal text-slate-500 ml-1">items</span>
             </div>
+            {counter && ((counter.rework.items ?? 0) > 0 || counter.rework.orders > 0) ? (
+              <div className="text-xs text-amber-700 dark:text-amber-300 tabular-nums">
+                + CS/rework {counter.rework.items ?? "—"} items · {counter.rework.orders} orders
+              </div>
+            ) : null}
             <div className="text-[10px] uppercase tracking-widest text-slate-500">
-              today (since 4am)
+              today (since 4am{counter ? ` ${counter.range.timeZone.split("/").pop()?.replace("_", " ")}` : ""})
             </div>
+            <ProductionCountStatus
+              className="mt-1 max-w-[16rem] text-left"
+              state={counterState}
+              range={counter?.range ?? null}
+              coverage={counter?.coverage ?? null}
+              compact
+            />
           </div>
         </div>
       </div>
@@ -1931,7 +2270,7 @@ function ActiveScreen({
             orderNumber={currentOrder.number}
             author={null}
             variant="loud"
-          />
+          />
 
           {/* Phase 4: per-line verification list with three colour states. */}
           <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
@@ -1975,101 +2314,64 @@ function ActiveScreen({
                     className={containerCls + (orient ? " relative pl-3" : "")}
                     onClick={verifiable && !isVerified ? () => onVerifyLine(line) : undefined}
                   >
-                    <div className={
-                      "text-xl font-bold tabular-nums w-12 text-right " +
-                      (line.quantity > 1 ? "text-red-600 dark:text-red-400" : "text-slate-700 dark:text-slate-300")
-                    }>
-                      {"x" + line.quantity}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <div className={"text-sm font-semibold truncate " + (isMine ? "text-slate-900 dark:text-slate-100" : "text-slate-500")}>
-                          {line.title || line.sku}
-                        </div>
-                        <span className="shrink-0 inline-flex items-center rounded-full bg-slate-200 dark:bg-slate-700 text-[9px] font-bold uppercase tracking-wide text-slate-700 dark:text-slate-200 px-1.5 py-0.5">
-                          {skuTypeBadge(line.sku)}
-                        </span>
-                        {!isMine && verifiable && !isVerified ? (
-                          <span className="shrink-0 inline-flex items-center rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5">
-                            {line.dept ? PRODUCTION_DEPARTMENT_LABELS[line.dept] : "Other dept"}
+                    <OrderLineDisplay
+                      title={line.title}
+                      sku={line.sku}
+                      quantity={line.quantity}
+                      variantTitle={line.variantTitle ?? null}
+                      orientation={orient}
+                      isMine={isMine}
+                      badges={
+                        <>
+                          <span className="shrink-0 inline-flex items-center rounded-full bg-slate-200 dark:bg-slate-700 text-[9px] font-bold uppercase tracking-wide text-slate-700 dark:text-slate-200 px-1.5 py-0.5">
+                            {skuTypeBadge(line.sku)}
                           </span>
-                        ) : null}
-                      </div>
-                      {parsed && parsed.size ? (
-                        <div className="mt-1 flex items-center gap-2 flex-wrap text-[12px] text-slate-700 dark:text-slate-200">
-                          <span className="font-semibold">{friendlySize(parsed.size)}</span>
-                          {parsed.variant ? (
-                            <span className={variantChipClass(parsed.variant)}>
-                              {friendlyVariant(parsed.variant)}
+                          {!isMine && verifiable && !isVerified ? (
+                            <span className="shrink-0 inline-flex items-center rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200 text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5">
+                              {line.dept ? PRODUCTION_DEPARTMENT_LABELS[line.dept] : "Other dept"}
                             </span>
                           ) : null}
-                          {orient ? (
-                            <span
-                              className={
-                                "inline-flex items-center gap-1.5 rounded-md text-[11px] font-bold uppercase tracking-wide px-2 py-0.5 ring-1 " +
-                                (orient === "portrait"
-                                  ? "bg-blue-100 text-blue-900 ring-blue-400 dark:bg-blue-900/40 dark:text-blue-100 dark:ring-blue-600"
-                                  : "bg-orange-100 text-orange-900 ring-orange-400 dark:bg-orange-900/40 dark:text-orange-100 dark:ring-orange-600")
-                              }
-                              aria-label={orient === "portrait" ? "Portrait orientation" : "Landscape orientation"}
-                            >
-                              <span
-                                className={
-                                  orient === "portrait"
-                                    ? "inline-block w-1.5 h-2.5 bg-blue-800 dark:bg-blue-200 rounded-[1px]"
-                                    : "inline-block w-2.5 h-1.5 bg-orange-800 dark:bg-orange-200 rounded-[1px]"
-                                }
-                                aria-hidden="true"
-                              />
-                              {orient === "portrait" ? "Portrait" : "Landscape"}
-                            </span>
-                          ) : null}
-                          {parsed.type === "set_print" ? (
-                            <span className="text-[10px] uppercase tracking-wide text-slate-500">
+                          {parsed?.type === "set_print" ? (
+                            <span className="shrink-0 text-[10px] uppercase tracking-wide text-slate-500">
                               Set of {parsed.setCount}
                             </span>
                           ) : null}
-                        </div>
-                      ) : (
-                        <div className="text-[12px] text-slate-600 dark:text-slate-300 mt-0.5 truncate">
-                          {line.variantTitle ?? describeSku(line.sku)}
-                        </div>
-                      )}
-                      <div className="text-[10px] font-mono text-slate-400 dark:text-slate-500 truncate mt-0.5">
-                        {line.sku}
-                      </div>
-                    </div>
-                    {isVerified ? (
-                      <div className="flex items-center gap-2">
-                        <div className="flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300 font-semibold whitespace-nowrap">
-                          <Check size={14} />
-                          <span>
-                            {staffNames.get(verifiedRec.staff_id) ?? "Staff"} - {verifiedTime}
-                          </span>
-                        </div>
-                        {isMine ? (
+                        </>
+                      }
+                      actions={
+                        isVerified ? (
+                          <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300 font-semibold whitespace-nowrap">
+                              <Check size={14} />
+                              <span>
+                                {staffNames.get(verifiedRec.staff_id) ?? "Staff"} - {verifiedTime}
+                              </span>
+                            </div>
+                            {isMine ? (
+                              <button
+                                type="button"
+                                onClick={(e) => { e.stopPropagation(); onUnverifyLine(line); }}
+                                className="text-[11px] text-slate-500 hover:text-rose-600 dark:hover:text-rose-400 underline underline-offset-2 font-medium"
+                              >
+                                Undo
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : !verifiable ? (
+                          <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold whitespace-nowrap">
+                            No verify needed
+                          </div>
+                        ) : (
                           <button
                             type="button"
-                            onClick={(e) => { e.stopPropagation(); onUnverifyLine(line); }}
-                            className="text-[11px] text-slate-500 hover:text-rose-600 dark:hover:text-rose-400 underline underline-offset-2 font-medium"
+                            onClick={(e) => { e.stopPropagation(); onVerifyLine(line); }}
+                            className="px-3 py-1.5 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 whitespace-nowrap"
                           >
-                            Undo
+                            Verify
                           </button>
-                        ) : null}
-                      </div>
-                    ) : !verifiable ? (
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 font-semibold whitespace-nowrap">
-                        No verify needed
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={(e) => { e.stopPropagation(); onVerifyLine(line); }}
-                        className="px-3 py-1.5 rounded-md bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 whitespace-nowrap"
-                      >
-                        Verify
-                      </button>
-                    )}
+                        )
+                      }
+                    />
                   </li>
                 );
               })}
@@ -2085,8 +2387,11 @@ function ActiveScreen({
             </div>
           </div>
 
+          {/* F4 auto mode: the app picks the packaging; no scan panels. */}
+          {packagingMode === "auto" ? packagingSlot : null}
+
           {/* Package selector - shown when station requires packaging */}
-          {stationRequiresPackages(department) ? (
+          {packagingMode !== "auto" && stationRequiresPackages(department) ? (
             <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 p-5">
               <div className="text-xs uppercase tracking-widest text-slate-500 mb-3 flex items-center justify-between">
                 <span>Packages for this shipment</span>
@@ -2136,7 +2441,7 @@ function ActiveScreen({
           ) : null}
 
           {/* Auto mail-tube info shown at unframed station */}
-          {department === "unframed" && packages.size > 0 ? (
+          {packagingMode !== "auto" && department === "unframed" && packages.size > 0 ? (
             <div className="rounded-2xl ring-1 ring-emerald-200 dark:ring-emerald-800 bg-emerald-50/60 dark:bg-emerald-900/20 p-4">
               <div className="text-[10px] uppercase tracking-widest text-emerald-700 dark:text-emerald-300 font-bold mb-1">
                 Auto-assigned packaging
@@ -2155,6 +2460,7 @@ function ActiveScreen({
             onScrapOrder={onScrapOrder}
             department={department}
             packagesSet={packages.size > 0}
+            packagingMode={packagingMode}
           />
           {/* Inline error during line operations */}
           {error ? (
@@ -2298,12 +2604,14 @@ null
 // ============================================================
 
 function DepartmentPicker({
-  current, onPick, onClose, onReset,
+  current, onPick, onClose, onReset, onSharedScanners,
 }: {
   current: StationConfig | null;
   onPick: (cfg: StationConfig) => void;
   onClose?: () => void;
   onReset?: () => void;
+  /** F6: open the Shared scanners setup instead of a single bench. */
+  onSharedScanners?: () => void;
 }) {
   const [dept, setDept] = useState<ProductionDepartment>(current?.department ?? "framed");
 
@@ -2341,6 +2649,17 @@ function DepartmentPicker({
             ))}
           </div>
         </div>
+
+        {onSharedScanners ? (
+          <button
+            type="button"
+            onClick={onSharedScanners}
+            className="w-full px-4 py-3 rounded-lg ring-1 ring-sky-300 dark:ring-sky-800 text-left hover:bg-sky-50 dark:hover:bg-sky-950"
+          >
+            <div className="font-semibold">Shared scanners (wall receiver)</div>
+            <div className="text-xs opacity-70 mt-0.5">Up to three cordless scanners; badge, then order, saved without taps</div>
+          </button>
+        ) : null}
 
         <div className="flex items-center justify-between pt-2">
 
@@ -2397,14 +2716,16 @@ function LiveClock() {
 // fires onScrapOrder.
 // ============================================================
 function OrderActionBar({
-  onCompleteOrder, onScrapOrder, department, packagesSet,
+  onCompleteOrder, onScrapOrder, department, packagesSet, packagingMode,
 }: {
   onCompleteOrder: () => void;
   onScrapOrder: () => void;
   department: ProductionDepartment;
   packagesSet: boolean;
+  packagingMode: StationPackagingMode;
 }) {
-  const blocked = (department === "a0_framed" || department === "dispatch" || department === "unframed") && !packagesSet;
+  // Same predicate the new station screen uses (stationScreenModel).
+  const blocked = packagingBlocksComplete(department, packagesSet ? 1 : 0, packagingMode);
   const [scrapConfirm, setScrapConfirm] = useState(false);
   return (
     <div className="space-y-2">

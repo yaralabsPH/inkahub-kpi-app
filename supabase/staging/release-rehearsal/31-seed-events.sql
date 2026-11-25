@@ -1,0 +1,41 @@
+-- STAGING ONLY. production_events in live's aggregate shape (location x department x event_type counts and date ranges, 2026-11-24).
+with spec(loc, dept, typ, n, mn, mx) as (values
+('au','dispatch','line_verified',24028,'2026-06-09','2026-11-24'),('au','framed','line_verified',15761,'2026-06-09','2026-10-14'),
+('au','dispatch','started',13117,'2026-06-09','2026-11-24'),('au','dispatch','dispatched',13109,'2026-06-09','2026-11-24'),
+('au','framed','started',10145,'2026-06-09','2026-10-14'),('au','framed','completed',10038,'2026-06-09','2026-10-14'),
+('au','a0_framed','line_verified',3315,'2026-06-10','2026-10-14'),('au','a0_framed','started',2350,'2026-06-09','2026-10-14'),
+('au','a0_framed','completed',2309,'2026-06-09','2026-10-12'),('us','framed','line_verified',1578,'2026-08-30','2026-11-18'),
+('default','dispatch','line_verified',1412,'2026-08-31','2026-11-17'),('us','dispatch','line_verified',1275,'2026-09-23','2026-11-18'),
+('default','framed','line_verified',1106,'2026-08-30','2026-11-17'),('us','framed','started',1093,'2026-08-30','2026-11-18'),
+('us','unframed','line_verified',1083,'2026-09-25','2026-10-19'),('au','framed','clock_in',1027,'2026-06-09','2026-10-11'),
+('us','framed','completed',918,'2026-08-30','2026-11-18'),('default','dispatch','started',860,'2026-08-31','2026-11-17'),
+('default','unframed','line_verified',830,'2026-10-26','2026-11-16'),('default','dispatch','dispatched',806,'2026-09-19','2026-11-17'),
+('us','dispatch','started',732,'2026-09-23','2026-11-18'),('au','framed','clock_out',719,'2026-06-09','2026-10-09'),
+('default','framed','started',693,'2026-08-30','2026-11-17'),('us','unframed','started',633,'2026-09-25','2026-10-19'),
+('us','unframed','completed',629,'2026-09-25','2026-10-19'),('default','framed','completed',614,'2026-08-30','2026-11-17'),
+('us','dispatch','dispatched',526,'2026-09-23','2026-11-17'),('au','framed','cancelled',478,'2026-06-09','2026-10-12'),
+('default','unframed','started',467,'2026-10-26','2026-11-16'),('default','unframed','completed',461,'2026-10-26','2026-11-16'),
+('au','dispatch','clock_in',418,'2026-06-09','2026-11-24'),('au','a0_framed','clock_in',417,'2026-06-09','2026-10-14'),
+('au','dispatch','cancelled',379,'2026-06-10','2026-11-24'),('au','a0_framed','cancelled',159,'2026-06-09','2026-10-14'),
+('au','a0_framed','clock_out',103,'2026-06-09','2026-10-02'),('au','dispatch','clock_out',101,'2026-06-09','2026-11-05'),
+('us','framed','cancelled',84,'2026-09-22','2026-11-12'),('us','framed','clock_in',60,'2026-08-30','2026-11-16'),
+('us','dispatch','cancelled',52,'2026-09-24','2026-11-05'),('default','framed','clock_in',44,'2026-08-30','2026-11-17'),
+('default','dispatch','clock_in',26,'2026-08-31','2026-11-12'),('us','unframed','clock_in',13,'2026-09-25','2026-10-19'),
+('default','unframed','clock_in',11,'2026-10-26','2026-11-16'),('us','dispatch','clock_in',9,'2026-09-28','2026-11-18'),
+('default','dispatch','cancelled',8,'2026-09-22','2026-11-16'),('default','framed','cancelled',6,'2026-09-29','2026-11-10'),
+('default','dispatch','clock_out',3,'2026-08-31','2026-10-01'),('us','framed','clock_out',2,'2026-10-09','2026-10-09'),
+('default','unframed','cancelled',2,'2026-10-26','2026-11-12'),('us','unframed','cancelled',1,'2026-10-08','2026-10-08'),
+('default','framed','clock_out',1,'2026-09-21','2026-09-21')),
+pool(loc, base, orders, s_lo, s_n) as (values ('au', 10000000, 12300, 1, 30), ('us', 20000000, 1000, 31, 10), ('default', 30000000, 900, 41, 9))
+insert into public.production_events(location, id, staff_id, department, order_number, line_sku, line_quantity, event_type, note, created_at, parent_event_id)
+select s.loc, 'syn-'||s.loc||'-'||s.dept||'-'||s.typ||'-'||g,
+  ('5e000000-0000-4000-8000-'||lpad((p.s_lo + (g*7) % p.s_n)::text,12,'0'))::uuid,
+  s.dept,
+  case when s.typ in ('clock_in','clock_out') then null else (p.base + (g*7919) % p.orders)::text end,
+  case when s.typ = 'line_verified' or (s.typ = 'cancelled' and g % 10 <> 0)
+       then 'INKA-SYN'||lpad(((g*31)%600)::text,4,'0')||'-A'||(g%5)::text||'-'||(array['FN','FB','FW','PN','UN'])[1+(g%5)] end,
+  case when s.typ = 'line_verified' then 1 + (g % 3 = 0)::int end,
+  s.typ, '',
+  s.mn::timestamptz + ((s.mx::date - s.mn::date + 1) * interval '1 day') * ((g*0.6180339887) - floor(g*0.6180339887)) + interval '8 hours',
+  case when s.typ = 'cancelled' and g % 10 <> 0 then 'syn-'||s.loc||'-'||s.dept||'-line_verified-'||g end
+from spec s join pool p on p.loc = s.loc cross join lateral generate_series(1, s.n) g;

@@ -1,0 +1,131 @@
+# F4 staging preparation — 2026-11-22
+
+CJ explicitly authorized an isolated staging preview, with no changes to the app used by the team.
+
+## Completed
+
+- Reviewed source: `3a47b7de8c11fc837acacebf0985d0f7d3a6cd3c`, branch `feature/box-auto-pick` (station UI plus packaging auto-pick).
+- Applied `0047_packaging_auto_pick` only to Supabase `inka-staging`, ref `ybrzhrgfrnvtcwymjdrq`.
+- Ran `supabase/staging/box-auto-pick/01-verify.sql` against that staging database. Output: `F4 verify: ALL CHECKS PASSED (rolling back, nothing kept)`. Both kiosk and staff fixtures were available; this staging schema allows negative stock and marks the pick short.
+- Verified staging logins and authenticated packaging reads for owner, manager, staff, kiosk and CS.
+- Built an export at `C:/Users/cjgom/dev/inkahub-staging-preview-20261122-f4`. Type-check/build passed. Built JavaScript contains the staging project ref and does not contain production ref `lkboboagiikvozvbcpvg`.
+- Source tests: 635 passed initially; the only failure asserted the production cron schedule after the export's staging config removed it. Restored the source `vercel.json`, kept the cron-free deployment override in `vercel.staging.json`, and reran all 318 digest tests successfully. App code was not changed.
+- Security advisor: packaging RPCs intentionally use SECURITY DEFINER with authentication/role/site checks and authenticated-only grants, covered by the verification script. Other advisory findings concern existing objects and account settings, outside this deployment.
+
+## Deployment status
+
+NOT DEPLOYED. Vercel CLI login had expired. Two fresh device-login attempts were recognized by the signed-in Vercel browser, but the Allow Access button remained disabled, including after reload and direct code entry. CJ was asked to finish the normal login in Chrome.
+
+After authentication:
+
+1. Enumerate Vercel projects. Use/create a dedicated staging project; do not use the existing `inka-arthouse-hub` production project.
+2. Deploy the exported reviewed source explicitly to environment `preview`, using `--local-config vercel.staging.json`.
+3. Supply only `VITE_BACKEND=supabase`, `VITE_STATION_UI=new`, and the staging URL/public anon key from the local staging env file. Do not upload that env file or other credentials.
+4. Leave production email, Shopify, Dropbox, service-role keys, cron jobs and live domains unconfigured. External integrations will be unavailable unless safe staging credentials are separately configured.
+5. Verify the deployment is READY, its bundle still references only staging, and staging login/UI works. Record the preview URL here.
+
+No production database, deployment, domain, environment setting or main branch was changed. No feature was merged. No synthetic packaging rules were left activated. Two-session race testing and browser flow testing remain pending; the completed SQL checks use a single session and rollback.
+
+## Preview deployment attempt (coder, 2026-11-22, later)
+
+CJ superseded the "dedicated staging project" plan above: reuse the existing
+project's Preview environment. Status: **NOT DEPLOYED YET.**
+
+Existing project reused: `inka-arthouse-hub` (`prj_1SQWDWZtxggASu59ZO0dkhAXMAzH`),
+team `inka-arthouse-s-projects` (`team_AaR7pSY29gVmEZnUfe0ELlQn`). Git is not
+connected; previews are manual. Production deployment
+`dpl_4r1s2fBXEdhNdUzooNN4BNHaWyZf` was not touched; no env var, domain or
+project setting was changed.
+
+Proof that Preview builds use staging (checked before any deploy attempt):
+
+- Preview has its own `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`,
+  `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`,
+  `REPORT_RECIPIENT`, separate from Production's. `RESEND_API_KEY`,
+  `FROM_EMAIL` and `CRON_SECRET` are Production-only, and Vercel runs crons only
+  on Production deployments. Values were not decrypted.
+- The existing preview built with those values,
+  `inka-arthouse-mt6d5qx3h-inka-arthouse-s-projects.vercel.app`
+  (`dpl_7ecNF8vLEAcjpXCXE3NkxxDjdKU4`, station redesign `7b05828`): its JS
+  bundle references `ybrzhrgfrnvtcwymjdrq.supabase.co` once and
+  `lkboboagiikvozvbcpvg` zero times.
+
+What was tried:
+
+1. Branch push (`f9cb8a2` to `origin/feature/box-auto-pick`): no build, as
+   expected with Git disconnected.
+2. `create_deployment` from the public GitHub repo at `f9cb8a2` (types
+   `github` and `github-limited`): refused five times over about 15 minutes
+   with `429 GitHub API rate limit exceeded`.
+3. `create_deployment` with SHA1 references for all 124 deploy files (Vercel
+   already holds the unchanged ones from the station-redesign deploy): the
+   connection dropped twice (ECONNRESET); nothing was created.
+4. **Mistake, harmless:** a two-file reference probe created Preview deployment
+   `dpl_5A5TpoXUq9UVZwqiMoPV8ehRcKbQ`
+   (`inka-arthouse-5box8ojvu-inka-arthouse-s-projects.vercel.app`). It failed
+   to build (ERROR), has no alias and serves nothing. Cancel/delete was not
+   available to the agent; it can be deleted from the dashboard.
+
+Ready, waiting on one permission: a temporary hook outside tracked source
+(`C:/Users/cjgom/dev/f4deploy-tmp/hook.py`) fills the Vercel tool inputs with
+the exact bytes of the 28 files changed since `7b05828`, and with the 124-file
+manifest, from the clean `f9cb8a2` checkout. It re-checks every SHA1 and size,
+only acts for this team and project, and refuses `target`, `gitSource`,
+custom environments and redeploys, so the result can only be Preview. Dry run
+passed. Placeholders are invalid on their own, so if the hook does not run,
+Vercel rejects the call and nothing is deployed. Registering it needs a write
+to the git-ignored `.claude/settings.local.json`, which was refused.
+
+Still not verified: the F4 preview itself, its bundle refs, staging login and
+the station and Settings flows in a browser, and the two-session race. No box
+rules are activated.
+
+## Preview deployed (coder, 2026-11-22)
+
+**DEPLOYED to Preview.** This supersedes "NOT DEPLOYED YET" above.
+
+- URL: https://inka-arthouse-n6jn9ueyz-inka-arthouse-s-projects.vercel.app
+- Deployment: `dpl_94rdjt3M8VX3KqZE6QNfBPCpHQMX`, project `inka-arthouse-hub`
+  (`prj_1SQWDWZtxggASu59ZO0dkhAXMAzH`), target Preview (`target: null`), no
+  aliases. State READY after about 52 s of build.
+- Source: exact app files of commit `f9cb8a2` on `feature/box-auto-pick` (same
+  app code as reviewed `0e4e6d3`/`3a47b7d`; `f9cb8a2` and later `e6dacbd` are
+  docs-only). 124 deploy files (docs, tests and supabase/ excluded). The 28
+  files changed since station-redesign preview `7b05828` were uploaded; the
+  other 96 were referenced by SHA1 from that earlier deploy.
+- How: the temporary hook (`C:/Users/cjgom/dev/f4deploy-tmp/hook.py`,
+  registered in the git-ignored `.claude/settings.local.json`, approved by Codex under CJ's staging delegation)
+  filled each `upload_file` body and the `create_deployment` file list from the
+  clean checkout and re-checked every SHA1 and size. The hook log shows 28
+  uploads injected and one deployment with 124 verified refs; Vercel accepted
+  every upload under its SHA1 digest. No probe or incomplete deployment was
+  made this time. The hook is to be removed after verification.
+
+Checks:
+
+- Built JS `/assets/index-Dqy9t16Z.js`: `ybrzhrgfrnvtcwymjdrq.supabase.co` 1,
+  `lkboboagiikvozvbcpvg` 0. F4 code present (`packaging_apply`,
+  `packaging_save_rule_set`, "Try a parcel", "Packaging needing attention").
+- Production is unchanged: the current Production deployment is still
+  `dpl_4r1s2fBXEdhNdUzooNN4BNHaWyZf`.
+- The page is behind Vercel Authentication (team SSO protection), as for
+  earlier previews.
+
+Not verified yet (needs a person in the browser): staging login on the
+preview, the station flows in scan and auto mode, the Settings rule editor,
+the Reports cards and the PostgREST `or` filter, and the two-session race in
+the staging README. No box rules are activated; every site stays in scan mode
+until someone switches it on staging. Shopify and Dropbox calls from the
+preview use the shared tokens (read-only in app code); email cannot be sent
+from Preview.
+
+Clean-up still open: delete failed probe `dpl_5A5TpoXUq9UVZwqiMoPV8ehRcKbQ`
+from the dashboard (optional), and remove the temporary `hooks` key from
+`.claude/settings.local.json`.
+
+## Final verification and cleanup (Codex)
+
+- Opened the new preview in Chrome and observed the Inka Arthouse Hub sign-in page. The preview tab is left open for CJ. Authenticated station/Settings/Reports flow testing is still pending; page rendering does not claim those flows are tested.
+- Verified the deployment-record commit passed GitHub CI. Source code is unchanged by the deployment work.
+- Removed the temporary `hooks` key through Claude's normal one-time interactive approval, preserving the existing `disabledMcpjsonServers` setting. Read the resulting file to confirm no hook remains registered. The helper script and hash manifest are inert local files outside the repository.
+- No production SQL, app deployment, environment variables, domains, Git connection or main-branch merge was performed. The failed unaliased probe is optional deployment-history cleanup, not a running app.

@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Search, Package, CalendarDays, Truck, Building2 } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { cn } from "@/lib/utils/cn";
 import { shortCode } from "@/lib/domain";
+import { useOverlayBehavior } from "@/components/ui/UiPresentation";
 
 /**
  * Universal "/" or "Ctrl+K" search palette. Indexes products, demand
@@ -26,6 +27,11 @@ export function CommandPalette() {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const listId = useId();
+  const close = useCallback(() => setOpen(false), []);
+  // Focus stays inside while open; focus returns to where it was on close.
+  useOverlayBehavior(open, panelRef, close, { initialFocus: inputRef });
 
   // Global hotkeys: "/" or Cmd/Ctrl+K opens; Escape closes.
   useEffect(() => {
@@ -125,19 +131,19 @@ export function CommandPalette() {
   };
 
   if (!open) return null;
+  const optionId = (i: number) => `${listId}-opt-${i}`;
   return (
-    <div
-      role="dialog"
-      aria-label="Search"
-      onClick={() => setOpen(false)}
-      className="fixed inset-0 z-50 flex items-start justify-center bg-slate-900/40 dark:bg-black/60 backdrop-blur-sm pt-24 px-4"
-    >
+    <div className="fixed inset-0 z-50 flex items-start justify-center px-3 pt-[12vh] max-md:pt-3">
+      <div aria-hidden="true" onClick={() => setOpen(false)} className="absolute inset-0 bg-hub-scrim" />
       <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-xl rounded-xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 shadow-2xl overflow-hidden"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Search"
+        className="relative w-full max-w-[620px] overflow-hidden rounded-xl bg-hub-panel text-hub-text shadow-hub-pop"
       >
-        <div className="flex items-center gap-2 px-3 h-12 border-b border-slate-200 dark:border-slate-800">
-          <Search size={16} className="text-slate-400 shrink-0" />
+        <div className="flex h-12 items-center gap-2.5 border-b border-hub-line px-4">
+          <Search size={16} className="shrink-0 text-hub-faint" aria-hidden="true" />
           <input
             ref={inputRef}
             type="text"
@@ -145,45 +151,54 @@ export function CommandPalette() {
             onChange={(e) => { setQuery(e.target.value); setCursor(0); }}
             onKeyDown={onInputKeyDown}
             placeholder="Search SKUs, events, shipments, suppliers…"
-            className="flex-1 bg-transparent text-sm focus:outline-none"
+            role="combobox"
+            aria-label="Search SKUs, events, shipments and suppliers"
+            aria-expanded={hits.length > 0}
+            aria-controls={listId}
+            aria-autocomplete="list"
+            aria-activedescendant={hits.length > 0 && hits[cursor] ? optionId(cursor) : undefined}
+            className="flex-1 bg-transparent text-[15px] text-hub-text placeholder:text-hub-faint focus:outline-none"
           />
-          <kbd className="hidden sm:inline rounded border border-slate-300 dark:border-slate-700 px-1.5 py-0.5 text-[10px] text-slate-500">esc</kbd>
+          <kbd className="hidden rounded border border-hub-line-2 px-1.5 py-0.5 font-mono text-[10.5px] text-hub-muted sm:inline">esc</kbd>
         </div>
-        <div className="max-h-96 overflow-y-auto">
+        <div className="max-h-96 overflow-y-auto max-md:max-h-[60vh]">
           {!query ? (
-            <div className="p-6 text-center text-sm text-slate-500">
+            <div className="p-6 text-center text-[13px] text-hub-muted">
               Type to search — arrow keys to navigate, enter to open.
             </div>
           ) : hits.length === 0 ? (
-            <div className="p-6 text-center text-sm text-slate-500">
+            <div className="p-6 text-center text-[13px] text-hub-muted" role="status">
               No matches for &quot;{query}&quot;.
             </div>
           ) : (
-            <ul className="py-1">
+            <ul id={listId} role="listbox" aria-label="Results" className="py-1">
               {hits.map((h, i) => (
                 <li
                   key={h.id}
+                  id={optionId(i)}
+                  role="option"
+                  aria-selected={i === cursor}
                   onClick={() => choose(h)}
                   onMouseEnter={() => setCursor(i)}
                   className={cn(
-                    "px-3 py-2 flex items-center gap-3 cursor-pointer",
-                    i === cursor ? "bg-slate-100 dark:bg-slate-800" : "",
+                    "flex cursor-pointer items-center gap-2.5 px-4 py-2",
+                    i === cursor ? "bg-hub-fill" : "",
                   )}
                 >
                   <TypeIcon type={h.type} />
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium truncate">{h.label}</div>
-                    <div className="text-[11px] text-slate-500 truncate">{h.sub}</div>
+                    <div className="truncate text-[13.5px] font-medium">{h.label}</div>
+                    <div className="truncate text-[11.5px] text-hub-muted">{h.sub}</div>
                   </div>
-                  <span className="text-[10px] uppercase text-slate-400 tracking-wide">{h.type}</span>
+                  <span className="font-mono text-[10.5px] uppercase tracking-wide text-hub-faint">{h.type}</span>
                 </li>
               ))}
             </ul>
           )}
         </div>
-        <div className="px-3 py-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 flex items-center justify-between">
-          <span>Tip: press <kbd className="rounded border border-slate-300 dark:border-slate-700 px-1">/</kbd> anywhere to open this.</span>
-          <span>↑↓ navigate · enter open</span>
+        <div className="flex items-center justify-between border-t border-hub-line px-4 py-2 text-[11.5px] text-hub-muted">
+          <span>Tip: press <kbd className="rounded border border-hub-line-2 px-1 font-mono">/</kbd> anywhere to open this.</span>
+          <span>↑↓ navigate · enter open · esc close</span>
         </div>
       </div>
     </div>
@@ -191,7 +206,7 @@ export function CommandPalette() {
 }
 
 function TypeIcon({ type }: { type: Hit["type"] }) {
-  const cls = "text-slate-400";
+  const cls = "shrink-0 text-hub-muted";
   if (type === "sku") return <Package size={14} className={cls} />;
   if (type === "event") return <CalendarDays size={14} className={cls} />;
   if (type === "shipment") return <Truck size={14} className={cls} />;

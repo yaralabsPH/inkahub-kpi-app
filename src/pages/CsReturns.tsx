@@ -20,6 +20,7 @@ import {
   type CsReturnStatus,
   type Product,
 } from "@/lib/domain";
+import { planCsReturnStock } from "@/lib/domain/csReturnStock";
 
 /** Per-status colour map for List and Kanban pill rendering. */
 const RETURN_STATUS_TONE: Record<CsReturnStatus, string> = {
@@ -198,7 +199,7 @@ export function CsReturns() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight inline-flex items-center gap-2">
+          <h1 className="inline-flex items-center gap-2 text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">
             <PackageOpen size={18} /> Returns
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
@@ -729,7 +730,15 @@ function ReturnModal({
   };
 
   // Inventory impact summary (live).
-  const willCreditLines = (status === "received" || status === "rts") ? lines.filter((l) => l.restock) : [];
+  // Same rules as the save (planCsReturnStock): net per-product change
+  // against what this return has already restocked.
+  const stockPreview = useMemo(() => {
+    try {
+      return { moves: planCsReturnStock(initial?.lines ?? [], status, lines).moves, error: null as string | null };
+    } catch (e) {
+      return { moves: [], error: e instanceof Error ? e.message : String(e) };
+    }
+  }, [initial, status, lines]);
 
   const submit = async () => {
     setError(null);
@@ -1046,19 +1055,28 @@ function ReturnModal({
           </Field>
 
           {/* ---- Inventory impact preview ---- */}
-          {willCreditLines.length > 0 ? (
+          {stockPreview.error ? (
+            <div className="rounded-md ring-1 ring-amber-200 dark:ring-amber-900/40 bg-amber-50/40 dark:bg-amber-900/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-300">
+              {stockPreview.error}
+            </div>
+          ) : stockPreview.moves.length > 0 ? (
             <div className="rounded-md ring-1 ring-emerald-200 dark:ring-emerald-900/40 bg-emerald-50/40 dark:bg-emerald-900/10 px-3 py-2 text-xs text-emerald-900 dark:text-emerald-300">
-              <strong>Saving will credit inventory:</strong>{" "}
-              {willCreditLines.map((l, i) => {
-                const p = products.find((pp) => pp.id === l.product_id);
+              <strong>Saving will change stock:</strong>{" "}
+              {stockPreview.moves.map((mv, i) => {
+                const p = products.find((pp) => pp.id === mv.productId);
+                const onHand = p?.current_on_hand ?? 0;
                 return (
-                  <span key={l.id}>
+                  <span key={mv.productId}>
                     {i > 0 ? ", " : ""}
-                    <strong>{l.quantity}× {p?.code ?? "?"}</strong>
-                    {p ? ` (after: ${fmtNum((p.current_on_hand ?? 0) + l.quantity)})` : ""}
+                    <strong>{mv.change > 0 ? "+" : "−"}{Math.abs(mv.change)} {p?.code ?? "?"}</strong>
+                    {p ? ` (after: ${fmtNum(onHand + mv.change)})` : ""}
                   </span>
                 );
               })}
+            </div>
+          ) : status === "closed" && (initial?.lines ?? []).some((l) => l.inventory_credited) ? (
+            <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-700 px-3 py-2 text-xs text-slate-600 dark:text-slate-300">
+              Units already restocked stay in stock when this return is closed.
             </div>
           ) : null}
 

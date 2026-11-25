@@ -1,0 +1,32 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Movements — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <h1 class="t">Movements</h1><p class="sub">Every change to stock on hand, newest first. This is the ledger.</p>
+
+  <div class="card" style="margin-bottom:16px"><span class="pin">1</span>
+    <div class="row" style="flex-wrap:wrap">
+      <span class="field sel" style="width:220px;color:var(--txt)" aria-label="Category">Damaged / written off</span>
+      <span class="field" style="width:220px;display:inline-flex;gap:6px;align-items:center" role="combobox" aria-label="SKU">Search SKU… <span class="new">New</span></span>
+      <span class="field" style="width:90px;text-align:center;color:var(--txt)" aria-label="Quantity">3</span>
+      <span class="field" style="flex:1;min-width:160px">Note (optional) e.g. “April count”, “→ UK”</span>
+      <span class="btn pri" data-confirm="Log movement?|A2-WHT on hand goes <b>120 → 117</b> (−3, Damaged / written off). Writes a usage ledger row. You can reverse it later.|Log movement">Log movement</span>
+    </div>
+    <div class="small muted" style="margin-top:8px">Damaged / written off deducts. Categories: Sample · Damaged · Internal use · Transfer out · Transfer in · Stocktake adjustment · Found stock · Other</div>
+  </div>
+
+  <div class="views"><span class="on">All</span><span>Sales</span><span>Shipments</span><span>Usage</span><span>Stocktake</span><span>Transfers</span><span>Returns &amp; replacements</span><span class="pin">2</span></div>
+  <div class="tools"><span class="input">Search SKU or note…</span><span class="chip filter">Last 30 days ▾</span><span class="chip">+ Filter</span><span class="sp"></span><span class="btn ghost">Export CSV</span></div>
+  <div class="grid"><table class="tb">
+    <tr><th>When</th><th>SKU</th><th class="num">Delta</th><th>Reason</th><th>Source</th><th>By</th><th></th></tr>
+    <tr><td class="muted">Today 10:42</td><td class="mono">FR-OAK-A3</td><td class="num up">+200</td><td><span class="tag g">shipment</span></td><td>PO-2228 ↗</td><td>Mark K.</td><td></td></tr>
+    <tr><td class="muted">Today 09:30</td><td class="mono">A3-WHT</td><td class="num up">+1</td><td><span class="tag b">return</span></td><td>#R-88 ↗</td><td>Ana L.</td><td></td></tr>
+    <tr><td class="muted">Mon 23 Nov</td><td class="mono">A2-WHT</td><td class="num down">−92</td><td><span class="tag">sale</span></td><td>Week 47 ↗</td><td>CJ</td><td></td></tr>
+    <tr><td class="muted">Mon 23 Nov</td><td class="mono">A2-WHT</td><td class="num down">−3</td><td><span class="tag y">usage</span> <span class="small muted">Damaged</span></td><td>“roll edge torn”</td><td>Jane S.</td><td><span class="btn ghost sm" data-confirm="Reverse this movement?|Adds <b>+3</b> back to A2-WHT (117 → 120) with a new ledger row that points to this one. The original row stays.|Reverse">Reverse <span class="pin">3</span></span></td></tr>
+    <tr style="opacity:.5"><td class="muted">Sun 22 Nov</td><td class="mono">A4-WHT</td><td class="num"><s>+40</s></td><td><span class="tag">stocktake</span></td><td>Reversed by CJ</td><td>Jane S.</td><td></td></tr>
+  </table><div class="gridfoot"><span>Net this view: +106</span><span>Load more</span></div></div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"movements",title:"Movements",empty:{title:"No movements in this range",body:"Try a longer date range or another view."},crumb:["Inventory","Movements"],notes:[
+ "Quick-add uses the existing category presets (each maps to a ledger reason and a default direction). The SKU field becomes a search box instead of a 142-option list. Logging asks first and shows before → after.",
+ "Views and tags use the real ledger reasons (sale, shipment, usage, manual, stocktake, transfer, initial, import, replacement, return). The Source column links back to what caused the movement.",
+ "Reverse is offered only on manual rows. Reversed rows stay visible and struck through, so the ledger stays append-only."]});</script>
+</body></html>

@@ -1,0 +1,65 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <div class="emoji">icon</div>
+  <h1 class="t">Good afternoon, <span class="wf-first">CJ</span></h1>
+  <p class="sub">Tuesday 24 Nov · Week 48 · Arthouse AU</p>
+
+  <div class="callout warn" data-roles="owner manager"><span class="ci"></span><div><b>3 things need you today</b><span class="pin">1</span><br>
+    <span class="muted">2 SKUs drop below safety stock this week · Shipment PO-2231 is 4 days late · 5 CS cases are critical</span></div>
+    <span class="btn sm" style="margin-left:auto;align-self:center" onclick="document.getElementById('wf-bell').click()">Review</span></div>
+  <div class="callout warn" data-roles="cs"><span class="ci"></span><div><b>5 critical CS cases and 2 overdue returns</b><br>
+    <span class="muted">Stock and money aren't shown for your role.</span></div><a class="btn sm" style="margin-left:auto;align-self:center" href="cs-cases.html">Open cases</a></div>
+  <div class="callout" data-roles="staff"><span class="ci"></span><div><b>You're clocked in · Unframed · 3h 12m</b><br><span class="muted">Your numbers for today are below.</span></div></div>
+
+  <h2 class="h">Today on the floor <span class="pin">2</span></h2>
+  <div class="cards c4">
+    <div class="card"><div class="lbl">Orders completed <span>⋯</span></div><div class="val">184</div><div class="dl"><span class="up">▲ 12%</span> vs same day last week</div><div class="ph spark"></div></div>
+    <div class="card"><div class="lbl">Units completed</div><div class="val">612</div><div class="dl"><span class="up">▲ 6%</span> vs last Tue</div><div class="ph spark"></div></div>
+    <div class="card"><div class="lbl">Labour hours</div><div class="val">41.5h</div><div class="dl"><span class="down">▼ 3%</span> vs last Tue</div><div class="ph spark"></div></div>
+    <div class="card"><div class="lbl">Avg min / unit</div><div class="val">4.1</div><div class="dl">target 4.5</div><div class="ph spark"></div></div>
+  </div>
+
+  <div class="split" style="margin-top:18px">
+    <div>
+      <h2 class="h" style="margin-top:0">By department</h2>
+      <div class="grid"><table class="tb">
+        <tr><th>Department <small>production</small></th><th class="num">Orders</th><th class="num">Units</th><th class="num">vs last week</th><th style="width:30%">Progress to daily target</th></tr>
+        <tr><td><span class="dot g"></span>A0 Framed</td><td class="num">42</td><td class="num">58</td><td class="num up">+9%</td><td><div class="bar g"><i style="width:82%"></i></div></td></tr>
+        <tr><td><span class="dot b"></span>Framed</td><td class="num">96</td><td class="num">131</td><td class="num down">−4%</td><td><div class="bar"><i style="width:58%"></i></div></td></tr>
+        <tr><td><span class="dot y"></span>Unframed</td><td class="num">184</td><td class="num">612</td><td class="num up">+12%</td><td><div class="bar g"><i style="width:91%"></i></div></td></tr>
+        <tr><td><span class="dot"></span>Dispatch</td><td class="num">170</td><td class="num">—</td><td class="num">+0%</td><td><div class="bar"><i style="width:70%"></i></div></td></tr>
+      </table></div>
+
+      <h2 class="h" data-roles="owner manager cs">Quick actions <span class="pin">3</span></h2>
+      <div class="cards c3" data-roles="owner manager cs">
+        <a class="card" href="sales-entry.html" data-roles="owner manager"><b>Enter weekly sales</b><div class="small muted">Week of 23 Nov not entered</div></a>
+        <a class="card" href="cs-cases.html" data-roles="owner manager cs"><b>New CS case</b><div class="small muted">Ctrl K → “New CS case” <span class="new">New</span></div></a>
+        <a class="card" href="movements.html" data-roles="owner manager"><b>Log a movement</b><div class="small muted">Adjust stock with a reason</div></a>
+        <a class="card" href="returns.html" data-roles="cs"><b>Log arrived return</b><div class="small muted">Scan or type the order #</div></a>
+      </div>
+    </div>
+    <div>
+      <div class="card"><div class="card-h">Clocked in now <span class="tag g">7</span></div>
+        <div class="row" style="margin:8px 0"><span class="av lt">JS</span>Jane S.<span class="tag" style="margin-left:auto">Printing · 3h12</span></div>
+        <div class="row" style="margin:8px 0"><span class="av lt">MK</span>Mark K.<span class="tag" style="margin-left:auto">Framing · 2h40</span></div>
+        <div class="row" style="margin:8px 0"><span class="av lt">AL</span>Ana L.<span class="tag" style="margin-left:auto">Packing · 5h01</span></div>
+        <div class="small muted">+ 4 more</div>
+      </div>
+      <div class="card" style="margin-top:12px" data-roles="owner manager"><div class="card-h">Recent activity <span class="small muted">last 7 days</span><span class="pin">4</span></div>
+        <div class="small" style="line-height:2">
+          <div><span class="muted">10:42</span> · Mark received <b>PO-2228</b> (48 units)</div>
+          <div><span class="muted">10:15</span> · Ana opened case <b>#C-311</b></div>
+          <div><span class="muted">09:58</span> · CJ edited SKU <span class="mono">A2-WHT</span></div>
+          <div><span class="muted">09:30</span> · Return <b>#R-88</b> restocked</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"welcome",title:"Home",empty:{title:"No production yet today",body:"Numbers appear after the first kiosk scan."},crumb:["Inka Arthouse","Home"],notes:[
+ "The attention callout reads the same alerts as the top-bar bell. Home is the one page every role sees, so it changes by role: owner and manager see stock and shipment alerts, CS sees cases and returns, staff see only their own shift. Try Preview as in the wireframe bar.",
+ "Stat cards use the real production departments (A0 Framed, Framed, Unframed, Dispatch) and the existing 'vs same day last week' comparison.",
+ "Quick actions are links and change with the role. Palette actions (like New CS case) are new; today the palette only searches.",
+ "Recent activity is the existing RecentActivityCard (last 7 days of the ledger and events), restyled. Owners and managers only."]});</script>
+</body></html>

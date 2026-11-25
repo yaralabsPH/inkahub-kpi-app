@@ -1,0 +1,39 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <div class="between"><div><h1 class="t">Dashboard</h1><p class="sub">Stock health and what to order · <b>Framed</b> department · Base scenario</p></div>
+    <div class="row"><span class="chip filter">Supplier: All ▾</span><span class="chip filter">Week 48 ▾</span><span class="btn">Export</span></div></div>
+
+  <div class="callout"><span class="ci"></span><div><b>Reminder:</b> Supplier invoices for PO-2219 are due Friday.</div><span class="btn ghost sm" style="margin-left:auto">Dismiss</span></div>
+
+  <div class="views" style="margin-top:-6px"><span class="on">Overview</span><a href="#" class="small" style="padding:7px 10px;color:var(--muted)">Stock value</a><a href="#" class="small" style="padding:7px 10px;color:var(--muted)">Stock chart</a><span class="pin">4</span></div>
+  <div class="cards c5">
+    <div class="card"><div class="lbl">Total on hand</div><div class="val">18,420</div><div class="dl">units</div></div>
+    <div class="card"><div class="lbl">Stock value</div><div class="val">$84.2k</div><div class="dl"><a class="up">View breakdown →</a></div></div>
+    <div class="card"><div class="lbl">Weekly demand</div><div class="val">2,310</div><div class="dl"><span class="up">▲ 4%</span> 4-wk avg</div></div>
+    <div class="card"><div class="lbl">Avg weeks cover</div><div class="val">7.9</div><div class="dl">target 8</div></div>
+    <div class="card"><div class="lbl">Open shipments</div><div class="val">5</div><div class="dl"><span class="down">1 late</span></div></div>
+  </div>
+
+  <div class="cards c2" style="margin-top:12px">
+    <div class="card"><div class="card-h">Weeks of cover by product type <span class="pin">1</span><span class="muted small" style="margin-left:auto">Bar · ⋯</span></div><div class="ph" style="height:180px">bar chart · red line at target cover</div></div>
+    <div class="card"><div class="card-h">On hand vs incoming (12 weeks)<span class="muted small" style="margin-left:auto">Area · ⋯</span></div><div class="ph" style="height:180px">stacked area · on hand + shipments arriving</div></div>
+  </div>
+
+  <h2 class="h">Order now <span class="tag r">8 SKUs</span><span class="pin">2</span></h2>
+  <div class="views"><span class="on">Needs ordering</span><span>Low cover</span><span>All SKUs</span><span>By supplier</span></div>
+  <div class="tools"><span class="chip filter">Status is Order now ✕</span><span class="chip">+ Filter</span><span class="chip">Sort: Wks of cover ↑</span><span class="sp"></span><span class="btn" data-confirm="Build order for 2 SKUs?|Opens the order builder with A2-WHT (760) and A3-BLK (500). Nothing is ordered until you save it there.|Open order builder">Build order from selected</span></div>
+  <div class="grid"><table class="tb">
+    <tr><th class="chk"><span class="box"></span></th><th>SKU</th><th>Supplier</th><th class="num">On hand</th><th class="num">Wk avg</th><th>Wks of cover</th><th class="num">Order in</th><th class="num">Outstanding</th><th class="num">Suggested</th><th>Status</th></tr>
+    <tr class="sel"><td class="chk"><span class="box x"></span></td><td class="mono">A2-WHT</td><td>Paper Co</td><td class="num">120</td><td class="num">95</td><td><div class="row"><div class="bar r" style="width:70px"><i style="width:15%"></i></div><span class="small">1.3</span></div></td><td class="num">0</td><td class="num">0</td><td class="num"><b>760</b></td><td><span class="tag r">Order now</span></td></tr>
+    <tr class="sel"><td class="chk"><span class="box x"></span></td><td class="mono">A3-BLK</td><td>Paper Co</td><td class="num">210</td><td class="num">88</td><td><div class="row"><div class="bar r" style="width:70px"><i style="width:28%"></i></div><span class="small">2.4</span></div></td><td class="num">0</td><td class="num">200</td><td class="num"><b>500</b></td><td><span class="tag r">Order now</span></td></tr>
+    <tr><td class="chk"><span class="box"></span></td><td class="mono">FR-OAK-A3</td><td>FrameWorks</td><td class="num">64</td><td class="num">20</td><td><div class="row"><div class="bar y" style="width:70px"><i style="width:40%"></i></div><span class="small">3.2</span></div></td><td class="num">2 wk</td><td class="num">100</td><td class="num"><b>80</b></td><td><span class="tag y">Order soon</span></td></tr>
+    <tr><td class="chk"><span class="box"></span></td><td class="mono">CV-60x90</td><td>CanvasCo</td><td class="num">35</td><td class="num">9</td><td><div class="row"><div class="bar y" style="width:70px"><i style="width:48%"></i></div><span class="small">3.9</span></div></td><td class="num">—</td><td class="num">0</td><td class="num"><b>40</b></td><td><span class="tag y">Order soon</span></td></tr>
+    <tr><td class="chk"><span class="box"></span></td><td class="mono">A4-WHT</td><td>Paper Co</td><td class="num">1,240</td><td class="num">130</td><td><div class="row"><div class="bar g" style="width:70px"><i style="width:100%"></i></div><span class="small">9.5</span></div></td><td class="num">—</td><td class="num">0</td><td class="num">0</td><td><span class="tag g">OK</span></td></tr>
+  </table><div class="gridfoot"><span>2 selected · 1,260 units · est. $5,820</span><span>8 of 142 rows</span></div></div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"dashboard",title:"Dashboard",ownerOnly:true,dept:true,empty:{title:"Nothing to order",body:"Every SKU in this view is above its target cover."},crumb:["Inka Arthouse","Dashboard"],notes:[
+ "Charts sit in Supabase-style cards with a small type/menu label. Each chart can be switched (bar/line) or filtered by supplier.",
+ "The 'Order now' list is a Notion database with saved views (Needs ordering, Low cover, By supplier). Removable filter chips replace the dropdowns. Ticking rows shows a sticky footer total and a 'Build order' action.",
+ "Weeks of cover shows as an inline bar coloured by status, so you can scan it faster than a number.", "Owner only (financial data), shown in the top bar. Stock value and Stock chart stay here as tabs because they use the same owner-only permission; moving them to Reports would show them to managers. Numbers follow the Framed/Unframed toggle and the Scenario."]});</script>
+</body></html>

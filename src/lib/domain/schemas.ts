@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DepartmentSnapshotShape } from "./departments";
 
 export const IsoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, "Expected YYYY-MM-DD");
 export const IsoDateTime = z.string().datetime({ offset: true });
@@ -796,6 +797,10 @@ export const ProductionEventTypeSchema = z.enum([
   "completed",
   "cancelled",
   "dispatched",
+  // Added by migrations 0022 and 0029; kept in step with the SQL CHECK.
+  "line_verified",
+  "clock_in",
+  "clock_out",
 ]);
 export type ProductionEventType = z.infer<typeof ProductionEventTypeSchema>;
 
@@ -806,7 +811,7 @@ export const ProductionEventSchema = z.object({
   department: ProductionDepartmentSchema,
   /** Shopify order name, e.g. "#10186629" (with the # prefix kept for
    *  human readability). */
-  order_number: z.string().min(1),
+  order_number: z.string().min(1).nullable(),
   /** SKU code of the line item this event applies to. Null for
    *  dispatch events (they're order-level, not line-level). */
   line_sku: z.string().nullable().default(null),
@@ -821,7 +826,16 @@ export const ProductionEventSchema = z.object({
   /** Optional note attached to a Cancel event ("damaged, restart"). */
   note: z.string().default(""),
   created_at: IsoDateTime,
-});
+  /** CS case driving the work, and the event this one replaces (0022). */
+  cs_case_id: z.string().nullable().optional(),
+  parent_event_id: z.string().nullable().optional(),
+  // F5 business-department snapshot (0054). Filled by the database only;
+  // absent or null on older rows, which stay "legacy" for ever.
+  ...DepartmentSnapshotShape,
+}).refine(
+  (e) => (e.event_type === "clock_in" || e.event_type === "clock_out") === (e.order_number === null),
+  { message: "Clock events have no order number; every other event needs one.", path: ["order_number"] },
+);
 export type ProductionEvent = z.infer<typeof ProductionEventSchema>;
 
 /**

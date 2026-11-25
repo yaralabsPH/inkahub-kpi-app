@@ -41,6 +41,9 @@ export function effectiveNavAccess(profile: UserProfile | null): Set<NavKey> {
         keys = ["cs_returns", "cs_cases"] as NavKey[];
         break;
       case "staff":
+        // F8: staff see Reports (their own work only; the server enforces it).
+        keys = ["welcome", "reports"];
+        break;
       default:
         keys = ["welcome"];
         break;

@@ -1,4 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
+import { DataState } from "@/components/ui/DataState";
+import { ReportsSectionNav } from "@/components/ReportsSectionNav";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useMutations } from "@/lib/hooks/useMutations";
@@ -11,6 +14,9 @@ import { getSupabase, isSupabaseConfigured } from "@/lib/repository/supabase/cli
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { SupplierPaymentTermsCard } from "@/components/SupplierPaymentTermsCard";
 import { ProductionBenchmarksCard } from "@/components/ProductionBenchmarksCard";
+import { PackagingRulesCard } from "@/components/PackagingRulesCard";
+import { FrameTimingWeightsCard, supabaseWeightsRpc } from "@/components/FrameTimingWeightsCard";
+import { getBackendMode } from "@/lib/repository/supabase/client";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Input, Select } from "@/components/ui/Input";
@@ -25,7 +31,8 @@ import { cn } from "@/lib/utils/cn";
 import type { Repository } from "@/lib/repository/Repository";
 
 export function Settings() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const repo = useRepo();
   const m = useMutations();
   const location = useAppStore((s) => s.location);
@@ -41,17 +48,18 @@ export function Settings() {
   const [cleanupMsg, setCleanupMsg] = useState<string | null>(null);
   const [copyMsg, setCopyMsg] = useState<string | null>(null);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading settings…" />;
   const s = data.settings;
 
   return (
-    <div className="space-y-5 max-w-3xl">
-      <div className="flex items-end justify-between">
-        <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
-        <span className="text-xs text-slate-500 dark:text-slate-400">
+    <div id="settings-root" className="mx-auto max-w-[860px] space-y-5">
+      <div className="flex flex-wrap items-end justify-between gap-2">
+        <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Settings</h1>
+        <span className="text-xs text-hub-muted">
           Editing <strong>{LOCATION_LABELS[location]}</strong> · each location has its own settings.
         </span>
       </div>
+      <ReportsSectionNav containerId="settings-root" label="Settings sections" />
 
       <Card>
         <CardHeader>
@@ -150,6 +158,9 @@ export function Settings() {
       <SupplierPaymentTermsCard />
 
       <ProductionBenchmarksCard />
+
+      <PackagingRulesCard />
+      <OwnerFrameTimingWeights />
 
       <CrossLocationDiagnostics />
 
@@ -1216,4 +1227,16 @@ async function applyCartonDefaults(
   return count;
 }
 
-
+/**
+ * F9: owner-only frame timing weights for the selected site (Supabase only).
+ * Shown only for a loaded profile that matches the signed-in user; the RPCs
+ * re-check the owner role on the server.
+ */
+function OwnerFrameTimingWeights() {
+  const auth = useAuthOptional();
+  const site = useAppStore((s) => s.location);
+  const isOwner = !!auth && !auth.loading && !!auth.user && auth.profile?.user_id === auth.user.id && auth.profile?.role === "owner";
+  const rpc = useMemo(() => (getBackendMode() === "supabase" ? supabaseWeightsRpc(getSupabase()) : null), []);
+  if (!isOwner || !rpc || !["au", "uk", "us"].includes(site)) return null;
+  return <FrameTimingWeightsCard key={site} rpc={rpc} site={site} />;
+}
