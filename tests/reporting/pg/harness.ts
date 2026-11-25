@@ -79,6 +79,7 @@ export const NON_REPORTING_MIGRATIONS: ReadonlySet<string> = new Set([
   "0054_departments_snapshots.sql",
   "0055_scanner_stations.sql",
   "0056_dispatch_flow.sql",
+  "0063_exact_stock_adjust.sql",
 ]);
 
 export function reportingMigrations(from = "0037"): Array<{ name: string; sql: string }> {
