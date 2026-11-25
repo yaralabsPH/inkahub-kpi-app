@@ -4,8 +4,10 @@
  * the classic station instead.
  *
  * Strict by design (spec decision 5): it uses the existing SKU parser and
- * deduction router, never the fail-open isLineMyDept. Any line it cannot
- * classify with certainty sends the whole order to the classic station.
+ * deduction router, never the fail-open isLineMyDept. Since
+ * scanner-stations-tuning only framing lines count: other lines are ignored
+ * silently, and a line that looks framed but cannot be identified sends the
+ * whole order to the classic station.
  */
 import {
   parseSku,
@@ -97,7 +99,8 @@ export type PrepareCode =
   | "unroutable_component"
   | "missing_stock_code"
   | "packaging_not_auto"
-  | "packaging_unresolved";
+  | "packaging_unresolved"
+  | "suspicious_framing";
 
 export type PrepareRefusal = { ok: false; code: PrepareCode; message: string };
 export type PrepareResult = { ok: true; prepared: PreparedFraming } | PrepareRefusal;
@@ -211,43 +214,47 @@ export function prepareFramingOrder(
 
   const items = lookup.line_items ?? [];
 
+  // scanner-stations-tuning: only framing lines count. Everything else is
+  // ignored silently (no credit, no quantity check, no stock, no box); a
+  // line that looks framed but is not a valid framed SKU refuses the scan.
   const bySku = new Map<string, FramingLine>();
-  const allLines: Array<{ sku: string; quantity: number }> = [];
+  const framingLines: Array<{ sku: string; quantity: number }> = [];
   for (const it of items) {
-    const sku = (it.sku ?? "").trim().toUpperCase();
-    if (!sku) return no("blank_sku", `Order #${n} has a line without a SKU.`);
+    const c = classifyFramingLine(it);
+    if (c.kind === "ignored") continue;
+    if (c.kind === "suspicious") {
+      return {
+        ok: false,
+        code: "suspicious_framing",
+        message: `This order has a framed print we couldn't identify: ${c.label}. Nothing was saved. Ask a manager to check it on the classic station.`,
+      };
+    }
+    const sku = c.sku;
     const q = it.quantity;
     if (!Number.isInteger(q) || q < 1 || q > MAX_LINE_QUANTITY) {
       return no("invalid_quantity", `Line ${sku} has quantity ${String(q)}.`);
     }
-    const p = parseSku(sku);
-    if (!p) return no("unknown_sku", `Line ${sku} is not a current SKU.`);
-    if (p.variant === "SC") return no("canvas", `Line ${sku} is stretched canvas.`);
-    allLines.push({ sku, quantity: q });
-
-    const isPrint = p.type === "single_print" || p.type === "set_print";
-    if (isPrint && p.size === "GW" && p.type !== "set_print") return no("unsupported_sku", `Line ${sku} is not a supported gallery-wall SKU.`);
-    const framed = isPrint && (p.variant === "FB" || p.variant === "FW" || p.variant === "FN");
-    if (!framed) continue; // unframed, picture frame, gift card, accessory: no framing credit
-
-    const workType: FramingWorkType = p.size === "A0" ? "a0_framed" : "framed";
+    framingLines.push({ sku, quantity: q });
     const hit = bySku.get(sku);
     const quantity = (hit?.quantity ?? 0) + q;
     if (quantity > MAX_LINE_QUANTITY) return no("invalid_quantity", `Line ${sku} has quantity ${quantity}.`);
-    bySku.set(sku, { sku, quantity, workType, pieces: quantity * framingPieceMultiplier(sku) });
+    bySku.set(sku, { sku, quantity, workType: c.workType, pieces: quantity * framingPieceMultiplier(sku) });
   }
 
   const lines = [...bySku.values()].sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0));
-  if (lines.length === 0) return no("no_framing_lines", `Order #${n} has no framed prints.`);
+  if (lines.length === 0) {
+    return { ok: false, code: "no_framing_lines", message: "Nothing to frame on this order. Nothing was saved." };
+  }
   const workTypes = (["a0_framed", "framed"] as const).filter((w) => lines.some((l) => l.workType === w));
 
   let components: Array<{ code: string; qty: number }> = [];
   let packaging: FramingPackaging | null = null;
   if (workTypes.includes("a0_framed")) {
-    // The A0 bench is terminal: the same lines the classic A0 completion
-    // deducts (A0 framed prints and accessories), nothing more.
+    // The A0 bench is terminal. Its components and box come from the
+    // framing lines only (CJ, 2026-11-25: accessories and canvas are
+    // ignored here, A0 orders included).
     const byCode = new Map<string, number>();
-    for (const l of allLines) {
+    for (const l of framingLines) {
       if (!shouldDeductAtDept(l.sku, "a0_framed", "completed")) continue;
       const route = routeShopifyLineToCatalogueLines(l.sku, l.quantity);
       if (route.lines.length === 0) return no("unroutable_component", `No stock components for ${l.sku}: ${route.reason ?? "unknown"}.`);
@@ -263,7 +270,7 @@ export function prepareFramingOrder(
     if (!setup || setup.mode !== "auto" || !setup.ruleSet) {
       return no("packaging_not_auto", `A0 order #${n} needs automatic box rules at this site.`);
     }
-    const prediction = predictPackaging(setup.ruleSet.body, "a0_framed", packagingLinesFromOrder(allLines), { replacement: false });
+    const prediction = predictPackaging(setup.ruleSet.body, "a0_framed", packagingLinesFromOrder(framingLines), { replacement: false });
     const ev = prediction.evaluation;
     if (ev.status !== "resolved" || ev.packages.length === 0) {
       return no("packaging_unresolved", `The box rules could not pick the A0 packaging for #${n}${ev.reason ? ` (${ev.reason})` : ""}.`);

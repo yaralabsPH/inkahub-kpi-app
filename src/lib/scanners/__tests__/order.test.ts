@@ -18,6 +18,8 @@ const body: RuleSetBody = {
   examples: [],
 };
 const auto: PackagingSetup = { mode: "auto", ruleSet: { id: "rs-1", version: 3, body } };
+/** One A0 single + one A0 set of 2 = 3 framed pieces at capacity 2. */
+const A0_BOXES = 2;
 
 function order(lines: OrderLookup["line_items"], over: Partial<OrderLookup> = {}): OrderLookup {
   return { found: true, complete: true, truncated: false, order_name: "#10190203", cancelled_at: null, tags: [], line_items: lines, ...over };
@@ -113,7 +115,7 @@ describe("prepareFramingOrder", () => {
     });
   });
 
-  it("mixed A0 + regular: both work types, A0 components incl. accessories, and F4 packaging", () => {
+  it("mixed A0 + regular: both work types, A0 components from framing lines only, and F4 packaging", () => {
     const r = prepareFramingOrder(order([
       { sku: "INKA-ABC0001-A0-FB", quantity: 1 },
       { sku: "INKA-S2ABC0003-A0-FN", quantity: 1 },
@@ -130,14 +132,13 @@ describe("prepareFramingOrder", () => {
     expect(r.prepared.components).toEqual([
       { code: "A0-Black", qty: 1 },
       { code: "A0-Natural", qty: 2 },
-      { code: "INKA-AUX-HOOK", qty: 2 },
     ]);
     expect(r.prepared.packaging).toMatchObject({
       ruleSetId: "rs-1",
       ruleSetVersion: 3,
       resolved: true,
-      predicted: { "p-box": 2 },
-      target: { "p-box": 2 },
+      predicted: { "p-box": A0_BOXES },
+      target: { "p-box": A0_BOXES },
       snapshot: { rule_set_version: 3, packing_point: "a0_framed" },
     });
   });
@@ -159,13 +160,11 @@ describe("prepareFramingOrder", () => {
     ["cancelled", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }], { cancelled_at: "2026-11-01T00:00:00Z" }), {}, "cancelled"],
     ["edit tag", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }], { tags: ["oe-staff-edit"] }), {}, "edit_warning"],
     ["open case", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }]), { openCase: true }, "open_case"],
-    ["blank SKU", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, { sku: null, quantity: 1 }]), {}, "blank_sku"],
-    ["legacy SKU", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, { sku: "A2 Black Frame", quantity: 1 }]), {}, "unknown_sku"],
-    ["canvas", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, { sku: "INKA-ABC0001-A2-SC", quantity: 1 }]), {}, "canvas"],
+    ["framed print it cannot identify", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, { sku: "INKA-ABC0001-A9-FB", quantity: 1 }]), {}, "suspicious_framing"],
     ["zero quantity", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 0 }]), {}, "invalid_quantity"],
     ["fractional quantity", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1.5 }]), {}, "invalid_quantity"],
     ["huge quantity", order([{ sku: "INKA-ABC0001-A2-FB", quantity: 101 }]), {}, "invalid_quantity"],
-    ["single gallery wall", order([{ sku: "INKA-ABC0001-GW-FB", quantity: 1 }]), {}, "unsupported_sku"],
+    ["single gallery wall", order([{ sku: "INKA-ABC0001-GW-FB", quantity: 1 }]), {}, "suspicious_framing"],
     ["no framing lines", order([{ sku: "INKA-ABC0001-A2-UN", quantity: 1 }, { sku: "INKA-AUX-HOOK", quantity: 1 }]), {}, "no_framing_lines"],
     ["A0 stock code missing", order([{ sku: "INKA-ABC0001-A0-FW", quantity: 1 }]), {}, "missing_stock_code"],
     ["A0 without auto packaging", order([{ sku: "INKA-ABC0001-A0-FB", quantity: 1 }]), { packaging: { mode: "scan", ruleSet: null } }, "packaging_not_auto"],
@@ -176,7 +175,112 @@ describe("prepareFramingOrder", () => {
     it(`sends the whole order to classic: ${name}`, () => {
       const r = prepareFramingOrder(lookup, ctx(over));
       expect(r).toMatchObject({ ok: false, code });
-      if (!r.ok) expect(r.message).toMatch(/classic station/);
+      if (!r.ok && code !== "no_framing_lines") expect(r.message).toMatch(/classic station/);
     });
   }
+
+  it("mixed order saves only framing lines and leaves lookup untouched", () => {
+    const lookup = order([
+      { sku: "INKA-ABC0001-A2-FB", quantity: 2 },
+      { sku: "INKA-ABC0001-A2-SC", quantity: 1 }, // canvas
+      { sku: "INKA-AUXMFL", quantity: 1, title: "Framed hanging kit" },
+      { sku: "INKA-AUX-HOOK", quantity: 3 },
+      { sku: null, quantity: 1, title: "Gift bag" },
+      { sku: "A2 Black Frame", quantity: 1 }, // legacy frame only
+      { sku: "INKA-GC0001-50", quantity: 1 },
+    ]);
+    const before = JSON.stringify(lookup);
+    Object.freeze(lookup.line_items);
+    const r = prepareFramingOrder(lookup, ctx({ packaging: null }));
+    expect(JSON.stringify(lookup)).toBe(before);
+    expect(r).toEqual({
+      ok: true,
+      prepared: {
+        orderNumber: "10190203",
+        displayName: "#10190203",
+        lines: [{ sku: "INKA-ABC0001-A2-FB", quantity: 2, workType: "framed", pieces: 2 }],
+        workTypes: ["framed"],
+        pieces: 2,
+        components: [],
+        packaging: null,
+      },
+    });
+  });
+
+  it("suspicious framing refuses the whole mixed order", () => {
+    const r = prepareFramingOrder(order([
+      { sku: "INKA-ABC0001-A2-FB", quantity: 1 },
+      { sku: "INKA-ABC0002-A2-FX", quantity: 1 },
+      { sku: "INKA-AUX-HOOK", quantity: 1 },
+    ]), ctx({ packaging: null }));
+    expect(r).toEqual({
+      ok: false,
+      code: "suspicious_framing",
+      message: "This order has a framed print we couldn't identify: INKA-ABC0002-A2-FX. Nothing was saved. Ask a manager to check it on the classic station.",
+    });
+  });
+
+  it("validates only selected quantities and their aggregate", () => {
+    for (const q of [1, 100]) {
+      expect(prepareFramingOrder(order([{ sku: "INKA-ABC0001-A2-FB", quantity: q }]), ctx({ packaging: null })).ok).toBe(true);
+    }
+    for (const q of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 101]) {
+      expect(prepareFramingOrder(order([{ sku: "INKA-ABC0001-A2-FB", quantity: q }]), ctx({ packaging: null })), String(q))
+        .toMatchObject({ ok: false, code: "invalid_quantity" });
+      // the same bad quantity on an ignored line never blocks framing
+      expect(prepareFramingOrder(order([
+        { sku: "INKA-ABC0001-A2-FB", quantity: 1 },
+        { sku: "INKA-AUX-HOOK", quantity: q },
+        { sku: "INKA-ABC0001-A2-SC", quantity: q },
+      ]), ctx({ packaging: null })).ok, String(q)).toBe(true);
+    }
+    expect(prepareFramingOrder(order([
+      { sku: "INKA-ABC0001-A2-FB", quantity: 60 },
+      { sku: "INKA-ABC0001-A2-FB", quantity: 41 },
+    ]), ctx({ packaging: null }))).toMatchObject({ ok: false, code: "invalid_quantity" });
+  });
+
+  it("empty selection uses the approved message", () => {
+    const r = prepareFramingOrder(order([
+      { sku: "INKA-ABC0001-A2-UN", quantity: 1 },
+      { sku: "INKA-ABC0001-A2-SC", quantity: 1 },
+      { sku: "INKA-AUX-HOOK", quantity: 1 },
+    ]), ctx());
+    expect(r).toEqual({ ok: false, code: "no_framing_lines", message: "Nothing to frame on this order. Nothing was saved." });
+  });
+
+  it("A0-only with canvas and AUXMFL uses only framed stock and box contents", () => {
+    const withExtras = prepareFramingOrder(order([
+      { sku: "INKA-ABC0001-A0-FB", quantity: 1 },
+      { sku: "INKA-S2ABC0003-A0-FN", quantity: 1 },
+      { sku: "INKA-ABC0005-A0-SC", quantity: 1 },
+      { sku: "INKA-AUXMFL", quantity: 2 },
+      { sku: "INKA-AUX-HOOK", quantity: 4 },
+    ]), ctx());
+    const plain = prepareFramingOrder(order([
+      { sku: "INKA-ABC0001-A0-FB", quantity: 1 },
+      { sku: "INKA-S2ABC0003-A0-FN", quantity: 1 },
+    ]), ctx());
+    if (!withExtras.ok || !plain.ok) throw new Error("expected both to prepare");
+    expect(withExtras.prepared.components).toEqual([
+      { code: "A0-Black", qty: 1 },
+      { code: "A0-Natural", qty: 2 },
+    ]);
+    expect(withExtras.prepared.pieces).toBe(3);
+    // identical box prediction and snapshot to the same order without extras
+    expect(withExtras.prepared.packaging).toEqual(plain.prepared.packaging);
+    expect(JSON.stringify(withExtras.prepared.packaging)).not.toMatch(/AUX|-SC/);
+  });
+
+  it("mixed A0 and regular sets keep set pieces and only A0 components", () => {
+    const r = prepareFramingOrder(order([
+      { sku: "INKA-S3WIL0049-A0-FB", quantity: 1 },
+      { sku: "INKA-S2ABC0003-A2-FN", quantity: 2 },
+      { sku: "INKA-AUX-HOOK", quantity: 1 },
+    ]), ctx());
+    if (!r.ok) throw new Error(r.message);
+    expect(r.prepared.workTypes).toEqual(["a0_framed", "framed"]);
+    expect(r.prepared.pieces).toBe(3 + 4);
+    expect(r.prepared.components).toEqual([{ code: "A0-Black", qty: 3 }]);
+  });
 });

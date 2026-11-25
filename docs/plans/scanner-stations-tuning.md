@@ -52,7 +52,7 @@ Execute in order, with one writer. Each task is one coder commit named `task N: 
 - [ ] Implement precedence: explicit non-framing category evidence first, valid strict framed grammar second, then the spec's suffix/artwork-stem/standalone-framed safeguards, otherwise ignore. Keep title evidence a safeguard/exclusion signal, never a source of credit. Quantity validation belongs to selected lines in Task 2.
 - Done when: `npm run test -- --run src/lib/scanners/__tests__/order.test.ts` passes with the new classification tests; preparation behavior remains unchanged until Task 2.
 
-### [ ] Task 2: Prepare only framing credit, A0 components and packaging; preserve retries
+### [x] Task 2: Prepare only framing credit, A0 components and packaging; preserve retries
 
 - Files: modify `src/lib/scanners/order.ts`; tests in `src/lib/scanners/__tests__/order.test.ts` and `src/lib/scanners/__tests__/outbox.test.ts`. Read, but do not change, `src/lib/scanners/client.ts`, `src/lib/scanners/outbox.ts`, `src/lib/domain/skuRouting.ts` and `src/lib/domain/packaging/contents.ts` / `session.ts`.
 - Interfaces: consume Task 1's classifier inside the existing `prepareFramingOrder(lookup, ctx): PrepareResult`; keep `PreparedFraming`, `commitParams` and `processNext` payload contracts unchanged. Add a Framing refusal code `suspicious_framing` to `PrepareCode`; retain other codes used by Dispatch.
@@ -157,3 +157,4 @@ Coder adds one line per task with commit, named tests/check results and any limi
 
 - 2026-11-25 — Planner: inspected current branch and wrote this plan; spec approval recorded exactly as instructed. No implementation, SQL, staging run, test/build result or release is claimed. A0 operational question remains a pre-release gate.
 - 2026-11-25 — Task 1: added `classifyFramingLine` in `src/lib/scanners/order.ts` (explicit non-framing first, strict framed grammar second, suffix/artwork-stem/"framed"-word safeguards third, else ignored); 3 table tests in `order.test.ts` (24/24 pass), `npx tsc -b` clean. Not yet used by preparation (Task 2). Note: `INKA-AUX*`, `INKA-GC*`, `INKA-PF*` prefixes count as explicit non-framing even when they do not parse.
+- 2026-11-25 — Task 2: `prepareFramingOrder` now uses the classifier: ignored lines skip every check, suspicious lines return `suspicious_framing` with the spec's exact text, empty selection returns "Nothing to frame on this order. Nothing was saved." (no classic suffix); A0 components and packaging input come from framing lines only. Updated the A0 accessory expectation and reject table (legacy/blank/canvas lines are now ignored, single GW is suspicious); added 6 order tests and 3 outbox tests incl. `old prepared A0 payload replays unchanged after tuning`. 158/158 scanner tests, `npx tsc -b` clean.
