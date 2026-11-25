@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
 import { ClipboardList, Save, Undo2 } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useLedger } from "@/lib/hooks/useLedger";
@@ -6,6 +7,9 @@ import { useMutations } from "@/lib/hooks/useMutations";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Field, Input, Select } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
+import { DataState } from "@/components/ui/DataState";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
+import { filterProductsForPicker } from "@/lib/ui/productSearch";
 import { fmtDayMonth, fmtNum } from "@/lib/utils/format";
 import { shortCode } from "@/lib/domain";
 import type { LedgerReason } from "@/lib/domain";
@@ -49,7 +53,8 @@ const PRESETS: readonly Preset[] = [
 ];
 
 export function Movements() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { data: recent } = useLedger(undefined, 25);
   const m = useMutations();
 
@@ -60,6 +65,9 @@ export function Movements() {
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reversingId, setReversingId] = useState<string | null>(null);
+  // Local narrowing of the SKU list (presentation only; same productId state).
+  const [skuQuery, setSkuQuery] = useState("");
+  const { ask, dialog: confirmDialog } = useConfirm();
 
   const preset = PRESETS.find((p) => p.key === presetKey) ?? PRESETS[0];
 
@@ -69,6 +77,11 @@ export function Movements() {
   }, [data]);
 
   const selectedProduct = products.find((p) => p.id === productId);
+  // The selected SKU always stays in the list, even when the search hides it.
+  const pickerProducts = useMemo(() => {
+    const matched = filterProductsForPicker(products, skuQuery);
+    return selectedProduct && !matched.some((x) => x.id === selectedProduct.id) ? [selectedProduct, ...matched] : matched;
+  }, [products, skuQuery, selectedProduct]);
   const numericQty = Math.abs(Number(qty));
   const valid = !!selectedProduct && Number.isFinite(numericQty) && numericQty > 0;
 
@@ -168,15 +181,38 @@ export function Movements() {
     }
   };
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!data) return <DatasetLoadState result={dataset} title="Loading movements…" />;
+
+  /** Confirm step before the existing submit: states the requested change. */
+  const confirmAndSubmit = async () => {
+    if (!valid || !selectedProduct) return;
+    const out = preset.defaultDirection === "out";
+    const now = selectedProduct.current_on_hand ?? 0;
+    const ok = await ask({
+      title: "Log this movement?",
+      confirmLabel: "Log movement",
+      body: (
+        <div className="space-y-2">
+          <p>
+            <span className="font-mono">{out ? "−" : "+"}{fmtNum(numericQty)} {selectedProduct.code}</span> as “{preset.label}”.
+          </p>
+          <p className="text-hub-muted">
+            On hand now {fmtNum(now)}; after this it should be about {fmtNum(Math.max(now - (out ? numericQty : -numericQty), 0))}.
+            This is the requested change, not a guaranteed balance if someone else changes stock at the same time.
+          </p>
+        </div>
+      ),
+    });
+    if (ok) await submit();
+  };
 
   return (
-    <div className="space-y-5 max-w-5xl">
+    <div className="mx-auto max-w-hub space-y-5">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight inline-flex items-center gap-2">
-          <ClipboardList size={18} /> Movements
+        <h1 className="inline-flex items-center gap-2 text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">
+          <ClipboardList size={24} aria-hidden="true" /> Movements
         </h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
+        <p className="mt-1 text-sm text-hub-muted">
           Log ad-hoc inventory movements that aren't sales or shipment arrivals — samples, damaged stock, internal use, transfers, stocktake reconciliation. Every submit appends a row to the ledger and atomically adjusts on-hand.
         </p>
       </div>
@@ -198,9 +234,17 @@ export function Movements() {
               </Select>
             </Field>
             <Field label="SKU" hint={preset.hint}>
-              <Select value={productId} onChange={(e) => setProductId(e.target.value)}>
-                <option value="">— pick a SKU —</option>
-                {products.map((p) => (
+              <Input
+                type="search"
+                value={skuQuery}
+                onChange={(e) => setSkuQuery(e.target.value)}
+                placeholder="Type to narrow the list (code or short code)"
+                aria-label="Search SKUs to narrow the SKU list"
+                className="mb-1.5"
+              />
+              <Select value={productId} onChange={(e) => setProductId(e.target.value)} aria-label="SKU">
+                <option value="">{pickerProducts.length === 0 ? "— no SKU matches —" : "— pick a SKU —"}</option>
+                {pickerProducts.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.code} · {shortCode(p)} · on hand: {p.current_on_hand}
                   </option>
@@ -222,7 +266,7 @@ export function Movements() {
               <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder={preset.label} />
             </Field>
             <div className="flex flex-wrap items-end gap-2">
-              <Button disabled={!valid || busy} onClick={submit}>
+              <Button disabled={!valid || busy} onClick={() => void confirmAndSubmit()}>
                 <Save size={14} /> {busy ? "Saving…" : "Log movement"}
               </Button>
               {selectedProduct ? (
@@ -325,6 +369,7 @@ export function Movements() {
           )}
         </CardBody>
       </Card>
+      {confirmDialog}
     </div>
   );
 }

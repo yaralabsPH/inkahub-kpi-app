@@ -199,7 +199,7 @@ export function CsReturns() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight inline-flex items-center gap-2">
+          <h1 className="inline-flex items-center gap-2 text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">
             <PackageOpen size={18} /> Returns
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">

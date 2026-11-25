@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { DataState } from "@/components/ui/DataState";
 import { LineChart, Line, ResponsiveContainer } from "recharts";
 import { Trophy, Sparkles } from "lucide-react";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
@@ -54,14 +56,8 @@ export function Welcome() {
   // Construct the Supabase client only on the Supabase path (Dexie shows the message below).
   if (getBackendMode() !== "supabase") {
     return (
-      <div className="p-6">
-        <Card>
-          <CardBody>
-            <div className="text-sm text-slate-600 dark:text-slate-400">
-              Welcome page is only available when signed in.
-            </div>
-          </CardBody>
-        </Card>
+      <div className="mx-auto max-w-hub">
+        <DataState kind="empty" title="Welcome page is only available when signed in." />
       </div>
     );
   }
@@ -160,14 +156,9 @@ function SupabaseWelcome() {
   const todayStr = shownToday ? dateLabel(shownToday, { weekday: "long", month: "long", day: "numeric" }) : "";
 
   return (
-    <div className="p-4 md:p-6 space-y-4 max-w-5xl mx-auto">
+    <div className="mx-auto max-w-hub space-y-4">
       {/* ------------ Header ------------ */}
-      <div className="space-y-1">
-        <h1 className="text-3xl md:text-4xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">
-          {greeting(now)}
-        </h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400">{dateStr}</p>
-      </div>
+      <PageHeader title={greeting(now)} description={dateStr} />
 
       {namesError ? (
         <div className="text-xs text-amber-700 dark:text-amber-300">{namesError}</div>
@@ -183,9 +174,9 @@ function SupabaseWelcome() {
 
       {/* ------------ Today header ------------ */}
       <div>
-        <h2 className="text-xl font-semibold text-slate-900 dark:text-slate-100">
+        <h2 className="mt-2 flex flex-wrap items-baseline gap-2 text-lg font-semibold text-hub-text">
           Today
-          <span className="text-sm font-normal text-slate-500 ml-2">{todayStr}</span>
+          <span className="text-sm font-normal text-hub-muted">{todayStr}</span>
         </h2>
         {view && !todayShown ? (
           <div className="text-xs text-amber-700 dark:text-amber-300" role="status">
@@ -208,18 +199,18 @@ function SupabaseWelcome() {
           return (
             <Card key={dep}>
               <CardBody>
-                <div className="text-xs uppercase tracking-widest text-slate-500 dark:text-slate-400 font-semibold mb-2">
+                <div className="mb-1.5 text-xs text-hub-muted">
                   {PRODUCTION_DEPARTMENT_LABELS[dep]}
                 </div>
                 <div className="flex items-baseline gap-2 flex-wrap">
-                  <div className="text-3xl font-semibold tabular-nums">{d.normal.orders}</div>
+                  <div className="text-2xl font-semibold tabular-nums text-hub-text">{d.normal.orders}</div>
                   <div className="text-sm text-slate-500">orders today</div>
                   {d.vsLastWeek !== null && d.vsLastWeek !== 0 ? (
                     <span
                       className={
                         d.vsLastWeek > 0
-                          ? "text-xs font-medium text-emerald-700 bg-emerald-50 ring-1 ring-emerald-200 rounded-full px-2 py-0.5 dark:bg-emerald-900/30 dark:text-emerald-300 dark:ring-emerald-800"
-                          : "text-xs font-medium text-rose-700 bg-rose-50 ring-1 ring-rose-200 rounded-full px-2 py-0.5 dark:bg-rose-900/30 dark:text-rose-300 dark:ring-rose-800"
+                          ? "rounded px-1.5 py-px text-xs font-medium bg-hub-accent-bg text-hub-accent-text"
+                          : "rounded px-1.5 py-px text-xs font-medium bg-hub-bad-bg text-hub-bad"
                       }
                       title={`Today so far vs the whole of ${lastWeekLabel}`}
                     >
@@ -249,7 +240,7 @@ function SupabaseWelcome() {
                       </span>
                       {d.streak > 1 ? (
                         <span
-                          className="ml-auto text-xs font-medium text-amber-800 bg-amber-50 ring-1 ring-amber-200 rounded-full px-2 py-0.5 dark:bg-amber-900/30 dark:text-amber-200 dark:ring-amber-800"
+                          className="ml-auto rounded px-1.5 py-px text-xs font-medium bg-hub-warn-bg text-hub-warn"
                           title="Consecutive production days, ending today, as top worker here"
                         >
                           {d.streak}-day streak
@@ -292,22 +283,22 @@ function SupabaseWelcome() {
         <CardBody>
           <div className="flex items-center justify-between gap-4 flex-wrap">
             <div>
-              <div className="text-xs uppercase tracking-widest text-slate-500 dark:text-slate-400 font-semibold">
+              <div className="text-xs text-hub-muted">
                 Team total yesterday
               </div>
-              <div className="text-3xl font-semibold tabular-nums mt-1">
+              <div className="mt-1 text-2xl font-semibold tabular-nums text-hub-text">
                 {view.teamTotalYesterday}
                 <span className="text-base font-normal text-slate-500 ml-2">orders</span>
               </div>
             </div>
             <div className="flex-1 min-w-[200px] max-w-md">
-              <div className="text-[10px] uppercase tracking-widest text-slate-500 text-right mb-1">
+              <div className="mb-1 text-right text-[11px] text-hub-muted">
                 7 days to yesterday
               </div>
-              <div style={{ width: "100%", height: 60 }}>
+              <div className="text-hub-text" style={{ width: "100%", height: 60 }}>
                 <ResponsiveContainer>
                   <LineChart data={view.sparkline} margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
-                    <Line type="monotone" dataKey="orders" stroke="#0f172a" strokeWidth={2} dot={false} />
+                    <Line type="monotone" dataKey="orders" stroke="currentColor" strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>

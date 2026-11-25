@@ -1,4 +1,9 @@
 import { useMemo, useState } from "react";
+import { useAuthOptional } from "@/lib/auth/AuthProvider";
+import { allNavAccess, effectiveNavAccess } from "@/lib/auth/permissions";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
+import { DataState } from "@/components/ui/DataState";
+import { BayMap } from "@/components/BayMap";
 import { Link } from "react-router-dom";
 import { ChevronDown, ChevronRight, Truck, Sparkles } from "lucide-react";
 import { useDataset } from "@/lib/hooks/useDataset";
@@ -18,7 +23,17 @@ function fullnessLevel(pct: number): "low" | "ok" | "high" | "over" {
 }
 
 export function Warehouse() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
+  // The page's other hooks live in WarehouseLoaded so their order never
+  // depends on whether the dataset has loaded yet.
+  if (!data) return <DatasetLoadState result={dataset} title="Loading warehouse…" />;
+  return <WarehouseLoaded data={data} />;
+}
+
+function WarehouseLoaded({ data }: { data: NonNullable<ReturnType<typeof useDataset>["data"]> }) {
+  const auth = useAuthOptional();
+  const canOpenSettings = (auth?.profile ? effectiveNavAccess(auth.profile) : allNavAccess()).has("settings");
   const { byId } = useForecasts();
   const [showBreakdown, setShowBreakdown] = useState(false);
   /** Week the time-scrubber slider is parked on (0 = today). */
@@ -29,8 +44,6 @@ export function Warehouse() {
   const [stockoutSupplier, setStockoutSupplier] = useState<string>("all");
   /** Sort mode for the stockout schedule. */
   const [stockoutSort, setStockoutSort] = useState<"stockout" | "display">("display");
-
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
 
   const { bays } = data.storage;
   const totalCap = bays.reduce((a, b) => a + b.max_pallets, 0);
@@ -184,8 +197,8 @@ export function Warehouse() {
   return (
     <div className="space-y-5">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight">Warehouse</h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
+        <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Warehouse</h1>
+        <p className="mt-1 text-sm text-hub-muted">
           One overall score for how full the warehouse is — and where it's heading.
         </p>
       </div>
@@ -201,7 +214,7 @@ export function Warehouse() {
         <CardBody>
           {totalCap === 0 ? (
             <div className="text-sm text-slate-500">
-              No bays defined yet — head to <strong>Settings → Warehouse capacity</strong> and set bay count × pallets-per-bay (default 2/bay) to start tracking fullness.
+              No bays defined yet — {canOpenSettings ? <Link to="/settings" className="font-semibold underline">Settings → Warehouse capacity</Link> : <strong>Settings → Warehouse capacity</strong>} {canOpenSettings ? "" : "(ask an owner) "}and set bay count × pallets-per-bay (default 2/bay) to start tracking fullness.
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-[auto_1fr] gap-8 items-center">
@@ -285,6 +298,9 @@ export function Warehouse() {
           )}
         </CardBody>
       </Card>
+
+      {/* ---------- Bay layout (read-only) ---------- */}
+      <BayMap storage={data.storage} products={data.products} />
 
       {/* ---------- Time scrubber: drag to see warehouse fullness over time ---------- */}
       {totalCap > 0 ? (() => {

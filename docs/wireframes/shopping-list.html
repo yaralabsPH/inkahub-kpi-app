@@ -1,0 +1,30 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shopping list — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page">
+  <div class="between"><div><h1 class="t">Shopping list</h1><p class="sub">Suggested purchase orders, grouped by supplier</p></div>
+    <div class="row"><span class="chip filter">Order for week of 30 Nov ▾</span><span class="btn">Export CSV</span></div></div>
+
+  <div class="cards c4"><div class="card"><div class="lbl">Suppliers</div><div class="val">3</div></div><div class="card"><div class="lbl">Lines</div><div class="val">14</div></div><div class="card"><div class="lbl">Units</div><div class="val">3,180</div></div><div class="card"><div class="lbl">Value</div><div class="val">$14.6k</div></div></div>
+
+  <h2 class="h">Paper Co <span class="tag">lead 21d · arrives ~21 Dec</span><span class="pin">1</span><span style="margin-left:auto" class="row"><span class="small muted">6 lines · $8,240</span><span class="btn sm">Copy as email</span><span class="btn pri sm" data-confirm="Create draft shipments for Paper Co?|Creates <b>2 draft shipments</b> (one per line, as today) with status Draft. Nothing is ordered and stock doesn't change until a shipment is marked Delivered.|Create drafts">Create draft shipments</span></span></h2>
+  <div class="grid"><table class="tb">
+    <tr><th class="chk"><span class="box x"></span></th><th>SKU</th><th class="num">Suggested</th><th class="num" style="width:120px">Qty <small>edit</small></th><th class="num">Unit cost</th><th class="num">Line total</th><th>Why <span class="pin">2</span></th></tr>
+    <tr><td class="chk"><span class="box x"></span></td><td class="mono">A2-WHT</td><td class="num muted">760</td><td class="num">800</td><td class="num">$4.60</td><td class="num">$3,680</td><td class="small muted">1.3 wk cover · Black Friday ×2.5</td></tr>
+    <tr><td class="chk"><span class="box x"></span></td><td class="mono">A3-BLK</td><td class="num muted">500</td><td class="num">500</td><td class="num">$3.90</td><td class="num">$1,950</td><td class="small muted">2.4 wk cover · min order 200</td></tr>
+    <tr><td class="chk"><span class="box"></span></td><td class="mono">A3-WHT</td><td class="num muted">0</td><td class="num faint">—</td><td class="num">$3.90</td><td class="num faint">—</td><td class="small muted">OK, 8.0 wk</td></tr>
+  </table><div class="gridfoot"><span>2 of 3 lines included</span><span>Rounded up to order increment of 50</span></div></div>
+
+  <h2 class="h">FrameWorks <span class="tag">lead 35d</span><span style="margin-left:auto" class="row"><span class="small muted">5 lines · $4,900</span><span class="btn pri sm" data-confirm="Create draft shipments for Paper Co?|Creates <b>2 draft shipments</b> (one per line, as today) with status Draft. Nothing is ordered and stock doesn't change until a shipment is marked Delivered.|Create drafts">Create draft shipments</span></span></h2>
+  <div class="toggle"><div class="th">5 lines</div></div>
+  <h2 class="h">CanvasCo <span class="tag">lead 28d</span><span style="margin-left:auto" class="row"><span class="small muted">3 lines · $1,460</span><span class="btn pri sm" data-confirm="Create draft shipments for Paper Co?|Creates <b>2 draft shipments</b> (one per line, as today) with status Draft. Nothing is ordered and stock doesn't change until a shipment is marked Delivered.|Create drafts">Create draft shipments</span></span></h2>
+  <div class="toggle"><div class="th">3 lines</div></div>
+
+  <h2 class="h">Arriving soon</h2>
+  <div class="grid"><table class="tb"><tr><th>Week of</th><th>Shipment</th><th class="num">SKUs</th><th class="num">Units</th></tr>
+    <tr><td>30 Nov</td><td>PO-2231 · FrameWorks</td><td class="num">4</td><td class="num">480</td></tr>
+    <tr><td>14 Dec</td><td>PO-2234 · Paper Co</td><td class="num">6</td><td class="num">1,400</td></tr></table></div>
+</div></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"orders",title:"Shopping list",dept:true,empty:{title:"Nothing to buy",body:"Every SKU is above its target cover for this week."},crumb:["Planning","Shopping list"],notes:[
+ "One section per supplier with its own subtotal. Create draft shipments makes one Draft shipment per line, as the app does today. One PO per supplier would be nicer but changes behaviour: open question for CJ.",
+ "A 'Why' column explains each suggestion (cover, events, min order), so people trust the number. Suggested qty stays visible next to the edited qty."]});</script>
+</body></html>

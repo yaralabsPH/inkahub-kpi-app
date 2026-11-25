@@ -239,6 +239,15 @@ export function OverviewBodyView({ state, nameOf, onRetry }: { state: OverviewSt
         <button type="button" className="underline" onClick={onRetry}>Retry</button>
       </div>
     );
+  // A "ready" reply without a usable body (e.g. a proxy page instead of the API's JSON) must not blank
+  // the whole Reports page: show it as a load failure with the existing Retry.
+  if (!state.data || typeof state.data !== "object" || !("meta" in (state.data as object)))
+    return (
+      <div className="text-sm text-rose-700 dark:text-rose-300" role="alert">
+        Couldn't load the production summary: the report service returned no data.{" "}
+        <button type="button" className="underline" onClick={onRetry}>Retry</button>
+      </div>
+    );
   const d = state.data as OverviewResult;
   return <OverviewTables data={d} nameOf={nameOf} />;
 }

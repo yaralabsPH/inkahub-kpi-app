@@ -15,10 +15,10 @@ import { printAllLanyards, downloadAllLanyardsAsJpegs } from "@/lib/utils/lanyar
  */
 export function Team() {
   return (
-    <div className="space-y-4">
+    <div className="mx-auto max-w-hub space-y-4">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight">Team</h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
+        <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Team</h1>
+        <p className="mt-1 text-sm text-hub-muted">
           Manage team members, roles, and lanyard barcodes for this location.
         </p>
       </div>

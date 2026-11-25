@@ -1,0 +1,56 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SKUs — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page has-peek" style="max-width:none;padding-right:500px">
+  <h1 class="t">SKUs</h1><p class="sub">142 products · 6 suppliers</p>
+  <div class="views"><span class="on">All</span><span>Running low</span><span>By supplier</span><span>Gallery</span><span class="pin">1</span></div>
+  <div class="tools">
+    <span class="input">Search code, size, colour…</span>
+    <span class="chip">+ Filter</span><span class="chip">Sort</span><span class="chip">Group: Department</span>
+    <span class="sp"></span><span class="btn ghost">Compare</span><span class="btn ghost">Bulk edit</span><span class="btn ghost">Import CSV</span><span class="btn pri">+ New SKU</span>
+  </div>
+  <div class="grid"><table class="tb">
+    <tr><th class="chk"><span class="box"></span></th><th>Code <small>text</small></th><th>Size · colour</th><th>Supplier</th><th class="num">On hand</th><th class="num">Avg / wk</th><th>Weeks left</th><th class="num">Lead</th><th class="num">Safety %</th><th>Status</th></tr>
+    <tr><td colspan="10" style="background:var(--sub)"><b>▾ Unframed</b> <span class="muted small">A0–A4 prints · 48</span></td></tr>
+    <tr class="sel" data-peek><td class="chk">⋮⋮</td><td class="mono">A2-WHT</td><td>A2 · White</td><td><span class="tag">Paper Co</span></td><td class="num">120</td><td class="num">95</td><td><div class="bar r"><i style="width:15%"></i></div></td><td class="num">21d</td><td class="num">20</td><td><span class="tag r">Short</span></td></tr>
+    <tr><td class="chk">⋮⋮</td><td class="mono">A3-WHT</td><td>A3 · White</td><td><span class="tag">Paper Co</span></td><td class="num">880</td><td class="num">110</td><td><div class="bar g"><i style="width:80%"></i></div></td><td class="num">21d</td><td class="num">20</td><td><span class="tag g">OK</span></td></tr>
+    <tr><td class="chk">⋮⋮</td><td class="mono">A3-BLK</td><td>A3 · Black</td><td><span class="tag">Paper Co</span></td><td class="num">210</td><td class="num">88</td><td><div class="bar r"><i style="width:28%"></i></div></td><td class="num">21d</td><td class="num">20</td><td><span class="tag r">Short</span></td></tr>
+    <tr><td class="chk">⋮⋮</td><td class="mono">A4-WHT</td><td>A4 · White</td><td><span class="tag">Paper Co</span></td><td class="num">1,240</td><td class="num">130</td><td><div class="bar g"><i style="width:100%"></i></div></td><td class="num">21d</td><td class="num">15</td><td><span class="tag g">OK</span></td></tr>
+    <tr><td colspan="10" style="background:var(--sub)"><b>▾ Framed</b> <span class="muted small">China-supplied · 31</span></td></tr>
+    <tr><td class="chk">⋮⋮</td><td class="mono">FR-OAK-A3</td><td>A3 · Oak</td><td><span class="tag">FrameWorks</span></td><td class="num">64</td><td class="num">20</td><td><div class="bar y"><i style="width:40%"></i></div></td><td class="num">35d</td><td class="num">25</td><td><span class="tag y">Low</span></td></tr>
+    <tr><td class="chk">⋮⋮</td><td class="mono">FR-BLK-A2</td><td>A2 · Black</td><td><span class="tag">FrameWorks</span></td><td class="num">140</td><td class="num">18</td><td><div class="bar g"><i style="width:90%"></i></div></td><td class="num">35d</td><td class="num">25</td><td><span class="tag g">OK</span></td></tr>
+    <tr class="newrow"><td class="chk"></td><td colspan="9">+ New SKU</td></tr>
+  </table><div class="gridfoot"><span>Sum on hand 18,420 · Avg weeks left 7.9</span><span>Double-click a cell to edit · drag ⋮⋮ to reorder</span></div></div>
+</div>
+
+<aside class="peek"><span class="pin" style="position:absolute;left:-10px;top:20px">2</span>
+  <div class="ptop"><span>⤢ Open as page</span><span class="sp"></span><span>‹ ›</span><span>⋯</span><span>✕</span></div>
+  <div class="ph" style="height:120px;margin-bottom:10px">product image</div>
+  <h1>A2 · White</h1>
+  <div class="props">
+    <div class="k">Code</div><div class="v mono">A2-WHT</div>
+    <div class="k">Short code</div><div class="v faint">Empty</div>
+    <div class="k">Product type</div><div class="v"><span class="tag">Product</span> <span class="muted small">product · consumable · packaging · service</span></div>
+    <div class="k">Department</div><div class="v"><span class="tag">Unframed</span></div>
+    <div class="k">Supplier</div><div class="v"><span class="tag">Paper Co</span></div>
+    <div class="k">On hand</div><div class="v"><b>120</b> <span class="btn sm" style="margin-left:6px" data-confirm="Adjust A2-WHT on hand|Opens Movements with this SKU picked. Every change is written to the ledger with a category and note, so it can be reversed.|Open Movements">Adjust</span></div>
+    <div class="k">Unit cost</div><div class="v">$4.60</div>
+    <div class="k">Lead time</div><div class="v">21 days</div>
+    <div class="k">Safety stock</div><div class="v">20%</div>
+    <div class="k">Target cover</div><div class="v">8 weeks</div>
+    <div class="k">Min order · increment</div><div class="v">200 · 50</div>
+    <div class="k">Pallet capacity</div><div class="v">1,200</div>
+    <div class="k">Avg method</div><div class="v">Trailing 8 weeks ▾ <span class="muted small">· 12 wk · weighted · manual · selected weeks</span></div>
+  </div>
+  <div class="toggle open"><div class="th">Stock forecast <span class="pin">3</span></div><div class="tb2"><div class="ph" style="height:110px">line: projected on hand · stockout in 1.3 wk</div></div></div>
+  <div class="toggle"><div class="th">Recent movements (12)</div></div>
+  <div class="toggle"><div class="th">Incoming shipments (0)</div></div>
+  <div class="toggle"><div class="th">Demand events affecting this SKU (1)</div></div>
+  <div class="toggle"><div class="th">Components (BOM) · 1 <span class="muted small">0.000028 × 30 m paper roll per print</span></div></div>
+  <div class="acts"><span class="btn ghost" style="margin-right:auto;color:var(--bad)" data-confirm="Delete A2-WHT?|Its sales history and ledger rows stay, but it disappears from every list and forecast. This can't be undone here.|Delete SKU|danger">Delete</span><span class="btn">Add to order</span><span class="btn pri">Save</span></div>
+</aside></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"skus",title:"SKUs",dept:true,empty:{title:"No SKUs yet",body:"Add one, or import a CSV or JSON backup.",cta:"New SKU"},crumb:["Inventory","SKUs"],notes:[
+ "One database with saved views (table, grouped, gallery). Grouping by product type replaces separate tabs. Filters are chips. Search is always visible.",
+ "Clicking a row opens a side peek with the SKU's fields. On hand is read-only here: Adjust goes through Movements so every change lands in the ledger. Open as page goes to the existing SkuDetail route.",
+ "Toggle blocks keep the forecast, movements, shipments, events and the bill of materials (components) on one panel. Closed toggles load lazily. Field values use the real enums (product types, avg methods).",
+ "Supabase table-editor habits: column type hints, sticky header, footer aggregates, inline '+ New' row, ⋮⋮ drag handle."]});</script>
+</body></html>

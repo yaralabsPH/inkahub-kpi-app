@@ -1,4 +1,8 @@
 import { Link } from "react-router-dom";
+import { DatasetLoadState } from "@/components/DatasetLoadState";
+import { PageHeader } from "@/components/ui/PageHeader";
+import { DataState } from "@/components/ui/DataState";
+import { DashboardTabs, OwnerOnlyBadge } from "@/components/DashboardTabs";
 import {
   Boxes, Coins, Truck, Sparkles, TrendingUp, ShoppingCart, CalendarClock,
   AlarmClock, Download, X,
@@ -25,7 +29,8 @@ import { useState, useEffect, useMemo } from "react";
  * shipments, and the at-risk SKU table.
  */
 export function Dashboard() {
-  const { data } = useDataset();
+  const dataset = useDataset();
+  const { data } = dataset;
   const { list } = useForecasts();
   const m = useMutations();
   const repo = useRepo();
@@ -54,11 +59,6 @@ export function Dashboard() {
     return () => { cancelled = true; };
   }, [isOwner, isSupabase, location]);
 
-  if (!data) return <div className="text-sm text-slate-500">Loading…</div>;
-
-  const today = todayIso();
-  const currency = data.settings.currency_symbol;
-
   // === outstanding by supplier rollup ===
   const outstandingBySupplier = useMemo(() => {
     if (!data) return [];
@@ -77,6 +77,13 @@ export function Dashboard() {
       .map(([supplier, v]) => ({ supplier, amount: v.amount, count: v.count }))
       .sort((a, b) => b.amount - a.amount);
   }, [accountsList, data]);
+
+  // Loading boundary sits after every hook so the hook order never changes
+  // between the first (no data) render and the next one.
+  if (!data) return <div className="mx-auto max-w-hub"><DatasetLoadState result={dataset} title="Loading dashboard…" /></div>;
+
+  const today = todayIso();
+  const currency = data.settings.currency_symbol;
   const outstandingTotalAmount = outstandingBySupplier.reduce((s2, r) => s2 + r.amount, 0);
   const outstandingTotalCount  = outstandingBySupplier.reduce((s2, r) => s2 + r.count, 0);
 
@@ -177,7 +184,14 @@ export function Dashboard() {
   };
 
   return (
-    <div className="space-y-5">
+    <div className="mx-auto max-w-hub space-y-5">
+      <PageHeader
+        title="Dashboard"
+        description={<>{data.products.length} SKUs · {data.shipments.length} shipments · {data.events.length} demand events</>}
+        actions={<OwnerOnlyBadge />}
+      />
+      <DashboardTabs />
+
       {/* ---------- Backup reminder ---------- */}
       {showBackupBanner ? (
         <div className="rounded-lg ring-1 ring-amber-200 dark:ring-amber-800 bg-amber-50 dark:bg-amber-900/20 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
@@ -203,12 +217,6 @@ export function Dashboard() {
         </div>
       ) : null}
 
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight">Dashboard</h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          {data.products.length} SKUs · {data.shipments.length} shipments · {data.events.length} demand events
-        </p>
-      </div>
 
       {/* ---------- Order-now / order-soon banner ---------- */}
       {orderNow.length > 0 || orderThisWeek.length > 0 ? (

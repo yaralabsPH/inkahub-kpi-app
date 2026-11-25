@@ -1,0 +1,55 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CS cases — wireframe</title><link rel="stylesheet" href="wf.css"></head><body>
+<div id="content"><div class="page has-peek" style="max-width:none;padding-right:500px">
+  <h1 class="t">CS cases</h1><p class="sub">Customer issues and replacement shipments</p>
+  <div class="cards c4" style="margin-bottom:14px">
+    <div class="card"><div class="lbl">Open</div><div class="val">12</div></div>
+    <div class="card"><div class="lbl">Critical</div><div class="val down">5</div></div>
+    <div class="card"><div class="lbl">Avg cases / wk</div><div class="val">18</div></div>
+    <div class="card"><div class="lbl">Replacement units this wk</div><div class="val">27</div></div>
+  </div>
+  <div class="views"><span class="on">Board</span><span>My cases</span><span>Table</span><span>By issue type</span><span class="pin">1</span></div>
+  <div class="tools"><span class="input">Search order #, customer, SKU…</span><span class="chip filter">Urgency: All ▾</span><span class="chip filter">Issue type ▾</span><span class="chip filter">Department ▾</span><span class="sp"></span><span class="btn pri">+ New case</span></div>
+  <div class="board">
+    <div class="col"><h4><span class="dot r"></span>New <span class="n">4</span></h4>
+      <div class="kcard" style="outline:2px solid var(--accent)" tabindex="0" role="button" aria-label="Open case 10190203"><div class="kt">#10190203 · Damaged</div><div class="km"><span class="tag r">Critical</span><span class="tag">Framed</span></div><div class="row small muted" style="margin-top:6px"><span class="av lt" style="width:18px;height:18px;font-size:9px">JS</span>Jane Smith · 2h</div></div>
+      <div class="kcard"><div class="kt">#10190177 · Incorrect / missing</div><div class="km"><span class="tag y">Medium</span><span class="tag">Unframed</span></div></div></div>
+    <div class="col"><h4><span class="dot y"></span>Query <span class="n">5</span></h4>
+      <div class="kcard"><div class="kt">#10190102 · Quality</div><div class="km"><span class="tag y">High</span><span class="tag">Mixed</span></div><div class="small muted" style="margin-top:6px">Waiting on customer photos</div></div></div>
+    <div class="col"><h4><span class="dot b"></span>Shipped <span class="n">3</span></h4>
+      <div class="kcard"><div class="kt">#10189990 · Delivery issue</div><div class="km"><span class="tag">Auspost</span><span class="mono small">TRK…8821</span></div></div></div>
+    <div class="col"><h4><span class="dot g"></span>Closed <span class="n">48</span></h4><div class="addc">Collapsed · show</div></div>
+    <div class="col"><h4><span class="dot"></span>Denied <span class="n">6</span></h4><div class="addc">Collapsed · show</div></div>
+  </div>
+</div>
+
+<aside class="peek">
+  <div class="ptop"><span>Case #C-311</span><span class="sp"></span><span>Copy link</span><span>⋯</span><span>✕</span></div>
+  <h1>#10190203 · Damaged</h1>
+  <div class="props">
+    <div class="k">Status</div><div class="v"><span class="tag r">New</span> ▾ <span class="muted small">New · Query · Shipped · Closed · Denied</span></div>
+    <div class="k">Urgency</div><div class="v"><span class="tag r">Critical</span></div>
+    <div class="k">Issue type</div><div class="v"><span class="tag">Damaged</span></div>
+    <div class="k">Department</div><div class="v"><span class="tag">Framed</span> <span class="muted small">auto from lines</span></div>
+    <div class="k">Customer</div><div class="v">Jane Smith · <span class="muted">jane@…</span></div>
+    <div class="k">Order</div><div class="v">#10190203 · Shopify ↗ <span class="pin">2</span></div>
+    <div class="k">Date ordered</div><div class="v">12 Nov</div>
+    <div class="k">Original carrier</div><div class="v">Aramex</div>
+    <div class="k">Keeps original?</div><div class="v"><span class="sw"></span> No</div>
+  </div>
+  <h3 class="h">Replacement lines <span class="pin">3</span></h3>
+  <div class="grid"><table class="tb"><tr><th>SKU</th><th class="num">Qty</th><th class="num">On hand</th><th></th></tr>
+    <tr><td class="mono">FR-OAK-A3</td><td class="num">1</td><td class="num">64</td><td>✕</td></tr>
+    <tr class="newrow"><td colspan="4">+ Add SKU</td></tr></table></div>
+  <div class="toggle"><div class="th">Replacement shipping</div></div>
+  <h3 class="h">Notes</h3>
+  <div class="field" style="min-height:64px;color:var(--txt)">Customer sent photos, corner smashed. Replacement approved by Ana.</div>
+  <div class="small muted" style="margin-top:6px">Created by Ana · 2h ago · saved automatically</div>
+  <div class="callout" style="margin-top:10px"><span class="ci"></span><div class="small"><b>Threaded comments</b> <span class="new">New</span> would need a new table with RLS. Open question for CJ.</div></div>
+  <div class="acts"><span class="btn">Set to Query</span><span class="btn pri" data-confirm="Mark case shipped?|Deducts the replacement lines from stock (<b>FR-OAK-A3 −1</b>) as a <i>replacement</i> ledger row, which is excluded from sales and revenue.|Mark shipped">Mark shipped</span></div>
+</aside></div>
+<script src="icons.js"></script><script src="wf.js"></script>
+<script>WF({page:"cs_cases",title:"CS cases",empty:{title:"No open cases",body:"Nice. New cases from customers will show in New.",cta:"New case"},crumb:["Customer service","CS cases"],notes:[
+ "Board columns are the real statuses (New, Query, Shipped, Closed, Denied); Closed and Denied start collapsed. Urgency (Critical, High, Medium, Low) is the card colour. 'My cases' filters on created_by.",
+ "Properties use the real issue types (damaged, incorrect/missing, delivery issue, expedite, quality, other). Department is worked out from the lines. The Shopify order is a link, not a raw URL field.",
+ "Replacement lines show stock on hand. Marking shipped asks first and writes a replacement ledger row. Notes stays one field, as today."]});</script>
+</body></html>
