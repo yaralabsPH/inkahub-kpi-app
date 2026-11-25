@@ -11,6 +11,8 @@ import type { ScanMode } from "@/lib/scanners/dispatch";
 import type { PeopleState } from "./FramerPicker";
 import { SharedScannerWall } from "./SharedScannerWall";
 import { useSharedScannerStation } from "./useSharedScannerStation";
+import { useScannerWallTotals } from "./useScannerWallTotals";
+import { isReportSite, SITE_TIME_ZONES } from "@/lib/domain/productionPeriods";
 import { IDENTITY_IDLE_WORDS } from "@/lib/scanners/session";
 
 const OPERATOR_ROLES = new Set(["owner", "manager", "kiosk"]);
@@ -82,10 +84,26 @@ function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitch
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [waitingId]);
   const [now, setNow] = useState(() => Date.now());
+  const [elapsedNow, setElapsedNow] = useState(() => performance.now());
   useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), 1_000);
+    const t = window.setInterval(() => {
+      setNow(Date.now());
+      setElapsedNow(performance.now());
+    }, 1_000);
     return () => window.clearInterval(t);
   }, []);
+  // scanner-wall-redesign: today's per-person totals (Framing only, display only).
+  const bindingKey = config.scannerIds.map((id) => `${id}=${st.state.slots[id]?.identity?.personId ?? ""}`).join(",");
+  const personIds = useMemo(
+    () => config.scannerIds.map((id) => st.state.slots[id]?.identity?.personId).filter((x): x is string => !!x),
+    // The map's key changes exactly when a scanner changes hands.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [bindingKey],
+  );
+  const totals = useScannerWallTotals({
+    client, site: location, callerId, mode, roleAllowed, personIds, bindingKey,
+    saveRevision: st.state.saveRevision, online: st.device.online, visible: st.device.visible, now,
+  });
   return (
     <SharedScannerWall
       siteLabel={LOCATION_LABELS[location as LocationKey] ?? location}
@@ -105,6 +123,9 @@ function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitch
       onSwitchMode={onSwitchMode}
       onChooseFramers={st.chooseFramers}
       people={people}
+      totals={mode === "framing" ? totals : undefined}
+      timeZone={isReportSite(location) ? SITE_TIME_ZONES[location] : undefined}
+      elapsedNow={elapsedNow}
     />
   );
 }

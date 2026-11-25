@@ -36,20 +36,22 @@ describe("SharedScannerWall", () => {
     const html = render({ state: state({ slots }) });
     expect(html).toContain("Alice");
     expect(html).toContain("Signs out in 14:00");
-    expect(html).toContain("Signing in");
-    expect(html).toContain("Scan badge");
+    expect(html).toContain("Checking badge…"); // an unverified badge never looks signed in
+    expect(html).toContain("Scan your badge to start");
   });
 
   it("green saved with person, order and pieces; amber queued; red not saved", () => {
     const saved = render({ state: state({ last: { kind: "saved", title: "Saved #10190203", scannerId: "S1", person: "Alice", order: "10190203", pieces: 3, at: 1 } }) });
     expect(saved).toContain('data-kind="saved"');
-    expect(saved).toContain("bg-emerald-600");
+    expect(saved).toContain("SAVED · S1");
     expect(saved).toContain("Alice · #10190203 · 3 pieces");
     const queued = render({ state: state({ last: { kind: "queued", title: "Queued #10190203 for Alice", scannerId: "S1", at: 1 } }) });
+    expect(queued).toContain('data-kind="queued"');
     expect(queued).toContain("QUEUED");
-    expect(queued).not.toContain("bg-emerald-600");
+    expect(queued).not.toContain('data-kind="saved"');
     const red = render({ state: state({ last: { kind: "rejected", title: "NOT SAVED: #1", scannerId: "S2", at: 1 } }) });
-    expect(red).toContain("bg-red-600");
+    expect(red).toContain('data-kind="rejected"');
+    expect(red).toContain("NOT SAVED · S2");
   });
 
   it("is loud about offline, storage, focus, paused capture, auth and role", () => {

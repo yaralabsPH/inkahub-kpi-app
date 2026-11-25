@@ -1,0 +1,3 @@
+Atkinson Hyperlegible (Braille Institute of America), version 1.006, regular and bold.
+Source: https://github.com/google/fonts/tree/main/ofl/atkinsonhyperlegible (Google Fonts repository), files AtkinsonHyperlegible-Regular.ttf, AtkinsonHyperlegible-Bold.ttf and OFL.txt, downloaded 2026-11-25 with CJ's approval.
+Licence: SIL Open Font License 1.1 (OFL.txt). Self-hosted for the scanner wall so the kiosk does not depend on fonts.googleapis.com.
