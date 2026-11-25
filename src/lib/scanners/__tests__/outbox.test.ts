@@ -163,6 +163,90 @@ describe("delivery", () => {
     expect(v.jobs[0]).toMatchObject({ status: "done", uncertain: false, attempts: 2 });
   });
 
+  it("old prepared A0 payload replays unchanged after tuning", async () => {
+    // A job prepared by the pre-tuning code: its A0 components and box
+    // snapshot still include the accessory line. It may already have been
+    // sent, so a retry must resend it byte for byte, never re-prepare it.
+    const store = memoryJobStore();
+    let clock = 1_000;
+    const ob = createScannerOutbox(store, () => clock);
+    const job = await ob.enqueue(captured(), scope, uuid());
+    const claimed = await ob.claimNext(scope, "tab-1");
+    const oldPrepared: PreparedFraming = {
+      orderNumber: "10190203",
+      displayName: "#10190203",
+      lines: [{ sku: "INKA-ABC0001-A0-FB", quantity: 1, workType: "a0_framed", pieces: 1 }],
+      workTypes: ["a0_framed"],
+      pieces: 1,
+      components: [{ code: "A0-Black", qty: 1 }, { code: "INKA-AUX-HOOK", qty: 2 }],
+      packaging: {
+        ruleSetId: "rs-1", ruleSetVersion: 3, resolved: true,
+        predicted: { "p-box": 2 }, target: { "p-box": 2 },
+        snapshot: { rule_set_version: 3, packing_point: "a0_framed", lines: [{ sku: "INKA-AUX-HOOK", quantity: 2 }] },
+      },
+    };
+    await ob.setPrepared(job.requestId, claimed!.leaseOwner!, oldPrepared);
+    const expected = commitParams((await ob.view(scope)).jobs[0], oldPrepared);
+
+    // Reload: a new outbox over the same storage, after the first lease ran out.
+    clock += LEASE_MS + 1;
+    const reloaded = createScannerOutbox(store, () => clock);
+    const fail = () => { throw new Error("a prepared job must not be prepared again"); };
+    let first = true;
+    const sent: Array<Record<string, unknown>> = [];
+    const d = deps({
+      outbox: reloaded,
+      lookupOrder: async () => fail(),
+      openCase: async () => fail(),
+      products: () => fail(),
+      packaging: async () => fail(),
+      commit: async (j, p): Promise<CommitOutcome> => {
+        sent.push(commitParams(j, p));
+        if (first) { first = false; return { outcome: "network_error", message: "lost response" }; }
+        return { outcome: "saved", result: { pieces: 1, eventIds: ["e1"], negativeCodes: [], replayed: true } };
+      },
+    });
+    expect(await processNext(d)).toMatchObject({ kind: "waiting" });
+    clock += 120_000;
+    expect(await processNext(d)).toMatchObject({ kind: "saved", result: { pieces: 1, replayed: true } });
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toEqual(expected);
+    expect(sent[1]).toEqual(expected);
+    expect(JSON.stringify(sent[1])).toContain("INKA-AUX-HOOK");
+  });
+
+  it("a queued mixed job is prepared with the new framing-only selection", async () => {
+    const ob = createScannerOutbox(memoryJobStore());
+    await ob.enqueue(captured(), scope, uuid());
+    const d = deps({
+      outbox: ob,
+      lookupOrder: async () => ({ kind: "ok", lookup: { ...framedOrder(), line_items: [
+        { sku: "INKA-ABC0001-A2-FB", quantity: 2 },
+        { sku: "INKA-ABC0001-A2-SC", quantity: 1 },
+        { sku: "INKA-AUXMFL", quantity: 1 },
+      ] } }),
+    });
+    expect(await processNext(d)).toMatchObject({ kind: "saved", result: { pieces: 2 } });
+    expect(d.commits).toHaveLength(1);
+    expect(JSON.stringify(d.commits[0])).not.toMatch(/AUXMFL|-SC/);
+  });
+
+  it("a suspicious mixed job never calls commit", async () => {
+    for (const bad of [
+      { sku: "INKA-ABC0001-A9-FB", quantity: 1 },
+      { sku: null, title: "Framed print with free shipping", quantity: 1 }, // review r1 M1
+    ]) {
+      const ob = createScannerOutbox(memoryJobStore());
+      await ob.enqueue(captured(), scope, uuid());
+      const d = deps({
+        outbox: ob,
+        lookupOrder: async () => ({ kind: "ok", lookup: { ...framedOrder(), line_items: [{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, bad] } }),
+      });
+      expect(await processNext(d), JSON.stringify(bad)).toMatchObject({ kind: "blocked", code: "suspicious_framing" });
+      expect(d.commits).toHaveLength(0);
+    }
+  });
+
   it("an order that is not safe for shared scanners is blocked with its reason, not dropped", async () => {
     const ob = createScannerOutbox(memoryJobStore());
     const job = await ob.enqueue(captured(), scope, uuid());

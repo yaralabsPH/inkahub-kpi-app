@@ -80,6 +80,9 @@ export const NON_REPORTING_MIGRATIONS: ReadonlySet<string> = new Set([
   "0055_scanner_stations.sql",
   "0056_dispatch_flow.sql",
   "0063_exact_stock_adjust.sql",
+  // scanner-wall-redesign: an index for the scanner wall's read, not reporting SQL
+  // (covered by tests/scannerWallIndex.test.ts).
+  "0064_scanner_wall_count_window_index.sql",
 ]);
 
 export function reportingMigrations(from = "0037"): Array<{ name: string; sql: string }> {

@@ -110,7 +110,7 @@ export function useSharedScannerStation(opts: {
   // signed-in account), and a disposed controller starts nothing new.
   const [controller, setController] = useState<SharedScannerController | null>(null);
   const [state, setState] = useState<WallState>(() => ({
-    slots: emptySlots(scannerIds), last: null, view: null, storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null,
+    slots: emptySlots(scannerIds), last: null, recovery: null, slotNotes: {}, progress: {}, slotSaved: {}, goodbye: {}, saveRevision: 0, view: null, storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null,
   }));
   useEffect(() => {
     const ids = idsKey.split(",");
@@ -143,9 +143,12 @@ export function useSharedScannerStation(opts: {
           // Every job is delivered by its own captured mode, whatever this screen shows.
           evidence: (n, lines) => fetchFramerEvidence(client, { location, orderNumber: n, lines, expectedCaller: callerId }),
           commitDispatch: (job, prepared) => commitDispatch(client, job, prepared),
+          // scanner-wall-redesign: display-only progress for the panels.
+          onProgress: (ev) => c?.onDeliveryProgress(ev),
         }),
       isOnline: () => navigator.onLine,
       now: () => Date.now(),
+      elapsedNow: () => performance.now(),
       newRequestId,
       sound,
     });

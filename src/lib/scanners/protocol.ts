@@ -11,7 +11,9 @@
  * anything else (stray text, nested or mismatched markers, an unknown
  * scanner id, a frame that is too long or too slow, two scanners typing at
  * once) is an error. Errors whose source cannot be known for certain carry
- * `scannerId: null`; the station then clears every scanner identity.
+ * `scannerId: null`. The station saves nothing from an error and keeps every
+ * scanner identity (scanner-stations-tuning); it shows a recovery message
+ * until the next good scan.
  *
  * After any error the parser waits for a quiet gap (`quietMs` with no keys)
  * before it accepts a new frame, so the tail of a broken burst can never be

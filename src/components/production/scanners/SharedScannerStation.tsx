@@ -11,6 +11,9 @@ import type { ScanMode } from "@/lib/scanners/dispatch";
 import type { PeopleState } from "./FramerPicker";
 import { SharedScannerWall } from "./SharedScannerWall";
 import { useSharedScannerStation } from "./useSharedScannerStation";
+import { useScannerWallTotals } from "./useScannerWallTotals";
+import { isReportSite, SITE_TIME_ZONES } from "@/lib/domain/productionPeriods";
+import { IDENTITY_IDLE_WORDS } from "@/lib/scanners/session";
 
 const OPERATOR_ROLES = new Set(["owner", "manager", "kiosk"]);
 
@@ -48,14 +51,17 @@ export function SharedScannerStation({ config, onExit, onChangeConfig }: {
       callerId={callerId}
       location={location}
       roleAllowed={OPERATOR_ROLES.has(auth?.profile?.role ?? "")}
+      role={auth?.profile?.role ?? null}
+      siteMember={!!auth?.locations?.includes(location)}
       onExit={onExit}
       onSwitchMode={onChangeConfig ? () => onChangeConfig({ ...config, mode: mode === "dispatch" ? "framing" : "dispatch" }) : undefined}
     />
   );
 }
 
-function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitchMode }: {
-  config: SharedScannerConfig; mode: ScanMode; callerId: string; location: string; roleAllowed: boolean; onExit(): void; onSwitchMode?(): void;
+function Inner({ config, mode, callerId, location, roleAllowed, role, siteMember, onExit, onSwitchMode }: {
+  config: SharedScannerConfig; mode: ScanMode; callerId: string; location: string; roleAllowed: boolean;
+  role: string | null; siteMember: boolean; onExit(): void; onSwitchMode?(): void;
 }) {
   const client = getSupabase();
   const { data: dataset } = useDataset();
@@ -81,10 +87,26 @@ function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitch
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [waitingId]);
   const [now, setNow] = useState(() => Date.now());
+  const [elapsedNow, setElapsedNow] = useState(() => performance.now());
   useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), 1_000);
+    const t = window.setInterval(() => {
+      setNow(Date.now());
+      setElapsedNow(performance.now());
+    }, 1_000);
     return () => window.clearInterval(t);
   }, []);
+  // scanner-wall-redesign: today's per-person totals (Framing only, display only).
+  const bindingKey = config.scannerIds.map((id) => `${id}=${st.state.slots[id]?.identity?.personId ?? ""}`).join(",");
+  const personIds = useMemo(
+    () => config.scannerIds.map((id) => st.state.slots[id]?.identity?.personId).filter((x): x is string => !!x),
+    // The map's key changes exactly when a scanner changes hands.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [bindingKey],
+  );
+  const totals = useScannerWallTotals({
+    client, site: location, callerId, role, siteMember, mode, roleAllowed, personIds, bindingKey,
+    saveRevision: st.state.saveRevision, online: st.device.online, visible: st.device.visible, now,
+  });
   return (
     <SharedScannerWall
       siteLabel={LOCATION_LABELS[location as LocationKey] ?? location}
@@ -104,6 +126,9 @@ function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitch
       onSwitchMode={onSwitchMode}
       onChooseFramers={st.chooseFramers}
       people={people}
+      totals={mode === "framing" ? totals : undefined}
+      timeZone={isReportSite(location) ? SITE_TIME_ZONES[location] : undefined}
+      elapsedNow={elapsedNow}
     />
   );
 }
@@ -140,9 +165,14 @@ export function SharedScannerSetup({ current, onSave, onCancel }: {
         </label>
         <fieldset className="text-sm">
           <legend className="text-slate-600 dark:text-slate-300">What do the scanners record?</legend>
-          <label className="mr-4"><input type="radio" name="mode" checked={mode === "framing"} onChange={() => setMode("framing")} /> Framing (badge, then orders; 10 minutes)</label>
+          <label className="mr-4"><input type="radio" name="mode" checked={mode === "framing"} onChange={() => setMode("framing")} /> Framing (badge, then orders; {IDENTITY_IDLE_WORDS})</label>
           <label><input type="radio" name="mode" checked={mode === "dispatch"} onChange={() => setMode("dispatch")} /> Dispatch (badge once per shift, then order slips)</label>
         </fieldset>
+        {mode === "framing" ? (
+          <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="signout-guidance">
+            To sign out one scanner, scan your own badge 3 more times on it, at least one second apart. You stay clocked in.
+          </p>
+        ) : null}
         {problem ? <div className="text-sm text-red-600">{problem}</div> : null}
         <div className="flex justify-end gap-2">
           <button type="button" onClick={onCancel} className="px-3 h-9 rounded-md ring-1 ring-slate-200 dark:ring-slate-700 text-sm">Cancel</button>

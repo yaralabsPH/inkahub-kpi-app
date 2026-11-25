@@ -1,0 +1,338 @@
+import { describe, expect, it } from "vitest";
+import { createScannerOutbox, memoryJobStore, type JobScope, type ScannerJob } from "../outbox";
+import { processNext, type ActivateOutcome, type CommitOutcome, type DeliveryDeps, type LookupOutcome } from "../client";
+import { SharedScannerController, type ControllerDeps } from "../station";
+import type { CapturedOrder } from "../session";
+import type { OrderLookup } from "../order";
+
+// scanner-wall-redesign Task 3: truthful per-scan progress, display only.
+
+const scope: JobScope = { backend: "supabase", callerId: "kiosk-1", location: "au", receiverId: "wall-1" };
+const ALICE = "11111111-1111-4111-8111-111111111111";
+const BOB = "22222222-2222-4222-8222-222222222222";
+let seq = 0;
+const uuid = () => `00000000-0000-4000-8000-${String(++seq).padStart(12, "0")}`;
+const settle = async (n = 20) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+const lookup = (n: string): OrderLookup => ({
+  found: true, complete: true, truncated: false, order_name: `#${n}`, cancelled_at: null, tags: [],
+  line_items: [{ sku: "INKA-ABC0001-A2-FB", quantity: 2 }],
+});
+const captured = (): CapturedOrder => ({ scannerId: "S1", orderNumber: "10190203", person: { personId: ALICE, displayName: "Alice", badge: "AAAA0001" }, scannedAt: 1_000 });
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+describe("processNext onProgress", () => {
+  it("checking only after a claim, saving only right before the commit; a prepared retry skips checking", async () => {
+    let clock = 1_000;
+    const ob = createScannerOutbox(memoryJobStore(), () => clock);
+    await ob.enqueue(captured(), scope, uuid());
+    const events: string[] = [];
+    const sent: string[] = [];
+    let answer: CommitOutcome = { outcome: "network_error", message: "timeout" };
+    const d: DeliveryDeps = {
+      outbox: ob, scope, owner: "tab",
+      lookupOrder: async (): Promise<LookupOutcome> => { events.push("lookup"); return { kind: "ok", lookup: lookup("10190203") }; },
+      openCase: async () => false,
+      products: () => [],
+      packaging: async () => ({ mode: "scan", ruleSet: null }),
+      commit: async (job, prepared) => { events.push("commit"); sent.push(JSON.stringify(prepared)); return answer; },
+      onProgress: (e) => events.push(e.phase),
+    };
+    expect(await processNext(d)).toMatchObject({ kind: "waiting" });
+    expect(events).toEqual(["checking", "lookup", "saving", "commit"]);
+    events.length = 0;
+    clock += 120_000; // past the back-off
+    answer = { outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: true } };
+    expect(await processNext(d)).toMatchObject({ kind: "saved" });
+    expect(events).toEqual(["saving", "commit"]); // the stored payload is resent; nothing is checked again
+    expect(sent[1]).toBe(sent[0]);
+  });
+
+  it("a throwing observer changes nothing about delivery", async () => {
+    const run = async (onProgress?: DeliveryDeps["onProgress"]) => {
+      const ob = createScannerOutbox(memoryJobStore());
+      await ob.enqueue(captured(), scope, uuid());
+      let commits = 0;
+      const report = await processNext({
+        outbox: ob, scope, owner: "tab",
+        lookupOrder: async () => ({ kind: "ok", lookup: lookup("10190203") }),
+        openCase: async () => false,
+        products: () => [],
+        packaging: async () => ({ mode: "scan", ruleSet: null }),
+        commit: async () => { commits++; return { outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } }; },
+        onProgress,
+      });
+      return { report, commits, view: await ob.view(scope) };
+    };
+    const plain = await run();
+    const throwing = await run(() => { throw new Error("observer broke"); });
+    expect(throwing.report?.kind).toBe(plain.report?.kind);
+    expect(throwing.commits).toBe(plain.commits);
+    expect(throwing.view.jobs[0].status).toBe(plain.view.jobs[0].status);
+  });
+});
+
+describe("controller progress, last saved and goodbye", () => {
+  function rig(over: { commit?: () => Promise<CommitOutcome>; lookup?: () => Promise<LookupOutcome> } = {}) {
+    const outbox = createScannerOutbox(memoryJobStore());
+    let elapsed = 0;
+    const people: Record<string, { id: string; name: string }> = { AAAA0001: { id: ALICE, name: "Alice" }, BBBB0002: { id: BOB, name: "Bob" } };
+    let c!: SharedScannerController;
+    const deps: ControllerDeps = {
+      scannerIds: ["S1", "S2", "S3"], scope, outbox,
+      activate: async ({ badge }): Promise<ActivateOutcome> => (people[badge]
+        ? { outcome: "activated", personId: people[badge].id, displayName: people[badge].name, clockedIn: false }
+        : { outcome: "unknown_badge" }),
+      deliver: () => processNext({
+        outbox, scope, owner: "tab",
+        lookupOrder: over.lookup ?? (async () => ({ kind: "ok", lookup: lookup("10190203") })),
+        openCase: async () => false,
+        products: () => [],
+        packaging: async () => ({ mode: "scan", ruleSet: null }),
+        commit: over.commit ?? (async () => ({ outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } })),
+        onProgress: (e) => c.onDeliveryProgress(e),
+      }),
+      isOnline: () => true,
+      now: () => 5_000,
+      elapsedNow: () => elapsed,
+      newRequestId: uuid,
+      sound: () => {},
+    };
+    c = new SharedScannerController(deps);
+    return { c, setElapsed: (v: number) => { elapsed = v; } };
+  }
+
+  it("received after the durable write, then checking, saving, and gone once saved; only saved is green", async () => {
+    const lookupGate = deferred<LookupOutcome>();
+    const commitGate = deferred<CommitOutcome>();
+    const { c } = rig({ lookup: () => lookupGate.promise, commit: () => commitGate.promise });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    // Before the durable write: only an unconfirmed "receiving" entry, never "received" or green.
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["receiving"]);
+    await settle();
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["checking"]);
+    expect(c.state.last?.kind).toBe("queued");
+    lookupGate.resolve({ kind: "ok", lookup: lookup("10190203") });
+    await settle();
+    expect(Object.values(c.state.progress)).toMatchObject([{ phase: "saving", scannerId: "S1", personId: ALICE, orderNumber: "10190203", mode: "framing" }]);
+    expect(c.state.last?.kind).not.toBe("saved");
+    commitGate.resolve({ outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } });
+    await settle();
+    expect(c.state.progress).toEqual({});
+    expect(c.state.last?.kind).toBe("saved");
+    expect(c.state.slotSaved.S1).toMatchObject({ personId: ALICE, orderNumber: "10190203", pieces: 2, mode: "framing" });
+    expect(c.state.saveRevision).toBe(1);
+  });
+
+  it("already-recorded bumps the re-read counter but records no saved order; a refusal clears busy state", async () => {
+    let n = 0;
+    const { c } = rig({
+      commit: async () => (++n === 1
+        ? { outcome: "already_recorded", reason: "framed already completed" }
+        : { outcome: "rejected", code: "badge_inactive", message: "revoked" }),
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(c.state.saveRevision).toBe(1);
+    expect(c.state.slotSaved.S1).toBeUndefined();
+    c.onFrame("S1", "190204");
+    await settle();
+    expect(c.state.progress).toEqual({});
+    expect(c.state.last?.kind).toBe("rejected");
+  });
+
+  it("a save for the old person after a rebind is kept under that person, not the new one", async () => {
+    const gate = deferred<CommitOutcome>();
+    const { c } = rig({ commit: () => gate.promise });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203"); // Alice's order
+    await settle();
+    c.onFrame("S1", "BBBB0002"); // Bob takes the scanner before it saved
+    await settle();
+    gate.resolve({ outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } });
+    await settle();
+    expect(c.state.slots.S1.identity?.personId).toBe(BOB);
+    expect(c.state.slotSaved.S1.personId).toBe(ALICE); // the wall shows it only for Alice
+  });
+
+  it("progress from another scope is ignored", () => {
+    const { c } = rig();
+    const foreign = { requestId: "x", scannerId: "S1", personId: ALICE, orderNumber: "1", scannedAt: new Date(0).toISOString(),
+      backend: "supabase", callerId: "someone-else", location: "au", receiverId: "wall-1" } as unknown as ScannerJob;
+    c.onDeliveryProgress({ job: foreign, phase: "checking" });
+    expect(c.state.progress).toEqual({});
+  });
+
+  it("goodbye after a badge sign-out, cleared by the next scan on that scanner; expiry and reset are not goodbyes", async () => {
+    const { c, setElapsed } = rig();
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    for (const at of [2_000, 4_000]) {
+      setElapsed(at);
+      c.onFrame("S1", "AAAA0001");
+      await settle();
+    }
+    setElapsed(6_000);
+    c.onFrame("S1", "AAAA0001");
+    expect(c.state.goodbye.S1).toMatchObject({ personId: ALICE, displayName: "Alice" });
+    setElapsed(8_000);
+    c.onFrame("S1", "190203"); // next scan on S1 (refused: nobody there) ends the goodbye
+    expect(c.state.goodbye.S1).toBeUndefined();
+    c.onFrame("S2", "BBBB0002");
+    await settle();
+    c.resetAll("Signed out by the operator.");
+    expect(c.state.goodbye).toEqual({});
+  });
+
+  it("review r1 M7: progress follows the stored queue: retained jobs after a reload, waiting, storage failure", async () => {
+    // A job stored before a "reload" shows on its panel once the new controller reads the queue.
+    const store = memoryJobStore();
+    const ob = createScannerOutbox(store);
+    await ob.enqueue(captured(), scope, uuid());
+    const deps = {
+      scannerIds: ["S1", "S2", "S3"], scope, outbox: ob,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "unknown_badge" }),
+      deliver: async () => null,
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    } satisfies ControllerDeps;
+    const reloaded = new SharedScannerController(deps);
+    await reloaded.refreshView();
+    expect(Object.values(reloaded.state.progress)).toMatchObject([{ scannerId: "S1", personId: ALICE, orderNumber: "10190203", phase: "received" }]);
+    // Once the job is finished elsewhere, the next refresh drops it.
+    const claimed = await ob.claimNext(scope, "tab");
+    await ob.markDone(claimed!.requestId, { kind: "saved", message: "x", pieces: 1, warnings: [] });
+    await reloaded.refreshView();
+    expect(reloaded.state.progress).toEqual({});
+    // A queue that cannot be read: nothing claims to be in progress.
+    const broken = new SharedScannerController({ ...deps, outbox: { ...ob, view: async () => { throw new Error("IndexedDB gone"); } } });
+    (broken as unknown as { s: { progress: Record<string, unknown> } }).s.progress = { x: { scannerId: "S1" } };
+    await broken.refreshView();
+    expect(broken.state.progress).toEqual({});
+    expect(broken.state.storageError).toBe("IndexedDB gone");
+  });
+
+  it("review r1 M7: a send without an answer shows as waiting, not saving", async () => {
+    const { c } = rig({ commit: async () => ({ outcome: "network_error", message: "timeout" }) });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(Object.values(c.state.progress)).toMatchObject([{ phase: "waiting" }]);
+  });
+
+  it("review r1 S1: a garbled scan from that scanner ends its goodbye; other scanners keep theirs", async () => {
+    const { c, setElapsed } = rig();
+    c.onFrame("S1", "AAAA0001");
+    c.onFrame("S2", "BBBB0002");
+    await settle();
+    for (const id of ["S1", "S2"]) {
+      const badge = id === "S1" ? "AAAA0001" : "BBBB0002";
+      for (const at of [2_000, 4_000]) {
+        setElapsed(at);
+        c.onFrame(id, badge);
+        await settle();
+      }
+      setElapsed(6_000);
+      c.onFrame(id, badge);
+    }
+    expect(Object.keys(c.state.goodbye).sort()).toEqual(["S1", "S2"]);
+    c.onProtocolError("bad_payload", "S1");
+    expect(Object.keys(c.state.goodbye)).toEqual(["S2"]);
+  });
+
+  it("review r2 M2: receiving while the scan is written; replaced once stored; cleared if storing fails", async () => {
+    const store = memoryJobStore();
+    const gate = deferred<void>();
+    let fail = false;
+    const outbox = createScannerOutbox(store);
+    const slowOutbox = { ...outbox, enqueue: async (...args: Parameters<typeof outbox.enqueue>) => {
+      await gate.promise;
+      if (fail) throw new Error("disk full");
+      return outbox.enqueue(...args);
+    } };
+    const c = new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox: slowOutbox,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: false }),
+      deliver: async () => null,
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(Object.values(c.state.progress)).toMatchObject([{ phase: "receiving", orderNumber: "10190203" }]);
+    await c.refreshView(); // a refresh while writing keeps the unconfirmed entry
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["receiving"]);
+    gate.resolve();
+    await settle();
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["received"]);
+    expect(Object.keys(c.state.progress)[0]).not.toMatch(/^receiving:/);
+    fail = true;
+    c.onFrame("S1", "190204");
+    await settle();
+    expect(Object.values(c.state.progress).map((p) => p.orderNumber)).toEqual(["10190203"]); // the failed one is gone
+    expect(c.state.last?.title).toMatch(/NOT SAVED/);
+  });
+
+  it("review r2 M1: a storage failure after the commit leaves no panel saying Saving", async () => {
+    const outbox = createScannerOutbox(memoryJobStore());
+    const broken = { ...outbox, markDone: async () => { throw new Error("finish write failed"); } };
+    let c!: SharedScannerController;
+    c = new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox: broken,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: false }),
+      deliver: () => processNext({
+        outbox: broken, scope, owner: "tab",
+        lookupOrder: async () => ({ kind: "ok", lookup: lookup("10190203") }),
+        openCase: async () => false, products: () => [], packaging: async () => ({ mode: "scan", ruleSet: null }),
+        commit: async () => ({ outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } }),
+        onProgress: (e) => c.onDeliveryProgress(e),
+      }),
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle(40);
+    expect(c.state.storageError).toBe("finish write failed");
+    const phases = Object.values(c.state.progress).map((p) => p.phase);
+    expect(phases).not.toContain("saving");
+    expect(phases).not.toContain("checking");
+    expect(phases).toEqual(["waiting"]); // the job is still stored, its outcome unconfirmed
+  });
+
+  it("review r2 S2: uncertain outcomes and framer choices are urgent; a plain queued result is not", async () => {
+    const job = { requestId: "r1", scannerId: "S1", personId: ALICE, displayName: "Alice", orderNumber: "10190203", scannedAt: new Date(0).toISOString(),
+      backend: "supabase", callerId: "kiosk-1", location: "au", receiverId: "wall-1", status: "blocked", attempts: 1 } as unknown as ScannerJob;
+    const reports: Array<Awaited<ReturnType<ControllerDeps["deliver"]>>> = [
+      { kind: "blocked", job, code: "forbidden_role", message: "role", uncertain: true },
+      { kind: "needs_choice", job, message: "choose" },
+      { kind: "blocked", job, code: "cancelled", message: "cancelled", uncertain: false },
+    ];
+    const outbox = createScannerOutbox(memoryJobStore());
+    const seen: Array<{ title: string; urgent?: boolean; kind: string }> = [];
+    const c = new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "unknown_badge" }),
+      deliver: async () => reports.shift() ?? null,
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    });
+    c.subscribe((st) => { if (st.last && seen.at(-1)?.title !== st.last.title) seen.push({ title: st.last.title, urgent: st.last.urgent, kind: st.last.kind }); });
+    c.pump();
+    await settle(40);
+    expect(seen).toEqual([
+      { title: "#10190203: outcome not confirmed yet", urgent: true, kind: "queued" },
+      { title: "#10190203: framing scan missing", urgent: true, kind: "queued" },
+      { title: "#10190203 not saved — use the classic station", urgent: undefined, kind: "rejected" }, // urgent by kind
+    ]);
+  });
+});

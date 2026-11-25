@@ -1,0 +1,173 @@
+/*
+ * scanner-wall-redesign: the shared scanner wall (approved 2026-11-25).
+ * Scoped to .scanner-wall; the app's dark --hub-* values and green accent.
+ *
+ * Fonts (CJ, 2026-11-25): Frutiger for headlines, Inter for text, Helvetica
+ * Neue for numbers. Frutiger and Helvetica Neue are commercial and not
+ * bundled: a device that has them licensed and installed uses them; otherwise
+ * headlines fall back to the bundled Atkinson Hyperlegible (SIL OFL, a free
+ * Frutiger-style face, public/fonts/atkinson-hyperlegible) and numbers to
+ * Inter with tabular figures. Inter is the app's existing UI font.
+ */
+@font-face {
+  font-family: "Atkinson Hyperlegible";
+  src: url("/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible";
+  src: url("/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+.scanner-wall {
+  /* Dark hub tokens (src/index.css .dark), fixed: the wall is always dark. */
+  --w-page: 18 18 18;
+  --w-head: 22 22 22;
+  --w-panel: 28 28 28;
+  --w-sub: 22 22 22;
+  --w-line: 46 46 46;
+  --w-text: 237 237 237;
+  --w-muted: 170 170 170;
+  --w-accent: 62 207 142;
+  --w-warn: 245 184 65;
+  --w-bad: 240 104 95;
+  --w-info: 74 158 255;
+  --w-font-head: Frutiger, "Frutiger LT Std", "Frutiger LT Pro", "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --w-font-text: Inter, "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --w-font-num: "Helvetica Neue", Helvetica, Inter, Arial, sans-serif;
+  /* Natural height: content reflows and the page scrolls; nothing is clipped. */
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: rgb(var(--w-page));
+  color: rgb(var(--w-text));
+  font-family: var(--w-font-text);
+  font-size: 16px;
+  user-select: none;
+}
+.scanner-wall .w-num { font-family: var(--w-font-num); font-variant-numeric: tabular-nums; }
+.scanner-wall .w-muted { color: rgb(var(--w-muted)); }
+.scanner-wall .w-label { font-family: var(--w-font-head); font-size: 16px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: rgb(var(--w-muted)); }
+.scanner-wall .w-small { font-size: 16px; color: rgb(var(--w-muted)); }
+
+.scanner-wall .w-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  padding: 12px 28px; border-bottom: 1px solid rgb(var(--w-line)); background: rgb(var(--w-head));
+}
+.scanner-wall .w-brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.scanner-wall .w-brand b { font-family: var(--w-font-head); font-size: 22px; letter-spacing: 0.08em; }
+.scanner-wall .w-receiver { font-family: var(--w-font-head); font-size: 18px; font-weight: 700; }
+.scanner-wall .w-clock { font-family: var(--w-font-num); font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 700; letter-spacing: 0.02em; }
+.scanner-wall .w-chips { display: flex; flex-wrap: wrap; gap: 8px; font-size: 16px; }
+.scanner-wall .w-chip {
+  display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; font: inherit;
+  background: rgb(var(--w-panel)); border: 1px solid rgb(var(--w-line)); color: rgb(var(--w-muted));
+}
+.scanner-wall .w-chip.is-ok { background: rgb(var(--w-accent) / 0.14); border-color: transparent; color: rgb(var(--w-accent)); }
+.scanner-wall .w-chip.is-bad { background: rgb(var(--w-bad) / 0.18); border-color: transparent; color: rgb(var(--w-bad)); }
+.scanner-wall .w-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.scanner-wall button.w-chip { cursor: pointer; color: rgb(var(--w-text)); }
+.scanner-wall button.w-chip:hover { background: rgb(var(--w-line)); }
+.scanner-wall button.w-chip.is-armed { background: rgb(var(--w-warn)); color: #1f1500; border-color: transparent; }
+.scanner-wall button:focus-visible { outline: 3px solid rgb(var(--w-info)); outline-offset: 2px; }
+
+.scanner-wall .w-start {
+  margin: 16px 28px 0; padding: 22px; border-radius: 14px; border: 0; cursor: pointer;
+  background: rgb(var(--w-accent)); color: #0b2a1c; font-family: var(--w-font-head); font-size: 26px; font-weight: 700;
+}
+.scanner-wall .w-warnings { margin: 12px 28px 0; display: grid; gap: 8px; }
+.scanner-wall .w-warning {
+  padding: 10px 16px; border-radius: 10px; font-size: 18px; font-weight: 700;
+  background: rgb(var(--w-bad) / 0.18); border: 1px solid rgb(var(--w-bad)); color: rgb(var(--w-text));
+}
+
+.scanner-wall .w-team { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 12px 28px 4px; }
+.scanner-wall .w-team-figs { display: flex; gap: 28px; align-items: baseline; flex-wrap: wrap; font-size: 16px; color: rgb(var(--w-muted)); }
+.scanner-wall .w-team-figs b { font-size: 30px; color: rgb(var(--w-text)); margin-left: 6px; }
+.scanner-wall .w-delayed { color: rgb(var(--w-warn)); font-weight: 700; }
+
+.scanner-wall .w-panels { display: grid; gap: 16px; padding: 8px 28px 12px; align-content: start; }
+.scanner-wall .w-panels.n1 { grid-template-columns: minmax(0, 1fr); }
+.scanner-wall .w-panels.n2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.scanner-wall .w-panels.n3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 900px) { .scanner-wall .w-panels.n2, .scanner-wall .w-panels.n3 { grid-template-columns: minmax(0, 1fr); } }
+
+.scanner-wall .w-panel {
+  background: rgb(var(--w-panel)); border: 1px solid rgb(var(--w-line)); border-radius: 14px;
+  padding: 14px 18px; display: flex; flex-direction: column; gap: 8px; min-width: 0;
+}
+.scanner-wall .w-panel.is-leading { border-color: rgb(var(--w-accent) / 0.6); }
+.scanner-wall .w-panel.is-busy { border: 2px solid rgb(var(--w-info)); }
+.scanner-wall .w-panel.is-signing-out { border: 2px solid rgb(var(--w-warn)); }
+.scanner-wall .w-panel.is-free { background: rgb(var(--w-sub)); border: 2px dashed rgb(var(--w-line)); }
+.scanner-wall .w-panel-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.scanner-wall .w-pill { font-size: 16px; font-weight: 700; padding: 4px 12px; border-radius: 999px; white-space: nowrap; }
+.scanner-wall .w-pill.is-lead { background: rgb(var(--w-accent)); color: #121212; }
+.scanner-wall .w-pill.is-busy { background: rgb(var(--w-info)); color: #121212; }
+.scanner-wall .w-pill.is-warn { background: rgb(var(--w-warn)); color: #1f1500; }
+.scanner-wall .w-name { font-family: var(--w-font-head); font-size: 56px; font-weight: 700; line-height: 1.02; overflow-wrap: anywhere; }
+.scanner-wall .w-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.scanner-wall .w-stat { background: rgb(var(--w-sub)); border-radius: 10px; padding: 4px 12px 6px; }
+.scanner-wall .w-stat-label { font-size: 16px; letter-spacing: 0.1em; color: rgb(var(--w-muted)); }
+.scanner-wall .w-stat-value { font-family: var(--w-font-num); font-variant-numeric: tabular-nums; font-size: 64px; font-weight: 700; line-height: 1; }
+.scanner-wall .w-bar { height: 10px; border-radius: 999px; background: rgb(var(--w-line)); overflow: hidden; }
+.scanner-wall .w-bar > span { display: block; height: 100%; border-radius: 999px; background: rgb(var(--w-accent)); }
+.scanner-wall .w-bar.is-thin { height: 6px; }
+.scanner-wall .w-bar.is-thin > span { background: #7a7a7a; }
+.scanner-wall .w-bar.is-busy > span { background: rgb(var(--w-info)); }
+.scanner-wall .w-bar.is-warn > span { background: rgb(var(--w-warn)); }
+.scanner-wall .w-foot { margin-top: auto; border-top: 1px solid rgb(var(--w-line)); padding-top: 8px; display: grid; gap: 6px; font-size: 16px; }
+.scanner-wall .w-box { background: rgb(var(--w-sub)); border-radius: 10px; padding: 10px 14px; display: grid; gap: 6px; }
+.scanner-wall .w-box.is-warn { background: rgb(var(--w-warn) / 0.16); }
+.scanner-wall .w-dots { display: flex; gap: 8px; flex-shrink: 0; }
+.scanner-wall .w-dots span { width: 22px; height: 22px; border-radius: 50%; border: 3px solid #7a7a7a; box-sizing: border-box; }
+.scanner-wall .w-dots span.is-on { background: rgb(var(--w-warn)); border-color: rgb(var(--w-warn)); }
+.scanner-wall .w-free { flex-grow: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 10px; min-height: 200px; }
+.scanner-wall .w-free-title { font-family: var(--w-font-head); font-size: 36px; font-weight: 700; line-height: 1.15; }
+.scanner-wall .w-panel.is-compact { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
+.scanner-wall .w-name-compact { font-family: var(--w-font-head); font-size: 36px; font-weight: 700; line-height: 1.1; overflow-wrap: anywhere; }
+.scanner-wall .w-compact-value { font-size: 48px; font-weight: 700; line-height: 1; }
+.scanner-wall .w-note { font-size: 16px; font-weight: 700; color: rgb(var(--w-warn)); }
+
+/* Recovery and the latest result stay on screen: docked to the bottom while the page scrolls. */
+.scanner-wall .w-dock {
+  position: sticky; bottom: 0; z-index: 1; margin-top: auto;
+  background: rgb(var(--w-page)); padding: 4px 0 2px; max-height: 60vh; overflow-y: auto;
+}
+.scanner-wall .w-recovery { margin: 4px 28px 0; padding: 14px 26px; border-radius: 16px; background: rgb(var(--w-warn)); color: #1f1500; }
+.scanner-wall .w-recovery h2 { font-family: var(--w-font-head); margin: 2px 0 4px; font-size: 44px; line-height: 1.05; }
+.scanner-wall .w-recovery p { margin: 2px 0 0; font-size: 20px; }
+
+.scanner-wall .w-result { margin: 8px 28px 10px; border-radius: 14px; padding: 12px 24px; display: flex; flex-direction: column; gap: 4px; }
+.scanner-wall .w-result-word { font-family: var(--w-font-head); font-size: 16px; font-weight: 700; letter-spacing: 0.14em; }
+.scanner-wall .w-result-title { font-family: var(--w-font-head); font-size: 40px; font-weight: 700; line-height: 1.08; overflow-wrap: anywhere; }
+.scanner-wall .w-result-line { font-size: 24px; font-weight: 700; }
+.scanner-wall .w-result-detail { font-size: 18px; opacity: 0.92; }
+.scanner-wall .w-result[data-kind="saved"], .scanner-wall .w-result[data-kind="signed_out"] { background: rgb(var(--w-accent)); color: #0b2a1c; }
+.scanner-wall .w-result[data-kind="queued"] { background: rgb(var(--w-panel)); border: 1px solid rgb(var(--w-info)); }
+.scanner-wall .w-result[data-kind="queued"] .w-result-word { color: rgb(var(--w-info)); }
+.scanner-wall .w-result[data-kind="already"] { background: rgb(var(--w-warn)); color: #1f1500; }
+.scanner-wall .w-result[data-kind="rejected"] { background: rgb(var(--w-bad)); color: #1b0505; }
+.scanner-wall .w-result[data-kind="signed_in"] { background: rgb(var(--w-info)); color: #06162b; }
+.scanner-wall .w-result[data-kind="info"] { background: rgb(var(--w-panel)); border: 1px solid rgb(var(--w-line)); }
+.scanner-wall .w-result.is-idle { background: rgb(var(--w-panel)); border: 1px solid rgb(var(--w-line)); color: rgb(var(--w-muted)); font-size: 26px; align-items: center; }
+.scanner-wall .w-manual { font-size: 16px; font-weight: 700; text-transform: uppercase; background: rgb(0 0 0 / 0.3); border-radius: 6px; padding: 2px 8px; }
+
+.scanner-wall .w-blocked { padding: 0 28px 16px; }
+.scanner-wall .w-blocked-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  padding: 10px 16px; border-radius: 10px; background: rgb(var(--w-panel)); border: 1px solid rgb(var(--w-bad));
+}
+.scanner-wall .w-blocked-row + .w-blocked-row { margin-top: 8px; }
+.scanner-wall .w-btn { padding: 8px 14px; border-radius: 8px; border: 0; cursor: pointer; font: inherit; font-weight: 700; background: rgb(var(--w-line)); color: rgb(var(--w-text)); }
+.scanner-wall .w-btn.is-bad { background: rgb(var(--w-bad)); color: #1b0505; }
+.scanner-wall .w-footer { padding: 6px 28px; font-size: 14px; color: rgb(var(--w-muted)); border-top: 1px solid rgb(var(--w-line)); }
+
+@keyframes w-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.scanner-wall .w-pulse { animation: w-pulse 1.2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .scanner-wall .w-pulse { animation: none; } }
