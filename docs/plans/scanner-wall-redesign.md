@@ -1,0 +1,135 @@
+# Plan: Shared scanner wall redesign
+
+- Slug: `scanner-wall-redesign` · Spec: `docs/specs/scanner-wall-redesign.md`
+- Branch: `feature/scanner-stations-tuning` (same branch; tuning implemented first)
+- Status: Approved by CJ, 2026-11-25 (design approved in chat; mockups listed in spec)
+- Execution: coder uses `executing-plans` task by task, one writer. This planner handoff writes only this plan and its spec and does not commit.
+
+## Approach
+
+Implement the approved [spec](../specs/scanner-wall-redesign.md), using its four HTML artboards for composition and the already-approved tuning controller/session for recovery, badge gestures and fifteen-minute expiry. Current source inspection found the tuning implementation still in progress; finish that plan before this work. Do not reimplement its state machine or revert its changes.
+
+Daily numbers reuse the existing F1 evidence RPC/decoder and shared reducer, as Classic Production does. One current-site production-day snapshot serves all active people. Receipts prove individual saves but are not daily statistics; local increments and published management generations would respectively drift or lag. Add only a scanner-local reader/projection/polling wrapper. No Repository interface change: scanner mode is Supabase-only and Dexie remains device outbox storage.
+
+Progress is a passive observer of existing `processNext` preparation/commit stages, fenced by scope/request and kept separately per scanner. The wall stays a pure props-driven renderer, with a small panel component and scoped CSS. Self-host 400/700 Atkinson Hyperlegible with licence; no new npm dependency. Classic UI is not restyled. Dispatch uses the new shared chrome while retaining its existing flow/picker and no Framing competition/idle/gesture UI.
+
+**Schema decision:** no new tables or RPCs. One additive index is required for the existing evidence RPC's site/time predicate; existing person/time and department/time indexes do not directly cover it. Task 1 prepares the migration; CJ applies SQL. No existing migration edits, outbox schema changes, write payload changes, new env vars or provider configuration.
+
+### Fixed contracts and file responsibilities
+
+| File(s) | Responsibility |
+| --- | --- |
+| New `src/lib/scanners/wallTotals.ts` | Pure projection of prepared F1 evidence, deduplicated active-person team/ranking and freshness eligibility. |
+| New `src/lib/scanners/wallTotalsClient.ts` | Scanner-local bounded one-day call through existing evidence decoder/loader; no write/API fallback. |
+| New `src/lib/scanners/wallTotalsRefresh.ts` | Testable coalescing/dirty-refresh scheduling and scope cancellation. |
+| New `src/components/production/scanners/useScannerWallTotals.ts` | React lifecycle, site day, auth/role/site visibility and totals state. |
+| `src/lib/scanners/client.ts`, `station.ts`, `useSharedScannerStation.ts` | Optional non-blocking delivery observation and transient request-scoped panel results; preserve tuning state. |
+| `SharedScannerStation.tsx` | Wire totals, site zone, save revision and stable callback; preserve keyed account/site/receiver/mode reset and Dispatch people loading. |
+| `SharedScannerWall.tsx`, new `ScannerWallPanel.tsx`, new `scanner-wall.css` | Pure artboard presentation, all warnings/actions and scoped typography/theme. |
+| New `public/fonts/atkinson-hyperlegible/` | Regular/bold WOFF2 plus upstream licence and source provenance. |
+| New `supabase/migrations/0064_scanner_wall_count_window_index.sql` | Partial site/time index only; recheck next free number after tuning and record any allocation change here. |
+
+Global constraints: shared 04:00 site workday; framing work types `framed` + `a0_framed`; normal output only in headlines; five-second minimum read interval, sixty-second visible/online refresh, ten-second read deadline, zero immediate retries, 90-second stale threshold, 20,000-row complete-envelope ceiling. Goodbye five seconds or next input. Framing expiry/gesture values come from tuning exports, not new constants. No new npm dependencies. Display state is never read by credit/deduction/identity decisions.
+
+### Review focus
+
+- Old worker's queued save arrives after rebind: original global confirmation, no current-person last-order/count contamination (Tasks 2–3/5).
+- One order has A0 and regular work, or two people have credit: distinct team orders versus explicit order-credit share denominator (Task 1).
+- Lost response, stale lease or thrown observer: no invented saved state and no changed delivery outcome (Task 3).
+- Tab sleeps across site 04:00 or permission changes in flight: clear prior scope and fence responses before rendering (Task 2).
+- Warning overload/zoom and scanner Enter on operator controls: no hidden recovery or accidental mode/Classic activation (Tasks 4–5).
+
+## Tasks
+
+Execute in order. Each task is one coder commit `task N: <summary>`; tick the task and add a line to Implementation log. For behavioral logic write the named tests, observe failure, implement, rerun. Run `npx tsc -b` and `npm run test -- --run` before each implementation handoff, and `npm run build` before final review. Test names/assertions below define the checks; do not add a dependency just for DOM tests. Reuse injected clocks/deferred promises and `renderToStaticMarkup`; verify actual browser interactions in staging.
+
+### [ ] Task 1: Define daily totals projection and indexed read prerequisite
+
+- Files: create `src/lib/scanners/wallTotals.ts`, `src/lib/scanners/__tests__/wallTotals.test.ts`, and the next-number index migration identified above. Read-only references: `src/lib/domain/productionCounts.ts`, `productionItems.ts`, `productionPeriods.ts`, `supabase/migrations/0012_production.sql`, `0022_production_verify.sql`, `0035_load_production_evidence_v2.sql`, `0036_production_events_select_initplans.sql`.
+- Interface: export `buildScannerWallTotals(evidence: PreparedProductionEvidence, range: UtcWindow, personIds: readonly string[]): ScannerWallTotals`. Return `byPerson: Record<string, { orders: number; pieces: number | null; rank: number | null; share: number | null; leading: boolean; jointLead: boolean }>`, `team: { orders: number; pieces: number | null }`, `hasRework: boolean`, `incomplete: boolean`. Metadata/freshness is Task 2's wrapper, not this reducer. Validate the snapshot covers the requested window; on mismatch throw, never reuse another day's numbers.
+- [ ] Add `mixed A0 and regular count one order`, `sets use shared pieces`, `cancelled rows and pre-window qualification match F1`, `normal excludes rework`, `duplicate active people contribute once`, `two people same order use union team and credit-share denominator`, `ties rank 1 1 3`, `all zero has no leader`, `missing person in complete snapshot is zero`, `overflow or limited/incomplete evidence disables ranking`, and `wrong day rejected`. Assert headline/team outputs against `summarizeProduction`; independently pin expected fixture values (2 × S2 = 4 pieces, 1 order). Do not write a new SKU formula.
+- [ ] Implement using one framing summary for the distinct active set, its `byPerson` groups and normal union. Treat nullable pieces/coverage as incomplete for competition. Preserve separate rework detection.
+- [ ] Add `production_events_count_window_idx` on `public.production_events (location, created_at)` with predicate `event_type IN ('line_verified','completed','dispatched','cancelled')`. Migration contains only this non-unique additive index and documentation of lock/rollback/staging checks; no functions/policies/grants/data updates. Use the repo's numbered append-only convention, never a stale hard-coded `0034` from AGENTS. Standard CREATE INDEX has a write-lock cost: CJ schedules it at a quiet time and confirms the old app still works. Do not apply SQL.
+- Done when: targeted `npm run test -- --run src/lib/scanners/__tests__/wallTotals.test.ts` passes; diff confirms one new index only and unchanged existing migrations. Real query-plan proof belongs to staging, not this unit result.
+
+### [ ] Task 2: Load and refresh one safe site-day snapshot
+
+- Files: create `src/lib/scanners/wallTotalsClient.ts`, `wallTotalsRefresh.ts`, `src/components/production/scanners/useScannerWallTotals.ts`, tests `src/lib/scanners/__tests__/wallTotalsClient.test.ts` and `wallTotalsRefresh.test.ts`; modify `SharedScannerStation.tsx` for data wiring. Existing `productionEvidence.ts`, `useProductionSummary.ts` and Classic `Production.tsx` are references; do not alter their defaults.
+- Interfaces: `loadScannerWallEvidence(client: SupabaseClient, request: ProductionReadRequest): Promise<ProductionSnapshot>` delegates to `loadProductionEvidence`. Supply a local RPC-client adapter that checks the scalar envelope's `rowCount` and actual `rows.length` against 20,000 before passing it to the existing strict decoder; propagate abort handling. Restrict `range` to the computed site day at this caller boundary; no paginated/table-read fallback. Export testable `createWallTotalsRefresh({ now, schedule, cancel, read, publish })` with `request()`, `setEnabled(boolean)`, `dispose()`; exact callback types live in this module, with `read(): Promise<ProductionSnapshot>` and `publish(result: { snapshot: ProductionSnapshot | null; error: string | null }): void`.
+- Hook interface: `useScannerWallTotals({ client, site, callerId, mode, roleAllowed, personIds, bindingKey, saveRevision, online, visible, now })` returns `{ status, totals, pendingPersonIds, asOfUtc, loadedAtUtc, message, updating }`; status union is `loading | current | stale | unavailable`, and `pendingPersonIds` is a readonly string array. Caller/role/membership come from existing auth and form part of identity. `totals` is nullable Task 1 output. `bindingKey` is the stable ordered scanner-ID/person-ID map (including empty slots); own-badge repeats with unchanged identities do not change it. `saveRevision` is a monotonic transient counter from Task 3; wire initially as zero until that task. Disable reads for Dispatch, unauthorized/unsupported sites and after disposal.
+- [ ] Reader tests assert exact existing RPC name, site/day/as-of args, unchanged caller client/RLS, one call for three people, correct 04:00/DST boundaries, complete empty result versus failure, invalid/incomplete envelope refusal, 20,000 allowed/20,001 refused including lying rowCount, and timeout/abort. Reuse production evidence test fixtures rather than inventing an alternate wire format.
+- [ ] Scheduler tests with deferred reads/fake clock assert initial/bind refresh, five-second minimum starts, sixty-second refresh, one in flight, repeated save requests coalesced into one trailing refresh, no starvation during continued saves, no immediate retry, and offline/hidden pause/resume. A queued refresh uses the day/cutoff at actual execution, not when it was first requested. Dispose/identity change prevents all late publication.
+- [ ] Implement hook/composition with one shared snapshot per wall, current-day recomputation before focus/resume reads and boundary timer, latest callback refs to avoid effect resets each second. On bindingKey change increment a binding generation and mark all active IDs pending; only a read started for that generation can clear pending. Pending people render em dashes, and team/competition is withheld until all are ready. A complete fresh snapshot without that person's rows yields zero only after this gate. Test rebind/read start in the same millisecond and an unchanged own-badge repeat. Account/role/site/day/mode change clears prior data synchronously; a day change cannot show yesterday as today's stale totals.
+- [ ] Add projection/lifecycle tests for successful save plus failing statistics, last good snapshot labelled stale, initial error em dashes, 90-second freshness expiry, overflow/limited coverage, scope switch and out-of-order read, and permission loss. Refresh does not call activation, enqueue, commit, retry or update activity.
+- Done when: `npm run test -- --run src/lib/scanners/__tests__/wallTotalsClient.test.ts src/lib/scanners/__tests__/wallTotalsRefresh.test.ts src/lib/repository/supabase/__tests__/productionEvidence.test.ts src/lib/domain/__tests__/productionPeriods.test.ts src/lib/domain/__tests__/productionCounts.test.ts` passes. No claim of staging indexing/performance until Task 5 evidence.
+
+### [ ] Task 3: Expose truthful per-request progress without changing delivery
+
+- Files: modify `src/lib/scanners/client.ts`, `station.ts`, `src/components/production/scanners/useSharedScannerStation.ts`, `SharedScannerStation.tsx`; extend `src/lib/scanners/__tests__/client.test.ts`, `station.test.ts`, `station-dispatch.test.ts`.
+- Interface: add optional `DeliveryDeps.onProgress?(event: { job: ScannerJob; phase: 'checking' | 'saving' }): void`. Invoke checking only for actual preparation after claim, saving only after durable payload/attempt and active checks immediately before commit. A local non-throwing notifier contains observer errors; do not await it. No new network call, persisted job field or changed return contract. Wire to a public controller observer `onDeliveryProgress(event)`; fence disposed controller, captured job scope/mode and request identity. Validate mode against the job's stored scope, not equality with the displayed mode: this controller can drain retained Framing and Dispatch work. Keep either mode's global results/queue visible; only matching-mode work feeds current-mode panels.
+- Controller transient state: per-request progress (bounded by current scope's 200 unfinished jobs), per-slot recent saved result keyed by person/mode/request, and `saveRevision: number`. Increment revision on saved/already-recorded reports for read reconciliation, never as a total. Existing `WallResult` may gain optional captured `personId`, `requestId` and `mode` for honest panel matching; keep current banner/person/attribution fields. Receiving/received derive from actual enqueue start/success; return the enqueued job to observation and leave outbox shape untouched.
+- [ ] Deferred-promise tests assert before durable enqueue there is no received/green state; lookup pending shows checking; commit pending shows saving; only saved result is green. Offline/blocked/waiting/needs-choice/superseded replaces or clears busy status; already-recorded has no credit increment. Prepared retry skips checking and preserves the identical payload. Thrown observer leaves delivery/report/ledger-call count unchanged.
+- [ ] Race tests cover S1 and S2 independent progress, multiple jobs per slot (oldest outstanding + count), new scan while old job completes, old-person save after rebind/sign-out, mode change with an older-mode job, controller disposal, lease loss and stale callbacks. Current-person last saved line only accepts matching person/scanner/mode. Preserve all tuning recovery/gesture fields; a delivery/totals refresh never clears them.
+- [ ] Integrate goodbye from the tuning sign-out event with departed `personId`/name/time (and slot input generation for clearing), not from empty-identity inference. Keep it at most five seconds/next input. Tests prove failed next scan clears it, ordinary expiry/reset is not mislabelled as deliberate sign-out, and late totals cannot move it to another person. Projection may use labelled last-known totals; never query receipts for this UI.
+- Done when: targeted scanner client/controller/Dispatch tests pass, including existing replay, storage, full-queue, lease and captured-attribution cases. Outbox storage version, commit inputs and RPC call counts remain unchanged except display reads.
+
+### [ ] Task 4: Build the approved wall composition and preserve operator access
+
+- Files: modify `SharedScannerWall.tsx`; create `ScannerWallPanel.tsx`, `scanner-wall.css`, `public/fonts/atkinson-hyperlegible/AtkinsonHyperlegible-Regular.woff2`, `AtkinsonHyperlegible-Bold.woff2`, `OFL.txt` (upstream licence, retain exact upstream licence name if different), `SOURCE.txt`; extend `src/components/production/scanners/__tests__/SharedScannerWall.test.tsx` and `DispatchWall.test.tsx`. Use `src/index.css` token definitions as read-only reference; no global theme changes.
+- Interface: extend wall props with Task 2 totals state, explicit site timezone and `elapsedNow: number`; panel consumes scanner slot, matching transient job/result, daily person totals/readiness, freshness, wall-clock `now`, elapsed-clock `elapsedNow` and mode. `SharedScannerStation.tsx` updates both clocks on its existing UI tick, using `Date.now()` and `performance.now()` respectively. Keep `SharedScannerWall` pure, with only existing operator-arm interaction state. Avoid data fetching in either visual component.
+- [ ] Add static fixtures/assertions for Main, Saving, Problem and SignOut plus empty/loading/unavailable/stale/incomplete, pending badge, suppression, 1/3 and 2/3, positive tie/zero, long names and duplicate active person. Assert exact tuning recovery copy and no accessory-ignore copy. Replace old slate/emerald class assertions with semantic state/token assertions; retain saved-versus-queued/error distinctions.
+- [ ] Implement the approved layout with `.scanner-wall.dark`, hub tokens and imported scoped CSS. Fetch actual font assets from official distribution with licence/provenance, no Google runtime imports; `font-display: swap`, normal 400/700, tabular figures. Keep typography/dimensions/reflow requirements from spec. Ordinary three-card states fit 1280 × 800; extra content is scrollable, never clipped. Render one/two configured scanners sensibly.
+- [ ] Render numerical/bar idle time from tuning helpers and sign-out state from tuning data; no new input logic or idle refresh. Gesture remaining time uses `elapsedNow` with tuning's elapsed-time `firstRepeatAt` and shared sign-out window constant, never wall-clock `now`. Test wildly different clock origins and a wall-clock jump: gesture remaining time is unchanged, and the controller still owns timeout/reset. Recovery alert takes priority while ordinary result remains separately visible. Show site-local clock/expiry explicitly, not browser-local defaults.
+- [ ] Preserve every current warning: app signed out, unauthorized account, expired session, offline, storage, lost focus/visibility, editable capture pause, waiting delivery, corrupt stored jobs; retain queue/waiting/uncertain count, negative stock detail, sound/wake and heartbeat behavior. All operator actions and inline two-step mode/Classic/dismiss confirmations remain keyboard accessible. Uncertain jobs never get Recorded on classic.
+- [ ] Dispatch fixtures assert no Framing competition/idle/triple-scan prompt, unchanged shift wording, Framed by/manual lines and chooser/recheck/retry recovery. No Classic JSX/CSS changes. Add semantic assertions for headings, polite result live region, error alert, focus styling, text alternatives and no live countdown; reduced-motion CSS disables animation.
+- Done when: scanner component static-render suites pass and type-check succeeds; coder inspects all four states in browser at target size plus 200% zoom/narrow viewport and records observations. No screenshot/unit test is presented as proof of real scanner interaction or SQL correctness.
+
+### [ ] Task 5: Verify integrated behavior and prepare CJ's release evidence
+
+- Files: extend scanner controller/projection/component tests above only where integration gaps remain; update checkboxes/log in this plan. No additional app surface is in scope. Staging checklist is the spec's seven numbered steps.
+- [ ] Combine real parser-to-controller corruption with delayed save and count refresh; prove recovery and S2 gesture survive S1 completion. Replay already-saved requests across offline/reload/rebind and 04:00; assert unchanged original credit/stock payload and current-day display behavior. Retain tuning/classic/Dispatch regressions, not weakened expectations.
+- [ ] Run `npx tsc -b`, `npm run test -- --run`, `npm run build`; record commands, exits and test totals. Inspect final diff for only authorized feature changes, no existing migration edits, no `Repository`/Classic behavior changes, no secret/provider/config changes and no new dependency. Obtain green PR CI and planner review through the normal coder handoff. Agents never merge/deploy/apply SQL.
+- [ ] Give CJ the spec staging checklist, especially index query plans/performance, RLS roles, same-cutoff counting reconciliation, font/layout/accessibility, actual scanner gestures and unchanged Dispatch. Record actual staging results separately; if unavailable, mark the release gate pending instead of inventing success. A local manifest/test is not SQL execution evidence.
+- Done when: implementation and local checks/review/CI are complete, and CJ has explicit pending or passed staging/release gates. Product release requires all staging gates passed. Every evidence handoff ends with exactly one `STATUS: COMPLETE` or `STATUS: FAILED - <reason>` line; a failed/missing result stops the consumer.
+
+## Hardening in the plan
+
+| Checklist | Tasks and evidence |
+| --- | --- |
+| 1. Slow/down services, recovery | Task 2 count isolation/freshness; Tasks 3–4 true progress, warnings and unchanged durable queue. No new Dropbox/Make/Slack requests. |
+| 1. Retries, races, bad input | Tasks 3/5 replay, lease, corruption, old-person delivery and uncertain refusal; original strict parser/site/preflight rules unchanged. |
+| 2. Attribution/history/counting | Task 1 shared F1 projection/IDs/set/cancellation/team tests; Task 3 captured-person results. No history/department/credit mutation. |
+| 2. Time and manual/inferred data | Tasks 1–2 site 04:00/DST/original timestamp; Task 4 site-zone labels, stale status and Dispatch Manual markers. No inferred production measure. |
+| 3. Auth/RLS/secrets/cost | Task 2 existing invoker client, scope/permission cancellation and bounded calls; Task 5 real role tests. No new endpoint/table/grant/secrets/emails. |
+| 4. Expand-only/release/fallback | Task 1 one additive index; Task 5 CJ-only staging/application/rollout; Classic opt-out and preserved queues. |
+| 5. Growth/performance | Tasks 1–2 index/day scope/linked context, cadence/deadline/ceiling; Task 5 real plans with two years/three sites. No unbounded per-person/API fan-out. |
+| 6. Operations | Tasks 2/4 freshness/failure and preserved health indicators/actions; Task 5 monitor read latency and index write cost. No new retention store or subscriptions. |
+| 7. Tests | Tasks 1–4 pure/read/controller/render checks; Task 5 regression/build/CI plus actual staging credit/stock/RLS/performance. |
+
+Coverage: AC1 → Task 4; AC2 → Tasks 1–2; AC3 → Tasks 1–2/5; AC4 → Tasks 3/5; AC5 → Tasks 3–5; AC6 → Tasks 4–5.
+
+## Release and rollback
+
+- **Migration:** the next numbered index-only file from Task 1; non-unique additive partial site/time index. Existing functions, table data, grants and old app stay valid. Existing migrations are immutable. Reconcile any equivalent staging index with CJ before application; do not silently omit the indexed-access release requirement.
+- **CJ sequence:** finish tuning; apply the reviewed index on staging and record plans/latency under kiosk RLS; test Preview against inka-staging-2 per spec and RELEASING smoke tests; obtain approved review/green CI; record current Vercel rollback target; back up/check production per runbook and apply the index in a quiet window; merge/release; refresh receivers, Start sound/wake, confirm site/mode and bound workers. Agents perform none of those production actions.
+- **Settings:** no new environment variables, Edge Functions, Shopify/Make/Slack settings or npm dependency. Self-hosted fonts ship with the static bundle; verify their requests succeed after deploy.
+- **Monitoring:** first thirty minutes watch count freshness/read failures/latency, captured attribution, queue/uncertainty, focus/audio/wake and stock/credit. Statistics failure must leave scanning usable. If time-range index plans fail or read cost exceeds the staging target, stop release and record evidence under Open questions rather than increasing timeout or bypassing RLS.
+- **Fast opt-out:** existing Classic station action; keep queued/uncertain work on device. Resolve possibly committed work through its original request before Classic recording. No new flag needed.
+- **App rollback:** CJ restores prior Vercel deployment and refreshes receivers. Leave the additive index and all stored events/receipts/outbox jobs/stock intact. No database restore or queue clearing. A pre-tuning rollback also restores the earlier tuning behavior; communicate that to operators. No follow-up contract migration is required.
+
+## Out of scope
+
+- Classic redesign, reporting generation changes, new analytics tables, credit/inventory/packing/timesheet changes, migrations beyond the one index, provider integrations and new dependencies.
+- Scanner grammar, tuning timings/gestures/recovery semantics, Dispatch shift/framer rules, outbox format or immutable payload changes.
+- Treating CS/staff evidence read permissions as scanner write permissions; broadening role grants to obtain totals.
+
+## Open questions
+
+Coder stops affected work and records unforeseen evidence here for planner/CJ resolution; no scope improvisation.
+
+- No outstanding product-design approval. Required pre-release evidence remains staging index reconciliation/performance, role access, visual/accessibility and physical-scanner checks in the spec.
+- Recheck migration allocation after tuning; `0064` was next at planning time. If another migration occupies it, record the new filename here without editing any existing migration.
+
+## Implementation log
+
+- 2026-11-25 — Planner: read repo guidance, current scanner/F1 code, migrations and four approved HTML artboards; authored only this plan and its spec. Tuning is a prerequisite still in progress in the inspected checkout. No implementation, commit, SQL application, staging run, CI or app test/build result is claimed by this documentation handoff.
