@@ -1,7 +1,7 @@
 # Spec: Shared scanner station tuning
 
 - Slug: `scanner-stations-tuning` · Roadmap ID: `F6`
-- Status: Draft - awaiting CJ approval
+- Status: Approved by CJ, 2026-11-25
 - Author: planner (GPT-6 Astra)
 
 ## Problem
