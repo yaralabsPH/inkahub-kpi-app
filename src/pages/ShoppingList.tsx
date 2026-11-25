@@ -140,7 +140,21 @@ export function ShoppingList() {
 
   const placeOrders = async () => {
     if (lines.length === 0) return;
-    if (!window.confirm(`Create ${lines.length} purchase orders, one per SKU?`)) return;
+    // Spell out exactly what will be saved: these are real "Ordered"
+    // shipments (not drafts) and they immediately count as incoming stock
+    // in every forecast, so the list shrinks after you confirm.
+    const preview = supplierGroups
+      .map(([sup, items]) =>
+        `${sup}:\n` + items.map((l) => `  • ${l.productCode} × ${fmtNum(l.qty)}`).join("\n"),
+      )
+      .join("\n");
+    const units = lines.reduce((sum, l) => sum + l.qty, 0);
+    const message =
+      `Save ${lines.length} purchase order${lines.length === 1 ? "" : "s"} (${fmtNum(units)} units) to Shipments with status "Ordered"?\n\n` +
+      `${preview}\n\n` +
+      `They count as incoming stock straight away, so these SKUs will drop off this list. ` +
+      `To undo, delete them on the Shipments page.`;
+    if (!window.confirm(message)) return;
     setBusy(true);
     try {
       const now = new Date().toISOString();
@@ -173,7 +187,7 @@ export function ShoppingList() {
           });
         }
       }
-      window.alert(`Created ${ships.length} shipments. Find them under the Ordered column on /shipments.`);
+      window.alert(`Saved ${ships.length} purchase orders. Find them under the Ordered column on Shipments.`);
     } finally {
       setBusy(false);
     }
@@ -203,10 +217,10 @@ export function ShoppingList() {
             disabled={lines.length === 0 || busy}
             aria-describedby="shopping-create-help"
           >
-            <ShoppingCart size={14} /> {busy ? "Creating…" : "Create draft shipments"}
+            <ShoppingCart size={14} /> {busy ? "Saving…" : "Create purchase orders"}
           </Button>
           <p id="shopping-create-help" className="basis-full text-right text-xs text-hub-muted">
-            Creates one shipment per line, each with status <strong>Ordered</strong>.
+            Saves one real shipment per line with status <strong>Ordered</strong> (not a draft).
           </p>
         </div>
       </div>
