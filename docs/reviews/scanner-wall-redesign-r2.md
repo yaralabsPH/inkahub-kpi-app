@@ -180,6 +180,12 @@ After fixes and another review, CJ still needs green PR CI and the spec's comple
 
 ## Coder response
 
-(Coder fills this in after fixing. Address M1–M3 and disposition S1–S4 with specific tests/evidence; do not mark the remaining r1 items closed solely because existing tests pass.)
+- **M1 fixed.** The controller tracks the one job delivery is working on (`activeRequest`, set by the progress observer, cleared by its report or by a pump storage failure). On every queue refresh a retained job whose last phase was checking/saving but is not the active job becomes `waiting` (attempts > 0) or `received`. Test "a storage failure after the commit leaves no panel saying Saving" uses the real controller, `processNext` and memory outbox with `markDone` throwing: storageError set, phase `waiting`, never saving/checking.
+- **M2 fixed.** New `receiving` phase ("Receiving scan…"), set under a temporary key before `outbox.enqueue` is awaited, kept by refresh reconciliation, replaced by `received` under the real request id after the durable write, removed if the write fails. Test with a deferred enqueue covers before, during a refresh, after, and a failing write.
+- **M3 fixed.** While the recovery message is up, panels render compact (one row: scanner, name, "Still signed in" or "Sign out n/3", Orders), as in the approved Problem artboard. Busy and signing-out panels swap the large Orders/Pieces boxes for a one-line "Today: N orders · M pieces", as in the approved Saving and SignOut artboards; the sign-out dots moved onto the box's title row. Re-measured at 1280×800 with the real CSS and fonts: Main 800, Saving 800, Problem 800, SignOut 800 px; no clipping (no fixed height), the docked result stays visible.
+- **S1 fixed.** An access epoch is part of the scope and increases whenever access is lost, so allowed→denied→allowed (or member→not→member) can never match the old snapshot, errors or goodbye cache; last-known numbers are also cleared on denial.
+- **S2 fixed.** `WallResult.urgent` is set for uncertain blocked outcomes and framer choices (kind stays `queued`, so nothing is relabelled "not saved"); the wall announces urgent/rejected/already results with `aria-live="assertive"` and `role="alert"`. Controller test feeds the three reports and checks the flags; render test checks the live region.
+- **S3 fixed.** Dispatch progress reads "keep going, no need to wait"; render test for a busy dispatch panel.
+- **S4 fixed.** Correction and the round-2 entry added to the plan's Implementation log; detailed checkboxes ticked for completed local work, with PR CI and the staging/hardware checklist left unticked.
 
-STATUS: COMPLETE
+Checks: `npx tsc -b` 0; `npm run build` 0; `npm run test -- --run` 3680 passed / 6 failed (known CRLF set).

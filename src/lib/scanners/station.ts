@@ -33,6 +33,8 @@ export type WallResultKind = "saved" | "queued" | "rejected" | "already" | "sign
 
 export interface WallResult {
   kind: WallResultKind;
+  /** Needs someone now (refused, uncertain, a choice to make): announced at once. */
+  urgent?: boolean;
   title: string;
   detail?: string;
   scannerId: string | null;
@@ -71,7 +73,7 @@ export interface ScanProgress {
   orderNumber: string;
   mode: ScanMode;
   /** received: stored on this device; waiting: an attempt did not get an answer yet, will retry. */
-  phase: "received" | "checking" | "saving" | "waiting";
+  phase: "receiving" | "received" | "checking" | "saving" | "waiting";
   startedAt: number;
 }
 
@@ -149,6 +151,10 @@ export class SharedScannerController {
   private disposed = false;
   /** Order of every input (frames and parser errors), for recovery clearing. */
   private inputSeq = 0;
+  /** The one job delivery is working on right now (checking/saving are only shown for it). */
+  private activeRequest: string | null = null;
+  /** Scans being written to device storage, not yet confirmed. */
+  private receivingSeq = 0;
 
   get mode(): ScanMode {
     return this.d.mode ?? "framing";
@@ -258,6 +264,7 @@ export class SharedScannerController {
     const j = event.job;
     if (j.backend !== this.d.scope.backend || j.callerId !== this.d.scope.callerId || j.location !== this.d.scope.location) return;
     const prev = this.s.progress[j.requestId];
+    this.activeRequest = j.requestId;
     this.setProgress(j.requestId, {
       scannerId: j.scannerId, personId: j.personId, orderNumber: j.orderNumber, mode: jobMode(j),
       phase: event.phase, startedAt: prev?.startedAt ?? Date.parse(j.scannedAt),
@@ -387,10 +394,17 @@ export class SharedScannerController {
   }
 
   private async enqueue(order: CapturedOrder, seq: number): Promise<void> {
+    // Shown while the scan is being written to this device; not yet confirmed.
+    const tempKey = `receiving:${++this.receivingSeq}`;
+    this.setProgress(tempKey, {
+      scannerId: order.scannerId, personId: order.person.personId, orderNumber: order.orderNumber,
+      mode: this.mode, phase: "receiving", startedAt: order.scannedAt,
+    });
     let job: ScannerJob;
     try {
       job = await this.d.outbox.enqueue(order, this.d.scope, this.d.newRequestId(), this.mode);
     } catch (e) {
+      this.setProgress(tempKey, null);
       const full = e instanceof OutboxFullError;
       const message = e instanceof Error ? e.message : String(e);
       if (!full) this.set({ storageError: message });
@@ -407,6 +421,7 @@ export class SharedScannerController {
     this.set({ storageError: null, lastAcceptedAt: this.d.now() });
     this.goodScan(seq);
     // Received only once the scan is durably stored on this device.
+    this.setProgress(tempKey, null);
     this.setProgress(job.requestId, {
       scannerId: order.scannerId, personId: order.person.personId, orderNumber: order.orderNumber,
       mode: this.mode, phase: "received", startedAt: order.scannedAt,
@@ -465,13 +480,18 @@ export class SharedScannerController {
    */
   private reconcileProgress(view: ScopeView): Record<string, ScanProgress> {
     const next: Record<string, ScanProgress> = {};
+    // Scans still being written to device storage are not in the view yet.
+    for (const [key, p] of Object.entries(this.s.progress)) if (p.phase === "receiving") next[key] = p;
     for (const j of view.jobs) {
       if (j.status !== "queued" && j.status !== "prepared") continue;
       if (Object.keys(next).length >= MAX_TRACKED_PROGRESS) break;
       const prev = this.s.progress[j.requestId];
-      next[j.requestId] = prev ?? {
+      const idle: ScanProgress["phase"] = j.attempts > 0 ? "waiting" : "received";
+      // Checking/saving describe an active attempt; anything else is waiting or received.
+      const phase = prev && (prev.phase === "checking" || prev.phase === "saving") && j.requestId !== this.activeRequest ? idle : prev?.phase ?? idle;
+      next[j.requestId] = {
         scannerId: j.scannerId, personId: j.personId, orderNumber: j.orderNumber, mode: jobMode(j),
-        phase: j.attempts > 0 ? "waiting" : "received", startedAt: Date.parse(j.scannedAt),
+        phase, startedAt: prev?.startedAt ?? Date.parse(j.scannedAt),
       };
     }
     return next;
@@ -496,6 +516,7 @@ export class SharedScannerController {
               report = await this.d.deliver();
             } catch (e) {
               this.set({ storageError: e instanceof Error ? e.message : String(e) });
+              this.activeRequest = null; // delivery stopped: nothing is checking or saving
               void this.refreshView(); // reconcile (or clear) panel progress
               return;
             }
@@ -513,6 +534,7 @@ export class SharedScannerController {
 
   private onReport(r: DeliveryReport): void {
     const j = r.job;
+    if (this.activeRequest === j.requestId) this.activeRequest = null;
     // A final answer ends this scan's busy state; a retry later shows as waiting.
     if (r.kind === "waiting") {
       const prev = this.s.progress[j.requestId];
@@ -548,7 +570,7 @@ export class SharedScannerController {
         return;
       case "needs_choice":
         this.show({
-          kind: "queued", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
+          kind: "queued", urgent: true, scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
           title: `#${j.orderNumber}: framing scan missing`,
           detail: "Not saved yet. Choose who framed it below; other scans keep saving.",
         }, "error");
@@ -557,7 +579,7 @@ export class SharedScannerController {
         if (r.uncertain) {
           // An earlier attempt may have saved it: never claim "not saved" or send people to classic.
           this.show({
-            kind: "queued", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
+            kind: "queued", urgent: true, scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
             title: `#${j.orderNumber}: outcome not confirmed yet`,
             detail: `It may already be saved. Do NOT record it on the classic station. Tap Retry when this is fixed: ${r.message}`,
           }, "error");

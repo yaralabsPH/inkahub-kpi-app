@@ -113,7 +113,8 @@ describe("controller progress, last saved and goodbye", () => {
     c.onFrame("S1", "AAAA0001");
     await settle();
     c.onFrame("S1", "190203");
-    expect(Object.values(c.state.progress)).toEqual([]); // nothing before the queue write
+    // Before the durable write: only an unconfirmed "receiving" entry, never "received" or green.
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["receiving"]);
     await settle();
     expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["checking"]);
     expect(c.state.last?.kind).toBe("queued");
@@ -246,5 +247,92 @@ describe("controller progress, last saved and goodbye", () => {
     expect(Object.keys(c.state.goodbye).sort()).toEqual(["S1", "S2"]);
     c.onProtocolError("bad_payload", "S1");
     expect(Object.keys(c.state.goodbye)).toEqual(["S2"]);
+  });
+
+  it("review r2 M2: receiving while the scan is written; replaced once stored; cleared if storing fails", async () => {
+    const store = memoryJobStore();
+    const gate = deferred<void>();
+    let fail = false;
+    const outbox = createScannerOutbox(store);
+    const slowOutbox = { ...outbox, enqueue: async (...args: Parameters<typeof outbox.enqueue>) => {
+      await gate.promise;
+      if (fail) throw new Error("disk full");
+      return outbox.enqueue(...args);
+    } };
+    const c = new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox: slowOutbox,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: false }),
+      deliver: async () => null,
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(Object.values(c.state.progress)).toMatchObject([{ phase: "receiving", orderNumber: "10190203" }]);
+    await c.refreshView(); // a refresh while writing keeps the unconfirmed entry
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["receiving"]);
+    gate.resolve();
+    await settle();
+    expect(Object.values(c.state.progress).map((p) => p.phase)).toEqual(["received"]);
+    expect(Object.keys(c.state.progress)[0]).not.toMatch(/^receiving:/);
+    fail = true;
+    c.onFrame("S1", "190204");
+    await settle();
+    expect(Object.values(c.state.progress).map((p) => p.orderNumber)).toEqual(["10190203"]); // the failed one is gone
+    expect(c.state.last?.title).toMatch(/NOT SAVED/);
+  });
+
+  it("review r2 M1: a storage failure after the commit leaves no panel saying Saving", async () => {
+    const outbox = createScannerOutbox(memoryJobStore());
+    const broken = { ...outbox, markDone: async () => { throw new Error("finish write failed"); } };
+    let c!: SharedScannerController;
+    c = new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox: broken,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: false }),
+      deliver: () => processNext({
+        outbox: broken, scope, owner: "tab",
+        lookupOrder: async () => ({ kind: "ok", lookup: lookup("10190203") }),
+        openCase: async () => false, products: () => [], packaging: async () => ({ mode: "scan", ruleSet: null }),
+        commit: async () => ({ outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } }),
+        onProgress: (e) => c.onDeliveryProgress(e),
+      }),
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle(40);
+    expect(c.state.storageError).toBe("finish write failed");
+    const phases = Object.values(c.state.progress).map((p) => p.phase);
+    expect(phases).not.toContain("saving");
+    expect(phases).not.toContain("checking");
+    expect(phases).toEqual(["waiting"]); // the job is still stored, its outcome unconfirmed
+  });
+
+  it("review r2 S2: uncertain outcomes and framer choices are urgent; a plain queued result is not", async () => {
+    const job = { requestId: "r1", scannerId: "S1", personId: ALICE, displayName: "Alice", orderNumber: "10190203", scannedAt: new Date(0).toISOString(),
+      backend: "supabase", callerId: "kiosk-1", location: "au", receiverId: "wall-1", status: "blocked", attempts: 1 } as unknown as ScannerJob;
+    const reports: Array<Awaited<ReturnType<ControllerDeps["deliver"]>>> = [
+      { kind: "blocked", job, code: "forbidden_role", message: "role", uncertain: true },
+      { kind: "needs_choice", job, message: "choose" },
+      { kind: "blocked", job, code: "cancelled", message: "cancelled", uncertain: false },
+    ];
+    const outbox = createScannerOutbox(memoryJobStore());
+    const seen: Array<{ title: string; urgent?: boolean; kind: string }> = [];
+    const c = new SharedScannerController({
+      scannerIds: ["S1"], scope, outbox,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "unknown_badge" }),
+      deliver: async () => reports.shift() ?? null,
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    });
+    c.subscribe((st) => { if (st.last && seen.at(-1)?.title !== st.last.title) seen.push({ title: st.last.title, urgent: st.last.urgent, kind: st.last.kind }); });
+    c.pump();
+    await settle(40);
+    expect(seen).toEqual([
+      { title: "#10190203: outcome not confirmed yet", urgent: true, kind: "queued" },
+      { title: "#10190203: framing scan missing", urgent: true, kind: "queued" },
+      { title: "#10190203 not saved — use the classic station", urgent: undefined, kind: "rejected" }, // urgent by kind
+    ]);
   });
 });

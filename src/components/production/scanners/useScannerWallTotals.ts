@@ -57,8 +57,16 @@ export function useScannerWallTotals(a: UseScannerWallTotalsArgs): WallTotalsVie
     hasClient: !!a.client, site: a.site, callerId: a.callerId, roleAllowed: a.roleAllowed, role: a.role, siteMember: a.siteMember,
   });
   const enabled = access && a.mode === "framing" && a.online && a.visible;
+  // Losing access starts a new epoch: numbers read before it are never shown again,
+  // even when the same access comes back (review r2 S1).
+  const accessEpoch = useRef(0);
+  const hadAccess = useRef(access);
+  if (hadAccess.current !== access) {
+    hadAccess.current = access;
+    if (!access) accessEpoch.current += 1;
+  }
   // Everything that decides what may be shown; a change hides old numbers in the same render.
-  const scope = `${a.callerId ?? ""}|${a.role ?? ""}|${a.siteMember}|${a.roleAllowed}|${site ?? ""}|${day ?? ""}|${a.mode}`;
+  const scope = `${accessEpoch.current}|${a.callerId ?? ""}|${a.role ?? ""}|${a.siteMember}|${a.roleAllowed}|${site ?? ""}|${day ?? ""}|${a.mode}`;
 
   // Monotonic binding generation, bumped in the same render the map changes.
   const bindings = useRef<ReturnType<typeof createBindingGeneration> | null>(null);
@@ -143,7 +151,10 @@ export function useScannerWallTotals(a: UseScannerWallTotalsArgs): WallTotalsVie
     }
   }, [fresh, range, people]);
 
-  if (!access) return EMPTY;
+  if (!access) {
+    lastKnown.current = { scope, byPerson: {} }; // goodbye numbers do not survive a loss of access
+    return EMPTY;
+  }
 
   if (lastKnown.current.scope !== scope) lastKnown.current = { scope, byPerson: {} };
   // Only numbers read for the current people are remembered (for goodbyes).

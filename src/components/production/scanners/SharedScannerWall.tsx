@@ -91,6 +91,8 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
   const waiting = state.view?.waiting ?? 0;
   const uncertain = state.view?.uncertain ?? 0;
   const last = state.last;
+  // Refusals, uncertain outcomes and choices to make are announced at once.
+  const urgent = !!last && (last.urgent === true || last.kind === "rejected" || last.kind === "already");
   // Operator actions confirm inline (tap twice), never with a browser dialog:
   // a scanner's Enter would answer a dialog.
   const [armed, setArmed] = useState<string | null>(null);
@@ -219,6 +221,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
               goodbye={goodbye}
               note={state.slotNotes[id] ?? null}
               timeZone={p.timeZone}
+              compact={!!state.recovery}
             />
           );
         })}
@@ -235,8 +238,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
       ) : null}
 
       {/* Errors are announced at once; everything else politely. Counters and countdowns are not live regions. */}
-      <section aria-live={last && (last.kind === "rejected" || last.kind === "already") ? "assertive" : "polite"}
-        role={last && (last.kind === "rejected" || last.kind === "already") ? "alert" : undefined}>
+      <section aria-live={urgent ? "assertive" : "polite"} role={urgent ? "alert" : undefined}>
         {last ? (
           <div className="w-result" data-testid="last-result" data-kind={last.kind}>
             <div className="w-result-word">{RESULT_WORD[last.kind]}{last.scannerId ? ` · ${last.scannerId}` : ""}</div>

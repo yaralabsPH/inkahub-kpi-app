@@ -105,6 +105,36 @@ describe("scanner wall redesign", () => {
     expect(css).toMatch(/\.w-result-title \{[^}]*font-size: 40px/);
   });
 
+  it("review r2 S2: an urgent queued result (uncertain or a choice) is announced at once", () => {
+    const html = render({ state: state({ last: { kind: "queued", urgent: true, title: "#1: outcome not confirmed yet", detail: "Do NOT record it on the classic station.", scannerId: "S1", at: 1 } }) });
+    expect(html).toContain('aria-live="assertive" role="alert"');
+    const plain = render({ state: state({ last: { kind: "queued", title: "Queued #1 for Ben", scannerId: "S1", at: 1 } }) });
+    expect(plain).toContain('aria-live="polite"');
+  });
+
+  it("review r2 M3: with the recovery message up, panels shrink to one row each (approved Problem screen)", () => {
+    const html = render({ state: state({ slots: threeOn(), recovery: { title: "That scan didn't come through.", detail: "x", setupHint: null, seq: 1 } }),
+      totals: view(totals(COMPETITION)) });
+    expect(html.match(/w-panel is-compact/g)).toHaveLength(3);
+    expect(html).toContain("Still signed in");
+    expect(html).toContain('data-testid="orders-S2">17<');
+    expect(html).not.toContain("Share of active people");
+  });
+
+  it("review r2 S3: dispatch progress does not tell dispatchers to keep framing", () => {
+    const slots = threeOn();
+    slots.S1 = { ...slots.S1, identity: person("dee", "Dee", { expiresAt: NOW + 3_600_000 }) };
+    const html = render({ mode: "dispatch", state: state({ slots, progress: { r: { scannerId: "S1", personId: "dee", orderNumber: "10251294", mode: "dispatch", phase: "checking", startedAt: 1 } } }) });
+    expect(html).toContain('data-testid="panel-progress"');
+    expect(html).not.toContain("keep framing");
+    expect(html).toContain("keep going, no need to wait");
+  });
+
+  it("review r2 M2: the receiving stage renders", () => {
+    const html = render({ state: state({ slots: threeOn(), progress: { k: { scannerId: "S1", personId: "ben", orderNumber: "10251294", mode: "framing", phase: "receiving", startedAt: 1 } } }) });
+    expect(html).toContain("Receiving scan…");
+  });
+
   it("joint lead when tied; nobody leads at zero; ordinal ranks", () => {
     const tie = render({ state: state({ slots: threeOn() }), totals: view(totals({
       ben: { orders: 5, pieces: 5, rank: 1, share: 0.5, leading: true, jointLead: true },

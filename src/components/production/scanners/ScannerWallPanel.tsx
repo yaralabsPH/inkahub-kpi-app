@@ -38,6 +38,11 @@ export interface ScannerWallPanelProps {
   goodbye: PanelGoodbye | null;
   note: string | null;
   timeZone?: string;
+  /**
+   * While the garbled-scan recovery message is up the panels shrink to one
+   * row (the approved Problem screen): who is still signed in, and their orders.
+   */
+  compact?: boolean;
 }
 
 /** The goodbye card shows for at most this long. */
@@ -57,13 +62,14 @@ export function ordinal(n: number): string {
 const DASH = "—";
 
 const PHASE_TEXT: Record<SlotProgress["phase"], { step: number; text: string }> = {
+  receiving: { step: 1, text: "Receiving scan…" },
   received: { step: 1, text: "Scan received" },
   checking: { step: 2, text: "Checking the order…" },
   saving: { step: 3, text: "Saving…" },
   waiting: { step: 1, text: "Waiting to save (will retry)" },
 };
 
-function Progress({ p, person }: { p: SlotProgress; person: string }) {
+function Progress({ p, person, mode }: { p: SlotProgress; person: string; mode: ScanMode }) {
   const { step, text } = PHASE_TEXT[p.phase];
   return (
     <div className="w-box" data-testid="panel-progress" data-phase={p.phase}>
@@ -73,7 +79,7 @@ function Progress({ p, person }: { p: SlotProgress; person: string }) {
       </div>
       <div className="w-bar is-busy" aria-hidden="true"><span style={{ width: `${Math.round((step / 3) * 100)}%` }} /></div>
       <div className="w-small">
-        Step {step} of 3 · keep framing, no need to wait{p.waiting > 1 ? ` · ${p.waiting - 1} more waiting` : ""}
+        Step {step} of 3 · {mode === "dispatch" ? "keep going, no need to wait" : "keep framing, no need to wait"}{p.waiting > 1 ? ` · ${p.waiting - 1} more waiting` : ""}
       </div>
     </div>
   );
@@ -83,6 +89,25 @@ export function ScannerWallPanel(p: ScannerWallPanelProps) {
   const { id, slot, mode } = p;
   const identity = slot?.identity ?? null;
   const framing = mode === "framing";
+
+  if (p.compact) {
+    const t = p.totals && p.totals !== "pending" ? p.totals : null;
+    return (
+      <section className={`w-panel is-compact${identity ? "" : " is-free"}`} data-testid={`scanner-${id}`} aria-label={`Scanner ${id}${identity ? `: ${identity.displayName}` : ""}`}>
+        <div>
+          <div className="w-label">Scanner {id}</div>
+          <div className="w-name-compact">{identity ? identity.displayName : slot?.pending ? "Checking badge…" : "Scan your badge to start"}</div>
+          {identity ? <div className="w-small">{slot?.signOut ? `Sign out ${slot.signOut.count}/3` : "Still signed in"}</div> : null}
+        </div>
+        {identity && framing ? (
+          <div style={{ textAlign: "right" }}>
+            <div className="w-num w-compact-value" data-testid={`orders-${id}`}>{t ? t.orders : DASH}</div>
+            <div className="w-small">ORDERS</div>
+          </div>
+        ) : null}
+      </section>
+    );
+  }
 
   // ---- nobody on this scanner -------------------------------------------
   if (!identity) {
@@ -149,7 +174,7 @@ export function ScannerWallPanel(p: ScannerWallPanelProps) {
       <div className="w-name">{identity.displayName}</div>
       {repeatChecking ? <div className="w-small w-pulse">Checking badge…</div> : null}
 
-      {framing ? (
+      {framing && !busy && !signOut ? (
         <div className="w-stats">
           <div className="w-stat">
             <div className="w-stat-label">ORDERS</div>
@@ -171,9 +196,11 @@ export function ScannerWallPanel(p: ScannerWallPanelProps) {
 
       {signOut ? (
         <div className="w-box is-warn" data-testid={`signout-${id}`}>
-          <div style={{ fontSize: 20, fontWeight: 700 }}>{id} · {identity.displayName} · Sign out {signOut.count}/3</div>
-          <div className="w-dots" aria-hidden="true">
-            {[1, 2, 3].map((n) => <span key={n} className={n <= signOut.count ? "is-on" : ""} />)}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ fontSize: 20, fontWeight: 700 }}>{id} · {identity.displayName} · Sign out {signOut.count}/3</div>
+            <div className="w-dots" aria-hidden="true">
+              {[1, 2, 3].map((n) => <span key={n} className={n <= signOut.count ? "is-on" : ""} />)}
+            </div>
           </div>
           <div style={{ fontSize: 16 }}>Remove badge; wait one second before scanning again.</div>
           <div className="w-bar is-warn" aria-hidden="true"><span style={{ width: `${Math.round((signOutLeft / SIGN_OUT_WINDOW_MS) * 100)}%` }} /></div>
@@ -181,9 +208,16 @@ export function ScannerWallPanel(p: ScannerWallPanelProps) {
         </div>
       ) : null}
 
-      {p.progress ? <Progress p={p.progress} person={identity.displayName} /> : null}
+      {p.progress ? <Progress p={p.progress} person={identity.displayName} mode={mode} /> : null}
 
       <div className="w-foot">
+        {framing && (busy || signOut) ? (
+          <div data-testid={`today-${id}`}>
+            <span className="w-muted">Today:</span>{" "}
+            <b className="w-num" data-testid={`orders-${id}`}>{values ? values.orders : DASH}</b> orders ·{" "}
+            <b className="w-num" data-testid={`pieces-${id}`}>{values ? (values.pieces ?? DASH) : DASH}</b> pieces
+          </div>
+        ) : null}
         {framing ? (
           <div>
             <span className="w-muted">Last saved here:</span>{" "}

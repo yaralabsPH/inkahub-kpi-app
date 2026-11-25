@@ -124,11 +124,14 @@
 .scanner-wall .w-foot { margin-top: auto; border-top: 1px solid rgb(var(--w-line)); padding-top: 8px; display: grid; gap: 6px; font-size: 16px; }
 .scanner-wall .w-box { background: rgb(var(--w-sub)); border-radius: 10px; padding: 10px 14px; display: grid; gap: 6px; }
 .scanner-wall .w-box.is-warn { background: rgb(var(--w-warn) / 0.16); }
-.scanner-wall .w-dots { display: flex; gap: 12px; }
-.scanner-wall .w-dots span { width: 26px; height: 26px; border-radius: 50%; border: 3px solid #7a7a7a; box-sizing: border-box; }
+.scanner-wall .w-dots { display: flex; gap: 8px; flex-shrink: 0; }
+.scanner-wall .w-dots span { width: 22px; height: 22px; border-radius: 50%; border: 3px solid #7a7a7a; box-sizing: border-box; }
 .scanner-wall .w-dots span.is-on { background: rgb(var(--w-warn)); border-color: rgb(var(--w-warn)); }
 .scanner-wall .w-free { flex-grow: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 10px; min-height: 200px; }
 .scanner-wall .w-free-title { font-family: var(--w-font-head); font-size: 36px; font-weight: 700; line-height: 1.15; }
+.scanner-wall .w-panel.is-compact { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
+.scanner-wall .w-name-compact { font-family: var(--w-font-head); font-size: 36px; font-weight: 700; line-height: 1.1; overflow-wrap: anywhere; }
+.scanner-wall .w-compact-value { font-size: 48px; font-weight: 700; line-height: 1; }
 .scanner-wall .w-note { font-size: 16px; font-weight: 700; color: rgb(var(--w-warn)); }
 
 /* Recovery and the latest result stay on screen: docked to the bottom while the page scrolls. */
