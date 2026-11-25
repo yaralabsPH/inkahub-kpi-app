@@ -21,6 +21,7 @@ import {
   decideFrame,
   emptySlots,
   expireIdle,
+  IDENTITY_IDLE_WORDS,
   REJECT_TEXT,
   resolveActivation,
   type CapturedOrder,
@@ -291,7 +292,7 @@ export class SharedScannerController {
     }
     this.show({
       kind: "info", scannerId: expired[0],
-      title: this.mode === "dispatch" ? `${expired.join(", ")} signed out: dispatch shift ended` : `${expired.join(", ")} signed out after 10 minutes without a scan`,
+      title: this.mode === "dispatch" ? `${expired.join(", ")} signed out: dispatch shift ended` : `${expired.join(", ")} signed out after ${IDENTITY_IDLE_WORDS} without a scan`,
       detail: "Scan your badge again.",
     }, null);
   }

@@ -8,8 +8,10 @@
  * the network work these decisions ask for.
  */
 
-/** Ten minutes without a framing scan ends a scanner's identity. */
-export const IDENTITY_IDLE_MS = 10 * 60 * 1000;
+/** Fifteen minutes without a framing scan ends a scanner's identity (scanner-stations-tuning). */
+export const IDENTITY_IDLE_MS = 15 * 60 * 1000;
+/** The same limit in words, for every screen that mentions it. */
+export const IDENTITY_IDLE_WORDS = "15 minutes";
 /** A badge sign-in/lookup answer later than this is ignored and the scanner cleared. */
 export const PENDING_MAX_MS = 20 * 1000;
 
@@ -109,7 +111,7 @@ export const REJECT_TEXT: Record<RejectCode, string> = {
   badge_pending: "Still checking the previous scan on this scanner. This scan was NOT saved: scan it again in a moment.",
   pending_timeout: "Checking the badge took too long. Scanner signed out: scan the badge again, then any order not shown as queued.",
   no_person: "Scan your badge on this scanner first.",
-  identity_expired: "Signed out after 10 minutes without a scan. Scan your badge again.",
+  identity_expired: `Signed out after ${IDENTITY_IDLE_WORDS} without a scan. Scan your badge again.`,
   shift_ended: "Your dispatch sign-in ended (04:00 workday change or 12 hours). Scan your badge again.",
   unknown_scanner: "This scanner is not configured on this station.",
 };

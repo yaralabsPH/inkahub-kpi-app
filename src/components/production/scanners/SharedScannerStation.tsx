@@ -11,6 +11,7 @@ import type { ScanMode } from "@/lib/scanners/dispatch";
 import type { PeopleState } from "./FramerPicker";
 import { SharedScannerWall } from "./SharedScannerWall";
 import { useSharedScannerStation } from "./useSharedScannerStation";
+import { IDENTITY_IDLE_WORDS } from "@/lib/scanners/session";
 
 const OPERATOR_ROLES = new Set(["owner", "manager", "kiosk"]);
 
@@ -140,7 +141,7 @@ export function SharedScannerSetup({ current, onSave, onCancel }: {
         </label>
         <fieldset className="text-sm">
           <legend className="text-slate-600 dark:text-slate-300">What do the scanners record?</legend>
-          <label className="mr-4"><input type="radio" name="mode" checked={mode === "framing"} onChange={() => setMode("framing")} /> Framing (badge, then orders; 10 minutes)</label>
+          <label className="mr-4"><input type="radio" name="mode" checked={mode === "framing"} onChange={() => setMode("framing")} /> Framing (badge, then orders; {IDENTITY_IDLE_WORDS})</label>
           <label><input type="radio" name="mode" checked={mode === "dispatch"} onChange={() => setMode("dispatch")} /> Dispatch (badge once per shift, then order slips)</label>
         </fieldset>
         {problem ? <div className="text-sm text-red-600">{problem}</div> : null}

@@ -6,7 +6,9 @@ import {
   emptySlots,
   expireIdle,
   IDENTITY_IDLE_MS,
+  msUntilExpiry,
   PENDING_MAX_MS,
+  REJECT_TEXT,
   resolveActivation,
   type ScannerSlot,
 } from "../session";
@@ -102,7 +104,55 @@ describe("decideFrame", () => {
     expect(hash.decision).toMatchObject({ action: "enqueue", order: { orderNumber: "10190204" } });
   });
 
-  it("expires an identity after ten minutes without a framing scan", () => {
+  it("framing survives ten minutes and expires strictly after fifteen", () => {
+    expect(IDENTITY_IDLE_MS).toBe(900_000);
+    const t0 = 1_000_000;
+    // Fresh identity per check, so an accepted order cannot refresh the boundary under test.
+    for (const after of [600_001, 899_999, 900_000]) {
+      const slots = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice", t0);
+      expect(decideFrame(slots, { scannerId: "S1", payload: "190203" }, ctx({ now: t0 + after })).decision.action, String(after)).toBe("enqueue");
+      expect(expireIdle(slots, t0 + after).expired, String(after)).toEqual([]);
+    }
+    const slots = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice", t0);
+    expect(decideFrame(slots, { scannerId: "S1", payload: "190203" }, ctx({ now: t0 + 900_001 })).decision)
+      .toMatchObject({ action: "reject", code: "identity_expired", clearedIdentity: true });
+    const swept = expireIdle(slots, t0 + 900_001);
+    expect(swept.expired).toEqual(["S1"]);
+    expect(swept.slots.S1.identity).toBeNull();
+    expect(REJECT_TEXT.identity_expired).toBe("Signed out after 15 minutes without a scan. Scan your badge again.");
+  });
+
+  it("activity refresh comes only from successful activation and enqueue-path acceptance", () => {
+    const t0 = 1_000_000;
+    const slots = activate(emptySlots(["S1", "S2"]), "S1", "AAAA0001", "alice", t0);
+    const lastFramingAt = slots.S1.identity!.lastFramingAt;
+    expect(msUntilExpiry(slots.S1.identity, t0)).toBe(900_000); // a fresh countdown reads 15:00
+    expect(msUntilExpiry(slots.S1.identity, t0 + 60_000)).toBe(840_000); // 14:00 after a minute
+    // Rejected scans on this scanner and traffic on another do not extend it.
+    const invalid = decideFrame(slots, { scannerId: "S1", payload: "NOT-A-CODE" }, ctx({ now: t0 + 60_000 }));
+    expect(invalid.decision.action).toBe("reject");
+    expect(invalid.slots.S1.identity!.lastFramingAt).toBe(lastFramingAt);
+    const other = decideFrame(invalid.slots, { scannerId: "S2", payload: "190203" }, ctx({ now: t0 + 120_000 }));
+    expect(other.decision).toMatchObject({ action: "reject", code: "no_person" });
+    expect(other.slots.S1.identity!.lastFramingAt).toBe(lastFramingAt);
+    // An accepted order does.
+    const ok = decideFrame(other.slots, { scannerId: "S1", payload: "190204" }, ctx({ now: t0 + 180_000 }));
+    expect(ok.decision.action).toBe("enqueue");
+    expect(ok.slots.S1.identity!.lastFramingAt).toBe(t0 + 180_000);
+  });
+
+  it("dispatch keeps its absolute shift expiry, not the framing idle limit", () => {
+    const t0 = 1_000_000;
+    const a = decideFrame(emptySlots(["S1"]), { scannerId: "S1", payload: "AAAA0001" }, ctx({ now: t0 }));
+    if (a.decision.action !== "activate") throw new Error("expected activate");
+    const shiftEnd = t0 + 8 * 3600_000;
+    const slots = resolveActivation(a.slots, "S1", a.decision.epoch, a.decision.pending.requestId,
+      { outcome: "activated", personId: "alice", displayName: "ALICE", expiresAt: shiftEnd }, t0).slots;
+    expect(decideFrame(slots, { scannerId: "S1", payload: "190203" }, ctx({ now: t0 + 2 * IDENTITY_IDLE_MS })).decision.action).toBe("enqueue");
+    expect(decideFrame(slots, { scannerId: "S1", payload: "190203" }, ctx({ now: shiftEnd })).decision).toMatchObject({ code: "shift_ended" });
+  });
+
+  it("expires an identity after the idle limit without a framing scan", () => {
     const t0 = 1_000_000;
     let slots = activate(emptySlots(["S1"]), "S1", "AAAA0001", "alice", t0);
     const ok = decideFrame(slots, { scannerId: "S1", payload: "190203" }, ctx({ now: t0 + IDENTITY_IDLE_MS - 1 }));

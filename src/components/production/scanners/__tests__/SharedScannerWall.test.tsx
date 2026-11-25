@@ -35,7 +35,7 @@ describe("SharedScannerWall", () => {
     slots.S2 = { ...slots.S2, pending: { requestId: "r", badge: "X", startedAt: 0, orderFallback: null } };
     const html = render({ state: state({ slots }) });
     expect(html).toContain("Alice");
-    expect(html).toContain("Signs out in 9:00");
+    expect(html).toContain("Signs out in 14:00");
     expect(html).toContain("Signing in");
     expect(html).toContain("Scan badge");
   });
@@ -72,6 +72,12 @@ describe("SharedScannerWall", () => {
     expect(html).toContain("Retry");
     expect(html).toContain("Recorded on classic");
     expect(html).toContain("cannot be read");
+  });
+
+  it("a fresh framing countdown reads 15:00", () => {
+    const slots = emptySlots(["S1", "S2", "S3"]);
+    slots.S1 = { ...slots.S1, identity: { personId: "p", displayName: "Alice", badge: "B", activatedAt: 1_000_000, lastFramingAt: 1_000_000 } };
+    expect(render({ state: state({ slots }) })).toContain("Signs out in 15:00");
   });
 
   it("recovery stays visible beside an earlier saved result", () => {
