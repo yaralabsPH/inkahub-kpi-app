@@ -2710,7 +2710,7 @@ function LiveClock() {
 }
 
 // ============================================================
-// OrderActionBar â€” Complete + Scrap buttons shown beneath the
+// OrderActionBar — Complete + Scrap buttons shown beneath the
 // line cards on framing benches. Scrap is two-click: first
 // click reveals red "Are you sure?" confirm text; second click
 // fires onScrapOrder.

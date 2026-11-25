@@ -388,7 +388,7 @@ export function printAllLanyards(staff: Array<{
 // ---------------------------------------------------------------------------
 
 /**
- * Load a script tag from a URL and resolve once it's on window. Idempotent â€”
+ * Load a script tag from a URL and resolve once it's on window. Idempotent —
  * if the script is already loaded, resolves immediately. Used to pull
  * JsBarcode + JSZip from CDN at click-time so we don't need to npm install.
  */

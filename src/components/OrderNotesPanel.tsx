@@ -14,9 +14,9 @@ import { Button } from "@/components/ui/Button";
  * Backed by the `order_notes` table (see migration 0016_order_notes.sql).
  *
  * Two visual variants:
- *   - "loud"    â€” big amber banner, large type, used inside Production
+ *   - "loud"    — big amber banner, large type, used inside Production
  *                 so a framer can't miss a pending message
- *   - "compact" â€” neutral card, used in Reports' Order lookup
+ *   - "compact" — neutral card, used in Reports' Order lookup
  *
  * If `author` is null, the panel renders read-only (no Add / Resolve buttons).
  */

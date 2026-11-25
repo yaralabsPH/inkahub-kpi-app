@@ -1248,7 +1248,7 @@ function Empty({ label }: { label: string }) {
 }
 
 /* ============================================================
- * OrderLookupCard â€” search any order across all time
+ * OrderLookupCard — search any order across all time
  * ============================================================
  *
  * Standalone widget at the top of the Reports page. Lets owners /
@@ -1257,14 +1257,14 @@ function Empty({ label }: { label: string }) {
  * production_event ever logged against that order at the current
  * location. Useful for:
  *
- *   - "Did framing already touch this order?" â€” checks department chips
- *   - "Who dispatched it?" â€” first row in the timeline
- *   - "When did it move?" â€” chronological event log
+ *   - "Did framing already touch this order?" — checks department chips
+ *   - "Who dispatched it?" — first row in the timeline
+ *   - "When did it move?" — chronological event log
  *
  * Future: per-order notes (e.g. "framer flagged: customer changed mind,
  * cancel") will live alongside the event timeline. The placeholder
  * "Add note" button is wired but the order_notes table doesn't exist
- * yet â€” adding a note shows a "coming soon" toast.
+ * yet — adding a note shows a "coming soon" toast.
  */
 
 interface OrderEvent {
