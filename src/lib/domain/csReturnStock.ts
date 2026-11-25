@@ -5,8 +5,8 @@ import type { CsReturnLine, CsReturnStatus } from "./schemas";
  * and the return modal's preview, so all three agree.
  *
  * Sign convention: `Repository.adjustOnHand` SUBTRACTS a positive delta
- * (Dexie `Math.max(before - delta, 0)`; SQL adjust_on_hand
- * `GREATEST(v_before - p_delta, 0)`). Adding stock is a NEGATIVE delta.
+ * (Dexie `onHandAfterAdjust`; SQL adjust_on_hand `v_before - p_delta`, exact
+ * since 0063). Adding stock is a NEGATIVE delta.
  *
  * Which lines count as restocked (credited):
  *  - Received / RTS: every line with Restock ticked.
@@ -19,12 +19,10 @@ import type { CsReturnLine, CsReturnStatus } from "./schemas";
  *
  * Movements are NET per product: the total previously credited per product
  * is compared with the total that should be credited now, and only the
- * difference moves. An unchanged save moves nothing, so the zero floor can
- * never turn a resave into extra stock.
+ * difference moves. An unchanged save moves nothing.
  *
- * Insufficient stock: a removal (untick, status back to New, smaller
- * quantity, delete) is clamped at zero by adjustOnHand like every other
- * stock movement in the app; the ledger records the actual change.
+ * Stock changes are exact in both directions (no floor at zero), like
+ * dispatch deductions, so every change and its undo cancel out exactly.
  */
 
 /** adjustOnHand delta that ADDS `quantity` units to stock. */

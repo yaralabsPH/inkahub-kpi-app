@@ -7,7 +7,7 @@ import type { CsReturn, CsReturnLine, CsReturnStatus } from "@/lib/domain";
  * Drives the real SupabaseRepo return code against an in-memory client.
  * It checks the calls the adapter makes and their order. It is NOT a
  * Postgres, RLS or transaction test. What it models:
- *  - `adjust_on_hand` as in 0002_rpc.sql: after = GREATEST(before - p_delta, 0);
+ *  - `adjust_on_hand` as in 0063_exact_stock_adjust.sql: after = before - p_delta;
  *    a missing product is a silent no-op; a zero actual change writes no
  *    ledger row.
  *  - cs_return_lines' product FK (0009): inserting a line whose product is
@@ -37,7 +37,7 @@ class FakeDb {
         const p = db.tables.products.find((x) => x.location === args.p_location && x.id === args.p_product_id);
         if (!p) return { data: null, error: null };
         const before = p.current_on_hand;
-        p.current_on_hand = Math.max(before - args.p_delta, 0);
+        p.current_on_hand = before - args.p_delta;
         if (p.current_on_hand !== before) {
           db.tables.ledger.push({ product_id: p.id, delta: p.current_on_hand - before, reason: args.p_reason });
         }
@@ -172,13 +172,22 @@ describe("SupabaseRepo returns: stock through adjust_on_hand", () => {
     expect(db.onHand("p1")).toBe(10);
   });
 
-  it("delete after the units were used stops at zero and the ledger records the actual removal", async () => {
+  it("delete after the units were used removes them exactly (can go below zero)", async () => {
     const { db, repo } = setup({ p1: 0 });
     await repo.upsertCsReturn(ret("received"), [line()]);
     db.tables.products[0].current_on_hand = 1;
     await repo.deleteCsReturn("r1");
-    expect(db.onHand("p1")).toBe(0);
-    expect(db.tables.ledger.at(-1)).toEqual({ product_id: "p1", delta: -1, reason: "return" });
+    expect(db.onHand("p1")).toBe(-2);
+    expect(db.tables.ledger.at(-1)).toEqual({ product_id: "p1", delta: -3, reason: "return" });
+  });
+
+  it("restock onto negative stock adds exactly (live case: −12 → −11), delete restores −12", async () => {
+    const { db, repo } = setup({ p1: -12 });
+    await repo.upsertCsReturn(ret("received"), [line({ quantity: 1 })]);
+    expect(db.onHand("p1")).toBe(-11);
+    expect(db.tables.ledger).toEqual([{ product_id: "p1", delta: 1, reason: "return" }]);
+    await repo.deleteCsReturn("r1");
+    expect(db.onHand("p1")).toBe(-12);
   });
 
   it("a missing SKU on an UNTICKED line is rejected before any stock call or write (new return)", async () => {
