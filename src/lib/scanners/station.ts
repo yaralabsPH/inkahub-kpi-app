@@ -14,7 +14,7 @@
  */
 import type { ActivateOutcome, DeliveryReport, SavedAttribution } from "./client";
 import { CHOICE_CODES, dispatchShiftEnd, type FramerChoice, type ScanMode } from "./dispatch";
-import { OutboxFullError, type JobScope, type ScannerOutbox, type ScopeView } from "./outbox";
+import { jobMode, OutboxFullError, type JobScope, type ScannerJob, type ScannerOutbox, type ScopeView } from "./outbox";
 import type { ProtocolErrorReason } from "./protocol";
 import {
   cancelGestures,
@@ -64,6 +64,40 @@ export const RECOVERY_SETUP_HINT = "This scanner isn't set up here. Ask a manage
 export const SUPPRESSED_NOTE = "Remove the badge, wait one second, then scan again";
 export const REPEAT_HINT = "Remove badge; wait one second before scanning again.";
 
+/** scanner-wall-redesign: one unfinished scan, for its scanner's panel. */
+export interface ScanProgress {
+  scannerId: string;
+  personId: string;
+  orderNumber: string;
+  mode: ScanMode;
+  phase: "received" | "checking" | "saving";
+  startedAt: number;
+}
+
+/** The oldest unfinished scan on a scanner, with how many are unfinished there. */
+export interface SlotProgress extends ScanProgress {
+  waiting: number;
+}
+
+/** The last order saved on a scanner, for the person who scanned it. */
+export interface SlotSaved {
+  personId: string;
+  orderNumber: string;
+  pieces: number;
+  mode: ScanMode;
+  at: number;
+}
+
+/** Who just signed a scanner out with the badge gesture. */
+export interface SlotGoodbye {
+  personId: string;
+  displayName: string;
+  at: number;
+}
+
+/** Unfinished scans tracked for display, at most (the outbox's own bound). */
+export const MAX_TRACKED_PROGRESS = 200;
+
 export interface WallState {
   slots: Record<string, ScannerSlot>;
   last: WallResult | null;
@@ -73,6 +107,14 @@ export interface WallState {
    * repeat guard). Cleared by that scanner's next counted scan.
    */
   slotNotes: Record<string, string>;
+  /** Display only: unfinished scans by request id. */
+  progress: Record<string, ScanProgress>;
+  /** Display only: last saved order per scanner. */
+  slotSaved: Record<string, SlotSaved>;
+  /** Display only: goodbye after a badge sign-out, per scanner. */
+  goodbye: Record<string, SlotGoodbye>;
+  /** Bumped on every saved or already-recorded answer, so today's totals re-read. Not a count. */
+  saveRevision: number;
   view: ScopeView | null;
   storageError: string | null;
   deliveryWaiting: string | null;
@@ -117,6 +159,10 @@ export class SharedScannerController {
       last: null,
       recovery: null,
       slotNotes: {},
+      progress: {},
+      slotSaved: {},
+      goodbye: {},
+      saveRevision: 0,
       view: null,
       storageError: null,
       deliveryWaiting: null,
@@ -182,6 +228,40 @@ export class SharedScannerController {
     return this.d.elapsedNow ? this.d.elapsedNow() : this.d.now();
   }
 
+  private dropGoodbye(scannerId: string): void {
+    if (!(scannerId in this.s.goodbye)) return;
+    const goodbye = { ...this.s.goodbye };
+    delete goodbye[scannerId];
+    this.set({ goodbye });
+  }
+
+  private setProgress(requestId: string, entry: ScanProgress | null): void {
+    const progress = { ...this.s.progress };
+    if (entry === null) {
+      if (!(requestId in progress)) return;
+      delete progress[requestId];
+    } else {
+      if (!(requestId in progress) && Object.keys(progress).length >= MAX_TRACKED_PROGRESS) return;
+      progress[requestId] = entry;
+    }
+    this.set({ progress });
+  }
+
+  /**
+   * scanner-wall-redesign: delivery says a job is checking or saving.
+   * Display only, fenced to this station's own scope.
+   */
+  onDeliveryProgress(event: { job: ScannerJob; phase: "checking" | "saving" }): void {
+    if (this.disposed) return;
+    const j = event.job;
+    if (j.backend !== this.d.scope.backend || j.callerId !== this.d.scope.callerId || j.location !== this.d.scope.location) return;
+    const prev = this.s.progress[j.requestId];
+    this.setProgress(j.requestId, {
+      scannerId: j.scannerId, personId: j.personId, orderNumber: j.orderNumber, mode: jobMode(j),
+      phase: event.phase, startedAt: prev?.startedAt ?? Date.parse(j.scannedAt),
+    });
+  }
+
   private note(scannerId: string, text: string | null): void {
     const has = scannerId in this.s.slotNotes;
     if (text === null && !has) return;
@@ -215,10 +295,12 @@ export class SharedScannerController {
       return;
     }
     this.note(scannerId, null);
+    this.dropGoodbye(scannerId); // the next scan on this scanner ends the goodbye
     switch (decision.action) {
       case "sign_out": {
         const name = decision.person.displayName;
         this.goodScan(seq);
+        this.set({ goodbye: { ...this.s.goodbye, [scannerId]: { personId: decision.person.personId, displayName: name, at: this.d.now() } } });
         this.show({
           kind: "signed_out", scannerId, person: name,
           title: `${scannerId} signed out`,
@@ -303,8 +385,9 @@ export class SharedScannerController {
   }
 
   private async enqueue(order: CapturedOrder, seq: number): Promise<void> {
+    let job: ScannerJob;
     try {
-      await this.d.outbox.enqueue(order, this.d.scope, this.d.newRequestId(), this.mode);
+      job = await this.d.outbox.enqueue(order, this.d.scope, this.d.newRequestId(), this.mode);
     } catch (e) {
       const full = e instanceof OutboxFullError;
       const message = e instanceof Error ? e.message : String(e);
@@ -321,6 +404,11 @@ export class SharedScannerController {
     }
     this.set({ storageError: null, lastAcceptedAt: this.d.now() });
     this.goodScan(seq);
+    // Received only once the scan is durably stored on this device.
+    this.setProgress(job.requestId, {
+      scannerId: order.scannerId, personId: order.person.personId, orderNumber: order.orderNumber,
+      mode: this.mode, phase: "received", startedAt: order.scannedAt,
+    });
     this.show({
       kind: "queued",
       scannerId: order.scannerId,
@@ -352,7 +440,7 @@ export class SharedScannerController {
 
   /** Clear every identity (auth/site/mode change, operator reset). */
   resetAll(reason: string): void {
-    this.set({ slots: clearAll(this.s.slots), slotNotes: {} });
+    this.set({ slots: clearAll(this.s.slots), slotNotes: {}, goodbye: {} });
     this.show({ kind: "info", scannerId: null, title: "All scanners signed out", detail: reason }, null);
   }
 
@@ -402,9 +490,19 @@ export class SharedScannerController {
 
   private onReport(r: DeliveryReport): void {
     const j = r.job;
+    // Any answer ends this scan's busy state on its panel.
+    this.setProgress(j.requestId, null);
     switch (r.kind) {
       case "saved":
-        this.set({ deliveryWaiting: null, authProblem: false });
+        this.set({
+          deliveryWaiting: null,
+          authProblem: false,
+          saveRevision: this.s.saveRevision + 1,
+          slotSaved: {
+            ...this.s.slotSaved,
+            [j.scannerId]: { personId: j.personId, orderNumber: j.orderNumber, pieces: r.result.pieces, mode: jobMode(j), at: this.d.now() },
+          },
+        });
         this.show({
           kind: "saved", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber, pieces: r.result.pieces,
           title: j.mode === "dispatch" ? `Dispatched #${j.orderNumber}` : `Saved #${j.orderNumber}`,
@@ -413,7 +511,7 @@ export class SharedScannerController {
         }, "ok");
         return;
       case "already_recorded":
-        this.set({ deliveryWaiting: null });
+        this.set({ deliveryWaiting: null, saveRevision: this.s.saveRevision + 1 });
         this.show({
           kind: "already", scannerId: j.scannerId, person: j.displayName, order: j.orderNumber,
           title: j.mode === "dispatch" ? `#${j.orderNumber} already dispatched — nothing more saved` : `#${j.orderNumber} already recorded — no extra credit`,

@@ -500,6 +500,12 @@ export interface DeliveryDeps {
   commitDispatch?(job: ScannerJob, prepared: PreparedDispatch): Promise<CommitOutcome>;
   /** False once the station was closed or its account/site changed: start nothing new. */
   active?(): boolean;
+  /**
+   * scanner-wall-redesign: told when a claimed job really starts checking
+   * its order, and right before its payload is sent. Display only: never
+   * awaited, errors ignored, no effect on delivery.
+   */
+  onProgress?(event: { job: ScannerJob; phase: "checking" | "saving" }): void;
 }
 
 export type DeliveryReport =
@@ -541,11 +547,19 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
 
   // The job's own mode, captured at scan time (F6 jobs have none: framing).
   const mode = jobMode(job);
+  const progress = (phase: "checking" | "saving") => {
+    try {
+      d.onProgress?.({ job, phase });
+    } catch {
+      // display only
+    }
+  };
 
   try {
     if (job.status === "queued" && mode === "dispatch") {
       const products = d.products();
       if (!products) return wait("Product catalogue still loading.");
+      progress("checking");
       const [lookup, openCase] = await Promise.all([d.lookupOrder(job.orderNumber), d.openCase(job.orderNumber)]);
       if (!active()) return stopped();
       if (lookup.kind === "network") return wait(lookup.message, lookup.auth ?? false);
@@ -588,6 +602,7 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
     if (job.status === "queued") {
       const products = d.products();
       if (!products) return wait("Product catalogue still loading.");
+      progress("checking");
       const [lookup, openCase] = await Promise.all([d.lookupOrder(job.orderNumber), d.openCase(job.orderNumber)]);
       if (!active()) return stopped();
       if (lookup.kind === "network") return wait(lookup.message, lookup.auth ?? false);
@@ -623,6 +638,7 @@ export async function processNext(d: DeliveryDeps): Promise<DeliveryReport | nul
       await d.outbox.releaseUnsent(job.requestId, lease, before);
       return superseded();
     }
+    progress("saving");
   } catch (e) {
     if (e instanceof LeaseLostError) return superseded();
     throw e;
