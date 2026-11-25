@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { SharedScannerWall, type SharedScannerWallProps } from "../SharedScannerWall";
@@ -60,12 +61,48 @@ describe("scanner wall redesign", () => {
     expect(html).toContain("2nd today");
     expect(html).toContain("3rd today");
     expect(html).toContain("Share of active people&#x27;s order credits");
-    expect(html).toContain("Orders <b>39</b>");
+    expect(html).toContain('Orders <b class="w-num">39</b>');
     expect(html).toContain("Last saved here:</span> #10251730 · 3 pieces");
     expect(html).toContain("No recent saved order on this scanner"); // Ben and Leo
     expect(html).toContain('data-kind="saved"');
     expect(html).toContain('aria-live="polite"');
     expect(html).toContain("Signs out in 15:00 without a scan");
+  });
+
+  it("review r1 M4: scope labels and the rework note", () => {
+    const html = render({ state: state({ slots: threeOn() }), totals: view(totals(COMPETITION, { hasRework: true })) });
+    expect(html).toContain("Today · people on this wall");
+    expect(html).toContain("Saved framing at this site · day starts 04:00 · CS/rework excluded");
+  });
+
+  it("review r1 S1: a goodbye without known numbers shows no figures", () => {
+    const html = render({ state: state({ goodbye: { S1: { personId: "nina", displayName: "Nina", at: NOW - 1_000 } } }), totals: view(null, { status: "loading" }) });
+    expect(html).toContain("Bye, Nina");
+    expect(html).not.toContain("pieces today");
+  });
+
+  it("review r1 S2: refusals are announced at once, other results politely", () => {
+    const red = render({ state: state({ last: { kind: "rejected", title: "NOT SAVED: #1", scannerId: "S2", at: 1 } }) });
+    expect(red).toContain('aria-live="assertive" role="alert"');
+    const already = render({ state: state({ last: { kind: "already", title: "#1 already recorded", scannerId: "S2", at: 1 } }) });
+    expect(already).toContain('aria-live="assertive"');
+    const saved = render({ state: state({ last: { kind: "saved", title: "Saved #1", scannerId: "S2", at: 1 } }) });
+    expect(saved).toContain('aria-live="polite"');
+    expect(saved).not.toContain('role="alert"><div class="w-result"');
+  });
+
+  it("review r1 M6: the page reflows (no fixed height), results and recovery dock at the bottom, fonts per CJ", () => {
+    const html = render({ state: state({ recovery: { title: "That scan didn't come through.", detail: "x", setupHint: null, seq: 1 } }) });
+    expect(html).toMatch(/<div class="w-dock"><section class="w-recovery"/);
+    const css = readFileSync("src/components/production/scanners/scanner-wall.css", "utf8");
+    expect(css).not.toMatch(/(^|[^-])height:\s*100vh/m);
+    expect(css).not.toMatch(/\.scanner-wall\s*\{[^}]*overflow:\s*hidden/);
+    expect(css).toMatch(/--w-font-head: Frutiger,[^;]*"Atkinson Hyperlegible"/);
+    expect(css).toMatch(/--w-font-text: Inter,/);
+    expect(css).toMatch(/--w-font-num: "Helvetica Neue", Helvetica, Inter/);
+    expect(css).toMatch(/\.w-name \{[^}]*font-size: 56px/);
+    expect(css).toMatch(/\.w-stat-value \{[^}]*font-size: 64px/);
+    expect(css).toMatch(/\.w-result-title \{[^}]*font-size: 40px/);
   });
 
   it("joint lead when tied; nobody leads at zero; ordinal ranks", () => {
@@ -128,13 +165,14 @@ describe("scanner wall redesign", () => {
     const html = render({
       elapsedNow: 50_000, // 4 s into the 10 s window
       state: state({ slots, goodbye: { S2: { personId: "mia", displayName: "Mia", at: NOW - 2_000 } } }),
-      totals: view(totals({ ben: COMPETITION.ben }), { lastKnown: { mia: { orders: 29, pieces: 71 } } }),
+      totals: view(totals({ ben: COMPETITION.ben }), { lastKnown: { mia: { orders: 29, pieces: 71, asOfUtc: new Date(NOW).toISOString() } } }),
     });
     expect(html).toContain("S1 · Ben · Sign out 2/3");
     expect(html).toContain("6 seconds left, or it starts over");
     expect(html.match(/class="is-on"/g)).toHaveLength(2);
     expect(html).toContain("Bye, Mia");
-    expect(html).toContain("29 orders · 71 pieces today");
+    expect(html).toMatch(/>29<\/span> orders · <span class="w-num">71<\/span> pieces today/);
+    expect(html).toContain("as of ");
     expect(html).toContain("Still clocked in.");
     expect(html).toContain("Scan your badge to start");
     // A wildly different clock origin gives the same countdown.
@@ -154,12 +192,15 @@ describe("scanner wall redesign", () => {
     const pending = render({ state: state({ slots: threeOn() }), totals: view(totals(COMPETITION), { pendingPersonIds: ["ben", "mia", "leo"] }) });
     expect(pending).toContain('data-testid="orders-S2">—<');
     expect(pending).not.toContain("Leading today");
-    expect(pending).not.toContain("Orders <b>");
+    expect(pending).not.toContain("Orders <b");
     const unavailable = render({ state: state({ slots: threeOn() }), totals: view(null, { status: "unavailable", message: "timeout" }) });
     expect(unavailable).toContain("Today&#x27;s totals unavailable: timeout");
     const stale = render({ state: state({ slots: threeOn() }), totals: view(totals(COMPETITION), { status: "stale" }) });
-    expect(stale).toContain("Last updated");
-    expect(stale).toContain('data-testid="orders-S2">17<');
+    expect(stale).toContain("Totals delayed · last updated");
+    expect(stale).toContain('data-testid="orders-S2">17<'); // labelled last-good figures
+    expect(stale).not.toContain("Leading today"); // review r1 M4: no competition on delayed numbers
+    expect(stale).not.toContain("Share of active people");
+    expect(stale).not.toContain("2nd today");
     const incomplete = render({ state: state({ slots: threeOn() }), totals: view(totals(COMPETITION, { incomplete: true })) });
     expect(incomplete).toContain("Some records need checking; no ranking shown");
     expect(incomplete).not.toContain("Leading today");

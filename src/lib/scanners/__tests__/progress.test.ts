@@ -191,4 +191,60 @@ describe("controller progress, last saved and goodbye", () => {
     c.resetAll("Signed out by the operator.");
     expect(c.state.goodbye).toEqual({});
   });
+
+  it("review r1 M7: progress follows the stored queue: retained jobs after a reload, waiting, storage failure", async () => {
+    // A job stored before a "reload" shows on its panel once the new controller reads the queue.
+    const store = memoryJobStore();
+    const ob = createScannerOutbox(store);
+    await ob.enqueue(captured(), scope, uuid());
+    const deps = {
+      scannerIds: ["S1", "S2", "S3"], scope, outbox: ob,
+      activate: async (): Promise<ActivateOutcome> => ({ outcome: "unknown_badge" }),
+      deliver: async () => null,
+      isOnline: () => true, now: () => 5_000, newRequestId: uuid, sound: () => {},
+    } satisfies ControllerDeps;
+    const reloaded = new SharedScannerController(deps);
+    await reloaded.refreshView();
+    expect(Object.values(reloaded.state.progress)).toMatchObject([{ scannerId: "S1", personId: ALICE, orderNumber: "10190203", phase: "received" }]);
+    // Once the job is finished elsewhere, the next refresh drops it.
+    const claimed = await ob.claimNext(scope, "tab");
+    await ob.markDone(claimed!.requestId, { kind: "saved", message: "x", pieces: 1, warnings: [] });
+    await reloaded.refreshView();
+    expect(reloaded.state.progress).toEqual({});
+    // A queue that cannot be read: nothing claims to be in progress.
+    const broken = new SharedScannerController({ ...deps, outbox: { ...ob, view: async () => { throw new Error("IndexedDB gone"); } } });
+    (broken as unknown as { s: { progress: Record<string, unknown> } }).s.progress = { x: { scannerId: "S1" } };
+    await broken.refreshView();
+    expect(broken.state.progress).toEqual({});
+    expect(broken.state.storageError).toBe("IndexedDB gone");
+  });
+
+  it("review r1 M7: a send without an answer shows as waiting, not saving", async () => {
+    const { c } = rig({ commit: async () => ({ outcome: "network_error", message: "timeout" }) });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(Object.values(c.state.progress)).toMatchObject([{ phase: "waiting" }]);
+  });
+
+  it("review r1 S1: a garbled scan from that scanner ends its goodbye; other scanners keep theirs", async () => {
+    const { c, setElapsed } = rig();
+    c.onFrame("S1", "AAAA0001");
+    c.onFrame("S2", "BBBB0002");
+    await settle();
+    for (const id of ["S1", "S2"]) {
+      const badge = id === "S1" ? "AAAA0001" : "BBBB0002";
+      for (const at of [2_000, 4_000]) {
+        setElapsed(at);
+        c.onFrame(id, badge);
+        await settle();
+      }
+      setElapsed(6_000);
+      c.onFrame(id, badge);
+    }
+    expect(Object.keys(c.state.goodbye).sort()).toEqual(["S1", "S2"]);
+    c.onProtocolError("bad_payload", "S1");
+    expect(Object.keys(c.state.goodbye)).toEqual(["S2"]);
+  });
 });

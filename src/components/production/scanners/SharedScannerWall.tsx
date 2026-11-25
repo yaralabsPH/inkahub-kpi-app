@@ -109,7 +109,8 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
   const activeIds = p.scannerIds.map((id) => state.slots[id]?.identity?.personId).filter((x): x is string => !!x);
   const anyPending = activeIds.some((id) => pending.has(id));
   const usable = view && view.totals && (view.status === "current" || view.status === "stale") ? view.totals : null;
-  const showCompetition = usable && !anyPending && !usable.incomplete;
+  // Leaders, ranks and shares only from current, complete numbers for everyone on the wall.
+  const showCompetition = !!usable && view?.status === "current" && !anyPending && !usable.incomplete;
   const panelTotals = (personId: string | null): PanelTotals => {
     if (!personId || !view) return null;
     if (pending.has(personId) || view.status === "loading") return "pending";
@@ -128,7 +129,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
               Shared scanners · {p.siteLabel} · <span data-testid="wall-mode">{mode === "dispatch" ? "Dispatch" : "Framing"}</span>
             </span>
           </div>
-          <div style={{ fontSize: 18, fontWeight: 700 }}>{p.receiverLabel || "Receiver"}</div>
+          <div className="w-receiver">{p.receiverLabel || "Receiver"}</div>
         </div>
         <div className="w-clock" aria-label="Site time">{clock(p.now, p.timeZone)}</div>
         <div className="w-chips">
@@ -170,17 +171,22 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
 
       {framing && view ? (
         <div className="w-team" data-testid="wall-team" data-status={view.status}>
-          <span className="w-label">Today on this wall</span>
+          <div>
+            <div className="w-label">Today · people on this wall</div>
+            <div className="w-small">Saved framing at this site · day starts 04:00{usable?.hasRework ? " · CS/rework excluded" : ""}</div>
+          </div>
           <div className="w-team-figs">
             {usable && !anyPending ? (
               <>
-                <span>Orders <b>{usable.team.orders}</b></span>
-                <span>Pieces <b>{usable.team.pieces ?? "—"}</b></span>
+                <span>Orders <b className="w-num">{usable.team.orders}</b></span>
+                <span>Pieces <b className="w-num">{usable.team.pieces ?? "—"}</b></span>
               </>
             ) : (
               <span>{view.status === "unavailable" ? `Today's totals unavailable${view.message ? `: ${view.message}` : ""}` : "Updating today's totals…"}</span>
             )}
-            {view.status === "stale" && view.loadedAtUtc ? <span>Last updated {clock(Date.parse(view.loadedAtUtc), p.timeZone)}</span> : null}
+            {view.status === "stale" && view.loadedAtUtc ? (
+              <span className="w-delayed">Totals delayed · last updated {clock(Date.parse(view.loadedAtUtc), p.timeZone)}</span>
+            ) : null}
             {usable?.incomplete ? <span>Some records need checking; no ranking shown</span> : null}
           </div>
         </div>
@@ -194,7 +200,10 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
           const gb = state.goodbye?.[id];
           const known = gb ? view?.lastKnown?.[gb.personId] : undefined;
           const goodbye: PanelGoodbye | null = gb
-            ? { displayName: gb.displayName, at: gb.at, orders: known?.orders ?? null, pieces: known?.pieces ?? null }
+            ? {
+              displayName: gb.displayName, at: gb.at, orders: known?.orders ?? null, pieces: known?.pieces ?? null,
+              asOf: known ? clock(Date.parse(known.asOfUtc), p.timeZone) : null,
+            }
             : null;
           return (
             <ScannerWallPanel
@@ -215,6 +224,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
         })}
       </section>
 
+      <div className="w-dock">
       {state.recovery ? (
         <section className="w-recovery" role="alert" data-testid="scan-recovery">
           <div className="w-label" style={{ color: "#1f1500" }}>NOTHING SAVED FROM THAT SCAN</div>
@@ -224,7 +234,9 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
         </section>
       ) : null}
 
-      <section aria-live="polite">
+      {/* Errors are announced at once; everything else politely. Counters and countdowns are not live regions. */}
+      <section aria-live={last && (last.kind === "rejected" || last.kind === "already") ? "assertive" : "polite"}
+        role={last && (last.kind === "rejected" || last.kind === "already") ? "alert" : undefined}>
         {last ? (
           <div className="w-result" data-testid="last-result" data-kind={last.kind}>
             <div className="w-result-word">{RESULT_WORD[last.kind]}{last.scannerId ? ` · ${last.scannerId}` : ""}</div>
@@ -242,7 +254,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
                   <li key={f.sku}>
                     <span style={{ fontWeight: 700 }}>Framed by: {f.displayName}</span>{" "}
                     {f.source === "scan" ? "✓" : <span className="w-manual">Manual</span>}
-                    <span style={{ fontSize: 15, opacity: 0.8, marginLeft: 12 }}>{f.sku}</span>
+                    <span style={{ fontSize: 16, opacity: 0.8, marginLeft: 12 }}>{f.sku}</span>
                   </li>
                 ))}
               </ul>
@@ -255,6 +267,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
           </div>
         )}
       </section>
+      </div>
 
       {choice && p.onChooseFramers ? (
         <FramerPicker
@@ -274,7 +287,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
                 <div style={{ fontWeight: 700 }}>#{j.orderNumber} · {j.displayName} · {j.scannerId}{jobMode(j) !== mode ? ` · ${jobMode(j)}` : ""}</div>
                 <div className="w-small">{j.blocked?.message}</div>
                 {j.uncertain ? (
-                  <div style={{ fontSize: 15, fontWeight: 700, color: "rgb(245 184 65)" }}>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: "rgb(245 184 65)" }}>
                     An earlier send may already have saved this. Do NOT record it on the classic station; tap Retry once fixed.
                   </div>
                 ) : null}

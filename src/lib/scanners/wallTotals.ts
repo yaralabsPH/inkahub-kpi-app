@@ -50,8 +50,8 @@ export interface WallTotalsView {
   pendingPersonIds: readonly string[];
   loadedAtUtc: string | null;
   message: string | null;
-  /** Last numbers read today for anyone seen on this wall (for goodbyes). */
-  lastKnown?: Readonly<Record<string, { orders: number; pieces: number | null }>>;
+  /** Last numbers read today for anyone seen on this wall (for goodbyes), with their cutoff. */
+  lastKnown?: Readonly<Record<string, { orders: number; pieces: number | null; asOfUtc: string }>>;
 }
 
 export class WallTotalsRangeError extends Error {

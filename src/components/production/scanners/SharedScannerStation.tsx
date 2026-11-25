@@ -51,14 +51,17 @@ export function SharedScannerStation({ config, onExit, onChangeConfig }: {
       callerId={callerId}
       location={location}
       roleAllowed={OPERATOR_ROLES.has(auth?.profile?.role ?? "")}
+      role={auth?.profile?.role ?? null}
+      siteMember={!!auth?.locations?.includes(location)}
       onExit={onExit}
       onSwitchMode={onChangeConfig ? () => onChangeConfig({ ...config, mode: mode === "dispatch" ? "framing" : "dispatch" }) : undefined}
     />
   );
 }
 
-function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitchMode }: {
-  config: SharedScannerConfig; mode: ScanMode; callerId: string; location: string; roleAllowed: boolean; onExit(): void; onSwitchMode?(): void;
+function Inner({ config, mode, callerId, location, roleAllowed, role, siteMember, onExit, onSwitchMode }: {
+  config: SharedScannerConfig; mode: ScanMode; callerId: string; location: string; roleAllowed: boolean;
+  role: string | null; siteMember: boolean; onExit(): void; onSwitchMode?(): void;
 }) {
   const client = getSupabase();
   const { data: dataset } = useDataset();
@@ -101,7 +104,7 @@ function Inner({ config, mode, callerId, location, roleAllowed, onExit, onSwitch
     [bindingKey],
   );
   const totals = useScannerWallTotals({
-    client, site: location, callerId, mode, roleAllowed, personIds, bindingKey,
+    client, site: location, callerId, role, siteMember, mode, roleAllowed, personIds, bindingKey,
     saveRevision: st.state.saveRevision, online: st.device.online, visible: st.device.visible, now,
   });
   return (

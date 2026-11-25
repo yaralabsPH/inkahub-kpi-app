@@ -70,7 +70,8 @@ export interface ScanProgress {
   personId: string;
   orderNumber: string;
   mode: ScanMode;
-  phase: "received" | "checking" | "saving";
+  /** received: stored on this device; waiting: an attempt did not get an answer yet, will retry. */
+  phase: "received" | "checking" | "saving" | "waiting";
   startedAt: number;
 }
 
@@ -212,6 +213,7 @@ export class SharedScannerController {
     // Never attributed to a worker; a known source cancels only its own
     // sign-out progress, an unknown one cancels every scanner's.
     const seq = ++this.inputSeq;
+    if (scannerId !== null) this.dropGoodbye(scannerId); // the next input on that scanner, even a failed one
     this.set({
       slots: cancelGestures(this.s.slots, scannerId),
       recovery: {
@@ -449,10 +451,30 @@ export class SharedScannerController {
   async refreshView(): Promise<void> {
     try {
       const view = await this.d.outbox.view(this.d.scope);
-      this.set({ view });
+      this.set({ view, progress: this.reconcileProgress(view) });
     } catch (e) {
-      this.set({ storageError: e instanceof Error ? e.message : String(e) });
+      // The queue cannot be read: no panel may keep claiming work is in progress.
+      this.set({ storageError: e instanceof Error ? e.message : String(e), progress: {} });
     }
+  }
+
+  /**
+   * scanner-wall-redesign: panel progress follows the stored queue. Unfinished
+   * jobs (queued/prepared) are shown, including ones kept from before a
+   * reload; finished, blocked or vanished ones are dropped.
+   */
+  private reconcileProgress(view: ScopeView): Record<string, ScanProgress> {
+    const next: Record<string, ScanProgress> = {};
+    for (const j of view.jobs) {
+      if (j.status !== "queued" && j.status !== "prepared") continue;
+      if (Object.keys(next).length >= MAX_TRACKED_PROGRESS) break;
+      const prev = this.s.progress[j.requestId];
+      next[j.requestId] = prev ?? {
+        scannerId: j.scannerId, personId: j.personId, orderNumber: j.orderNumber, mode: jobMode(j),
+        phase: j.attempts > 0 ? "waiting" : "received", startedAt: Date.parse(j.scannedAt),
+      };
+    }
+    return next;
   }
 
   /** Start (or re-check) the single delivery loop. */
@@ -474,6 +496,7 @@ export class SharedScannerController {
               report = await this.d.deliver();
             } catch (e) {
               this.set({ storageError: e instanceof Error ? e.message : String(e) });
+              void this.refreshView(); // reconcile (or clear) panel progress
               return;
             }
             if (!report) break;
@@ -490,8 +513,13 @@ export class SharedScannerController {
 
   private onReport(r: DeliveryReport): void {
     const j = r.job;
-    // Any answer ends this scan's busy state on its panel.
-    this.setProgress(j.requestId, null);
+    // A final answer ends this scan's busy state; a retry later shows as waiting.
+    if (r.kind === "waiting") {
+      const prev = this.s.progress[j.requestId];
+      if (prev) this.setProgress(j.requestId, { ...prev, phase: "waiting" });
+    } else if (r.kind !== "superseded") {
+      this.setProgress(j.requestId, null);
+    }
     switch (r.kind) {
       case "saved":
         this.set({

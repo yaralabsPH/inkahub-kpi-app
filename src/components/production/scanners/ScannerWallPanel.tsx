@@ -14,6 +14,8 @@ export interface PanelGoodbye {
   displayName: string;
   orders: number | null;
   pieces: number | null;
+  /** Site time of the read the numbers came from; null = no numbers known. */
+  asOf: string | null;
   at: number;
 }
 
@@ -58,6 +60,7 @@ const PHASE_TEXT: Record<SlotProgress["phase"], { step: number; text: string }> 
   received: { step: 1, text: "Scan received" },
   checking: { step: 2, text: "Checking the order…" },
   saving: { step: 3, text: "Saving…" },
+  waiting: { step: 1, text: "Waiting to save (will retry)" },
 };
 
 function Progress({ p, person }: { p: SlotProgress; person: string }) {
@@ -97,8 +100,11 @@ export function ScannerWallPanel(p: ScannerWallPanelProps) {
           ) : bye ? (
             <>
               <div className="w-free-title">Bye, {bye.displayName}</div>
-              {bye.orders !== null ? (
-                <div style={{ fontSize: 20 }}>{bye.orders} order{bye.orders === 1 ? "" : "s"} · {bye.pieces ?? DASH} pieces today</div>
+              {bye.orders !== null && bye.asOf ? (
+                <div style={{ fontSize: 20 }}>
+                  <span className="w-num">{bye.orders}</span> order{bye.orders === 1 ? "" : "s"} · <span className="w-num">{bye.pieces ?? DASH}</span> pieces today
+                  <div className="w-small">as of {bye.asOf}</div>
+                </div>
               ) : null}
               <div className="w-small">Still clocked in. Clock out on the station screen when you leave.</div>
             </>

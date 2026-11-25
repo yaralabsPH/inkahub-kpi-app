@@ -8,13 +8,13 @@ function harness() {
   let clock = 0;
   const timers = new Map<number, { at: number; fn: () => void }>();
   let nextId = 1;
-  const reads: Array<{ at: number; resolve: (s: ProductionSnapshot) => void; reject: (e: Error) => void }> = [];
+  const reads: Array<{ at: number; signal: AbortSignal; resolve: (s: ProductionSnapshot) => void; reject: (e: Error) => void }> = [];
   const published: WallRefreshResult[] = [];
   const r = createWallTotalsRefresh<number>({
     now: () => clock,
     schedule: (fn, ms) => { const id = nextId++; timers.set(id, { at: clock + ms, fn }); return id; },
     cancel: (id) => { timers.delete(id); },
-    read: () => new Promise<ProductionSnapshot>((resolve, reject) => reads.push({ at: clock, resolve, reject })),
+    read: (signal) => new Promise<ProductionSnapshot>((resolve, reject) => reads.push({ at: clock, signal, resolve, reject })),
     publish: (p) => published.push(p),
   });
   /** Advance the fake clock, firing due timers in order. */
@@ -112,10 +112,37 @@ describe("createWallTotalsRefresh", () => {
     expect(h.reads[1].at).toBe(WALL_MIN_GAP_MS); // started later; read() computes day/cutoff then
   });
 
+  it("review r1 M5: a save soon after a fast read is not held behind the one-minute timer", async () => {
+    const h = harness();
+    h.r.setEnabled(true);
+    h.reads[0].resolve(h.snap("a"));
+    await h.advance(1_000); // read done; the periodic timer is now due at 61 s
+    h.r.request(); // a save at +1 s
+    await h.advance(WALL_MIN_GAP_MS - 1_000);
+    expect(h.reads).toHaveLength(2);
+    expect(h.reads[1].at).toBe(WALL_MIN_GAP_MS);
+  });
+
+  it("review r1 M5: hide/resume aborts the running read and never overlaps a second one", async () => {
+    const h = harness();
+    h.r.setEnabled(true);
+    h.r.setEnabled(false);
+    expect(h.reads[0].signal.aborted).toBe(true);
+    await h.advance(WALL_MIN_GAP_MS * 2);
+    h.r.setEnabled(true); // resumed while the first read has not settled
+    await h.advance(WALL_MIN_GAP_MS * 2);
+    expect(h.reads).toHaveLength(1); // still one in flight
+    h.reads[0].reject(new Error("aborted"));
+    await h.advance(0);
+    expect(h.published).toEqual([]); // the aborted read publishes nothing
+    expect(h.reads).toHaveLength(2); // the resumed read starts once the slot is free
+  });
+
   it("dispose prevents every late publication and timer", async () => {
     const h = harness();
     h.r.setEnabled(true);
     h.r.dispose();
+    expect(h.reads[0].signal.aborted).toBe(true);
     h.reads[0].resolve(h.snap("late"));
     await h.advance(WALL_REFRESH_MS * 2);
     expect(h.published).toEqual([]);
