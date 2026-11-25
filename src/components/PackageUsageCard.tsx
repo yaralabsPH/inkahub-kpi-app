@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Package } from "lucide-react";
-import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
+import { Section } from "@/components/ui/Section";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Tag } from "@/components/ui/Tag";
 import { Button } from "@/components/ui/Button";
 import { getSupabase } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
@@ -136,76 +138,58 @@ export function PackageUsageCard({
     return { rows: summaryRows, totalQty, totalCost, hasCost, currency };
   }, [rows, data, catalogue]);
 
+  const tubeIds = new Set([MAIL_TUBE_LARGE_PRODUCT_ID, MAIL_TUBE_SMALL_PRODUCT_ID]);
+  const isTube = (r: { productId: string; label: string }) => tubeIds.has(r.productId) || /tube/i.test(r.label);
+  const meta = rows !== null && summary.rows.length > 0
+    ? `${summary.totalQty.toLocaleString()} used${summary.hasCost ? ` · est. ${summary.currency}${summary.totalCost.toFixed(2)}` : ""}`
+    : undefined;
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="inline-flex items-center gap-2">
-          <Package size={16} /> Packages used
-        </CardTitle>
-        <span className="text-xs text-slate-500 dark:text-slate-400">
-          Boxes + mail tubes deducted from stock — {rangeLabel}
-        </span>
-      </CardHeader>
-      <CardBody className="p-0">
-        {loading ? (
-          <div className="p-6 text-sm text-slate-500">Loading…</div>
-        ) : error ? (
-          <div className="p-6 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
-            {error}
-            <Button variant="secondary" size="sm" onClick={() => void load()}>Retry</Button>
-          </div>
-        ) : rows === null ? (
-          <div className="p-6 text-sm text-slate-500 flex items-center gap-2">
-            Not loaded for this range.
-            <Button variant="secondary" size="sm" onClick={() => void load()}>Load package usage</Button>
-          </div>
-        ) : summary.rows.length === 0 ? (
-          <div className="p-6 text-sm text-slate-500 italic">
-            No packages deducted in this range.
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                <tr>
-                  <th className="text-left px-4 py-2 font-semibold">Package</th>
-                  <th className="text-right px-3 py-2 font-semibold">Qty used</th>
-                  <th className="text-right px-3 py-2 font-semibold">Unit cost</th>
-                  <th className="text-right px-4 py-2 font-semibold">Est. cost</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {summary.rows.map((r) => (
-                  <tr key={r.productId}>
-                    <td className="px-4 py-2 font-medium">{r.label}</td>
-                    <td className="px-3 py-2 text-right tabular-nums">{r.qty.toLocaleString()}</td>
-                    <td className="px-3 py-2 text-right tabular-nums text-slate-500">
-                      {r.unitCost == null ? "—" : `${summary.currency}${r.unitCost.toFixed(2)}`}
-                    </td>
-                    <td className="px-4 py-2 text-right tabular-nums">
-                      {r.cost == null
-                        ? <span className="text-slate-400 italic">no cost</span>
-                        : `${summary.currency}${r.cost.toFixed(2)}`}
-                    </td>
-                  </tr>
-                ))}
-                <tr className="bg-slate-50 dark:bg-slate-900/40 font-semibold">
-                  <td className="px-4 py-2">Total</td>
-                  <td className="px-3 py-2 text-right tabular-nums">
-                    {summary.totalQty.toLocaleString()}
-                  </td>
-                  <td />
-                  <td className="px-4 py-2 text-right tabular-nums">
-                    {summary.hasCost
-                      ? `${summary.currency}${summary.totalCost.toFixed(2)}`
-                      : <span className="text-slate-400 italic">—</span>}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        )}
-      </CardBody>
-    </Card>
+    <Section
+      title="Packages used"
+      meta={meta}
+      subtitle={
+        rangeLabel === "current range"
+          ? "Boxes and mail tubes deducted from stock in the current range"
+          : `Boxes and mail tubes deducted from stock · ${rangeLabel}`
+      }
+      storageKey="inka-reports-collapse:packages-used"
+    >
+      {loading ? (
+        <div className="text-[13px] text-hub-faint">Loading…</div>
+      ) : error ? (
+        <div className="flex flex-wrap items-center gap-2 text-[13px] text-hub-bad">
+          {error}
+          <Button variant="secondary" size="sm" onClick={() => void load()}>Retry</Button>
+        </div>
+      ) : rows === null ? (
+        <div className="flex flex-wrap items-center gap-2 text-[13px] text-hub-muted">
+          Not loaded for this range.
+          <Button variant="secondary" size="sm" onClick={() => void load()}>Load package usage</Button>
+        </div>
+      ) : summary.rows.length === 0 ? (
+        <EmptyState icon={Package} title="No packages deducted in this range" hint="Boxes and mail tubes are deducted from stock as orders ship." />
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          {summary.rows.map((r) => {
+            const tube = isTube(r);
+            const costTitle = r.unitCost == null
+              ? "No unit cost set"
+              : `Unit cost ${summary.currency}${r.unitCost.toFixed(2)} · est. ${summary.currency}${(r.cost ?? 0).toFixed(2)}`;
+            return (
+              <div
+                key={r.productId}
+                title={costTitle}
+                className="flex items-center gap-2 rounded-hub border border-hub-line px-2.5 py-1.5"
+              >
+                <Tag color={tube ? "blue" : "gray"}>{tube ? "TUBE" : "BOX"}</Tag>
+                <span className="text-[13px] text-hub-text">{r.label}</span>
+                <b className="font-semibold tabular-nums text-hub-text">{r.qty.toLocaleString()}</b>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Section>
   );
 }

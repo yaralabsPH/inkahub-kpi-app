@@ -1,4 +1,9 @@
-import type { NavKey } from "@/lib/domain";
+import {
+  Home, LayoutDashboard, Package, ClipboardList, Truck,
+  CalendarDays, Warehouse, ShoppingCart, Settings, Users, Printer, ArrowLeftRight, LifeBuoy,
+  PackageOpen, ScanLine, BarChart3,
+} from "lucide-react";
+import { NAV_KEYS, type NavKey } from "@/lib/domain";
 
 /**
  * Sidebar structure for the redesigned shell. Routes and keys are the same as
@@ -71,4 +76,36 @@ export function visibleNavGroups(allowed: ReadonlySet<NavKey>): NavGroup[] {
     if (items.length > 0) out.push({ label: group.label, items });
   }
   return out;
+}
+
+/** One icon per page; shared by the sidebar and the Team page access editor. */
+export const NAV_ICONS: Record<NavKey, typeof LayoutDashboard> = {
+  welcome: Home,
+  dashboard: LayoutDashboard,
+  skus: Package,
+  sales: ClipboardList,
+  shipments: Truck,
+  events: CalendarDays,
+  warehouse: Warehouse,
+  orders: ShoppingCart,
+  paper: Printer,
+  movements: ArrowLeftRight,
+  cs_cases: LifeBuoy,
+  cs_returns: PackageOpen,
+  order_submission: ScanLine,
+  reports: BarChart3,
+  team: Users,
+  settings: Settings,
+};
+
+/**
+ * Every page in sidebar order, grouped like the sidebar (the untitled first
+ * group is "General"); any page not in a group is listed under "Other".
+ * Used by the Team page access editor.
+ */
+export function accessGroups(): Array<{ label: string; keys: NavKey[] }> {
+  const groups = NAV_GROUPS.map((g) => ({ label: g.label ?? "General", keys: g.items.map((i) => i.key) }));
+  const seen = new Set<NavKey>(groups.flatMap((g) => g.keys));
+  const rest = NAV_KEYS.filter((k) => !seen.has(k));
+  return rest.length ? [...groups, { label: "Other", keys: [...rest] }] : groups;
 }

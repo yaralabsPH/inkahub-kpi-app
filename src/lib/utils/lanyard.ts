@@ -388,7 +388,7 @@ export function printAllLanyards(staff: Array<{
 // ---------------------------------------------------------------------------
 
 /**
- * Load a script tag from a URL and resolve once it's on window. Idempotent â€”
+ * Load a script tag from a URL and resolve once it's on window. Idempotent —
  * if the script is already loaded, resolves immediately. Used to pull
  * JsBarcode + JSZip from CDN at click-time so we don't need to npm install.
  */
@@ -553,4 +553,26 @@ export async function downloadAllLanyardsAsJpegs(
   // Give the browser a moment to start the download before revoking.
   setTimeout(() => URL.revokeObjectURL(url), 4000);
   return { count: staff.length, filename };
+}
+
+/**
+ * Draw the Code128 barcode for `token` into an on-screen <svg>, using the
+ * same CDN JsBarcode build as the print and JPEG paths. Resolves false if
+ * the script can't load (the token text is still shown by the caller).
+ */
+export async function renderBarcodeSvg(svg: SVGSVGElement, token: string, color: string): Promise<boolean> {
+  try {
+    await loadScript("https://unpkg.com/jsbarcode@3.11.6/dist/JsBarcode.all.min.js");
+    const w = window as unknown as { JsBarcode?: (el: SVGSVGElement, v: string, o: Record<string, unknown>) => void };
+    // loadScript resolves early when the tag already exists; wait briefly for it.
+    for (let i = 0; i < 20 && !w.JsBarcode; i++) await new Promise((r) => setTimeout(r, 100));
+    if (!w.JsBarcode) return false;
+    w.JsBarcode(svg, token, {
+      format: "CODE128", displayValue: false, height: 56, width: 1.6, margin: 0,
+      background: "transparent", lineColor: color,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -1,12 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ReportsSectionNav } from "@/components/ReportsSectionNav";
-import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshCw, Search, Trash2 } from "lucide-react";
-import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import {
+  ArrowRight, BarChart3, ChevronDown, Clock, Download, Layers, Package, RefreshCw, RotateCcw, Search, Trash2, User, Users, Zap,
+  type LucideIcon,
+} from "lucide-react";
+import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
 import { createOrderLookupSession, viewForScope, type OrderLookupView } from "@/lib/repository/supabase/orderLookupSession";
 import { useAppStore } from "@/lib/state/appStore";
-import { Card, CardHeader, CardTitle, CardBody } from "@/components/ui/Card";
+import { Section } from "@/components/ui/Section";
+import { EmptyState } from "@/components/ui/EmptyState";
+import { Callout } from "@/components/ui/Callout";
+import { Segmented } from "@/components/ui/Segmented";
+import { Avatar, Tag, colorForId } from "@/components/ui/Tag";
+import { Pager, clampPage, type PageSize } from "@/components/ui/Pager";
+import { nField, nTable, nTableWrap, nTd, nTdNum, nTh, nThNum } from "@/components/ui/nStyles";
+import type { TagColor } from "@/lib/auth/roles";
 import { Button } from "@/components/ui/Button";
 import {
   PRODUCTION_DEPARTMENT_LABELS,
@@ -170,15 +180,11 @@ export function Reports() {
   // local-only (Dexie) build renders this message without missing-key errors.
   if (getBackendMode() !== "supabase") {
     return (
-      <div className="p-6">
-        <Card>
-          <CardBody>
-            <div className="text-sm text-slate-600 dark:text-slate-400">
-              Reports require the Supabase backend. This dataset is running in
-              local-only mode.
-            </div>
-          </CardBody>
-        </Card>
+      <div className="mx-auto max-w-hub px-4 pt-9 sm:px-8 lg:px-14">
+        <Callout>
+          Reports require the Supabase backend. This dataset is running in
+          local-only mode.
+        </Callout>
       </div>
     );
   }
@@ -296,6 +302,11 @@ function SupabaseReports() {
   const [refreshTick, setRefreshTick] = useState(0);
   // === per-day-worked view ===
   const [chartMode, setChartMode] = useState<"totals" | "perDay">("totals");
+  // "Orders handled by" table: shown a page at a time.
+  const [ordersPage, setOrdersPage] = useState(0);
+  const [ordersPageSize, setOrdersPageSize] = useState<PageSize>(10);
+  // Back to the first page whenever the filtered set changes.
+  useEffect(() => { setOrdersPage(0); }, [selectedStaff, selectedDepartment, preset, customFrom, customTo, location]);
 
   // Production days at the site (04:00 boundaries). Recomputed on refresh so
   // "today" rolls over at 04:00 site time.
@@ -578,48 +589,76 @@ function SupabaseReports() {
     "CS/rework is counted separately. Rework scanned without a case tag cannot be told apart from normal work.",
   ].filter((x): x is string => !!x);
 
+  const kpis: KpiCell[] = [
+    { label: itemsLabel, icon: Layers, value: summary ? fmtItems(summary.normal.items) : "--", sub: workType ? undefined : "work processed" },
+    {
+      label: "Orders completed",
+      icon: Package,
+      value: summary ? summary.normal.orders.toLocaleString() : "--",
+      sub: view && view.dispatchedOrders > 0 ? `${view.dispatchedOrders.toLocaleString()} dispatched` : undefined,
+    },
+    {
+      label: "CS / rework",
+      icon: RotateCcw,
+      value: summary ? `${fmtItems(summary.rework.items)} items` : "--",
+      sub: summary ? `${summary.rework.orders.toLocaleString()} case order${summary.rework.orders === 1 ? "" : "s"}` : undefined,
+    },
+    { label: "Avg min / unit", icon: Clock, value: view ? formatMinutes(view.timing.avgMinPerUnit) : "--", sub: "framed units only" },
+    selectedStaff === ALL_STAFF
+      ? { label: "Active staff", icon: User, value: view ? view.activeStaff.toLocaleString() : "--" }
+      : { label: "Hours worked", icon: User, value: view ? formatHours(view.timing.durationMin) : "--" },
+    {
+      label: "Avg orders / staff-day",
+      icon: Zap,
+      value: view && view.avgOrdersPerStaffDay > 0 ? view.avgOrdersPerStaffDay.toFixed(1) : "--",
+      sub: view && view.staffDays > 0 ? `${view.staffDays} staff-day${view.staffDays === 1 ? "" : "s"}` : undefined,
+    },
+  ];
+  const chartRows = staffBoard.map((s) => ({
+    staff_id: s.staffId,
+    name: s.display_name,
+    Items: chartMode === "perDay" ? Number(s.itemsPerDay.toFixed(1)) : (s.normal.items ?? 0),
+    Orders: chartMode === "perDay" ? Number(s.ordersPerDay.toFixed(1)) : s.normal.orders,
+    valueLabel: chartMode === "perDay"
+      ? `${s.itemsPerDay.toFixed(1)} · ${s.ordersPerDay.toFixed(1)}`
+      : `${fmtItems(s.normal.items)} · ${s.normal.orders.toLocaleString()}`,
+  }));
+  const maxChartValue = Math.max(1, ...chartRows.map((r) => Math.max(r.Items, r.Orders)));
+  const slowestAvg = view?.skuBoard[0]?.avgMin ?? 0;
+  const ordersPageSafe = clampPage(ordersPage, orderRows.length, ordersPageSize);
+  const loadingOrEmpty = (empty: string) =>
+    statusState.status === "loading" ? "Loading…" : statusState.status === "error" ? "Counts unavailable." : empty;
+
   return (
-    <div className="p-4 md:p-6 space-y-4">
+    <div className="relative mx-auto max-w-hub px-4 pb-[100px] pt-6 sm:px-8 lg:px-14">
       {/* Page header */}
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 flex-wrap">
-          <BarChart3 size={20} className="text-slate-600 dark:text-slate-400" />
+      <div className="flex flex-wrap items-end gap-4">
+        <div className="min-w-0">
+          <div className="mb-3.5 grid h-[52px] w-[52px] place-items-center rounded-xl border border-hub-line bg-hub-fill text-hub-muted">
+            <BarChart3 size={26} strokeWidth={1.4} aria-hidden />
+          </div>
           <h1 className="text-[26px] font-bold leading-tight tracking-[-0.01em] text-hub-text md:text-[32px]">Production Reports</h1>
-          {selectedStaffName && (
-            <span className="ml-1 inline-flex items-center gap-1 rounded-full bg-slate-900 text-white text-xs font-medium px-2 py-0.5 dark:bg-slate-100 dark:text-slate-900">
-              {selectedStaffName}
-            </span>
-          )}
-          {selectedDeptLabel && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-indigo-600 text-white text-xs font-medium px-2 py-0.5">
-              {selectedDeptLabel}
-            </span>
-          )}
+          <p className="mt-1.5 text-sm text-hub-muted">
+            Output, speed and packaging across the floor for this location.
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setRefreshTick((n) => n + 1)}
-            title="Refetch data"
-          >
-            <RefreshCw size={14} />
-            Refresh
+        <div className="ml-auto flex gap-1.5 pb-1">
+          <Button variant="ghost" onClick={() => setRefreshTick((n) => n + 1)} title="Refetch data">
+            <RefreshCw size={15} strokeWidth={1.6} aria-hidden /> Refresh
           </Button>
           <Button
             variant="secondary"
-            size="sm"
             onClick={() => void (source === "legacy" ? handleExport() : handlePublishedExport())}
             disabled={exporting || (source === "legacy" ? !legacyView || legacyView.exportEvents.length === 0 : source !== "published" || !pub.summary)}
             title={source === "legacy" ? "Download raw event log as CSV" : "Download the raw event log of this report version as CSV"}
           >
-            <Download size={14} />
+            <Download size={15} strokeWidth={1.6} aria-hidden />
             {exporting ? "Exporting…" : "Export CSV"}
           </Button>
         </div>
       </div>
 
-      {/* Order lookup — independent of date filter */}
+      {/* Order lookup (independent of the date filter) */}
       <OrderLookupCard
         supabase={supabase}
         location={location}
@@ -627,59 +666,52 @@ function SupabaseReports() {
       />
 
       {/* Filter bar */}
-      <Card>
-        <CardBody className="flex flex-wrap items-center gap-2">
-          {([
-            { key: "today", label: "Today" },
-            { key: "7d", label: "Last 7 days" },
-            { key: "30d", label: "Last 30 days" },
-            { key: "custom", label: "Custom" },
-          ] as { key: PresetRange; label: string }[]).map((p) => (
+      <div className="mt-[26px] border-b border-hub-line pb-3">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {RANGE_PRESETS.map((p) => (
             <button
               key={p.key}
               type="button"
               onClick={() => setPreset(p.key)}
-              className={cn(
-                "px-3 h-8 rounded-md text-xs font-medium transition",
-                preset === p.key
-                  ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
-                  : "bg-white text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-200 dark:ring-slate-700 dark:hover:bg-slate-800",
-              )}
+              aria-pressed={preset === p.key}
+              className={cn(pill, preset === p.key && pillOn)}
             >
               {p.label}
             </button>
           ))}
           {preset === "custom" && (
-            <div className="flex items-center gap-2 ml-2">
+            <div className="flex items-center gap-1.5">
               <input
                 type="date"
+                aria-label="From"
                 value={customFrom}
                 onChange={(e) => setCustomFrom(e.target.value)}
-                className="h-8 px-2 rounded-md border border-slate-300 bg-white text-xs dark:border-slate-700 dark:bg-slate-900"
+                className={cn(nField, "h-7 text-[13px]")}
               />
-              <span className="text-xs text-slate-500">to</span>
+              <ArrowRight size={14} className="text-hub-faint" aria-hidden />
               <input
                 type="date"
+                aria-label="To"
                 value={customTo}
                 onChange={(e) => setCustomTo(e.target.value)}
-                className="h-8 px-2 rounded-md border border-slate-300 bg-white text-xs dark:border-slate-700 dark:bg-slate-900"
+                className={cn(nField, "h-7 text-[13px]")}
               />
             </div>
           )}
 
-          {/* Staff dropdown */}
-          <div className="flex items-center gap-2 ml-2">
-            <label
-              htmlFor="staff-filter"
-              className="text-xs text-slate-500 dark:text-slate-400"
-            >
-              Staff:
-            </label>
+          <span aria-hidden className="mx-1.5 h-[18px] w-px bg-hub-line-2" />
+
+          {/* Staff dropdown: the native select is stretched invisibly over the pill */}
+          <label className={cn(pill, "relative", selectedStaff !== ALL_STAFF && pillOn)}>
+            <User size={13} strokeWidth={1.6} aria-hidden />
+            Staff: <b className="font-medium text-hub-text">{selectedStaffName ?? "All"}</b>
+            <ChevronDown size={13} strokeWidth={1.6} aria-hidden />
             <select
               id="staff-filter"
+              aria-label="Staff"
               value={selectedStaff}
               onChange={(e) => setSelectedStaff(e.target.value)}
-              className="h-8 px-2 rounded-md border border-slate-300 bg-white text-xs dark:border-slate-700 dark:bg-slate-900"
+              className="absolute inset-0 cursor-pointer opacity-0"
             >
               <option value={ALL_STAFF}>All staff</option>
               {staffOptions.map((s) => (
@@ -688,23 +720,20 @@ function SupabaseReports() {
                 </option>
               ))}
             </select>
-          </div>
+          </label>
 
-          {/* Department dropdown */}
-          <div className="flex items-center gap-2 ml-2">
-            <label
-              htmlFor="dept-filter"
-              className="text-xs text-slate-500 dark:text-slate-400"
-            >
-              Dept:
-            </label>
+          <label className={cn(pill, "relative", selectedDepartment !== ALL_DEPARTMENTS && pillOn)}>
+            <Layers size={13} strokeWidth={1.6} aria-hidden />
+            Dept: <b className="font-medium text-hub-text">{selectedDeptLabel ?? "All"}</b>
+            <ChevronDown size={13} strokeWidth={1.6} aria-hidden />
             <select
               id="dept-filter"
+              aria-label="Department"
               value={selectedDepartment}
               onChange={(e) =>
                 setSelectedDepartment(e.target.value as ProductionDepartment | typeof ALL_DEPARTMENTS)
               }
-              className="h-8 px-2 rounded-md border border-slate-300 bg-white text-xs dark:border-slate-700 dark:bg-slate-900"
+              className="absolute inset-0 cursor-pointer opacity-0"
             >
               {DEPARTMENT_OPTIONS.map((d) => (
                 <option key={d.value} value={d.value}>
@@ -712,7 +741,7 @@ function SupabaseReports() {
                 </option>
               ))}
             </select>
-          </div>
+          </label>
 
           {(selectedStaff !== ALL_STAFF || selectedDepartment !== ALL_DEPARTMENTS) && (
             <button
@@ -721,280 +750,266 @@ function SupabaseReports() {
                 setSelectedStaff(ALL_STAFF);
                 setSelectedDepartment(ALL_DEPARTMENTS);
               }}
-              className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 underline ml-1"
+              className="rounded px-1.5 text-[13px] text-hub-muted hover:bg-hub-fill hover:text-hub-text"
             >
               Clear
             </button>
           )}
 
-          <div className="ml-auto text-xs text-slate-500 dark:text-slate-400">
-            {range ? `${range.firstDate} → ${range.lastDate}` : null}
-            {rangeProblem && <span className="ml-2 text-red-600">{rangeProblem}</span>}
-            {staffError && <span className="ml-2 text-red-600">{staffError}</span>}
-            {exportError && <span className="ml-2 text-red-600">{exportError}</span>}
+          <div className="ml-auto text-[12.5px] tabular-nums text-hub-faint">
+            {range ? formatRangeLabel(range.firstDate, range.lastDate) : null}
           </div>
-          <ProductionCountStatus
-            className="basis-full"
-            state={statusState}
-            range={range}
-            coverage={view?.coverage ?? null}
-            notes={line ? [...disclosures, ...line.notes.filter((n) => !line.warnings.includes(n))] : disclosures}
-            warnings={line?.warnings}
-          />
-
-        </CardBody>
-      </Card>
-
-      {/* KPI tiles */}
-      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-        <KpiTile
-          label={itemsLabel}
-          value={summary ? fmtItems(summary.normal.items) : "--"}
-          sub={workType ? undefined : "work processed"}
-        />
-        <KpiTile
-          label="Orders completed"
-          value={summary ? summary.normal.orders.toLocaleString() : "--"}
-          sub={
-            view && view.dispatchedOrders > 0
-              ? `${view.dispatchedOrders.toLocaleString()} dispatched`
-              : undefined
-          }
-        />
-        <KpiTile
-          label="CS / rework"
-          value={summary ? `${fmtItems(summary.rework.items)} items` : "--"}
-          sub={summary ? `${summary.rework.orders.toLocaleString()} case order${summary.rework.orders === 1 ? "" : "s"}` : undefined}
-        />
-        <KpiTile
-          label="Avg min / unit"
-          value={view ? formatMinutes(view.timing.avgMinPerUnit) : "--"}
-          sub="framed units only"
-        />
-        <KpiTile
-          label={selectedStaff === ALL_STAFF ? "Active staff" : "Hours worked"}
-          value={
-            !view
-              ? "--"
-              : selectedStaff === ALL_STAFF
-                ? view.activeStaff.toLocaleString()
-                : formatHours(view.timing.durationMin)
-          }
-        />
-        <KpiTile
-          label="Avg orders / staff-day"
-          value={view && view.avgOrdersPerStaffDay > 0 ? view.avgOrdersPerStaffDay.toFixed(1) : "--"}
-          sub={view && view.staffDays > 0 ? `${view.staffDays} staff-day${view.staffDays === 1 ? "" : "s"}` : undefined}
+        </div>
+        {rangeProblem || staffError || exportError ? (
+          <div className="mt-2 flex flex-wrap gap-x-3 text-[12.5px] text-hub-bad">
+            {rangeProblem ? <span>{rangeProblem}</span> : null}
+            {staffError ? <span>{staffError}</span> : null}
+            {exportError ? <span>{exportError}</span> : null}
+          </div>
+        ) : null}
+        <ProductionCountStatus
+          className="mt-2"
+          state={statusState}
+          range={range}
+          coverage={view?.coverage ?? null}
+          notes={line ? [...disclosures, ...line.notes.filter((n) => !line.warnings.includes(n))] : disclosures}
+          warnings={line?.warnings}
         />
       </div>
 
-      {/* === per-staff grouped bars === */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between w-full gap-3">
-            <CardTitle>Output by staff</CardTitle>
-            <div className="flex gap-0.5 rounded-md ring-1 ring-slate-200 dark:ring-slate-800 p-0.5 text-xs">
-              <button
-                type="button"
-                onClick={() => setChartMode("totals")}
-                className={cn(
-                  "px-2 h-6 rounded transition",
-                  chartMode === "totals"
-                    ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
-                    : "text-slate-600 hover:text-slate-900 dark:text-slate-300",
-                )}
-              >
-                Totals
-              </button>
-              <button
-                type="button"
-                onClick={() => setChartMode("perDay")}
-                className={cn(
-                  "px-2 h-6 rounded transition",
-                  chartMode === "perDay"
-                    ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
-                    : "text-slate-600 hover:text-slate-900 dark:text-slate-300",
-                )}
-              >
-                Per day worked
-              </button>
+      {/* KPI strip: one bordered box, hairline dividers */}
+      <div className="mt-[22px] grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-hub-line bg-hub-line md:grid-cols-3 xl:grid-cols-6">
+        {kpis.map((k) => (
+          <div key={k.label} className="bg-hub-page px-[18px] py-4">
+            <div className="flex items-center gap-1.5 text-[12.5px] text-hub-muted">
+              <k.icon size={14} strokeWidth={1.6} className="text-hub-faint" aria-hidden />
+              {k.label}
             </div>
+            <div
+              className={cn(
+                "mt-1 text-[26px] font-semibold tracking-[-0.02em] tabular-nums text-hub-text",
+                isDimValue(k.value) && "text-hub-faint",
+              )}
+            >
+              {k.value}
+            </div>
+            {/* There is no previous-period comparison, so this line holds the
+                existing sub-text (or stays empty at the same height). */}
+            <div className="mt-0.5 text-xs text-hub-faint">{k.sub ?? " "}</div>
           </div>
-          <span className="text-xs text-slate-500 dark:text-slate-400">
-            Items vs Orders per person (normal work; all visible staff)
-            {selectedDeptLabel ? ` -- ${selectedDeptLabel}` : ""}
-          </span>
-        </CardHeader>
-        <CardBody>
-          {staffBoard.length === 0 ? (
-            <Empty label={statusState.status === "loading" ? "Loading…" : statusState.status === "error" ? "Counts unavailable." : "No credited items or orders in this range."} />
-          ) : (
-            <div className="text-hub-accent-text" style={{ width: "100%", height: 260 }}>
-              <ResponsiveContainer>
-                <BarChart
-                  data={staffBoard.map((s) => ({
-                    staff_id: s.staffId,
-                    name: s.display_name,
-                    Items: chartMode === "perDay"
-                      ? Number(s.itemsPerDay.toFixed(1))
-                      : (s.normal.items ?? 0),
-                    Orders: chartMode === "perDay"
-                      ? Number(s.ordersPerDay.toFixed(1))
-                      : s.normal.orders,
-                  }))}
-                  margin={{ top: 8, right: 16, bottom: 8, left: 0 }}
-                  onClick={(state: any) => {
-                    const pl = state?.activePayload?.[0]?.payload;
-                    if (pl?.staff_id) {
-                      setSelectedStaff((cur) => cur === pl.staff_id ? ALL_STAFF : pl.staff_id);
-                    }
-                  }}
-                >
-                  <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" />
-                  <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} angle={-15} textAnchor="end" height={50} />
-                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
-                  <Tooltip
-                    cursor={{ fill: "rgba(148,163,184,0.15)" }}
-                    contentStyle={{ fontSize: 12, borderRadius: 6 }}
-                  />
-                  <Legend wrapperStyle={{ fontSize: 12 }} />
-                  <Bar dataKey="Items"  fill="currentColor" radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="Orders" fill="#64748b" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </CardBody>
-      </Card>
+        ))}
+      </div>
+
+      {/* Output by staff */}
+      <Section
+        title="Output by staff"
+        subtitle={`Items vs orders per person (normal work; all visible staff)${selectedDeptLabel ? ` · ${selectedDeptLabel}` : ""}`}
+        storageKey={sectionKey("output-by-staff")}
+        actions={
+          <>
+            {staffBoard.length > 0 ? (
+              <div className="flex gap-3.5 text-xs text-hub-muted">
+                <span className="inline-flex items-center gap-1.5"><i aria-hidden className="inline-block h-2 w-2 rounded-sm bg-hub-accent-text" />Items</span>
+                <span className="inline-flex items-center gap-1.5"><i aria-hidden className="inline-block h-2 w-2 rounded-sm bg-hub-info opacity-70" />Orders</span>
+              </div>
+            ) : null}
+            <Segmented
+              label="Chart values"
+              className="ml-2.5"
+              value={chartMode}
+              onChange={setChartMode}
+              options={[
+                { value: "totals", label: "Totals" },
+                { value: "perDay", label: "Per day worked" },
+              ]}
+            />
+          </>
+        }
+      >
+        {staffBoard.length === 0 ? (
+          <EmptyState icon={BarChart3} title={loadingOrEmpty("No credited items or orders in this range")} hint="Try a wider date range or a different department." />
+        ) : (
+          <div style={{ width: "100%", height: Math.max(80, chartRows.length * 36 + 8) }}>
+            <ResponsiveContainer>
+              <BarChart
+                layout="vertical"
+                data={chartRows}
+                margin={{ top: 0, right: 0, bottom: 0, left: 0 }}
+                barGap={3}
+                barCategoryGap={12}
+                onClick={(state: any) => {
+                  const pl = state?.activePayload?.[0]?.payload;
+                  if (pl?.staff_id) {
+                    setSelectedStaff((cur) => cur === pl.staff_id ? ALL_STAFF : pl.staff_id);
+                  }
+                }}
+                style={{ cursor: "pointer", fontFamily: "inherit" }}
+              >
+                <XAxis type="number" domain={[0, maxChartValue]} hide />
+                <YAxis
+                  yAxisId="names"
+                  type="category"
+                  dataKey="name"
+                  width={150}
+                  tick={{ fontSize: 13.5, fill: "rgb(var(--hub-text))", textAnchor: "start", dx: -142 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                {/* Values on the right, as "items · orders" */}
+                <YAxis
+                  yAxisId="values"
+                  orientation="right"
+                  type="category"
+                  dataKey="valueLabel"
+                  width={116}
+                  tick={{ fontSize: 12.5, fill: "rgb(var(--hub-muted))" }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <Tooltip
+                  cursor={{ fill: "rgb(var(--hub-hover))" }}
+                  contentStyle={CHART_TOOLTIP}
+                  labelStyle={{ fontWeight: 600, color: "rgb(var(--hub-text))" }}
+                  itemStyle={{ color: "rgb(var(--hub-muted))" }}
+                />
+                <Bar yAxisId="names" dataKey="Items" fill="rgb(var(--hub-accent-text))" barSize={8} radius={3} isAnimationActive={false} />
+                <Bar yAxisId="names" dataKey="Orders" fill="rgb(var(--hub-info))" fillOpacity={0.7} barSize={8} radius={3} isAnimationActive={false} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </Section>
 
       {/* Staff leaderboard */}
-      <CollapsibleSection storageKey="staff-leaderboard" title="Staff leaderboard">
-      <Card>
-        <CardHeader>
-          <CardTitle>Staff leaderboard</CardTitle>
-          <span className="text-xs text-slate-500 dark:text-slate-400">
-            {selectedDeptLabel ? `${selectedDeptLabel} only` : "All departments"} — all visible staff
-            {selectedStaffName ? ` (the tiles above show ${selectedStaffName} only)` : ""} — click row to filter
-          </span>
-        </CardHeader>
-        <CardBody className="p-0">
-          {pubView && !pubView.people.complete ? (
-            <div className="px-4 py-2 text-xs text-amber-700 dark:text-amber-300 flex items-center gap-2" role="status">
-              Showing {pubView.people.shown.toLocaleString()} of {pubView.people.total.toLocaleString()} people.
-              <button type="button" className="underline" onClick={() => pub.nextPage("people")}>Load more</button>
-            </div>
-          ) : null}
-          {staffBoard.length === 0 ? (
-            <Empty label={statusState.status === "error" ? "Counts unavailable." : "No credited production from staff in this range."} />
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-sm">
-                <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                  <tr>
-                    <th className="text-left px-4 py-2 font-semibold">Staff</th>
-                    <th className="text-right px-3 py-2 font-semibold">Orders</th>
-                    <th className="text-right px-3 py-2 font-semibold">Items</th>
-                    <th className="text-right px-3 py-2 font-semibold">Rework</th>
-                    <th className="text-right px-3 py-2 font-semibold">Days</th>
-                    <th className="text-right px-3 py-2 font-semibold">O/day</th>
-                    <th className="text-right px-3 py-2 font-semibold">I/day</th>
-                    <th className="text-right px-3 py-2 font-semibold">Hours</th>
-                    <th className="text-right px-3 py-2 font-semibold">Avg min/unit</th>
-                    <th className="text-right px-4 py-2 font-semibold">Est. cost</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {staffBoard.map((r) => {
-                    const isSelected = selectedStaff === r.staffId;
-                    return (
-                      <tr
-                        key={r.staffId}
-                        onClick={() =>
-                          setSelectedStaff(isSelected ? ALL_STAFF : r.staffId)
-                        }
-                        className={cn(
-                          "border-t border-slate-100 dark:border-slate-800 cursor-pointer transition",
-                          isSelected
-                            ? "bg-slate-100 dark:bg-slate-800"
-                            : "hover:bg-slate-50 dark:hover:bg-slate-800/50",
-                        )}
-                        title={isSelected ? "Click to clear filter" : `Click to filter to ${r.display_name}`}
-                      >
-                        <td className="px-4 py-2 font-medium">
-                          {r.display_name}
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.normal.orders.toLocaleString()}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{fmtItems(r.normal.items)}</td>
-                        <td className="px-3 py-2 text-right tabular-nums text-slate-500">
-                          {(r.rework.items ?? 0) > 0 || r.rework.orders > 0 ? `${fmtItems(r.rework.items)} / ${r.rework.orders}` : "--"}
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.daysWorked.toLocaleString()}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.ordersPerDay > 0 ? r.ordersPerDay.toFixed(1) : "--"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.itemsPerDay > 0 ? r.itemsPerDay.toFixed(1) : "--"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{formatHours(r.timing.durationMin)}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{formatMinutes(r.timing.avgMinPerUnit)}</td>
-                        <td className="px-4 py-2 text-right tabular-nums">
-                          {r.cost == null
-                            ? <span className="text-slate-400 italic">no rate</span>
-                            : `$${r.cost.toFixed(2)}`}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardBody>
-      </Card>
-      </CollapsibleSection>
-
-      {/* SKU bottleneck */}
-      <CollapsibleSection storageKey="slowest-variants" title="Slowest variants">
-      <Card>
-        <CardHeader>
-          <CardTitle>Slowest variants</CardTitle>
-          <span className="text-xs text-slate-500 dark:text-slate-400">
-            Grouped by size and variant. Top 20 by avg minutes per framed unit
-            {subtitleSuffix ? ` — ${subtitleSuffix}` : ""}
-          </span>
-        </CardHeader>
-        <CardBody className="p-0">
-          {!view || view.skuBoard.length === 0 ? (
-            <Empty label="No SKU-level events in this range." />
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-sm">
-                <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                  <tr>
-                    <th className="text-left px-4 py-2 font-semibold">Size / Variant</th>
-                    <th className="text-right px-3 py-2 font-semibold">Timed units</th>
-                    <th className="text-right px-3 py-2 font-semibold">Total time</th>
-                    <th className="text-right px-4 py-2 font-semibold">Avg min/unit</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {view.skuBoard.map((r) => (
+      <Section
+        title="Staff leaderboard"
+        meta={staffBoard.length > 0 ? `${staffBoard.length} ${staffBoard.length === 1 ? "person" : "people"}` : undefined}
+        subtitle={
+          `${selectedDeptLabel ? `${selectedDeptLabel} only` : "All departments"} · all visible staff`
+          + (selectedStaffName ? ` (the tiles above show ${selectedStaffName} only)` : "")
+          + " · click a row to filter the page"
+        }
+        storageKey={sectionKey("staff-leaderboard")}
+      >
+        {pubView && !pubView.people.complete ? (
+          <div className="mb-2 flex items-center gap-2 text-xs text-hub-warn" role="status">
+            Showing {pubView.people.shown.toLocaleString()} of {pubView.people.total.toLocaleString()} people.
+            <button type="button" className="underline" onClick={() => pub.nextPage("people")}>Load more</button>
+          </div>
+        ) : null}
+        {staffBoard.length === 0 ? (
+          <EmptyState icon={Users} title={statusState.status === "error" ? "Counts unavailable." : "No credited production from staff in this range"} hint="Events appear here once staff start scanning orders." />
+        ) : (
+          <div className={nTableWrap}>
+            <table className={nTable}>
+              <thead>
+                <tr>
+                  <th className={cn(nTh, "w-[30px]")}><span className="sr-only">Rank</span></th>
+                  <th className={nTh}>Staff</th>
+                  <th className={nThNum}>Orders</th>
+                  <th className={nThNum}>Items</th>
+                  <th className={nThNum}>Rework</th>
+                  <th className={nThNum}>Days</th>
+                  <th className={nThNum}>O/day</th>
+                  <th className={nThNum}>I/day</th>
+                  <th className={nThNum}>Hours</th>
+                  <th className={nThNum}>Avg min/unit</th>
+                  <th className={nThNum}>Est. cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {staffBoard.map((r, i) => {
+                  const isSelected = selectedStaff === r.staffId;
+                  return (
                     <tr
-                      key={r.sku}
-                      className="border-t border-slate-100 dark:border-slate-800"
+                      key={r.staffId}
+                      onClick={() =>
+                        setSelectedStaff(isSelected ? ALL_STAFF : r.staffId)
+                      }
+                      className={cn("cursor-pointer", isSelected ? "bg-hub-fill" : "hover:bg-hub-hover")}
+                      title={isSelected ? "Click to clear filter" : `Click to filter to ${r.display_name}`}
                     >
-                      <td className="px-4 py-2 font-mono text-xs">{r.sku}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{r.weight.toLocaleString()}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{formatHours(r.durationMin)}</td>
-                      <td className="px-4 py-2 text-right tabular-nums">{formatMinutes(r.avgMin)}</td>
+                      <td className={cn(nTd, "w-[30px] tabular-nums text-hub-faint")}>{i + 1}</td>
+                      <td className={nTd}>
+                        <div className="flex items-center gap-[9px] whitespace-nowrap">
+                          <Avatar name={r.display_name} color={colorForId(r.staffId)} size={22} />
+                          {r.display_name}
+                        </div>
+                      </td>
+                      <td className={nTdNum}>{r.normal.orders.toLocaleString()}</td>
+                      <td className={nTdNum}>{fmtItems(r.normal.items)}</td>
+                      <td className={cn(nTdNum, "text-hub-faint")}>
+                        {(r.rework.items ?? 0) > 0 || r.rework.orders > 0 ? `${fmtItems(r.rework.items)} / ${r.rework.orders}` : "—"}
+                      </td>
+                      <td className={cn(nTdNum, "text-hub-faint")}>{r.daysWorked.toLocaleString()}</td>
+                      <td className={nTdNum}>{r.ordersPerDay > 0 ? r.ordersPerDay.toFixed(1) : <Dash />}</td>
+                      <td className={nTdNum}>{r.itemsPerDay > 0 ? r.itemsPerDay.toFixed(1) : <Dash />}</td>
+                      <td className={nTdNum}>{formatHours(r.timing.durationMin)}</td>
+                      <td className={nTdNum}>{formatMinutes(r.timing.avgMinPerUnit)}</td>
+                      <td className={nTdNum}>
+                        {r.cost == null
+                          ? <span className="text-hub-faint">No rate</span>
+                          : `$${r.cost.toFixed(2)}`}
+                      </td>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardBody>
-      </Card>
-      </CollapsibleSection>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Section>
+
+      {/* Slowest variants (SKU bottleneck) */}
+      <Section
+        title="Slowest variants"
+        subtitle={`Grouped by size and variant · top 20 by avg minutes per framed unit${subtitleSuffix ? ` · ${subtitleSuffix}` : ""}`}
+        storageKey={sectionKey("slowest-variants")}
+      >
+        {!view || view.skuBoard.length === 0 ? (
+          <EmptyState icon={Layers} title="No SKU-level events in this range" hint="Variants are ranked once units are completed." />
+        ) : (
+          <div className={nTableWrap}>
+            <table className={nTable}>
+              <thead>
+                <tr>
+                  <th className={nTh}>Size</th>
+                  <th className={nTh}>Variant</th>
+                  <th className={nThNum}>Avg min / unit</th>
+                  <th className={nThNum}>Timed units</th>
+                  <th className={nThNum}>Total time</th>
+                  <th className={cn(nTh, "w-[28%]")}><span className="sr-only">Relative time</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {view.skuBoard.map((r) => {
+                  const { size, variant } = splitSizeVariant(r.sku);
+                  return (
+                    <tr key={r.sku} className="hover:bg-hub-hover">
+                      <td className={nTd}><Tag color="blue">{size}</Tag></td>
+                      <td className={cn(nTd, "font-mono text-[12.5px]")}>{variant}</td>
+                      <td className={nTdNum}>{formatMinutes(r.avgMin)}</td>
+                      <td className={cn(nTdNum, "text-hub-faint")}>{r.weight.toLocaleString()}</td>
+                      <td className={cn(nTdNum, "text-hub-faint")}>{formatHours(r.durationMin)}</td>
+                      <td className={nTd}>
+                        <div className="h-1.5 rounded-[3px] bg-hub-line-2">
+                          <div
+                            className="h-full rounded-[3px] bg-hub-warn opacity-80"
+                            style={{ width: `${slowestAvg > 0 ? Math.max(2, (r.avgMin / slowestAvg) * 100) : 0}%` }}
+                          />
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Section>
 
       {staffId && pubOrders && (!pubOrders.started || !pubOrders.complete) ? (
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400" role="status">
+        <div className="mt-[30px] flex items-center gap-2 text-xs text-hub-muted" role="status">
           {pubOrders.started
             ? `Showing ${pubOrders.shown.toLocaleString()} of ${pubOrders.total.toLocaleString()} orders handled by ${selectedStaffName}.`
             : `Orders handled by ${selectedStaffName} load on request.`}
@@ -1004,78 +1019,83 @@ function SupabaseReports() {
         </div>
       ) : null}
 
-      {/* Per-staff order drill-down - only when a single staff is selected */}
+      {/* Per-staff order drill-down: only when a single staff is selected */}
       {staffId && view && orderRows.length > 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Orders handled by {selectedStaffName}</CardTitle>
-            <span className="text-xs text-slate-500 dark:text-slate-400">
-              {legacyView
-                ? `${orderRows.length.toLocaleString()} distinct order${orderRows.length === 1 ? "" : "s"} touched in this range; `
-                : `${orderRows.length.toLocaleString()} of ${(pubOrders?.total ?? 0).toLocaleString()} order${pubOrders?.total === 1 ? "" : "s"} loaded; `}
-              {view.summary.normal.orders.toLocaleString()} completed by {selectedStaffName}. Click an order # to look it up.
-            </span>
-          </CardHeader>
-          <CardBody className="p-0">
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-sm">
-                <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                  <tr>
-                    <th className="text-left px-4 py-2 font-semibold">Order #</th>
-                    <th className="text-left px-3 py-2 font-semibold">First touched</th>
-                    <th className="text-left px-3 py-2 font-semibold">Last touched</th>
-                    <th className="text-left px-3 py-2 font-semibold">Departments</th>
-                    <th className="text-right px-3 py-2 font-semibold">Lines verified</th>
-                    <th className="text-right px-3 py-2 font-semibold">Items</th>
-                    <th className="text-left px-4 py-2 font-semibold">Completed</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {orderRows.map((r) => {
-                    const fmt = (ms: number) => new Date(ms).toLocaleString(undefined, {
-                      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-                      ...(range ? { timeZone: range.timeZone } : {}),
-                    });
-                    return (
-                      <tr key={r.key} className="border-t border-slate-100 dark:border-slate-800">
-                        <td className="px-4 py-2 font-mono text-xs">
-                          <button
-                            type="button"
-                            className="text-indigo-600 dark:text-indigo-400 hover:underline"
-                            onClick={() => {
-                              // Scroll to Order lookup and trigger search.
-                              const evt = new CustomEvent("inka:lookup-order", { detail: r.orderNumber });
-                              window.dispatchEvent(evt);
-                              window.scrollTo({ top: 0, behavior: "smooth" });
-                            }}
-                            title="Look up this order"
-                          >
-                            #{r.orderNumber}
-                          </button>
-                          {r.caseId ? <span className="ml-1 text-[10px] text-amber-700">CS {r.caseId}</span> : null}
-                        </td>
-                        <td className="px-3 py-2 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap">{fmt(r.firstMs)}</td>
-                        <td className="px-3 py-2 text-xs text-slate-600 dark:text-slate-400 whitespace-nowrap">{fmt(r.lastMs)}</td>
-                        <td className="px-3 py-2">
-                          <div className="flex flex-wrap gap-1">
-                            {r.workTypes.map((d) => (
-                              <span key={d} className="inline-flex items-center rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-[11px] px-2 py-0.5 ring-1 ring-slate-200 dark:ring-slate-700">
-                                {PRODUCTION_DEPARTMENT_LABELS[d]}
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.verifiedLines.toLocaleString()}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{fmtItems(r.items)}</td>
-                        <td className="px-4 py-2 text-xs">{r.completed ? "yes" : "--"}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </CardBody>
-        </Card>
+        <Section
+          title={`Orders handled by ${selectedStaffName}`}
+          navLabel="Orders handled"
+          subtitle={
+            (legacyView
+              ? `${orderRows.length.toLocaleString()} distinct order${orderRows.length === 1 ? "" : "s"} touched in this range; `
+              : `${orderRows.length.toLocaleString()} of ${(pubOrders?.total ?? 0).toLocaleString()} order${pubOrders?.total === 1 ? "" : "s"} loaded; `)
+            + `${view.summary.normal.orders.toLocaleString()} completed by ${selectedStaffName}. Click an order # to look it up.`
+          }
+          storageKey={sectionKey("staff-orders")}
+        >
+          <div className={nTableWrap}>
+            <table className={nTable}>
+              <thead>
+                <tr>
+                  <th className={nTh}>Order #</th>
+                  <th className={nTh}>First touched</th>
+                  <th className={nTh}>Last touched</th>
+                  <th className={nTh}>Departments</th>
+                  <th className={nThNum}>Lines verified</th>
+                  <th className={nThNum}>Items</th>
+                  <th className={nTh}>Completed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orderRows.slice(ordersPageSafe * ordersPageSize, (ordersPageSafe + 1) * ordersPageSize).map((r) => {
+                  const fmt = (ms: number) => new Date(ms).toLocaleString(undefined, {
+                    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                    ...(range ? { timeZone: range.timeZone } : {}),
+                  });
+                  return (
+                    <tr key={r.key} className="hover:bg-hub-hover">
+                      <td className={cn(nTd, "whitespace-nowrap")}>
+                        <button
+                          type="button"
+                          className="whitespace-nowrap font-mono text-[12.5px] text-hub-info hover:underline"
+                          onClick={() => {
+                            // Scroll to Order lookup and trigger search.
+                            const evt = new CustomEvent("inka:lookup-order", { detail: r.orderNumber });
+                            window.dispatchEvent(evt);
+                            window.scrollTo({ top: 0, behavior: "smooth" });
+                          }}
+                          title="Look up this order"
+                        >
+                          #{r.orderNumber}
+                        </button>
+                        {r.caseId ? <span className="ml-1.5"><Tag color="yellow">CS {r.caseId}</Tag></span> : null}
+                      </td>
+                      <td className={cn(nTd, "whitespace-nowrap text-hub-muted")}>{fmt(r.firstMs)}</td>
+                      <td className={cn(nTd, "whitespace-nowrap text-hub-muted")}>{fmt(r.lastMs)}</td>
+                      <td className={nTd}>
+                        <div className="flex flex-wrap gap-1">
+                          {r.workTypes.map((d) => (
+                            <Tag key={d}>{PRODUCTION_DEPARTMENT_LABELS[d]}</Tag>
+                          ))}
+                        </div>
+                      </td>
+                      <td className={nTdNum}>{r.verifiedLines.toLocaleString()}</td>
+                      <td className={nTdNum}>{fmtItems(r.items)}</td>
+                      <td className={nTd}>{r.completed ? "Yes" : <Dash />}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <Pager
+            total={orderRows.length}
+            page={ordersPageSafe}
+            size={ordersPageSize}
+            onPage={setOrdersPage}
+            onSize={(n) => { setOrdersPageSize(n); setOrdersPage(0); }}
+            label="orders"
+          />
+        </Section>
       ) : null}
 
       {/* Per-staff daily productivity chart */}
@@ -1087,7 +1107,7 @@ function SupabaseReports() {
         />
       ) : null}
       {staffId && pubView && (!pubView.daily.complete || pubView.daily.unpublishedAfter) ? (
-        <div className="text-xs text-amber-700 dark:text-amber-300" role="status">
+        <div className="mt-2 text-xs text-hub-warn" role="status">
           {!pubView.daily.complete ? `The chart shows ${pubView.daily.shown} of ${pubView.daily.total} production days. ` : ""}
           {pubView.daily.unpublishedAfter ? `Days after ${pubView.daily.unpublishedAfter} are not published yet and are not shown.` : ""}
           {!pubView.daily.complete ? (
@@ -1098,105 +1118,95 @@ function SupabaseReports() {
 
       {/* Coverage issues (published drill-down; loaded on request, only when there are issues) */}
       {pubView && coverageList && pubView.coverage.issueRows > 0 ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Coverage issues</CardTitle>
-            <span className="text-xs text-slate-500 dark:text-slate-400">
-              {coverageList.started
-                ? `${coverageList.shown.toLocaleString()} of ${coverageList.total.toLocaleString()} issue${coverageList.total === 1 ? "" : "s"} loaded`
-                : `${pubView.coverage.issueRows.toLocaleString()} issue${pubView.coverage.issueRows === 1 ? "" : "s"} in this report`}
-            </span>
-          </CardHeader>
-          <CardBody className="p-0">
-            {coverageList.rows.length > 0 ? (
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
-                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                    <tr>
-                      <th className="text-left px-4 py-2 font-semibold">Issue</th>
-                      <th className="text-left px-3 py-2 font-semibold">Event</th>
-                      <th className="text-left px-4 py-2 font-semibold">Detail</th>
+        <Section
+          title="Coverage issues"
+          meta={coverageList.started
+            ? `${coverageList.shown.toLocaleString()} of ${coverageList.total.toLocaleString()} issue${coverageList.total === 1 ? "" : "s"} loaded`
+            : `${pubView.coverage.issueRows.toLocaleString()} issue${pubView.coverage.issueRows === 1 ? "" : "s"} in this report`}
+          storageKey={sectionKey("coverage-issues")}
+        >
+          {coverageList.rows.length > 0 ? (
+            <div className={nTableWrap}>
+              <table className={nTable}>
+                <thead>
+                  <tr>
+                    <th className={nTh}>Issue</th>
+                    <th className={nTh}>Event</th>
+                    <th className={nTh}>Detail</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {coverageList.rows.map((r) => (
+                    <tr key={`${r.kind}|${r.eventId}`} className="hover:bg-hub-hover">
+                      <td className={nTd}>{r.kind.replace(/_/g, " ")}</td>
+                      <td className={cn(nTd, "font-mono text-[12.5px]")}>{r.eventId}</td>
+                      <td className={cn(nTd, "text-hub-muted")}>{r.detail ?? "—"}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {coverageList.rows.map((r) => (
-                      <tr key={`${r.kind}|${r.eventId}`} className="border-t border-slate-100 dark:border-slate-800">
-                        <td className="px-4 py-2 text-xs">{r.kind.replace(/_/g, " ")}</td>
-                        <td className="px-3 py-2 font-mono text-xs">{r.eventId}</td>
-                        <td className="px-4 py-2 text-xs text-slate-600 dark:text-slate-400">{r.detail ?? "--"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : null}
-            {!coverageList.complete ? (
-              <div className="px-4 py-2">
-                <Button variant="secondary" size="sm" onClick={() => pub.nextPage("coverage")}>
-                  {coverageList.started ? "Load more" : "Load coverage issues"}
-                </Button>
-              </div>
-            ) : null}
-          </CardBody>
-        </Card>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {!coverageList.complete ? (
+            <div className="pt-2.5">
+              <Button variant="secondary" size="sm" onClick={() => pub.nextPage("coverage")}>
+                {coverageList.started ? "Load more" : "Load coverage issues"}
+              </Button>
+            </div>
+          ) : null}
+        </Section>
       ) : null}
 
       {/* Timing observations (published drill-down; loaded on request) */}
       {pubView && timingList ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Timing observations</CardTitle>
-            <span className="text-xs text-slate-500 dark:text-slate-400">
-              {timingList.started
-                ? `${timingList.shown.toLocaleString()} of ${timingList.total.toLocaleString()} observation${timingList.total === 1 ? "" : "s"} loaded`
-                : "Each framed line with its gap since the worker's previous line"}
-            </span>
-          </CardHeader>
-          <CardBody className="p-0">
-            {timingList.rows.length > 0 ? (
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
-                  <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                    <tr>
-                      <th className="text-left px-4 py-2 font-semibold">Completed</th>
-                      <th className="text-left px-3 py-2 font-semibold">Staff</th>
-                      <th className="text-left px-3 py-2 font-semibold">Dept</th>
-                      <th className="text-left px-3 py-2 font-semibold">Order #</th>
-                      <th className="text-left px-3 py-2 font-semibold">SKU</th>
-                      <th className="text-right px-3 py-2 font-semibold">Weight</th>
-                      <th className="text-right px-4 py-2 font-semibold">Minutes</th>
+        <Section
+          title="Timing observations"
+          subtitle={timingList.started
+            ? `${timingList.shown.toLocaleString()} of ${timingList.total.toLocaleString()} observation${timingList.total === 1 ? "" : "s"} loaded`
+            : "Each framed line with its gap since the worker's previous line"}
+          storageKey={sectionKey("timing-observations")}
+        >
+          {timingList.rows.length > 0 ? (
+            <div className={nTableWrap}>
+              <table className={nTable}>
+                <thead>
+                  <tr>
+                    <th className={nTh}>Completed</th>
+                    <th className={nTh}>Staff</th>
+                    <th className={nTh}>Dept</th>
+                    <th className={nTh}>Order #</th>
+                    <th className={nTh}>SKU</th>
+                    <th className={nThNum}>Weight</th>
+                    <th className={nThNum}>Minutes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {timingList.rows.map((r) => (
+                    <tr key={r.eventId} className="hover:bg-hub-hover">
+                      <td className={cn(nTd, "whitespace-nowrap text-hub-muted")}>{fmtUtc(r.completedAtUtc)}</td>
+                      <td className={nTd}>{nameOf(r.staffId)}</td>
+                      <td className={nTd}>{PRODUCTION_DEPARTMENT_LABELS[r.workType as ProductionDepartment] ?? r.workType}</td>
+                      <td className={cn(nTd, "font-mono text-[12.5px]")}>#{r.orderNumber}</td>
+                      <td className={cn(nTd, "font-mono text-[12.5px]")}>{r.sku ?? "—"}</td>
+                      <td className={nTdNum}>{r.weight.toLocaleString()}</td>
+                      <td className={nTdNum}>{formatMinutes(r.durationMin)}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {timingList.rows.map((r) => (
-                      <tr key={r.eventId} className="border-t border-slate-100 dark:border-slate-800">
-                        <td className="px-4 py-2 text-xs whitespace-nowrap">{fmtUtc(r.completedAtUtc)}</td>
-                        <td className="px-3 py-2 text-xs">{nameOf(r.staffId)}</td>
-                        <td className="px-3 py-2 text-xs">{PRODUCTION_DEPARTMENT_LABELS[r.workType as ProductionDepartment] ?? r.workType}</td>
-                        <td className="px-3 py-2 font-mono text-xs">#{r.orderNumber}</td>
-                        <td className="px-3 py-2 font-mono text-xs">{r.sku ?? "--"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{r.weight.toLocaleString()}</td>
-                        <td className="px-4 py-2 text-right tabular-nums">{formatMinutes(r.durationMin)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : null}
-            {!timingList.complete ? (
-              <div className="px-4 py-2">
-                <Button variant="secondary" size="sm" onClick={() => pub.nextPage("timing")}>
-                  {timingList.started ? "Load more" : "Load timing observations"}
-                </Button>
-              </div>
-            ) : null}
-          </CardBody>
-        </Card>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {!timingList.complete ? (
+            <div className="pt-2.5">
+              <Button variant="secondary" size="sm" onClick={() => pub.nextPage("timing")}>
+                {timingList.started ? "Load more" : "Load timing observations"}
+              </Button>
+            </div>
+          ) : null}
+        </Section>
       ) : null}
 
-      <CollapsibleSection storageKey="live-completions" title="Live order completions">
-        <LiveOrderCompletionsCard />
-      </CollapsibleSection>
+      <LiveOrderCompletionsCard />
 
       <PackageUsageCard
         fromIso={pkgWindow.from.toISOString()}
@@ -1204,7 +1214,9 @@ function SupabaseReports() {
         rangeLabel={subtitleSuffix || "current range"}
       />
 
-      <PackagingAttentionCard fromIso={pkgWindow.from.toISOString()} toIso={pkgWindow.to.toISOString()} />
+      <div className="mt-[30px]">
+        <PackagingAttentionCard fromIso={pkgWindow.from.toISOString()} toIso={pkgWindow.to.toISOString()} />
+      </div>
 
       <PackageHistoryCard />
 
@@ -1217,38 +1229,77 @@ function SupabaseReports() {
  * Small subcomponents
  * ============================================================ */
 
-function KpiTile({
-  label,
-  value,
-  sub,
-}: {
+interface KpiCell {
   label: string;
+  icon: LucideIcon;
   value: string;
   sub?: string;
-}) {
-  return (
-    <Card>
-      <CardBody>
-        <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 font-semibold">
-          {label}
-        </div>
-        <div className="mt-1 text-2xl font-semibold tabular-nums">{value}</div>
-        {sub && <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{sub}</div>}
-      </CardBody>
-    </Card>
-  );
 }
 
-function Empty({ label }: { label: string }) {
-  return (
-    <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400 italic">
-      {label}
-    </div>
-  );
+const RANGE_PRESETS: { key: PresetRange; label: string }[] = [
+  { key: "today", label: "Today" },
+  { key: "7d", label: "Last 7 days" },
+  { key: "30d", label: "Last 30 days" },
+  { key: "custom", label: "Custom" },
+];
+
+/** Pill button / pill dropdown used in the filter bar. */
+const pill =
+  "inline-flex h-7 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 text-[13px] text-hub-muted shadow-[0_0_0_1px_rgb(var(--hub-line-2))] hover:bg-hub-hover hover:text-hub-text";
+const pillOn =
+  "bg-hub-accent-bg text-hub-text shadow-[0_0_0_1px_rgb(var(--hub-accent-text)/0.55)] hover:bg-hub-accent-bg";
+
+const CHART_TOOLTIP = {
+  fontSize: 12.5,
+  borderRadius: 8,
+  border: "1px solid rgb(var(--hub-line))",
+  background: "rgb(var(--hub-panel))",
+  boxShadow: "0 16px 40px var(--hub-shadow-2)",
+  color: "rgb(var(--hub-text))",
+};
+
+/** localStorage key for a section's open/closed state (same prefix as before). */
+function sectionKey(id: string): string {
+  return `inka-reports-collapse:${id}`;
+}
+
+/** Zero / empty KPI values render muted. */
+function isDimValue(v: string): boolean {
+  return /^(0|0h|—|--|0 items)$/.test(v.trim());
+}
+
+const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * "Nov 13 – Nov 19, 2026" from two YYYY-MM-DD production dates (no time
+ * zone conversion); the year is repeated only when it differs.
+ */
+export function formatRangeLabel(first: string, last: string): string {
+  const parse = (s: string) => {
+    const [y, m, d] = s.split("-").map(Number);
+    return { y, label: `${SHORT_MONTHS[m - 1]} ${d}` };
+  };
+  const a = parse(first);
+  const b = parse(last);
+  if (!a.label || !b.label || Number.isNaN(a.y) || Number.isNaN(b.y)) return `${first} → ${last}`;
+  if (first === last) return `${b.label}, ${b.y}`;
+  if (a.y === b.y) return `${a.label} – ${b.label}, ${b.y}`;
+  return `${a.label}, ${a.y} – ${b.label}, ${b.y}`;
+}
+
+/** "A3-FN" → A3 / FN, "PF A3-FN" → PF A3 / FN. Falls back to the whole key. */
+export function splitSizeVariant(key: string): { size: string; variant: string } {
+  const i = key.lastIndexOf("-");
+  if (i <= 0) return { size: key, variant: "" };
+  return { size: key.slice(0, i), variant: key.slice(i + 1) };
+}
+
+function Dash() {
+  return <span className="text-hub-faint">—</span>;
 }
 
 /* ============================================================
- * OrderLookupCard â€” search any order across all time
+ * OrderLookupCard — search any order across all time
  * ============================================================
  *
  * Standalone widget at the top of the Reports page. Lets owners /
@@ -1257,14 +1308,14 @@ function Empty({ label }: { label: string }) {
  * production_event ever logged against that order at the current
  * location. Useful for:
  *
- *   - "Did framing already touch this order?" â€” checks department chips
- *   - "Who dispatched it?" â€” first row in the timeline
- *   - "When did it move?" â€” chronological event log
+ *   - "Did framing already touch this order?" — checks department chips
+ *   - "Who dispatched it?" — first row in the timeline
+ *   - "When did it move?" — chronological event log
  *
  * Future: per-order notes (e.g. "framer flagged: customer changed mind,
  * cancel") will live alongside the event timeline. The placeholder
  * "Add note" button is wired but the order_notes table doesn't exist
- * yet â€” adding a note shows a "coming soon" toast.
+ * yet — adding a note shows a "coming soon" toast.
  */
 
 interface OrderEvent {
@@ -1444,180 +1495,160 @@ function OrderLookupCard({
     return null;
   }, [events]);
 
+  // Department trail: one step per department, oldest first, showing who
+  // last touched it there and when. Built only from the events above.
+  const trail = useMemo(() => {
+    if (!events || events.length === 0) return [];
+    const byDept = new Map<ProductionDepartment, { dept: ProductionDepartment; first: number; last: OrderEvent; done: boolean }>();
+    for (const ev of events) {
+      const ms = Date.parse(ev.created_at);
+      const cur = byDept.get(ev.department);
+      const done = ev.event_type === "completed" || ev.event_type === "dispatched" || ev.event_type === "line_verified";
+      if (!cur) {
+        byDept.set(ev.department, { dept: ev.department, first: ms, last: ev, done });
+      } else {
+        cur.first = Math.min(cur.first, ms);
+        if (ms > Date.parse(cur.last.created_at)) cur.last = ev;
+        cur.done = cur.done || done;
+      }
+    }
+    return Array.from(byDept.values()).sort((a, b) => a.first - b.first);
+  }, [events]);
+
+  const isOwner = !!author && auth.profile?.role === "owner";
+  const fmtWhen = (iso: string) => new Date(iso).toLocaleString(undefined, {
+    month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+  });
+  const nameFor = (id: string) => staffLookup.get(id)?.display_name ?? `User ${id.slice(0, 8)}`;
+
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center gap-2">
-          <ClipboardList size={16} className="text-slate-600 dark:text-slate-400" />
-          <CardTitle>Order lookup</CardTitle>
-        </div>
-        <span className="text-xs text-slate-500 dark:text-slate-400">
-          Search any order to see which departments interacted with it. Accepts the 6-digit scanner code or the full 10XXXXXX Shopify number.
-        </span>
-      </CardHeader>
-      <CardBody className="space-y-3">
-        <form
-          data-lookup-form="1"
-          onSubmit={(e) => {
-            e.preventDefault();
-            runSearch();
-          }}
-          className="flex flex-wrap items-center gap-2"
-        >
-          <div className="relative flex-1 min-w-[220px] max-w-md">
-            <Search
-              size={14}
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none"
-            />
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="e.g. 10190203 or 190203"
-              className="h-9 w-full rounded-md border border-slate-300 bg-white pl-8 pr-3 text-sm shadow-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 font-mono"
-              autoComplete="off"
-            />
-          </div>
-          <Button type="submit" variant="primary" size="sm" disabled={loading}>
-            {loading ? "Searching..." : "Search"}
-          </Button>
-          {(searched || input) && (
+    <div className="mt-7">
+      <form
+        data-lookup-form="1"
+        onSubmit={(e) => {
+          e.preventDefault();
+          runSearch();
+        }}
+      >
+        <label className="flex h-[46px] items-center gap-2.5 rounded-[10px] border border-hub-line bg-hub-fill pl-3.5 pr-1.5 transition-colors focus-within:border-hub-accent-text focus-within:bg-hub-panel">
+          <Search size={16} strokeWidth={1.6} className="shrink-0 text-hub-faint" aria-hidden />
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Look up an order…"
+            aria-label="Order number"
+            className="min-w-0 flex-1 bg-transparent text-[15px] text-hub-text outline-none placeholder:text-hub-faint"
+            autoComplete="off"
+          />
+          {(searched || input) && !loading ? (
             <button
               type="button"
               onClick={reset}
-              className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 underline"
+              className="rounded px-1.5 py-0.5 text-[12.5px] text-hub-muted hover:bg-hub-fill-2 hover:text-hub-text"
             >
               Clear
             </button>
+          ) : null}
+          {loading ? (
+            <span className="px-1.5 text-[12.5px] text-hub-faint">Searching…</span>
+          ) : (
+            <kbd className="mr-1.5 rounded px-1.5 py-px font-mono text-[11px] text-hub-faint shadow-[0_0_0_1px_rgb(var(--hub-line-2))]">Enter</kbd>
           )}
-        </form>
+          {/* Enter submits; this keeps a real submit control for assistive tech. */}
+          <button type="submit" className="sr-only" disabled={loading}>Search</button>
+        </label>
+      </form>
+      <div className="mx-0.5 mt-2 text-[12.5px] text-hub-faint">
+        See which departments touched an order. Accepts the 6-digit scanner code{" "}
+        <code className="rounded bg-hub-fill px-[5px] font-mono text-xs text-hub-muted">190203</code> or the full Shopify number{" "}
+        <code className="rounded bg-hub-fill px-[5px] font-mono text-xs text-hub-muted">10190203</code>.
+      </div>
 
-        {error ? (
-          <div className="text-xs text-rose-700 bg-rose-50 ring-1 ring-rose-200 rounded px-2 py-1.5 dark:bg-rose-900/20 dark:text-rose-300 dark:ring-rose-800">
-            {error}
+      {error ? (
+        <div className="mx-0.5 mt-2 text-[13px] text-hub-warn" role="alert">{error}</div>
+      ) : null}
+
+      {searched && events !== null && !loading ? (
+        <div className="mt-2.5 space-y-3 rounded-hub-card border border-hub-line px-4 py-3.5">
+          {/* Header row: order # + status (+ item count) */}
+          <div className="flex flex-wrap items-center gap-2.5">
+            <b className="font-semibold text-hub-text">Order #{searched}</b>
+            {events.length === 0 ? (
+              <Tag color="yellow">Not started</Tag>
+            ) : orderStatus ? (
+              <Tag color={statusColor(orderStatus)}>{orderStatus}</Tag>
+            ) : null}
+            {orderCounts && "unavailable" in orderCounts ? (
+              <span title="The order's history could not be confirmed complete, so no item count is shown.">
+                <Tag color="yellow">item count unavailable (incomplete read)</Tag>
+              </span>
+            ) : orderCounts ? (
+              <span title="Verified pieces across all work types: a piece verified at two stations counts at both.">
+                <Tag>
+                  {fmtItems(orderCounts.normal)} item{orderCounts.normal === 1 ? "" : "s"} processed
+                  {(orderCounts.rework ?? 0) > 0 ? ` · ${fmtItems(orderCounts.rework)} rework` : ""}
+                  {orderCounts.incomplete ? " · incomplete detail" : ""}
+                </Tag>
+              </span>
+            ) : null}
           </div>
-        ) : null}
 
-{searched && events !== null && !loading ? (
-          events.length === 0 ? (
-            <div className="space-y-3">
-              {/* Header row: order # + Not started status */}
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-sm font-semibold">
-                  #{searched}
-                </span>
-                <span className="inline-flex items-center rounded-full bg-amber-500 text-white text-[11px] font-medium px-2 py-0.5">
-                  Not started
-                </span>
-                <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Departments:
-                </span>
-                <span className="text-[11px] italic text-slate-400">none</span>
-              </div>
+          {/* Department trail */}
+          {trail.length === 0 ? (
+            <div className="text-[13px] text-hub-faint">No departments have touched this order yet.</div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-y-1.5">
+              {trail.map((s, i) => (
+                <div key={s.dept} className="flex items-center text-[13px] text-hub-muted">
+                  {i > 0 ? <span aria-hidden className="mx-2 h-px w-7 bg-hub-line-2" /> : null}
+                  <span aria-hidden className={cn("mr-2 h-2 w-2 rounded-full", s.done ? "bg-hub-accent-text" : "bg-hub-warn")} />
+                  <span>
+                    <span className="text-hub-text">{PRODUCTION_DEPARTMENT_LABELS[s.dept] ?? s.dept}</span>
+                    {" · "}{nameFor(s.last.staff_id)}{" · "}{fmtWhen(s.last.created_at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
 
-              {/* Notes panel - works without any production_events */}
-              <OrderNotesPanel
-                supabase={supabase}
-                location={location}
-                orderNumber={searched}
-                author={author}
-                variant="compact"
-              />
+          {/* Order notes (works without any production_events) */}
+          <OrderNotesPanel
+            supabase={supabase}
+            location={location}
+            orderNumber={searched}
+            author={author}
+            variant="compact"
+          />
 
-              <div className="text-xs text-slate-500 dark:text-slate-400 italic">
-                No production events yet at this location. Add a note above to
-                flag this order for whoever picks it up next.
-              </div>
+          {events.length === 0 ? (
+            <div className="text-[13px] text-hub-faint">
+              No production events yet at this location. Add a note above to
+              flag this order for whoever picks it up next.
             </div>
           ) : (
-            <div className="space-y-3">
-              {/* Header row: order # + status + dept chips */}
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono text-sm font-semibold">
-                  #{searched}
-                </span>
-                {orderCounts && "unavailable" in orderCounts ? (
-                  <span
-                    className="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 rounded-full px-2 py-0.5"
-                    title="The order's history could not be confirmed complete, so no item count is shown."
-                  >
-                    item count unavailable (incomplete read)
-                  </span>
-                ) : orderCounts ? (
-                  <span
-                    className="text-xs text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 rounded-full px-2 py-0.5"
-                    title="Verified pieces across all work types: a piece verified at two stations counts at both."
-                  >
-                    {fmtItems(orderCounts.normal)} item{orderCounts.normal === 1 ? "" : "s"} processed
-                    {(orderCounts.rework ?? 0) > 0 ? ` · ${fmtItems(orderCounts.rework)} rework` : ""}
-                    {orderCounts.incomplete ? " · incomplete detail" : ""}
-                  </span>
-                ) : null}
-                {orderStatus ? (
-                  <span
-                    className={
-                      orderStatus.startsWith("Dispatched")
-                        ? "inline-flex items-center rounded-full bg-emerald-600 text-white text-[11px] font-medium px-2 py-0.5"
-                        : orderStatus.startsWith("Scrapped")
-                        ? "inline-flex items-center rounded-full bg-rose-600 text-white text-[11px] font-medium px-2 py-0.5"
-                        : orderStatus.startsWith("Completed")
-                        ? "inline-flex items-center rounded-full bg-indigo-600 text-white text-[11px] font-medium px-2 py-0.5"
-                        : "inline-flex items-center rounded-full bg-amber-500 text-white text-[11px] font-medium px-2 py-0.5"
-                    }
-                  >
-                    {orderStatus}
-                  </span>
-                ) : null}
-                <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Departments:
-                </span>
-                {touchedDepartments.size === 0 ? (
-                  <span className="text-[11px] italic text-slate-400">none</span>
-                ) : (
-                  Array.from(touchedDepartments).map((d) => (
-                    <span
-                      key={d}
-                      className="inline-flex items-center rounded-full bg-slate-100 text-slate-800 text-[11px] font-medium px-2 py-0.5 dark:bg-slate-800 dark:text-slate-200 ring-1 ring-slate-200 dark:ring-slate-700"
-                    >
-                      {PRODUCTION_DEPARTMENT_LABELS[d]}
-                    </span>
-                  ))
-                )}
-                </div>
-
-              {/* Order notes */}
-              <OrderNotesPanel
-                supabase={supabase}
-                location={location}
-                orderNumber={searched}
-                author={author}
-                variant="compact"
-              />
-
+            <>
               {/* F7: who framed it, as recorded at shared-scanner dispatch */}
               {framersError ? (
-                <div className="text-xs text-rose-700 dark:text-rose-300">Couldn't load framer attribution: {framersError}</div>
+                <div className="text-xs text-hub-bad">Couldn't load framer attribution: {framersError}</div>
               ) : null}
               {framers && framers.length > 0 ? (
-                <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2" data-testid="framer-attribution">
-                  <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Framed by (recorded at dispatch)</div>
+                <div className="rounded-hub border border-hub-line px-3 py-2" data-testid="framer-attribution">
+                  <div className="mb-1 text-[12.5px] font-medium text-hub-muted">Framed by (recorded at dispatch)</div>
                   <ul className="space-y-0.5 text-sm">
                     {framers.map((f) => (
                       <li key={`${f.dispatch_event_id}|${f.sku}`} className="flex flex-wrap items-center gap-2">
                         <span className="font-mono text-xs">{f.sku}</span>
                         <span className="font-medium">{f.display_name}</span>
                         {f.source === "manual" ? (
-                          <span className="inline-flex items-center rounded-full bg-amber-100 text-amber-800 ring-1 ring-amber-200 text-[11px] font-semibold px-2 py-0.5 dark:bg-amber-900/30 dark:text-amber-200 dark:ring-amber-800"
-                            title="Chosen by the dispatcher; no framing scan exists, so it adds no framing time or credit">
-                            Manual
+                          <span title="Chosen by the dispatcher; no framing scan exists, so it adds no framing time or credit">
+                            <Tag color="yellow">Manual</Tag>
                           </span>
                         ) : (
-                          <span className="text-emerald-700 dark:text-emerald-300 text-xs" title="Measured: framing verification and completion scans">✓ scanned</span>
+                          <span className="text-xs text-hub-accent-text" title="Measured: framing verification and completion scans">✓ scanned</span>
                         )}
                         {f.source === "manual" ? (
-                          <span className="text-[11px] text-slate-500">
-                            chosen by {staffLookup.get(f.dispatcher_id)?.display_name ?? `User ${f.dispatcher_id.slice(0, 8)}`}
-                          </span>
+                          <span className="text-[11px] text-hub-faint">chosen by {nameFor(f.dispatcher_id)}</span>
                         ) : null}
                       </li>
                     ))}
@@ -1625,93 +1656,73 @@ function OrderLookupCard({
                 </div>
               ) : null}
 
-              {/* Timeline */}
-              <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 overflow-hidden">
-
-                <table className="w-full text-sm">
-                  <thead className="bg-slate-50 dark:bg-slate-900/60 text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400">
+              {/* Full event timeline */}
+              <div className={nTableWrap}>
+                <table className={nTable}>
+                  <thead>
                     <tr>
-                      <th className="text-left px-3 py-1.5 font-medium">When</th>
-                      <th className="text-left px-3 py-1.5 font-medium">Who</th>
-                      <th className="text-left px-3 py-1.5 font-medium">Department</th>
-                      <th className="text-left px-3 py-1.5 font-medium">Event</th>
-                      <th className="text-left px-3 py-1.5 font-medium">Note</th>
-                      {author && auth.profile?.role === "owner" ? (
-                        <th className="text-right px-3 py-1.5 font-medium w-px">Remove</th>
-                      ) : null}
+                      <th className={nTh}>When</th>
+                      <th className={nTh}>Who</th>
+                      <th className={nTh}>Department</th>
+                      <th className={nTh}>Event</th>
+                      <th className={nTh}>Note</th>
+                      {isOwner ? <th className={cn(nThNum, "w-px")}>Remove</th> : null}
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                    {events.map((ev) => {
-                      const who =
-                        staffLookup.get(ev.staff_id)?.display_name ??
-                        `User ${ev.staff_id.slice(0, 8)}`;
-                      const when = new Date(ev.created_at).toLocaleString(
-                        undefined,
-                        {
-                          month: "short",
-                          day: "numeric",
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        },
-                      );
-                      const eventPill =
-                        ev.event_type === "dispatched"
-                          ? "bg-emerald-100 text-emerald-800 ring-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-200 dark:ring-emerald-800"
-                          : ev.event_type === "completed"
-                          ? "bg-indigo-100 text-indigo-800 ring-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-200 dark:ring-indigo-800"
-                          : ev.event_type === "started"
-                          ? "bg-amber-100 text-amber-800 ring-amber-200 dark:bg-amber-900/30 dark:text-amber-200 dark:ring-amber-800"
-                          : "bg-rose-100 text-rose-800 ring-rose-200 dark:bg-rose-900/30 dark:text-rose-200 dark:ring-rose-800";
-                      return (
-                        <tr key={ev.id}>
-                          <td className="px-3 py-1.5 text-xs text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                            {when}
-                          </td>
-                          <td className="px-3 py-1.5 text-xs text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                            {who}
-                          </td>
-                          <td className="px-3 py-1.5 text-xs text-slate-700 dark:text-slate-300 whitespace-nowrap">
-                            {PRODUCTION_DEPARTMENT_LABELS[ev.department] ?? ev.department}
-                          </td>
-                          <td className="px-3 py-1.5">
-                            <span
-                              className={
-                                "inline-flex items-center rounded-full text-[11px] font-medium px-2 py-0.5 ring-1 " +
-                                eventPill
-                              }
+                  <tbody>
+                    {events.map((ev) => (
+                      <tr key={ev.id} className="hover:bg-hub-hover">
+                        <td className={cn(nTd, "whitespace-nowrap tabular-nums text-hub-muted")}>{fmtWhen(ev.created_at)}</td>
+                        <td className={cn(nTd, "whitespace-nowrap")}>{nameFor(ev.staff_id)}</td>
+                        <td className={cn(nTd, "whitespace-nowrap")}>
+                          {PRODUCTION_DEPARTMENT_LABELS[ev.department] ?? ev.department}
+                        </td>
+                        <td className={nTd}>
+                          <Tag color={eventColor(ev.event_type)}>{ev.event_type}</Tag>
+                        </td>
+                        <td className={cn(nTd, "max-w-[260px] truncate text-hub-muted")} title={ev.note ?? ""}>
+                          {ev.note?.trim() ? ev.note : <span className="text-hub-faint">—</span>}
+                        </td>
+                        {isOwner ? (
+                          <td className={cn(nTd, "whitespace-nowrap text-right")}>
+                            <button
+                              type="button"
+                              onClick={() => void deleteEvent(ev.id)}
+                              disabled={deletingId === ev.id}
+                              title="Remove this event from the order history"
+                              aria-label="Remove this event from the order history"
+                              className="inline-flex h-7 w-7 items-center justify-center rounded-hub text-hub-bad hover:bg-hub-bad-bg disabled:cursor-not-allowed disabled:opacity-40"
                             >
-                              {ev.event_type}
-                            </span>
+                              <Trash2 size={14} />
+                            </button>
                           </td>
-                          <td className="px-3 py-1.5 text-xs text-slate-600 dark:text-slate-400 max-w-[260px] truncate" title={ev.note ?? ""}>
-                            {ev.note?.trim() ? ev.note : <span className="italic text-slate-400">--</span>}
-                          </td>
-                          {author && auth.profile?.role === "owner" ? (
-                            <td className="px-3 py-1.5 text-right whitespace-nowrap">
-                              <button
-                                type="button"
-                                onClick={() => void deleteEvent(ev.id)}
-                                disabled={deletingId === ev.id}
-                                title="Remove this event from the order history"
-                                className="inline-flex items-center justify-center h-7 w-7 rounded-md text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
-                              >
-                                <Trash2 size={14} />
-                              </button>
-                            </td>
-                          ) : null}
-                        </tr>
-                      );
-                    })}
+                        ) : null}
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
-            </div>
-          )
-        ) : null}
-      </CardBody>
-    </Card>
+            </>
+          )}
+        </div>
+      ) : null}
+    </div>
   );
+}
+
+function statusColor(status: string): TagColor {
+  if (status.startsWith("Dispatched")) return "green";
+  if (status.startsWith("Scrapped")) return "pink";
+  if (status.startsWith("Completed")) return "blue";
+  return "yellow";
+}
+
+function eventColor(t: OrderEvent["event_type"]): TagColor {
+  if (t === "dispatched") return "green";
+  if (t === "completed") return "blue";
+  if (t === "started") return "yellow";
+  if (t === "cancelled") return "pink";
+  return "gray";
 }
 
 /* ============================================================
@@ -1768,131 +1779,67 @@ function StaffProductivityChart({ staffName, daily, totals }: StaffProductivityP
     return { totalOrders, totalItems, avgOrders, bestDay, highestItemsDay, stdev, weekendPct };
   }, [rows, totals]);
 
+  const cells: Array<[string, string, string?]> = [
+    ["Total orders", summary.totalOrders.toLocaleString()],
+    ["Total items", fmtItems(summary.totalItems)],
+    ["Avg / day worked", summary.avgOrders.toFixed(1), "orders"],
+    ["Best day", String(summary.bestDay.orders), `orders${summary.bestDay.dayLabel !== "-" ? " · " + summary.bestDay.dayLabel : ""}`],
+  ];
+  const axisTick = { fontSize: 11, fill: "rgb(var(--hub-faint))" };
+
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{staffName} - daily productivity</CardTitle>
-        <span className="text-xs text-slate-500 dark:text-slate-400">
-          Orders + items per production day (04:00 to 04:00 site time). Range totals count each order once.
-        </span>
-      </CardHeader>
-      <CardBody className="space-y-3">
-        {/* KPI tiles */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Total orders</div>
-            <div className="text-xl font-bold tabular-nums">{summary.totalOrders.toLocaleString()}</div>
-          </div>
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Total items</div>
-            <div className="text-xl font-bold tabular-nums">{fmtItems(summary.totalItems)}</div>
-          </div>
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Avg / day worked</div>
-            <div className="text-xl font-bold tabular-nums">{summary.avgOrders.toFixed(1)}</div>
-            <div className="text-[10px] text-slate-500">orders</div>
-          </div>
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Best day</div>
-            <div className="text-xl font-bold tabular-nums">{summary.bestDay.orders}</div>
-            <div className="text-[10px] text-slate-500">orders {summary.bestDay.dayLabel !== "-" ? "· " + summary.bestDay.dayLabel : ""}</div>
-          </div>
+    <Section
+      title={`${staffName} · daily productivity`}
+      navLabel="Daily productivity"
+      subtitle="Orders and items per production day (04:00 to 04:00 site time). Range totals count each order once."
+      storageKey="inka-reports-collapse:staff-daily"
+      actions={
+        <div className="flex gap-3.5 text-xs text-hub-muted">
+          <span className="inline-flex items-center gap-1.5"><i aria-hidden className="inline-block h-2 w-2 rounded-sm bg-hub-accent-text" />Orders</span>
+          <span className="inline-flex items-center gap-1.5"><i aria-hidden className="inline-block h-2 w-2 rounded-sm bg-hub-info opacity-70" />Items</span>
         </div>
+      }
+    >
+      <div className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-hub-line bg-hub-line md:grid-cols-4">
+        {cells.map(([label, value, sub]) => (
+          <div key={label} className="bg-hub-page px-4 py-3">
+            <div className="text-[12.5px] text-hub-muted">{label}</div>
+            <div className="mt-0.5 text-xl font-semibold tabular-nums text-hub-text">{value}</div>
+            <div className="text-xs text-hub-faint">{sub ?? " "}</div>
+          </div>
+        ))}
+      </div>
 
-        {/* Chart */}
-        <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 p-3">
-          <div className="flex items-center gap-3 text-[11px] text-slate-500 mb-2">
-            <span className="inline-flex items-center gap-1.5"><span className="inline-block w-2.5 h-2.5 rounded-full bg-hub-accent-text" />Orders</span>
-            <span className="inline-flex items-center gap-1.5"><span className="inline-block w-3 border-t-2 border-dashed border-[#64748b]" />Items</span>
-          </div>
-          <div className="text-hub-accent-text" style={{ width: "100%", height: 260 }}>
-            <ResponsiveContainer>
-              <LineChart data={rows} margin={{ top: 4, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke="#e2e8f0" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="dayLabel" tick={{ fontSize: 10, fill: "#64748b" }} axisLine={{ stroke: "#e2e8f0" }} tickLine={false} />
-                <YAxis yAxisId="orders" orientation="left" tick={{ fontSize: 10, fill: "#64748b" }} axisLine={{ stroke: "#e2e8f0" }} tickLine={false} width={30} />
-                <YAxis yAxisId="items" orientation="right" tick={{ fontSize: 10, fill: "#94a3b8" }} axisLine={{ stroke: "#e2e8f0" }} tickLine={false} width={30} />
-                <Tooltip
-                  contentStyle={{ fontSize: 12, borderRadius: 6, border: "1px solid #e2e8f0" }}
-                  labelStyle={{ fontWeight: 600 }}
-                />
-                <Line yAxisId="orders" type="monotone" dataKey="orders" stroke="currentColor" strokeWidth={2} dot={{ r: 2 }} activeDot={{ r: 4 }} name="Orders" isAnimationActive={false} />
-                <Line yAxisId="items" type="monotone" dataKey="items" stroke="#64748b" strokeWidth={2} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} name="Items" isAnimationActive={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
+      <div className="mt-4" style={{ width: "100%", height: 260 }}>
+        <ResponsiveContainer>
+          <LineChart data={rows} margin={{ top: 4, right: 4, left: 0, bottom: 0 }} style={{ fontFamily: "inherit" }}>
+            <CartesianGrid stroke="rgb(var(--hub-line))" vertical={false} />
+            <XAxis dataKey="dayLabel" tick={axisTick} axisLine={{ stroke: "rgb(var(--hub-line))" }} tickLine={false} />
+            <YAxis yAxisId="orders" orientation="left" tick={axisTick} axisLine={false} tickLine={false} width={30} />
+            <YAxis yAxisId="items" orientation="right" tick={axisTick} axisLine={false} tickLine={false} width={30} />
+            <Tooltip
+              contentStyle={CHART_TOOLTIP}
+              labelStyle={{ fontWeight: 600, color: "rgb(var(--hub-text))" }}
+              itemStyle={{ color: "rgb(var(--hub-muted))" }}
+            />
+            <Line yAxisId="orders" type="monotone" dataKey="orders" stroke="rgb(var(--hub-accent-text))" strokeWidth={1.75} dot={{ r: 2 }} activeDot={{ r: 4 }} name="Orders" isAnimationActive={false} />
+            <Line yAxisId="items" type="monotone" dataKey="items" stroke="rgb(var(--hub-info))" strokeOpacity={0.8} strokeWidth={1.75} strokeDasharray="4 3" dot={{ r: 2 }} activeDot={{ r: 4 }} name="Items" isAnimationActive={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
 
-        {/* Breakdown cells */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px]">
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2 bg-slate-50/50 dark:bg-slate-900/40">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Highest items in a day</div>
-            <div className="text-sm font-semibold mt-0.5">
-              {summary.highestItemsDay.items} items
-              {summary.highestItemsDay.dayLabel !== "-" ? <span className="font-normal text-slate-500"> on {summary.highestItemsDay.dayLabel}</span> : null}
-            </div>
+      <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+        {([
+          ["Highest items in a day", <>{summary.highestItemsDay.items} items{summary.highestItemsDay.dayLabel !== "-" ? <span className="font-normal text-hub-muted"> on {summary.highestItemsDay.dayLabel}</span> : null}</>],
+          ["Consistency (7d stdev)", <>&plusmn;{summary.stdev.toFixed(1)} orders/day</>],
+          ["Weekend contribution", <>{summary.weekendPct.toFixed(0)}% of items</>],
+        ] as Array<[string, ReactNode]>).map(([label, value]) => (
+          <div key={label} className="rounded-hub bg-hub-fill px-3.5 py-2.5">
+            <div className="text-[12.5px] text-hub-muted">{label}</div>
+            <div className="mt-0.5 text-sm font-semibold text-hub-text">{value}</div>
           </div>
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2 bg-slate-50/50 dark:bg-slate-900/40">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Consistency (7d stdev)</div>
-            <div className="text-sm font-semibold mt-0.5">
-              &plusmn;{summary.stdev.toFixed(1)} orders/day
-            </div>
-          </div>
-          <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2 bg-slate-50/50 dark:bg-slate-900/40">
-            <div className="text-[10px] uppercase tracking-wide text-slate-500 font-semibold">Weekend contribution</div>
-            <div className="text-sm font-semibold mt-0.5">
-              {summary.weekendPct.toFixed(0)}% of items
-            </div>
-          </div>
-        </div>
-      </CardBody>
-    </Card>
-  );
-}
-
-/* ============================================================
- * Collapsible section wrapper for Reports subsections
- * ============================================================ */
-
-function CollapsibleSection({
-  storageKey, title, defaultOpen = true, children,
-}: {
-  storageKey: string;
-  title: string;
-  defaultOpen?: boolean;
-  children: React.ReactNode;
-}) {
-  const [open, setOpen] = useState<boolean>(() => {
-    try {
-      const raw = window.localStorage.getItem(`inka-reports-collapse:${storageKey}`);
-      if (raw === "0") return false;
-      if (raw === "1") return true;
-    } catch {}
-    return defaultOpen;
-  });
-  const toggle = () => {
-    setOpen((o) => {
-      const next = !o;
-      try { window.localStorage.setItem(`inka-reports-collapse:${storageKey}`, next ? "1" : "0"); } catch {}
-      return next;
-    });
-  };
-  return (
-    <div data-report-section={title} className="rounded-xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900/40 overflow-hidden">
-      <button
-        type="button"
-        onClick={toggle}
-        className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition text-left"
-        aria-expanded={open}
-      >
-        <span className="text-sm font-semibold">{title}</span>
-        {open ? <ChevronDown size={16} className="text-slate-500" /> : <ChevronRight size={16} className="text-slate-500" />}
-      </button>
-      {open ? (
-        <div className="border-t border-slate-200 dark:border-slate-800">
-          {children}
-        </div>
-      ) : null}
-    </div>
+        ))}
+      </div>
+    </Section>
   );
 }

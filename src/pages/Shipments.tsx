@@ -1373,7 +1373,7 @@ function ShipmentFormModal({
   /** When provided, shows Archive/Restore. Only passed for shipments in
       a terminal state (Delivered or Cancelled). */
   onToggleArchive?: () => void;
-  /** Active location key â€” used by Accounts attachments + queries. */
+  /** Active location key — used by Accounts attachments + queries. */
   location: string;
   /** Owner-only: invoice/payment data for this shipment. */
   accountsRow?: ShipmentAccounts;

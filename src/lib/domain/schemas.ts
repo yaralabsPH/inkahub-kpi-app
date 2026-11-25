@@ -9,15 +9,15 @@ export const UnitOfSale = z.enum(["each", "case"]);
 
 /**
  * High-level category telling the UI how to treat a SKU:
- *   product    ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â finished goods sold to customers. Shows up in Sales
- *                Entry, Order builder, Shopping list ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â everywhere.
+ *   product    — finished goods sold to customers. Shows up in Sales
+ *                Entry, Order builder, Shopping list — everywhere.
  *                Default for backward compatibility.
- *   consumable ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â used in production but never sold (ink cartridges,
+ *   consumable — used in production but never sold (ink cartridges,
  *                paper rolls, mouldings, backing boards). Excluded from
  *                Sales Entry; still tracked for reorder & warehouse.
- *   packaging  ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â fulfillment supplies (boxes, bubble wrap, tape, corner
+ *   packaging  — fulfillment supplies (boxes, bubble wrap, tape, corner
  *                protectors). Behaves like consumable for the UI.
- *   service    ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â non-physical line items (printing fee, expedited
+ *   service    — non-physical line items (printing fee, expedited
  *                shipping). Tracked for reporting but not inventory.
  *
  * Adding a new type is one entry here + (optionally) one new branch in
@@ -47,10 +47,10 @@ export const SALEABLE_PRODUCT_TYPES = new Set<ProductTypeKey>(["product"]);
 /**
  * Derive the department for a product from its supplier field.
  *
- *   supplier === "UNFRAMED" (case-insensitive, trimmed) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "unframed"
- *   anything else (CHINA, blank, unknown)               ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "framed"
+ *   supplier === "UNFRAMED" (case-insensitive, trimmed) → "unframed"
+ *   anything else (CHINA, blank, unknown)               → "framed"
  *
- * Avoids needing a dedicated `department` column on Product ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the supplier
+ * Avoids needing a dedicated `department` column on Product — the supplier
  * is already the source of truth for which side of the business handles it.
  */
 export function productDepartment(p: { supplier?: string | null }): "framed" | "unframed" {
@@ -58,12 +58,12 @@ export function productDepartment(p: { supplier?: string | null }): "framed" | "
 }
 
 /**
- * Three-way production-department routing for a product (no dispatch ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â
+ * Three-way production-department routing for a product (no dispatch —
  * dispatch is order-level, not line-level):
  *
- *   unframed prints ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "unframed"
- *   framed A0       ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "a0_framed"  (own bench by business rule)
- *   framed other    ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "framed"
+ *   unframed prints → "unframed"
+ *   framed A0       → "a0_framed"  (own bench by business rule)
+ *   framed other    → "framed"
  *
  * Used on the Production page to filter which Shopify line items show on
  * each department's tablet. A bench worker on the "framed" bench only
@@ -137,8 +137,8 @@ export const ProductSchema = z.object({
   safety_stock_pct: z.number().nonnegative().default(100),
   /**
    * Target weeks of cover used by the Order builder to size the "Suggested"
-   * quantity (targetStock = weekly_avg ÃƒÆ’Ã†â€™— this). Does NOT drive Reorder /
-   * Critical alerts ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â those come from safety_stock_pct (Reorder) and
+   * quantity (targetStock = weekly_avg × this). Does NOT drive Reorder /
+   * Critical alerts — those come from safety_stock_pct (Reorder) and
    * lead_time_days (Critical). Default 21. Accepts null on input (older
    * backups stored it that way) and coerces to 21 on parse.
    */
@@ -154,7 +154,7 @@ export const ProductSchema = z.object({
   display_order: z.number().default(0),
   notes: z.string().default(""),
   /**
-   * Carton-pack info ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â how many units fit in one outer carton, plus carton
+   * Carton-pack info — how many units fit in one outer carton, plus carton
    * dimensions (cm). When all four are set we can compute CBM (cubic
    * metres) for any order quantity, which the order builder uses to show
    * a live container-fill stat. All four are optional; leave blank if the
@@ -179,7 +179,7 @@ export type Product = z.infer<typeof ProductSchema>;
  * Returns null when any of the four carton fields are missing.
  *
  * Mirrors the spreadsheet formula:
- *   cbm = (L ÃƒÆ’Ã†â€™— W ÃƒÆ’Ã†â€™— H / 1_000_000) ÃƒÆ’Ã†â€™— (qty / units_per_carton)
+ *   cbm = (L × W × H / 1_000_000) × (qty / units_per_carton)
  */
 export function computeCbm(
   p: Pick<Product, "carton_units" | "carton_length_cm" | "carton_width_cm" | "carton_height_cm">,
@@ -202,7 +202,7 @@ export function shortCode(p: Pick<Product, "size" | "colour" | "short_code">): s
  * Compute the effective safety-stock floor in units for a given SKU and its
  * current weekly-average demand.
  *
- * The `safety_stock_pct` field is authoritative ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â including when the user
+ * The `safety_stock_pct` field is authoritative — including when the user
  * sets it to 0 (which means "no safety floor"). The legacy
  * `safety_stock_units` is only consulted when `safety_stock_pct` is missing
  * entirely (pre-migration records that haven't been written through the
@@ -246,7 +246,7 @@ export const WeeklyEntrySchema = z.object({
   entered_by: z.string().default("system"),
   /**
    * Orders contributed by each Shopify weekly-report import, keyed by size
-   * (e.g. { A0: 73, A1: 133 }). Used to keep imports idempotent ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â re-running
+   * (e.g. { A0: 73, A1: 133 }). Used to keep imports idempotent — re-running
    * the same size replaces the previous contribution rather than adding to it.
    * The week's `total_orders` is whatever manual value the user typed, plus
    * the sum of these contributions.
@@ -288,7 +288,7 @@ export const IncomingShipmentSchema = z
     notes: z.string().default(""),
     /** Optional production lead (factory time) in days. */
     production_days: z.number().int().nonnegative().nullable().default(null),
-    /** Optional planned ship-out date ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â when goods physically leave factory. */
+    /** Optional planned ship-out date — when goods physically leave factory. */
     estimated_ship_date: IsoDate.nullable().default(null),
     /** Days for customs / clearance after arrival into region. Default 0. */
     customs_days: z.number().int().nonnegative().default(0),
@@ -297,14 +297,14 @@ export const IncomingShipmentSchema = z
      * credited to product `current_on_hand`. Set automatically by the
      * repository when status transitions to "Delivered"; cleared when
      * status moves away from Delivered. The presence of this field is
-     * the idempotency guard ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â we never double-credit and never reverse
+     * the idempotency guard — we never double-credit and never reverse
      * a credit that didn't fire (e.g. legacy shipments marked Delivered
      * before auto-credit existed will be silently caught on next save).
      */
     inventory_applied_at: IsoDateTime.nullable().default(null),
     /**
      * When true, this shipment is hidden from the default Kanban + List
-     * views. Only set on terminal states (Delivered / Cancelled) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â the
+     * views. Only set on terminal states (Delivered / Cancelled) — the
      * archive button is gated client-side so it's never offered on a
      * shipment that still needs work. Toggleable: setting back to false
      * brings the shipment back into the active view. The "Show archived"
@@ -329,15 +329,15 @@ export function shipmentTotalUnits(s: IncomingShipment): number {
 // ---------- Order templates (reusable line-ups) ----------
 
 /**
- * A saved order layout the user can reload later ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â supplier + a map of
- * product IDs ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ quantities + the shipping/customs presets. Lives on
+ * A saved order layout the user can reload later — supplier + a map of
+ * product IDs → quantities + the shipping/customs presets. Lives on
  * `GlobalSettings.order_templates`.
  */
 export const OrderTemplateSchema = z.object({
   id: Id,
   name: z.string().min(1),
   supplier: z.string().min(1),
-  /** productId ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ quantity. Quantities are pre-rounding, the modal will round on apply. */
+  /** productId → quantity. Quantities are pre-rounding, the modal will round on apply. */
   lines: z.record(z.string(), z.number().int().nonnegative()),
   production_days: z.number().int().nonnegative().nullable().default(null),
   customs_days: z.number().int().nonnegative().default(0),
@@ -396,7 +396,7 @@ export type StorageLayout = z.infer<typeof StorageLayoutSchema>;
 
 /**
  * Why an inventory movement happened. The set is deliberately small and
- * generic ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â specifics live in `source_id` (a back-reference to the
+ * generic — specifics live in `source_id` (a back-reference to the
  * originating event) and `note` (free text).
  */
 export const LedgerReasonSchema = z.enum([
@@ -409,16 +409,16 @@ export const LedgerReasonSchema = z.enum([
   "initial",      // First time a product is created with a non-zero on-hand
   "import",       // Bulk import from JSON / CSV / XLSX
   "bom",          // Future: cascading deduction from a parent SKU's recipe
-  "replacement",  // CS Cases replacement send-out ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â excluded from sales/revenue math
-  "return",       // CS Return restock credit ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â excluded from sales/revenue math
+  "replacement",  // CS Cases replacement send-out — excluded from sales/revenue math
+  "return",       // CS Return restock credit — excluded from sales/revenue math
 ]);
 export type LedgerReason = z.infer<typeof LedgerReasonSchema>;
 
 /**
  * Append-only inventory movement. Stored per location (same Dexie DB as
  * the rest of the catalog). `delta` is signed: positive = inbound,
- * negative = outbound. Computed on-hand for a product is `ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â£ delta` across
- * all ledger rows for it. Reversal is *not* destructive ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â it's a new row
+ * negative = outbound. Computed on-hand for a product is `Σ delta` across
+ * all ledger rows for it. Reversal is *not* destructive — it's a new row
  * with the opposite sign, optionally tagged with the same `source_id` so
  * a pair can be matched up later.
  *
@@ -459,9 +459,9 @@ export type LedgerEntry = z.infer<typeof LedgerEntrySchema>;
 // ---------- Paper usage history ----------
 
 /**
- * One persisted snapshot of weekly print counts ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ roll consumption. Stored
+ * One persisted snapshot of weekly print counts → roll consumption. Stored
  * per location so a multi-country setup can keep separate paper histories.
- * Keyed by iso_week_start (one entry per week ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â re-saving overwrites).
+ * Keyed by iso_week_start (one entry per week — re-saving overwrites).
  */
 export const PaperUsageEntrySchema = z.object({
   iso_week_start: IsoDate,
@@ -499,12 +499,12 @@ export type PaperUsageEntry = z.infer<typeof PaperUsageEntrySchema>;
 // ---------- CS Cases (customer service replacements / complaints) ----------
 
 /**
- * Mirrors the workflow:  new ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ query ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ shipped ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ closed
+ * Mirrors the workflow:  new → query → shipped → closed
  * (plus 'denied' as an occasional off-ramp from new or query).
  *
  * 'query' = CS is waiting on info / has follow-up questions before sending
  * the replacement (e.g. asking the customer for a photo of damage). It is a
- * holding state, NOT an approval ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â inventory must not move in this state.
+ * holding state, NOT an approval — inventory must not move in this state.
  *
  * Inventory deduction fires only when status transitions to 'shipped' AND
  * `tracking_number` is non-empty. Once deducted, edits to lines prompt a
@@ -530,7 +530,7 @@ export const CsCaseIssueTypeSchema = z.enum([
 ]);
 export type CsCaseIssueType = z.infer<typeof CsCaseIssueTypeSchema>;
 
-/** Routing hint ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â auto-derived from line items by the UI, but stored explicitly so reports can group cleanly. */
+/** Routing hint — auto-derived from line items by the UI, but stored explicitly so reports can group cleanly. */
 export const CsCaseDepartmentSchema = z.enum(["framed", "unframed", "mixed"]);
 export type CsCaseDepartment = z.infer<typeof CsCaseDepartmentSchema>;
 
@@ -559,7 +559,7 @@ export const CS_CASE_ISSUE_LABELS: Record<CsCaseIssueType, string> = {
 };
 
 /**
- * One line item being replaced. A case has many lines ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â used when the
+ * One line item being replaced. A case has many lines — used when the
  * customer needs multiple items resent. Quantity is positive; the
  * inventory deduction at approval time multiplies through.
  */
@@ -605,7 +605,7 @@ export const CsCaseSchema = z.object({
   customer_keeps_original: z.boolean().default(true),
 
   /**
-   * Carrier that delivered the *original* order to the customer. Optional ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â
+   * Carrier that delivered the *original* order to the customer. Optional —
    * captured by CS for reporting (which carrier causes most issues?).
    * Independent of the replacement parcel carrier below.
    */
@@ -623,7 +623,7 @@ export const CsCaseSchema = z.object({
   shipped_at: IsoDateTime.nullable().default(null),
   closed_at: IsoDateTime.nullable().default(null),
 
-  /** Idempotency flag ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â true once the lines have been deducted from inventory. */
+  /** Idempotency flag — true once the lines have been deducted from inventory. */
   inventory_deducted: z.boolean().default(false),
 
   updated_at: IsoDateTime,
@@ -636,17 +636,17 @@ export interface CsCaseWithLines extends CsCase {
 }
 
 
-// ---------- CS Returns (customer returns ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â inbound) ----------
+// ---------- CS Returns (customer returns — inbound) ----------
 
 /**
  * Mirror of CsCase for the inbound flow: customer is sending an item BACK
- * to us. Workflow: new ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ received ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ closed.
+ * to us. Workflow: new → received → closed.
  *
- *   new      ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â customer notified us, item hasn't arrived yet
- *   received ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â item is physically at our warehouse
- *   closed   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â process complete (refund issued / no-refund decided)
+ *   new      — customer notified us, item hasn't arrived yet
+ *   received — item is physically at our warehouse
+ *   closed   — process complete (refund issued / no-refund decided)
  *
- * v1 does NOT auto-adjust inventory when status moves to 'received' ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â
+ * v1 does NOT auto-adjust inventory when status moves to 'received' —
  * returned items often arrive damaged. Future iteration can add a per-line
  * "restock" toggle that credits inventory back conditionally.
  */
@@ -748,7 +748,7 @@ export const PRODUCTION_DEPARTMENT_LABELS: Record<ProductionDepartment, string> 
  * the token, the page looks up the staff identity.
  *
  * One user can have multiple barcodes (replacement issued after a loss,
- * for example) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â `active` distinguishes the current valid one. Old
+ * for example) — `active` distinguishes the current valid one. Old
  * barcodes stay in the table so historical events can still resolve
  * to the right person.
  */
@@ -768,7 +768,7 @@ export type StaffBarcode = z.infer<typeof StaffBarcodeSchema>;
  * so it can have its own permission model and audit history.
  *
  * One row per user. If a user has no rate set, labour cost is treated
- * as zero and the report flags it with a "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â rate missing" badge.
+ * as zero and the report flags it with a "— rate missing" badge.
  */
 export const StaffRateSchema = z.object({
   user_id: z.string().min(1),
@@ -784,13 +784,13 @@ export type StaffRate = z.infer<typeof StaffRateSchema>;
  * Append-only production event log. Every Start, Complete, Cancel, and
  * Dispatch action writes a row here. Time-deltas are derived from pairs
  * of Start+Complete events for the same staff + order + line. Dispatch
- * events have no line ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â they're per-order.
+ * events have no line — they're per-order.
  *
  * `event_type` semantics:
- *   started   ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â worker tapped Start on a line
- *   completed ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â worker tapped Complete on a line
- *   cancelled ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â worker tapped Cancel (or supervisor override)
- *   dispatched ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â order was scanned at the Dispatch bench
+ *   started   — worker tapped Start on a line
+ *   completed — worker tapped Complete on a line
+ *   cancelled — worker tapped Cancel (or supervisor override)
+ *   dispatched — order was scanned at the Dispatch bench
  */
 export const ProductionEventTypeSchema = z.enum([
   "started",
@@ -840,11 +840,11 @@ export type ProductionEvent = z.infer<typeof ProductionEventSchema>;
 
 /**
  * Size-effort scores feed the size-weighted volume metric:
- *   volume = ÃƒÆ’Ã…Â½Ãƒâ€šÃ‚Â£ (count ÃƒÆ’Ã†â€™— effort_score) across sizes.
+ *   volume = Σ (count × effort_score) across sizes.
  *
  * Hand-seeded at first; recomputable from observed medians once each
  * size has enough completion events. Keyed by size string ("A0",
- * "A1", ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦) which matches Product.size.
+ * "A1", …) which matches Product.size.
  *
  * Default values (per the user's instinct, will refine with data):
  *   A0=2.5, A1=1.5, A2=1.0, A3=0.7, A4=0.5
@@ -861,8 +861,8 @@ export type ProductionSizeEffort = z.infer<typeof ProductionSizeEffortSchema>;
 /**
  * Estimated time (in minutes) per SKU + department. Used to show
  * estimated-vs-actual feedback to workers in real time. Seeded by an
- * admin form (Settings ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Production Benchmarks); auto-updates as
- * rolling medians accrue once each combo has ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚Â¥50 events.
+ * admin form (Settings → Production Benchmarks); auto-updates as
+ * rolling medians accrue once each combo has ≥50 events.
  */
 export const ProductionBenchmarkSchema = z.object({
   /**
@@ -896,7 +896,7 @@ export const LOCATION_LABELS: Record<LocationKey, string> = {
 
 // ---------- Sidebar nav ----------
 
-/** Keys for the sidebar nav items ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â used as labels' map keys. */
+/** Keys for the sidebar nav items — used as labels' map keys. */
 export const NAV_KEYS = [
   "welcome", "dashboard", "skus", "sales", "shipments", "events", "warehouse", "orders", "paper", "movements", "cs_cases", "cs_returns", "order_submission", "reports", "team", "settings",
 ] as const;
@@ -934,7 +934,7 @@ export const GlobalSettingsSchema = z.object({
   /**
    * When a shipment's status transitions to "Delivered", credit each line's
    * quantity to that product's `current_on_hand`. Transitioning away from
-   * Delivered reverses the credit. Default ON ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â mirrors the sales auto-
+   * Delivered reverses the credit. Default ON — mirrors the sales auto-
    * deduct symmetry.
    */
   auto_apply_shipments_on_delivery: z.boolean().default(true),
@@ -951,13 +951,13 @@ export const GlobalSettingsSchema = z.object({
   order_templates: z.array(OrderTemplateSchema).default([]),
   /**
    * Cubic-metre capacity of one shipping container, used by the order
-   * builder's container-fill widget. 67 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€¹Ã¢â‚¬Â  40' high cube.
+   * builder's container-fill widget. 67 ≈ 40' high cube.
    */
   container_cbm: z.number().positive().default(67),
   /**
    * Product IDs of the SKUs that represent paper rolls in inventory. When
    * set, saving a Paper-usage snapshot atomically deducts the computed roll
-   * count from these SKUs' on-hand stock (rounded up ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â once a roll is
+   * count from these SKUs' on-hand stock (rounded up — once a roll is
    * opened it's counted as consumed). Null = no deduction.
    */
   paper_roll_24_sku_id: z.string().nullable().default(null),
@@ -984,7 +984,7 @@ export const BackupSchema = z.object({
   // Optional for backward compat with older backups that pre-date the
   // Paper usage history. Default to [] so existing JSON files still parse.
   paper_usage: z.array(PaperUsageEntrySchema).default([]),
-  // Inventory ledger ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â append-only audit of every stock movement. Phase 1
+  // Inventory ledger — append-only audit of every stock movement. Phase 1
   // backups include this so a future restore preserves the audit trail.
   // Older JSON exports without this field still parse cleanly.
   ledger: z.array(LedgerEntrySchema).default([]),
@@ -1062,7 +1062,7 @@ export const SupplierSettingsSchema = z.object({
 });
 export type SupplierSettings = z.infer<typeof SupplierSettingsSchema>;
 
-/** "COD" / "NET30" / "â€”" for null. Anything non-standard renders as `NET{n}`. */
+/** "COD" / "NET30" / "—" for null. Anything non-standard renders as `NET{n}`. */
 export function formatTermsLabel(days: number | null | undefined, eom: boolean = false): string {
   if (days == null) return "--";
   if (days === 0) return "Prepaid";

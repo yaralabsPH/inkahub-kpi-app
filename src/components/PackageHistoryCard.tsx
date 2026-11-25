@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Package, ExternalLink } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { Link } from "react-router-dom";
-import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
+import { Section } from "@/components/ui/Section";
+import { Segmented } from "@/components/ui/Segmented";
+import { Callout } from "@/components/ui/Callout";
+import { Tag } from "@/components/ui/Tag";
+import { nTable, nTableWrap, nTd, nTdNum, nTh, nThNum } from "@/components/ui/nStyles";
+import { cn } from "@/lib/utils/cn";
 import { Button } from "@/components/ui/Button";
 import { getSupabase } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
@@ -32,6 +37,8 @@ type PeriodKey = "7d" | "30d" | "8w" | "12w";
 interface PeriodDef {
   key: PeriodKey;
   label: string;
+  /** Label on the segmented control. */
+  short: string;
   days: number;
   bucketDays: number;
   bucketCount: number;
@@ -40,10 +47,10 @@ interface PeriodDef {
   coverLabel: string;
 }
 const PERIODS: PeriodDef[] = [
-  { key: "7d",  label: "Last 7 days",      days: 7,  bucketDays: 1, bucketCount: 7,  bucketLabel: "day",  avgLabel: "Avg / day", coverLabel: "Days cover" },
-  { key: "30d", label: "Last month",       days: 30, bucketDays: 1, bucketCount: 30, bucketLabel: "day",  avgLabel: "Avg / day", coverLabel: "Days cover" },
-  { key: "8w",  label: "Trailing 8 weeks", days: 56, bucketDays: 7, bucketCount: 8,  bucketLabel: "week", avgLabel: "Avg / wk",  coverLabel: "Weeks cover" },
-  { key: "12w", label: "Last 12 weeks",    days: 84, bucketDays: 7, bucketCount: 12, bucketLabel: "week", avgLabel: "Avg / wk",  coverLabel: "Weeks cover" },
+  { key: "7d",  label: "Last 7 days",      short: "7 days", days: 7,  bucketDays: 1, bucketCount: 7,  bucketLabel: "day",  avgLabel: "Avg / day", coverLabel: "Days cover" },
+  { key: "30d", label: "Last month",       short: "Last month", days: 30, bucketDays: 1, bucketCount: 30, bucketLabel: "day",  avgLabel: "Avg / day", coverLabel: "Days cover" },
+  { key: "8w",  label: "Trailing 8 weeks", short: "8 weeks", days: 56, bucketDays: 7, bucketCount: 8,  bucketLabel: "week", avgLabel: "Avg / wk",  coverLabel: "Weeks cover" },
+  { key: "12w", label: "Last 12 weeks",    short: "12 weeks", days: 84, bucketDays: 7, bucketCount: 12, bucketLabel: "week", avgLabel: "Avg / wk",  coverLabel: "Weeks cover" },
 ];
 
 function startOfDay(d: Date): Date {
@@ -67,33 +74,47 @@ function isoDate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function Sparkline({ values, width = 140, height = 28 }: { values: number[]; width?: number; height?: number }) {
-  if (values.length === 0) return <span className="text-slate-400 text-xs">—</span>;
+/**
+ * Stock-cover colour bands, in buckets of the active period (weeks for the
+ * weekly views, days for the daily ones). Below `critical` = red, below
+ * `warn` = amber, otherwise green. Same thresholds the card used before.
+ */
+export const COVER_THRESHOLDS = {
+  week: { critical: 4, warn: 8 },
+  day: { critical: 14, warn: 28 },
+} as const;
+
+export function coverLevel(cover: number, bucket: "week" | "day"): "critical" | "warn" | "ok" {
+  const t = COVER_THRESHOLDS[bucket];
+  if (cover < t.critical) return "critical";
+  if (cover < t.warn) return "warn";
+  return "ok";
+}
+
+const COVER_DOT: Record<"critical" | "warn" | "ok", string> = {
+  critical: "bg-hub-bad",
+  warn: "bg-hub-warn",
+  ok: "bg-hub-accent-text",
+};
+
+/** 120×24 line with a dot on the last point; dashed flat line when unused. */
+function Sparkline({ values, width = 120, height = 24 }: { values: number[]; width?: number; height?: number }) {
+  if (values.length === 0 || values.every((v) => v === 0)) {
+    return (
+      <svg width={width} height={height} aria-hidden className="block">
+        <line x1="0" y1={height - 2} x2={width} y2={height - 2} stroke="rgb(var(--hub-line-2))" strokeDasharray="2 3" />
+      </svg>
+    );
+  }
   const max = Math.max(...values, 1);
   const stepX = values.length > 1 ? width / (values.length - 1) : width;
-  const pts = values.map((v, i) => {
-    const x = i * stepX;
-    const y = height - (v / max) * (height - 4) - 2;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
+  const pt = (v: number, i: number) => [i * stepX, height - 2 - (v / max) * (height - 6)] as const;
+  const pts = values.map((v, i) => pt(v, i).map((n) => n.toFixed(1)).join(",")).join(" ");
+  const [lx, ly] = pt(values[values.length - 1], values.length - 1);
   return (
-    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="overflow-visible">
-      <polyline
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-        points={pts}
-        className="text-indigo-500 dark:text-indigo-400"
-      />
-      {values.map((v, i) => {
-        const x = i * stepX;
-        const y = height - (v / max) * (height - 4) - 2;
-        return (
-          <circle key={i} cx={x} cy={y} r="1.5" className="fill-indigo-500 dark:fill-indigo-400" />
-        );
-      })}
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden className="block overflow-visible">
+      <polyline fill="none" stroke="rgb(var(--hub-accent-text))" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" points={pts} />
+      <circle cx={lx} cy={ly} r="2.2" fill="rgb(var(--hub-accent-text))" />
     </svg>
   );
 }
@@ -330,107 +351,116 @@ export function PackageHistoryCard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, packageSlots, bucketStarts, denominators, period]);
 
+  const bucket = period.bucketDays === 7 ? "week" : "day";
+
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex-1 min-w-0">
-          <CardTitle className="inline-flex items-center gap-2">
-            <Package size={16} /> Package usage history
-          </CardTitle>
-          <div className="text-xs text-slate-500 dark:text-slate-400">
-            {events === null
-              ? `${period.label} · not loaded`
-              : <>{period.label} · {denominators.framed.toLocaleString()} framed orders (A0 + dispatch) · {denominators.unframed.toLocaleString()} unframed completed</>}
-          </div>
+    <Section
+      title="Package usage history"
+      meta={events === null
+        ? "Not loaded"
+        : `${denominators.framed.toLocaleString()} framed · ${denominators.unframed.toLocaleString()} unframed orders`}
+      subtitle={`${period.label} · framed = A0 + dispatch, unframed = completed at the unframed station`}
+      storageKey="inka-reports-collapse:package-history"
+      actions={
+        <Segmented
+          label="History range"
+          value={periodKey}
+          onChange={setPeriodKey}
+          options={PERIODS.map((p) => ({ value: p.key, label: p.short, title: `Show ${p.label.toLowerCase()}` }))}
+        />
+      }
+    >
+      {loading ? (
+        <div className="text-[13px] text-hub-faint">Loading…</div>
+      ) : error ? (
+        <div className="flex flex-wrap items-center gap-2 text-[13px] text-hub-bad">
+          {error}
+          <Button variant="secondary" size="sm" onClick={() => void load()}>Retry</Button>
         </div>
-        <div className="inline-flex rounded-md ring-1 ring-slate-200 dark:ring-slate-700 overflow-hidden text-xs">
-          {PERIODS.map((p) => (
-            <button
-              key={p.key}
-              type="button"
-              onClick={() => setPeriodKey(p.key)}
-              className={"px-2.5 h-8 " + (p.key === periodKey ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900" : "bg-white hover:bg-slate-100 dark:bg-slate-900 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300")}
-              title={`Show ${p.label.toLowerCase()}`}
-            >
-              {p.label}
-            </button>
-          ))}
+      ) : rows === null || events === null ? (
+        <div className="flex flex-wrap items-center gap-2 text-[13px] text-hub-muted">
+          Not loaded for this period.
+          <Button variant="secondary" size="sm" onClick={() => void load()}>Load package history</Button>
         </div>
-      </CardHeader>
-      <CardBody className="p-0">
-        {loading ? (
-          <div className="p-6 text-sm text-slate-500">Loading…</div>
-        ) : error ? (
-          <div className="p-6 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
-            {error}
-            <Button variant="secondary" size="sm" onClick={() => void load()}>Retry</Button>
-          </div>
-        ) : rows === null || events === null ? (
-          <div className="p-6 text-sm text-slate-500 flex items-center gap-2">
-            Not loaded for this period.
-            <Button variant="secondary" size="sm" onClick={() => void load()}>Load package history</Button>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 dark:bg-slate-800/50 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+      ) : (
+        <>
+          <div className={nTableWrap}>
+            <table className={nTable}>
+              <thead>
                 <tr>
-                  <th className="text-left px-4 py-2 font-semibold">Package</th>
-                  <th className="text-left px-3 py-2 font-semibold">{period.label}</th>
-                  <th className="text-right px-3 py-2 font-semibold">On hand</th>
-                  <th className="text-right px-3 py-2 font-semibold" title={`Average packages used per ${period.bucketLabel} over the ${period.label.toLowerCase()}`}>{period.avgLabel}</th>
-                  <th className="text-right px-3 py-2 font-semibold" title="Boxes: usage divided by framed orders (dispatch station + A0 framed station). Tubes: usage divided by unframed orders completed at the unframed station.">Per order</th>
-                  <th className="text-right px-3 py-2 font-semibold" title="On hand divided by average usage per bucket - how long stock lasts at current rate">{period.coverLabel}</th>
-                  <th className="text-right px-4 py-2 font-semibold">Reorder</th>
+                  <th className={nTh}>Package</th>
+                  <th className={nTh}>{period.label}</th>
+                  <th className={nThNum}>On hand</th>
+                  <th className={nThNum} title={`Average packages used per ${period.bucketLabel} over the ${period.label.toLowerCase()}`}>{period.avgLabel}</th>
+                  <th className={nThNum} title="Boxes: usage divided by framed orders (dispatch station + A0 framed station). Tubes: usage divided by unframed orders completed at the unframed station.">Per order</th>
+                  <th className={nThNum} title="On hand divided by average usage per bucket - how long stock lasts at current rate">{period.coverLabel}</th>
+                  <th className={nThNum}>Reorder</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+              <tbody>
                 {summary.map((r) => {
-                  const critThreshold = period.bucketDays === 7 ? 4 : 14;
-                  const warnThreshold = period.bucketDays === 7 ? 8 : 28;
-                  const critical = r.cover != null && r.cover < critThreshold;
-                  const warn = r.cover != null && r.cover >= critThreshold && r.cover < warnThreshold;
+                  const level = r.cover == null ? null : coverLevel(r.cover, bucket);
                   const denomLabel = r.kind === "tube" ? "unframed order" : "framed order";
                   return (
-                    <tr key={r.slotKey} className={critical ? "bg-red-50/40 dark:bg-red-900/10" : warn ? "bg-amber-50/40 dark:bg-amber-900/10" : ""}>
-                      <td className="px-4 py-2">
-                        <div className="font-medium flex items-center gap-1.5">
-                          <span>{r.label}</span>
-                          <span className={"text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded " + (r.kind === "tube" ? "bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300" : "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200")}>
-                            {r.kind}
-                          </span>
+                    <tr key={r.slotKey} className="hover:bg-hub-hover">
+                      <td className={nTd}>
+                        <div className="flex items-center gap-2">
+                          <b className="font-medium text-hub-text">{r.label}</b>
+                          <Tag color={r.kind === "tube" ? "blue" : "gray"}>{r.kind.toUpperCase()}</Tag>
                         </div>
                         {r.catalogued ? (
-                          r.supplier ? <div className="text-[11px] text-slate-500">{r.supplier}</div> : null
+                          r.supplier ? <div className="mt-0.5 text-xs text-hub-faint">{r.supplier}</div> : null
                         ) : (
-                          <div className="text-[11px] text-amber-700 dark:text-amber-400 italic">not in catalogue — add on SKUs page as code "{r.slotKey}"</div>
+                          <div className="mt-0.5 text-xs text-hub-warn">
+                            Not in catalogue ·{" "}
+                            {/* The SKUs page can't prefill a code from the URL, so this just opens it. */}
+                            <Link
+                              to="/skus"
+                              title={`Add a SKU with code "${r.slotKey}"`}
+                              className="text-hub-muted underline decoration-hub-line-2 underline-offset-2 hover:text-hub-text"
+                            >
+                              Add as “{r.slotKey}”
+                            </Link>
+                          </div>
                         )}
                       </td>
-                      <td className="px-3 py-2">
-                        <Sparkline values={r.buckets} />
-                        <div className="text-[10px] text-slate-500 mt-0.5 tabular-nums">
-                          {r.totalUsed.toLocaleString()} used
+                      <td className={nTd}>
+                        <div className="flex items-center gap-2.5">
+                          <Sparkline values={r.buckets} />
+                          <span className="min-w-[56px] whitespace-nowrap text-xs tabular-nums text-hub-faint">
+                            {r.totalUsed.toLocaleString()} used
+                          </span>
                         </div>
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums">{r.catalogued ? r.onHand.toLocaleString() : "—"}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{r.catalogued ? r.perBucketAvg.toFixed(1) : "—"}</td>
-                      <td className="px-3 py-2 text-right tabular-nums" title={r.ratio == null ? `No ${denomLabel}s in window` : `${(r.ratio * 100).toFixed(0)}% of ${denomLabel}s used this`}>
+                      <td className={cn(nTdNum, !r.catalogued && "text-hub-faint")}>{r.catalogued ? r.onHand.toLocaleString() : "—"}</td>
+                      <td className={cn(nTdNum, !r.catalogued && "text-hub-faint")}>{r.catalogued ? r.perBucketAvg.toFixed(1) : "—"}</td>
+                      <td
+                        className={cn(nTdNum, r.ratio == null && "text-hub-faint")}
+                        title={r.ratio == null ? `No ${denomLabel}s in window` : `${(r.ratio * 100).toFixed(0)}% of ${denomLabel}s used this`}
+                      >
                         {r.ratio == null ? "—" : r.ratio.toFixed(2)}
                       </td>
-                      <td className={"px-3 py-2 text-right tabular-nums " + (critical ? "text-red-700 dark:text-red-300 font-semibold" : warn ? "text-amber-700 dark:text-amber-300" : "")}>
-                        {r.cover == null ? "—" : r.cover.toFixed(1) + (period.bucketDays === 7 ? "w" : "d")}
+                      <td className={nTdNum}>
+                        {r.cover == null || level == null ? (
+                          <span className="text-hub-faint">—</span>
+                        ) : (
+                          <span className={cn("inline-flex items-center gap-1.5 whitespace-nowrap", level === "critical" && "font-semibold")}>
+                            <span aria-hidden className={cn("h-1.5 w-1.5 rounded-full", COVER_DOT[level])} />
+                            {r.cover.toFixed(1)} {bucket === "week" ? "wk" : "d"}
+                          </span>
+                        )}
                       </td>
-                      <td className="px-4 py-2 text-right">
+                      <td className={nTdNum}>
                         {r.supplier ? (
                           <Link
                             to={`/orders?supplier=${encodeURIComponent(r.supplier)}`}
-                            className="inline-flex items-center gap-1 text-xs text-indigo-600 dark:text-indigo-400 hover:underline"
+                            className="inline-flex items-center gap-1 whitespace-nowrap font-semibold text-hub-text hover:text-hub-accent-text"
                             title={`Open Order Builder for ${r.supplier}`}
                           >
-                            Build PO <ExternalLink size={11} />
+                            Build PO <ExternalLink size={11} aria-hidden />
                           </Link>
                         ) : (
-                          <span className="text-xs text-slate-400 italic">—</span>
+                          <span className="text-hub-faint">—</span>
                         )}
                       </td>
                     </tr>
@@ -438,12 +468,12 @@ export function PackageHistoryCard() {
                 })}
               </tbody>
             </table>
-            <div className="px-4 py-2 text-[11px] text-slate-500 border-t border-slate-200 dark:border-slate-800">
-              Boxes ratio = usage ÷ framed orders (dispatch + A0 framed). Tubes ratio = usage ÷ unframed orders completed. Multiply by expected order volume to size next PO.
-            </div>
           </div>
-        )}
-      </CardBody>
-    </Card>
+          <Callout className="mt-3.5">
+            <b>How ratios work.</b> Box ratio = usage ÷ framed orders (dispatch + A0 framed). Tube ratio = usage ÷ unframed orders completed. Multiply by expected order volume to size the next PO.
+          </Callout>
+        </>
+      )}
+    </Section>
   );
 }

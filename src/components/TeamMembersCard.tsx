@@ -1,7 +1,9 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { UserPlus, Trash2, Printer, RefreshCw, Search, ChevronRight, Lock, Check, X, Eye, EyeOff, Wand2 } from "lucide-react";
-import { Field, Input, Select } from "@/components/ui/Input";
-import { Button } from "@/components/ui/Button";
+import {
+  UserPlus, Printer, RefreshCw, Search, Lock, X, Eye, EyeOff, Wand2,
+  Users, Type, CircleChevronDown, AlignLeft, Barcode, Plus, ChevronDown, ChevronUp,
+  ChevronsRight, MoreHorizontal, Info, Mail, MapPin, Coins, ListFilter, Download, Check,
+} from "lucide-react";
 import { useAuth, type UserProfile } from "@/lib/auth/AuthProvider";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import {
@@ -10,10 +12,20 @@ import {
   type NavKey,
 } from "@/lib/domain";
 import { effectiveNavAccess } from "@/lib/auth/permissions";
-import { cn } from "@/lib/utils/cn";
-import { generateBarcodeToken, printLanyard } from "@/lib/utils/lanyard";
+import {
+  ROLE_LABELS, ROLE_DESCRIPTIONS, ROLE_ORDER, ROLE_TAG_COLOR,
+  type Role,
+} from "@/lib/auth/roles";
+import { NAV_ICONS, accessGroups } from "@/components/layout/navigation";
 
-type Role = "owner" | "manager" | "staff" | "kiosk" | "cs";
+const ACCESS_GROUPS = accessGroups();
+import { useAppStore } from "@/lib/state/appStore";
+import { useToast } from "@/components/ui/Toast";
+import { Tag, Avatar as SharedAvatar } from "@/components/ui/Tag";
+import { Callout } from "@/components/ui/Callout";
+import { printAllTeamLanyards, downloadAllTeamLanyards } from "@/components/team/bulkLanyards";
+import { cn } from "@/lib/utils/cn";
+import { generateBarcodeToken, printLanyard, renderBarcodeSvg } from "@/lib/utils/lanyard";
 
 interface MemberRow {
   user_id: string;
@@ -29,75 +41,23 @@ interface MemberRow {
   hourly_rate: number | null;
 }
 
-const ROLE_LABELS: Record<Role, string> = {
-  owner: "Owner",
-  manager: "Manager",
-  staff: "Staff",
-  kiosk: "Kiosk",
-  cs: "CS",
-};
-
-const ROLE_DESCRIPTIONS: Record<Role, string> = {
-  owner: "Full access. Only role that can manage users.",
-  manager: "Full operational access for their granted locations. Cannot manage users.",
-  staff: "Read access for granted locations. Write access is limited to staff-owned modules (returns / production runs — coming soon).",
-  kiosk: "Shared station login. Can record production events on behalf of scanned staff and nothing else. Cannot edit stock, sales, or correct events.",
-  cs: "Customer Service. Can log returns and create replacement cases on /cs-returns and /cs-cases. No access to stock editing, shipments, or reports.",
-};
-
-const ROLE_ORDER: Role[] = ["owner", "manager", "staff", "kiosk", "cs"];
-
-/** Badge + avatar colours per role (light and dark). */
-const ROLE_STYLE: Record<Role, { badge: string; avatar: string; dot: string }> = {
-  owner: {
-    badge: "bg-amber-50 text-amber-700 ring-amber-200 dark:bg-amber-400/10 dark:text-amber-300 dark:ring-amber-400/30",
-    avatar: "bg-amber-100 text-amber-700 dark:bg-amber-400/15 dark:text-amber-300",
-    dot: "bg-amber-500 dark:bg-amber-300",
-  },
-  manager: {
-    badge: "bg-indigo-50 text-indigo-700 ring-indigo-200 dark:bg-indigo-400/10 dark:text-indigo-300 dark:ring-indigo-400/30",
-    avatar: "bg-indigo-100 text-indigo-700 dark:bg-indigo-400/15 dark:text-indigo-300",
-    dot: "bg-indigo-500 dark:bg-indigo-300",
-  },
-  staff: {
-    badge: "bg-sky-50 text-sky-700 ring-sky-200 dark:bg-sky-400/10 dark:text-sky-300 dark:ring-sky-400/30",
-    avatar: "bg-sky-100 text-sky-700 dark:bg-sky-400/15 dark:text-sky-300",
-    dot: "bg-sky-500 dark:bg-sky-300",
-  },
-  kiosk: {
-    badge: "bg-pink-50 text-pink-700 ring-pink-200 dark:bg-pink-400/10 dark:text-pink-300 dark:ring-pink-400/30",
-    avatar: "bg-pink-100 text-pink-700 dark:bg-pink-400/15 dark:text-pink-300",
-    dot: "bg-pink-500 dark:bg-pink-300",
-  },
-  cs: {
-    badge: "bg-lime-50 text-lime-700 ring-lime-200 dark:bg-lime-400/10 dark:text-lime-300 dark:ring-lime-400/30",
-    avatar: "bg-lime-100 text-lime-700 dark:bg-lime-400/15 dark:text-lime-300",
-    dot: "bg-lime-500 dark:bg-lime-300",
-  },
-};
-
 const LOCATION_SHORT: Record<string, string> = { default: "Default", uk: "UK", us: "US", au: "AU" };
 
-/** Sidebar pages grouped for the access editor. Covers every NavKey. */
-const NAV_GROUPS: Array<{ label: string; keys: NavKey[] }> = [
-  { label: "Core", keys: ["welcome", "dashboard", "reports"] },
-  { label: "Catalogue & sales", keys: ["skus", "sales", "events", "order_submission"] },
-  { label: "Operations", keys: ["shipments", "warehouse", "orders", "paper", "movements"] },
-  { label: "Customer service", keys: ["cs_cases", "cs_returns"] },
-  { label: "Admin", keys: ["team", "settings"] },
-];
-const GROUPED_KEYS = new Set<NavKey>(NAV_GROUPS.flatMap((g) => g.keys));
-const UNGROUPED_KEYS = NAV_KEYS.filter((k) => !GROUPED_KEYS.has(k));
-const ALL_NAV_GROUPS = UNGROUPED_KEYS.length
-  ? [...NAV_GROUPS, { label: "Other", keys: [...UNGROUPED_KEYS] }]
-  : NAV_GROUPS;
+/**
+ * Optional one-line subtitle per location on the Locations tab (e.g.
+ * "Sydney studio"). Nothing in the database holds this yet.
+ * TODO(CJ): fill these in or back them with data; empty = no subtitle.
+ */
+const LOCATION_SUBTITLES: Partial<Record<string, string>> = {};
 
 type PanelTab = "access" | "locations" | "production";
-
-function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  return parts.map((p) => p[0]).join("").slice(0, 2).toUpperCase() || "?";
-}
+type ExtraFilter = "none" | "no_lanyard" | "no_rate" | "custom";
+const EXTRA_FILTER_LABELS: Record<ExtraFilter, string> = {
+  none: "Everyone",
+  no_lanyard: "No lanyard",
+  no_rate: "No rate set",
+  custom: "Custom page access",
+};
 
 function effectiveFor(m: MemberRow) {
   return effectiveNavAccess({
@@ -106,6 +66,48 @@ function effectiveFor(m: MemberRow) {
     role: m.role,
     allowed_nav: m.allowed_nav,
   });
+}
+
+/** True when the member's effective pages differ from their role defaults. */
+function isCustomAccess(m: MemberRow): boolean {
+  const eff = effectiveFor(m);
+  const def = effectiveFor({ ...m, allowed_nav: null });
+  if (eff.size !== def.size) return true;
+  for (const k of eff) if (!def.has(k)) return true;
+  return false;
+}
+
+function lockReasonFor(key: NavKey, role: Role): string | undefined {
+  return key === "welcome" ? "Welcome is always available"
+    : key === "dashboard" && role !== "owner" ? "Dashboard is only available to owners"
+      : key === "settings" && role === "owner" ? "Settings is always available to owners" : undefined;
+}
+
+const iconBtn = "inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-hub-muted hover:bg-hub-hover hover:text-hub-text disabled:pointer-events-none disabled:opacity-35";
+
+/** Page header: icon tile, title, description and (for owners) the stats row. */
+export function TeamHeader({ stats }: { stats?: Array<[ReactNode, string]> }) {
+  return (
+    <div>
+      <div className="mb-3.5 grid h-[52px] w-[52px] place-items-center rounded-xl border border-hub-line bg-hub-fill text-hub-muted">
+        <Users size={26} strokeWidth={1.4} />
+      </div>
+      <h1 className="text-[34px] font-bold leading-[1.15] tracking-[-0.02em]">Team</h1>
+      <p className="mt-1.5 text-[15px] text-hub-muted">
+        Manage team members, roles, and lanyard barcodes for this location.
+      </p>
+      {stats ? (
+        <div className="mt-[22px] flex flex-wrap gap-7 pb-1">
+          {stats.map(([n, l]) => (
+            <div key={l}>
+              <div className="text-xl font-semibold tracking-[-0.01em] tabular-nums">{n}</div>
+              <div className="text-[12.5px] text-hub-muted">{l}</div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 /**
@@ -148,6 +150,12 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
   const [tab, setTab] = useState<PanelTab>("access");
   const [query, setQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState<Role | "all">("all");
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [extraFilter, setExtraFilter] = useState<ExtraFilter>("none");
+  const searchRef = useRef<HTMLInputElement>(null);
+  const location = useAppStore((s) => s.location);
+  const selfEmail = useAuth().session?.user?.email ?? null;
+  const { toast, toastNode } = useToast();
 
   const loadMembers = async () => {
     setLoading(true);
@@ -227,6 +235,7 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
         .eq("user_id", userId);
       if (error) throw error;
       setMembers((prev) => prev.map((m) => m.user_id === userId ? { ...m, role } : m));
+      toast(`Role changed to ${ROLE_LABELS[role]}`);
     } catch (e) {
       setGlobalError(`Role update failed: ${(e as Error).message}`);
     } finally {
@@ -350,6 +359,8 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
       }
       setMembers((prev) => prev.filter((m) => m.user_id !== userId));
       setSelectedId(null);
+      setPanelOpen(false);
+      toast(`${name} removed`);
     } catch (e) {
       setGlobalError(`Remove failed: ${(e as Error).message}`);
     } finally {
@@ -412,6 +423,7 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
       setMembers((prev) => prev.map((m) =>
         m.user_id === member.user_id ? { ...m, barcode: token } : m,
       ));
+      toast(member.barcode ? "New lanyard issued" : "Lanyard issued");
     } catch (e) {
       setGlobalError(`Couldn't issue barcode: ${(e as Error).message}`);
     } finally {
@@ -536,6 +548,7 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
       await loadMembers();
       setSelectedId(body.user_id);
       setPanelMode("member");
+      toast("Member added");
     } catch (e) {
       setInviteMsg(`Invite failed: ${(e as Error).message}`);
     } finally {
@@ -543,203 +556,381 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
     }
   };
 
+  const busyAny = inviteBusy || busyUserId !== null;
+  const q = query.trim().toLowerCase();
   const visible = members.filter((m) =>
     (roleFilter === "all" || m.role === roleFilter)
-    && `${m.display_name} ${ROLE_LABELS[m.role]}`.toLowerCase().includes(query.trim().toLowerCase()),
+    && `${m.display_name} ${ROLE_LABELS[m.role]}`.toLowerCase().includes(q)
+    && (extraFilter === "none"
+      || (extraFilter === "no_lanyard" && !m.barcode)
+      || (extraFilter === "no_rate" && m.hourly_rate === null)
+      || (extraFilter === "custom" && isCustomAccess(m))),
   );
-  const selected = members.find((m) => m.user_id === selectedId) ?? members[0] ?? null;
-  const showAdd = panelMode === "add" || selected === null;
+  const selected = members.find((m) => m.user_id === selectedId) ?? null;
+  const showAdd = panelMode === "add";
+  const peekOpen = panelOpen && (showAdd || selected !== null);
 
   const selectMember = (userId: string) => {
     setSelectedId(userId);
     setPanelMode("member");
+    setPanelOpen(true);
+  };
+  const openAdd = () => {
+    setPanelMode("add");
+    setInviteMsg(null);
+    setPanelOpen(true);
+  };
+  const closePanel = () => setPanelOpen(false);
+  const step = (d: 1 | -1) => {
+    if (visible.length === 0) return;
+    const i = visible.findIndex((m) => m.user_id === selectedId);
+    const next = i < 0 ? visible[0] : visible[(i + d + visible.length) % visible.length];
+    selectMember(next.user_id);
   };
 
+  const runBulk = async (kind: "print" | "download") => {
+    toast(kind === "print" ? "Preparing lanyards…" : "Generating lanyard images…");
+    toast(kind === "print" ? await printAllTeamLanyards(location) : await downloadAllTeamLanyards(location));
+  };
+
+  // Keyboard: Esc closes the panel, ↑/↓ move between members while it is
+  // open (not while typing), Ctrl/Cmd+K focuses search on this page.
+  // A ref keeps the window listener stable across renders.
+  const keyState = useRef({ peekOpen, showAdd, step, closePanel });
+  keyState.current = { peekOpen, showAdd, step, closePanel };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const s = keyState.current;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        // Capture phase + stopPropagation so the global command palette
+        // doesn't also open while the Team page is showing.
+        e.preventDefault();
+        e.stopPropagation();
+        searchRef.current?.focus();
+        return;
+      }
+      if (!s.peekOpen) return;
+      if (e.key === "Escape") {
+        s.closePanel();
+        return;
+      }
+      if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !s.showAdd) {
+        const t = e.target as HTMLElement | null;
+        if (t?.closest("input, select, textarea, [contenteditable='true']")) return;
+        e.preventDefault();
+        s.step(e.key === "ArrowDown" ? 1 : -1);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, []);
+
+  const issued = members.filter((m) => m.barcode).length;
+  const stats: Array<[ReactNode, string]> = [
+    [members.length, "Members"],
+    [`${issued} / ${members.length}`, "Lanyards issued"],
+    [new Set(members.flatMap((m) => m.locations)).size, "Locations"],
+    [members.filter((m) => m.hourly_rate === null).length, "Missing rates"],
+  ];
+
   return (
-    <section className="space-y-4 p-1">
+    <section>
+      <TeamHeader stats={loading ? undefined : stats} />
+
       {globalError ? (
-        <div role="alert" className="flex items-start justify-between gap-3 text-sm text-red-600 dark:text-red-400 ring-1 ring-red-200 dark:ring-red-900/40 bg-red-50/40 dark:bg-red-900/10 px-3 py-2">
+        <div role="alert" className="mt-5 flex items-start justify-between gap-3 rounded-md bg-hub-fill px-3.5 py-2.5 text-[13.5px] text-hub-bad">
           <span>{globalError}</span>
-          <button
-            type="button"
-            onClick={() => setGlobalError(null)}
-            className="shrink-0 text-red-500 hover:text-red-700 dark:hover:text-red-300"
-            aria-label="Dismiss error"
-          >
+          <button type="button" onClick={() => setGlobalError(null)} className="shrink-0 opacity-70 hover:opacity-100" aria-label="Dismiss error">
             <X size={14} />
           </button>
         </div>
       ) : null}
 
       {addedNotice ? (
-        <div role="status" className="flex items-start justify-between gap-3 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 ring-1 ring-emerald-200 dark:bg-emerald-400/10 dark:text-emerald-300 dark:ring-emerald-400/30">
-          <span>{addedNotice}</span>
-          <button
-            type="button"
-            onClick={() => setAddedNotice(null)}
-            className="shrink-0 opacity-70 hover:opacity-100"
-            aria-label="Dismiss"
-          >
+        <div role="status" className="mt-5 flex items-start justify-between gap-3 rounded-md bg-hub-fill px-3.5 py-2.5 text-[13.5px] text-hub-muted">
+          <span className="flex items-start gap-2.5">
+            <Info size={16} strokeWidth={1.6} className="mt-0.5 shrink-0" />
+            <span>{addedNotice}</span>
+          </span>
+          <button type="button" onClick={() => setAddedNotice(null)} className="shrink-0 opacity-70 hover:opacity-100" aria-label="Dismiss">
             <X size={14} />
           </button>
         </div>
       ) : null}
 
-      {/* ----- Toolbar ----- */}
-      <div className="flex flex-wrap items-center gap-3">
-        <label className="flex h-10 min-w-[220px] flex-1 items-center gap-2 rounded-md bg-white px-3 ring-1 ring-slate-200 focus-within:ring-emerald-400 dark:bg-slate-900 dark:ring-slate-700">
-          <Search size={15} className="text-slate-400" />
-          <input
-            aria-label="Search members by name or role"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search by name or role…"
-            className="h-full min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
-          />
-        </label>
-        <div className="flex flex-wrap rounded-md bg-white p-1 ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-700" role="group" aria-label="Filter by role">
-          {(["all", ...ROLE_ORDER] as const).map((r) => (
-            <button
-              key={r}
-              type="button"
-              onClick={() => setRoleFilter(r)}
-              aria-pressed={roleFilter === r}
-              className={cn(
-                "rounded px-3 py-1.5 text-xs font-medium transition-colors",
-                roleFilter === r
-                  ? "bg-slate-100 text-slate-900 ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-100 dark:ring-slate-700"
-                  : "text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200",
-              )}
-            >
-              {r === "all" ? "All" : ROLE_LABELS[r]}
-            </button>
-          ))}
+      {/* ----- View tabs + toolbar ----- */}
+      <div className="mt-7 flex flex-wrap items-end gap-x-2 border-b border-hub-line">
+        <div className="flex flex-wrap gap-0.5" role="group" aria-label="Filter by role">
+          {(["all", ...ROLE_ORDER] as const).map((r) => {
+            const on = roleFilter === r;
+            const count = r === "all" ? members.length : members.filter((m) => m.role === r).length;
+            return (
+              <button
+                key={r}
+                type="button"
+                onClick={() => setRoleFilter(r)}
+                aria-pressed={on}
+                className={cn(
+                  "relative flex items-center gap-1.5 rounded-t-md px-2 pb-[9px] pt-1.5 text-[13.5px] font-medium transition-colors",
+                  on ? "text-hub-text" : "text-hub-muted hover:text-hub-text",
+                )}
+              >
+                {r === "all" ? "All members" : ROLE_LABELS[r]}
+                <span className="text-xs text-hub-faint">{count}</span>
+                {on ? <span aria-hidden className="absolute inset-x-1.5 -bottom-px h-0.5 rounded-sm bg-hub-text" /> : null}
+              </button>
+            );
+          })}
         </div>
-        <Button
-          disabled={inviteBusy || busyUserId !== null}
-          onClick={() => { setPanelMode("add"); setInviteMsg(null); }}
-          className="h-10 rounded-full px-5"
-        >
-          <UserPlus size={15} /> Add member
-        </Button>
+        <div className="ml-auto flex items-center gap-1 pb-1.5">
+          <label
+            className={cn(
+              "flex h-7 w-7 cursor-text items-center gap-1.5 overflow-hidden rounded-md px-1.5 text-hub-muted transition-[width] duration-200 focus-within:w-[220px] focus-within:bg-hub-hover",
+              query ? "w-[220px] bg-hub-hover" : "",
+            )}
+            title="Search (Ctrl+K)"
+          >
+            <Search size={16} strokeWidth={1.6} className="shrink-0" />
+            <input
+              ref={searchRef}
+              aria-label="Search members by name or role"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
+              placeholder="Search by name or role…"
+              className="min-w-0 flex-1 bg-transparent text-[13.5px] text-hub-text outline-none placeholder:text-hub-faint"
+            />
+          </label>
+          <Popover
+            label="Filter"
+            buttonClassName={cn(iconBtn, extraFilter !== "none" && "bg-hub-accent-bg text-hub-accent-text hover:text-hub-accent-text")}
+            button={<ListFilter size={16} strokeWidth={1.6} />}
+          >
+            {(close) => (Object.keys(EXTRA_FILTER_LABELS) as ExtraFilter[]).map((f) => (
+              <MenuItem key={f} onClick={() => { setExtraFilter(f); close(); }}>
+                <span className="w-4">{extraFilter === f ? <Check size={14} /> : null}</span>
+                {EXTRA_FILTER_LABELS[f]}
+              </MenuItem>
+            ))}
+          </Popover>
+          <div className="ml-1.5 flex h-7 items-stretch overflow-hidden rounded-md bg-hub-accent text-[13.5px] font-semibold text-[#0d2b1d]">
+            <button
+              type="button"
+              disabled={busyAny}
+              onClick={openAdd}
+              className="flex items-center gap-1.5 px-2.5 hover:bg-black/10 disabled:opacity-60"
+            >
+              <Plus size={14} strokeWidth={2} /> Add member
+            </button>
+            <span aria-hidden className="w-px bg-white/25" />
+            <Popover
+              label="More team actions"
+              align="right"
+              buttonClassName="flex h-full items-center px-1.5 hover:bg-black/10"
+              button={<ChevronDown size={14} strokeWidth={2} />}
+            >
+              {(close) => (
+                <>
+                  <MenuItem onClick={() => { close(); void runBulk("print"); }}>
+                    <Printer size={14} strokeWidth={1.6} /> Print all team lanyards (PDF)
+                  </MenuItem>
+                  <MenuItem onClick={() => { close(); void runBulk("download"); }}>
+                    <Download size={14} strokeWidth={1.6} /> Download all as JPEGs (zip)
+                  </MenuItem>
+                </>
+              )}
+            </Popover>
+          </div>
+        </div>
       </div>
 
-      <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_420px]">
-        {/* ----- Member list ----- */}
-        <Frame className="min-w-0">
-          <div className="overflow-x-auto bg-white ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
-            <div className="hidden h-12 grid-cols-[minmax(180px,1.6fr)_110px_minmax(140px,1.2fr)_110px_130px_16px] items-center gap-5 border-b border-slate-200 px-6 text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:border-slate-800 md:grid">
-              <span>Member</span>
-              <span>Role</span>
-              <span>Locations</span>
-              <span>Page access</span>
-              <span>Production</span>
-              <span />
-            </div>
+      {/* ----- Members table ----- */}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[760px] border-collapse text-sm">
+          <thead>
+            <tr>
+              {([
+                [Type, "Member", "w-[34%]"],
+                [CircleChevronDown, "Role", ""],
+                [AlignLeft, "Locations", ""],
+                [Lock, "Page access", ""],
+                [Barcode, "Production", ""],
+              ] as const).map(([Icon, label, w]) => (
+                <th key={label} className={cn("whitespace-nowrap border-b border-hub-line px-2.5 py-2 text-left text-[13px] font-medium text-hub-muted", w)}>
+                  <span className="flex items-center gap-1.5">
+                    <Icon size={14} strokeWidth={1.6} className="text-hub-faint" />{label}
+                  </span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
             {loading ? (
-              <div className="px-6 py-8 text-sm text-slate-500">Loading team…</div>
+              <tr><td colSpan={5} className="p-10 text-center text-hub-faint">Loading team…</td></tr>
             ) : members.length === 0 ? (
-              <div className="px-6 py-8 text-sm text-slate-500">No members yet.</div>
+              <tr><td colSpan={5} className="p-10 text-center text-hub-faint">No members yet.</td></tr>
             ) : visible.length === 0 ? (
-              <div className="px-6 py-8 text-sm text-slate-500">No members match.</div>
-            ) : (
-              <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-                {visible.map((m) => {
-                  const isSel = !showAdd && selected?.user_id === m.user_id;
-                  const pages = effectiveFor(m).size;
-                  return (
-                    <li key={m.user_id}>
+              <tr><td colSpan={5} className="p-10 text-center text-hub-faint">No members match{q ? ` “${query.trim()}”` : ""}.</td></tr>
+            ) : visible.map((m) => {
+              const isSel = peekOpen && !showAdd && selected?.user_id === m.user_id;
+              const pages = effectiveFor(m).size;
+              const full = pages === NAV_KEYS.length;
+              const self = m.user_id === profile.user_id;
+              return (
+                <tr
+                  key={m.user_id}
+                  onClick={() => { if (!busyAny) selectMember(m.user_id); }}
+                  className={cn(
+                    "group cursor-pointer transition-colors duration-100",
+                    isSel ? "bg-hub-accent-bg" : "hover:bg-hub-hover",
+                    busyUserId === m.user_id ? "opacity-60" : "",
+                  )}
+                >
+                  <td className="border-b border-hub-line px-2.5 py-[9px] align-middle">
+                    <div className="flex items-center gap-2.5">
+                      <Avatar member={m} size={28} />
                       <button
                         type="button"
-                        disabled={inviteBusy || busyUserId !== null}
-                        onClick={() => selectMember(m.user_id)}
+                        disabled={busyAny}
+                        onClick={(e) => { e.stopPropagation(); selectMember(m.user_id); }}
                         aria-current={isSel ? "true" : undefined}
-                        className={cn(
-                          "grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-x-5 gap-y-2 px-4 py-4 text-left transition-colors md:min-h-[76px] md:grid-cols-[minmax(180px,1.6fr)_110px_minmax(140px,1.2fr)_110px_130px_16px] md:px-6 md:py-0",
-                          isSel
-                            ? "bg-slate-50 shadow-[inset_3px_0_0_theme(colors.emerald.500)] dark:bg-slate-800/50 dark:shadow-[inset_3px_0_0_theme(colors.emerald.400)]"
-                            : "hover:bg-slate-50 dark:hover:bg-slate-800/30",
-                          busyUserId === m.user_id ? "opacity-60" : "",
-                        )}
+                        aria-label={`Open ${m.display_name}`}
+                        className="min-w-0 truncate text-left font-medium text-hub-text outline-none focus-visible:underline"
                       >
-                        <span className="flex min-w-0 items-center gap-3.5">
-                          <Avatar member={m} size="md" />
-                          <span className="truncate text-[15px] font-semibold text-slate-900 dark:text-slate-100">
-                            {m.display_name}
-                          </span>
-                          {m.user_id === profile?.user_id ? (
-                            <span className="shrink-0 text-[11px] text-slate-400">You</span>
-                          ) : null}
-                        </span>
-                        <span><RoleBadge role={m.role} /></span>
-                        <span className="col-span-2 flex flex-wrap gap-1.5 md:col-span-1">
-                          {m.locations.length === 0 ? (
-                            <span className="text-xs text-amber-600 dark:text-amber-400">No locations</span>
-                          ) : LOCATIONS.filter((l) => m.locations.includes(l)).map((l) => (
-                            <span key={l} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600 ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:ring-slate-700">
-                              {LOCATION_SHORT[l] ?? l}
-                            </span>
-                          ))}
-                        </span>
-                        <span className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                          <span className="h-1.5 w-12 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700">
-                            <span className="block h-full bg-emerald-500 dark:bg-emerald-400" style={{ width: `${(pages / NAV_KEYS.length) * 100}%` }} />
-                          </span>
-                          {pages}/{NAV_KEYS.length}
-                        </span>
-                        <span className="flex flex-col text-xs">
-                          {m.barcode
-                            ? <span className="text-emerald-600 dark:text-emerald-400">● Lanyard issued</span>
-                            : <span className="text-amber-600 dark:text-amber-400">○ No lanyard</span>}
-                          <span className="text-slate-400">
-                            {m.hourly_rate !== null ? `$${m.hourly_rate.toFixed(2)}/hr` : "No rate set"}
-                          </span>
-                        </span>
-                        <ChevronRight size={16} className="hidden text-slate-400 md:block" />
+                        {m.display_name}
                       </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
-        </Frame>
-
-        {/* ----- Side panel ----- */}
-        <Frame className="min-w-0 lg:sticky lg:top-4">
-          <aside className="bg-white ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
-            {showAdd ? (
-              <AddMemberPanel
-                newName={newName} setNewName={setNewName}
-                newEmail={newEmail} setNewEmail={setNewEmail}
-                newPassword={newPassword} setNewPassword={setNewPassword}
-                newRole={newRole} setNewRole={setNewRole}
-                newLocs={newLocs} setNewLocs={setNewLocs}
-                inviteBusy={inviteBusy} inviteMsg={inviteMsg}
-                onSubmit={() => void submitInvite()}
-                onCancel={members.length ? () => setPanelMode("member") : undefined}
-              />
-            ) : selected ? (
-              <MemberPanel
-                key={selected.user_id}
-                member={selected}
-                isSelf={selected.user_id === profile?.user_id}
-                busy={busyUserId !== null}
-                tab={tab}
-                setTab={setTab}
-                onRename={(name) => void updateDisplayName(selected.user_id, name)}
-                onRole={(role) => void updateRole(selected.user_id, role)}
-                onToggleLocation={(loc, on) => void toggleLocation(selected.user_id, loc, on)}
-                onSetNav={(next) => void updateAllowedNav(selected.user_id, next)}
-                onIssueBarcode={() => void issueBarcode(selected)}
-                onPrint={() => printBarcode(selected)}
-                onRate={(rate) => void updateRate(selected, rate)}
-                onRemove={() => void removeMember(selected.user_id, selected.display_name)}
-              />
+                      {self ? <span className="ml-0.5 text-[11.5px] text-hub-faint">You</span> : null}
+                      <span
+                        aria-hidden
+                        className="ml-auto rounded-[5px] bg-hub-panel px-[7px] py-0.5 text-[11.5px] font-semibold tracking-[0.03em] text-hub-muted opacity-0 shadow-[0_0_0_1px_rgb(var(--hub-line-2))] transition-opacity group-hover:opacity-100"
+                      >
+                        OPEN
+                      </span>
+                    </div>
+                  </td>
+                  <td className="border-b border-hub-line px-2.5 py-[9px]">
+                    <Tag color={ROLE_TAG_COLOR[m.role]}>{ROLE_LABELS[m.role]}</Tag>
+                  </td>
+                  <td className="border-b border-hub-line px-2.5 py-[9px]">
+                    <LocationTags locations={m.locations} />
+                  </td>
+                  <td className="border-b border-hub-line px-2.5 py-[9px]">
+                    <div className="flex items-center gap-2.5 whitespace-nowrap text-[13px] tabular-nums text-hub-muted">
+                      <span className="h-1 w-16 overflow-hidden rounded bg-hub-line-2">
+                        <span
+                          className={cn("block h-full rounded", full ? "bg-hub-accent-text" : "bg-hub-muted")}
+                          style={{ width: `${(pages / NAV_KEYS.length) * 100}%` }}
+                        />
+                      </span>
+                      {pages}/{NAV_KEYS.length}
+                      {isCustomAccess(m) ? <span className="text-xs text-hub-faint">· custom</span> : null}
+                    </div>
+                  </td>
+                  <td className="border-b border-hub-line px-2.5 py-[9px] text-[13px] leading-[1.35]">
+                    <StatusDot ok={!!m.barcode}>{m.barcode ? "Lanyard issued" : "No lanyard"}</StatusDot>
+                    <div className="pl-3 text-[12.5px] text-hub-faint">
+                      {m.hourly_rate !== null ? `$${m.hourly_rate.toFixed(2)}/hr` : "No rate set"}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {!loading ? (
+              <tr>
+                <td colSpan={5} className="p-0">
+                  <button
+                    type="button"
+                    disabled={busyAny}
+                    onClick={openAdd}
+                    className="flex w-full items-center gap-2 px-2.5 py-[9px] text-left text-hub-faint hover:bg-hub-hover hover:text-hub-muted disabled:opacity-50"
+                  >
+                    <Plus size={16} strokeWidth={1.6} /> New member
+                  </button>
+                </td>
+              </tr>
             ) : null}
-          </aside>
-        </Frame>
+          </tbody>
+        </table>
       </div>
+
+      {/* ----- Side peek ----- */}
+      <section
+        aria-label={showAdd ? "Add member" : selected ? `${selected.display_name} details` : "Member details"}
+        aria-hidden={!peekOpen}
+        className="fixed inset-y-0 right-0 z-30 flex w-full flex-col bg-hub-panel text-hub-text shadow-hub-pop md:w-[min(520px,46vw)]"
+        style={{
+          transform: peekOpen ? "none" : "translateX(102%)",
+          visibility: peekOpen ? "visible" : "hidden",
+          transition: "transform 260ms cubic-bezier(.2,.8,.2,1), visibility 260ms",
+        }}
+      >
+        <div className="flex h-11 shrink-0 items-center gap-1 px-2.5">
+          <button type="button" className={iconBtn} onClick={closePanel} aria-label="Close panel" title="Close">
+            <ChevronsRight size={16} strokeWidth={1.6} />
+          </button>
+          {!showAdd ? (
+            <>
+              <button type="button" className={iconBtn} onClick={() => step(-1)} disabled={busyAny || visible.length < 2} aria-label="Previous member" title="Previous">
+                <ChevronUp size={16} strokeWidth={1.6} />
+              </button>
+              <button type="button" className={iconBtn} onClick={() => step(1)} disabled={busyAny || visible.length < 2} aria-label="Next member" title="Next">
+                <ChevronDown size={16} strokeWidth={1.6} />
+              </button>
+            </>
+          ) : null}
+          <span className="flex-1" />
+          <span className="mr-1.5 text-xs text-hub-faint">Esc to close</span>
+          {!showAdd && selected ? (
+            <Popover label="More" align="right" buttonClassName={iconBtn} button={<MoreHorizontal size={16} strokeWidth={1.6} />}>
+              {(close) => (
+                <>
+                  <MenuItem disabled={!selected.barcode} onClick={() => { close(); printBarcode(selected); }}>
+                    <Printer size={14} strokeWidth={1.6} /> Print lanyard
+                  </MenuItem>
+                  <MenuItem
+                    disabled={busyAny || selected.locations.length === 0}
+                    onClick={() => { close(); void issueBarcode(selected); }}
+                  >
+                    <RefreshCw size={14} strokeWidth={1.6} /> {selected.barcode ? "Regenerate lanyard" : "Issue lanyard"}
+                  </MenuItem>
+                </>
+              )}
+            </Popover>
+          ) : null}
+        </div>
+        {showAdd ? (
+          <AddMemberPanel
+            newName={newName} setNewName={setNewName}
+            newEmail={newEmail} setNewEmail={setNewEmail}
+            newPassword={newPassword} setNewPassword={setNewPassword}
+            newRole={newRole} setNewRole={setNewRole}
+            newLocs={newLocs} setNewLocs={setNewLocs}
+            inviteBusy={inviteBusy} inviteMsg={inviteMsg}
+            onSubmit={() => void submitInvite()}
+            onCancel={closePanel}
+          />
+        ) : selected ? (
+          <MemberPanel
+            key={selected.user_id}
+            member={selected}
+            isSelf={selected.user_id === profile.user_id}
+            email={selected.user_id === profile.user_id ? selfEmail : null}
+            busy={busyUserId !== null}
+            tab={tab}
+            setTab={setTab}
+            onRename={(name) => void updateDisplayName(selected.user_id, name)}
+            onRole={(role) => void updateRole(selected.user_id, role)}
+            onToggleLocation={(loc, on) => void toggleLocation(selected.user_id, loc, on)}
+            onSetNav={(next) => void updateAllowedNav(selected.user_id, next)}
+            onIssueBarcode={() => void issueBarcode(selected)}
+            onPrint={() => printBarcode(selected)}
+            onRate={(rate) => void updateRate(selected, rate)}
+            onRemove={() => void removeMember(selected.user_id, selected.display_name)}
+          />
+        ) : null}
+      </section>
+
+      {toastNode}
     </section>
   );
 }
@@ -748,47 +939,53 @@ function OwnerTeamMembersCard({ profile }: { profile: UserProfile }) {
 // Presentational pieces
 // ---------------------------------------------------------------------------
 
-/** Hairline frame with small square markers on each corner. */
-function Frame({ className, children }: { className?: string; children: ReactNode }) {
-  const corner = "pointer-events-none absolute z-10 h-2 w-2 border border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-950";
+function LocationTags({ locations }: { locations: string[] }) {
+  if (locations.length === 0) return <span className="text-[13px] text-hub-warn">No locations</span>;
   return (
-    <div className={cn("relative", className)}>
-      <span aria-hidden className={cn(corner, "-left-1 -top-1")} />
-      <span aria-hidden className={cn(corner, "-right-1 -top-1")} />
-      <span aria-hidden className={cn(corner, "-bottom-1 -left-1")} />
-      <span aria-hidden className={cn(corner, "-bottom-1 -right-1")} />
+    <div className="flex flex-wrap gap-1">
+      {LOCATIONS.filter((l) => locations.includes(l)).map((l) => (
+        <Tag key={l}>{LOCATION_SHORT[l] ?? l}</Tag>
+      ))}
+    </div>
+  );
+}
+
+function StatusDot({ ok, children }: { ok: boolean; children: ReactNode }) {
+  return (
+    <div className={cn("flex items-center gap-1.5", ok ? "text-hub-accent-text" : "text-hub-warn")}>
+      <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-current" />
       {children}
     </div>
   );
 }
 
-function Avatar({ member, size }: { member: MemberRow; size: "md" | "lg" }) {
+function Avatar({ member, size }: { member: MemberRow; size: 28 | 64 }) {
+  return <SharedAvatar name={member.display_name} color={ROLE_TAG_COLOR[member.role]} size={size} className={size === 64 ? "text-[22px]" : "text-[11.5px]"} />;
+}
+
+/** 28×16 toggle switch visual (the clickable element is its parent row). */
+function SwitchVisual({ on }: { on: boolean }) {
   return (
     <span
       aria-hidden
       className={cn(
-        "grid shrink-0 place-items-center rounded-full font-semibold tracking-wide",
-        ROLE_STYLE[member.role].avatar,
-        size === "lg" ? "h-14 w-14 text-lg" : "h-10 w-10 text-sm",
+        "relative ml-auto h-4 w-7 shrink-0 rounded-full transition-colors duration-150",
+        on ? "bg-hub-accent" : "bg-hub-line-2",
       )}
     >
-      {initials(member.display_name)}
+      <span
+        className={cn(
+          "absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-[#fff] shadow-[0_1px_2px_rgba(0,0,0,.25)] transition-transform duration-150",
+          on ? "translate-x-3" : "",
+        )}
+      />
     </span>
   );
 }
 
-function RoleBadge({ role }: { role: Role }) {
-  return (
-    <span className={cn("inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ring-1", ROLE_STYLE[role].badge)}>
-      <span className={cn("h-1.5 w-1.5 rounded-full", ROLE_STYLE[role].dot)} />
-      {ROLE_LABELS[role]}
-    </span>
-  );
-}
-
-/** Large checkbox-style toggle used for pages and locations. */
-function ToggleChip({
-  checked, locked, disabled, onChange, children, title,
+/** A full-width row that toggles a setting; rendered as role="switch". */
+function SwitchRow({
+  checked, locked, disabled, onChange, children, title, className,
 }: {
   checked: boolean;
   locked?: boolean;
@@ -796,55 +993,198 @@ function ToggleChip({
   onChange: (next: boolean) => void;
   children: ReactNode;
   title?: string;
+  className?: string;
 }) {
   return (
     <button
       type="button"
-      role="checkbox"
+      role="switch"
       aria-checked={checked}
-      aria-disabled={locked || undefined}
       disabled={disabled || locked}
       title={title}
       onClick={() => { if (!locked) onChange(!checked); }}
       className={cn(
-        "flex min-w-0 items-center gap-2.5 rounded px-3 py-2.5 text-left text-sm ring-1 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-500 disabled:cursor-not-allowed",
-        checked
-          ? "bg-emerald-50 text-emerald-900 ring-emerald-400 dark:bg-emerald-400/10 dark:text-slate-100 dark:ring-emerald-400/50"
-          : "bg-slate-50 text-slate-500 ring-slate-200 hover:ring-slate-300 dark:bg-slate-800/40 dark:text-slate-400 dark:ring-slate-700 dark:hover:ring-slate-600",
-        locked ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+        "flex w-full select-none items-center gap-2.5 rounded-[5px] px-1.5 py-1.5 text-left text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-hub-accent-text",
+        locked ? "cursor-default [&>span:last-child]:opacity-[.45]" : "cursor-pointer hover:bg-hub-hover disabled:cursor-not-allowed disabled:opacity-60",
+        className,
       )}
     >
-      <span
-        className={cn(
-          "grid h-[18px] w-[18px] shrink-0 place-items-center rounded-[3px] border-[1.5px]",
-          checked
-            ? "border-emerald-500 bg-emerald-500 text-white dark:border-emerald-400 dark:bg-emerald-400 dark:text-slate-900"
-            : "border-slate-300 dark:border-slate-600",
-        )}
-      >
-        {checked ? <Check size={12} strokeWidth={3} /> : null}
-      </span>
-      <span className="min-w-0 flex-1 break-words">{children}</span>
-      {locked ? <Lock size={12} className="shrink-0" /> : null}
+      {children}
+      <SwitchVisual on={checked} />
     </button>
   );
 }
 
-function SectionTitle({ title, hint }: { title: string; hint?: ReactNode }) {
+function TextButton({
+  children, onClick, disabled, title,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+}) {
   return (
-    <div className="mb-3">
-      <h3 className="text-[13px] font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
-      {hint ? <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{hint}</p> : null}
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className="inline-flex items-center gap-1.5 rounded-[5px] px-2 py-[3px] text-[13px] text-hub-muted hover:bg-hub-hover hover:text-hub-text disabled:pointer-events-none disabled:opacity-35"
+    >
+      {children}
+    </button>
+  );
+}
+
+function OutlineButton({
+  children, onClick, disabled, title,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className="inline-flex items-center gap-1.5 rounded-md px-3 py-[5px] text-[13px] text-hub-text shadow-[0_0_0_1px_rgb(var(--hub-line-2))] hover:bg-hub-hover disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Small click-to-open menu that closes on outside click or Escape. */
+function Popover({
+  label, button, buttonClassName, align = "right", children,
+}: {
+  label: string;
+  button: ReactNode;
+  buttonClassName?: string;
+  align?: "left" | "right";
+  children: (close: () => void) => ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); setOpen(false); } };
+    document.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [open]);
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        aria-label={label}
+        title={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={buttonClassName}
+      >
+        {button}
+      </button>
+      {open ? (
+        <div
+          role="menu"
+          className={cn(
+            "absolute top-8 z-40 min-w-[220px] rounded-lg bg-hub-panel p-1 text-[13.5px] font-normal text-hub-text shadow-hub-pop",
+            align === "right" ? "right-0" : "left-0",
+          )}
+        >
+          {children(() => setOpen(false))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function MenuItem({ children, onClick, disabled }: { children: ReactNode; onClick: () => void; disabled?: boolean }) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      className="flex w-full items-center gap-2 whitespace-nowrap rounded-[5px] px-2 py-1.5 text-left hover:bg-hub-hover disabled:pointer-events-none disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
+function BarcodeGraphic({ token }: { token: string }) {
+  const ref = useRef<SVGSVGElement>(null);
+  const [ok, setOk] = useState(true);
+  useEffect(() => {
+    if (!ref.current) return;
+    let alive = true;
+    // currentColor follows the theme without re-rendering the bars.
+    void renderBarcodeSvg(ref.current, token, "currentColor").then((r) => { if (alive) setOk(r); });
+    return () => { alive = false; };
+  }, [token]);
+  return <svg ref={ref} aria-hidden className={cn("h-14 max-w-full text-hub-text", ok ? "" : "hidden")} />;
+}
+
+const rateInputCls = "h-full w-16 min-w-0 bg-transparent px-1 text-[13.5px] text-hub-text outline-none [appearance:textfield] placeholder:text-hub-faint disabled:cursor-not-allowed [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none";
+
+/** Inline hourly-rate editor. Saves on blur, exactly as before. */
+function RateInput({ member, busy, onRate }: { member: MemberRow; busy: boolean; onRate: (rate: number | null) => void }) {
+  return (
+    <span className="flex h-[30px] w-fit items-center rounded-[5px] pl-2 hover:bg-hub-hover focus-within:bg-hub-hover">
+      <span className="text-[13.5px] text-hub-faint">$</span>
+      <input
+        key={member.hourly_rate ?? "none"}
+        type="number"
+        disabled={busy}
+        min={0}
+        step={0.01}
+        defaultValue={member.hourly_rate ?? ""}
+        placeholder="Empty"
+        aria-label="Hourly rate"
+        onBlur={(e) => {
+          const v = e.target.value.trim();
+          if (v === "") {
+            if (member.hourly_rate !== null) onRate(null);
+            return;
+          }
+          const n = Number(v);
+          if (!Number.isFinite(n) || n < 0) return;
+          if (n !== member.hourly_rate) onRate(n);
+        }}
+        onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+        className={rateInputCls}
+      />
+      <span className="pr-2 text-[13.5px] text-hub-faint">/hr</span>
+    </span>
+  );
+}
+
+function PropKey({ icon: Icon, children }: { icon: typeof Info; children: ReactNode }) {
+  return (
+    <div className="flex h-[34px] items-center gap-2 text-[13.5px] text-hub-muted">
+      <Icon size={15} strokeWidth={1.6} className="text-hub-faint" />{children}
     </div>
   );
 }
 
 export function MemberPanel({
-  member, isSelf, busy, tab, setTab,
+  member, isSelf, email, busy, tab, setTab,
   onRename, onRole, onToggleLocation, onSetNav, onIssueBarcode, onPrint, onRate, onRemove,
 }: {
   member: MemberRow;
   isSelf: boolean;
+  /** Only known for the signed-in user (auth emails aren't readable client-side). */
+  email?: string | null;
   busy: boolean;
   tab: PanelTab;
   setTab: (t: PanelTab) => void;
@@ -858,6 +1198,7 @@ export function MemberPanel({
   onRemove: () => void;
 }) {
   const eff = effectiveFor(member);
+  const custom = isCustomAccess(member);
   const tabId = useId();
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const tabs: Array<{ key: PanelTab; label: string; count?: number }> = [
@@ -874,254 +1215,246 @@ export function MemberPanel({
   };
 
   return (
-    <div className={cn(busy ? "opacity-70" : "")}>
-      {/* Header */}
-      <div className="flex items-center gap-4 border-b border-slate-200 p-6 dark:border-slate-800">
-        <Avatar member={member} size="lg" />
-        <div className="flex min-w-0 flex-1 flex-col items-start gap-2">
-          <input
-            disabled={busy}
-            defaultValue={member.display_name}
-            aria-label="Display name"
-            onBlur={(e) => {
-              const v = e.target.value.trim();
-              if (v && v !== member.display_name) onRename(v);
-              else e.target.value = member.display_name;
-            }}
-            onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
-            className="-ml-2 h-9 w-full rounded-md bg-transparent px-2 text-lg font-semibold text-slate-900 outline-none ring-1 ring-transparent transition hover:bg-slate-50 focus:bg-slate-50 focus:ring-emerald-400 dark:text-slate-100 dark:hover:bg-slate-800/60 dark:focus:bg-slate-800/60"
-          />
-          <RoleBadge role={member.role} />
-        </div>
-      </div>
+    <div className={cn("flex min-h-0 flex-1 flex-col", busy ? "opacity-70" : "")}>
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-10 pt-3.5 sm:px-10">
+        {/* Header */}
+        <div className="mb-3.5"><Avatar member={member} size={64} /></div>
+        <input
+          key={member.display_name}
+          disabled={busy}
+          defaultValue={member.display_name}
+          aria-label="Display name"
+          onBlur={(e) => {
+            const v = e.target.value.trim();
+            if (v && v !== member.display_name) onRename(v);
+            else e.target.value = member.display_name;
+          }}
+          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+          className="-ml-1.5 w-[calc(100%+12px)] rounded-md bg-transparent px-1.5 text-[28px] font-bold leading-[1.2] tracking-[-0.02em] text-hub-text outline-none hover:bg-hub-hover focus:bg-hub-hover"
+        />
 
-      {/* Tabs */}
-      <div className="flex gap-1 overflow-x-auto border-b border-slate-200 px-4 dark:border-slate-800" role="tablist" aria-label="Member settings">
-        {tabs.map((t, index) => (
-          <button
-            key={t.key}
-            type="button"
-            role="tab"
-            id={`${tabId}-${t.key}`}
-            aria-controls={`${tabId}-panel`}
-            aria-selected={tab === t.key}
-            tabIndex={tab === t.key ? 0 : -1}
-            ref={(el) => { tabRefs.current[index] = el; }}
-            onClick={() => setTab(t.key)}
-            onKeyDown={(e) => {
-              const next = e.key === "ArrowRight" ? (index + 1) % tabs.length
-                : e.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
-                  : e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : null;
-              if (next === null) return;
-              e.preventDefault();
-              setTab(tabs[next].key);
-              tabRefs.current[next]?.focus();
-            }}
-            className={cn(
-              "-mb-px flex items-center gap-1.5 border-b-2 px-2.5 py-3 text-sm font-medium transition-colors",
-              tab === t.key
-                ? "border-emerald-500 text-slate-900 dark:border-emerald-400 dark:text-slate-100"
-                : "border-transparent text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200",
-            )}
+        {/* Properties */}
+        <div className="mt-[18px] grid grid-cols-[140px_minmax(0,1fr)] gap-y-0.5">
+          <PropKey icon={CircleChevronDown}>Role</PropKey>
+          <div
+            className={cn("relative flex min-h-[34px] items-center rounded-[5px] px-2", !(isSelf || busy) && "hover:bg-hub-hover")}
+            title={isSelf ? "You can't change your own role here." : ROLE_DESCRIPTIONS[member.role]}
           >
-            {t.label}
-            {t.count !== undefined ? (
-              <span className="rounded-full bg-slate-100 px-1.5 text-[11px] text-slate-500 ring-1 ring-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:ring-slate-700">
-                {t.count}
-              </span>
-            ) : null}
-          </button>
-        ))}
-      </div>
+            <Tag color={ROLE_TAG_COLOR[member.role]}>{ROLE_LABELS[member.role]}</Tag>
+            <select
+              value={member.role}
+              aria-label="Role"
+              disabled={isSelf || busy}
+              onChange={(e) => onRole(e.target.value as Role)}
+              className="absolute inset-0 h-full w-full cursor-pointer appearance-none opacity-0 disabled:cursor-not-allowed"
+            >
+              {ROLE_ORDER.map((r) => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+            </select>
+          </div>
 
-      {/* Body */}
-      <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${tab}`} tabIndex={0} className="flex flex-col gap-6 p-4 sm:p-6 lg:max-h-[calc(100vh-260px)] lg:overflow-auto">
-        {tab === "access" ? (
-          <>
-            <div>
-              <SectionTitle title="Role" hint={ROLE_DESCRIPTIONS[member.role]} />
-              <Select
-                value={member.role}
-                aria-label="Role"
-                disabled={isSelf || busy}
-                onChange={(e) => onRole(e.target.value as Role)}
-                title={isSelf ? "You can't change your own role here." : undefined}
-                className="h-10 w-full"
-              >
-                {ROLE_ORDER.map((r) => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
-              </Select>
-            </div>
-            <div>
-              <SectionTitle
-                title="Page access"
-                hint={<>
-                  {member.allowed_nav === null
-                    ? <>Using <strong>{ROLE_LABELS[member.role]}</strong> role defaults.</>
-                    : "Custom selection."}{" "}
-                  Pages show in the sidebar and can be opened by URL.
-                </>}
-              />
-              <div className="mb-4 flex flex-wrap gap-2">
-                <MiniButton onClick={() => onSetNav(NAV_KEYS.filter((key) => key !== "dashboard" || member.role === "owner"))} disabled={busy}>Select all</MiniButton>
-                <MiniButton onClick={() => onSetNav([])} disabled={busy}>Clear</MiniButton>
-                <MiniButton onClick={() => onSetNav(null)} disabled={busy || member.allowed_nav === null}>
+          {email ? (
+            <>
+              <PropKey icon={Mail}>Email</PropKey>
+              <div className="flex min-h-[34px] min-w-0 items-center px-2 text-[13.5px]"><span className="truncate">{email}</span></div>
+            </>
+          ) : null}
+
+          <PropKey icon={MapPin}>Locations</PropKey>
+          <div className="flex min-h-[34px] items-center px-2">
+            {member.locations.length ? <LocationTags locations={member.locations} /> : <span className="text-[13.5px] text-hub-faint">Empty</span>}
+          </div>
+
+          <PropKey icon={Barcode}>Lanyard</PropKey>
+          <div className="flex min-h-[34px] items-center px-2 text-[13.5px]">
+            {member.barcode ? <span className="text-hub-accent-text">Issued</span> : <span className="text-hub-faint">Not issued</span>}
+          </div>
+
+          <PropKey icon={Coins}>Hourly rate</PropKey>
+          <div className="flex min-h-[34px] items-center">
+            <RateInput member={member} busy={busy} onRate={onRate} />
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div className="mt-[22px] flex gap-0.5 border-b border-hub-line" role="tablist" aria-label="Member settings">
+          {tabs.map((t, index) => (
+            <button
+              key={t.key}
+              type="button"
+              role="tab"
+              id={`${tabId}-${t.key}`}
+              aria-controls={`${tabId}-panel`}
+              aria-selected={tab === t.key}
+              tabIndex={tab === t.key ? 0 : -1}
+              ref={(el) => { tabRefs.current[index] = el; }}
+              onClick={() => setTab(t.key)}
+              onKeyDown={(e) => {
+                const next = e.key === "ArrowRight" ? (index + 1) % tabs.length
+                  : e.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+                    : e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : null;
+                if (next === null) return;
+                e.preventDefault();
+                setTab(tabs[next].key);
+                tabRefs.current[next]?.focus();
+              }}
+              className={cn(
+                "relative flex items-center gap-1.5 px-2 pb-[9px] pt-1.5 text-[13.5px] font-medium transition-colors",
+                tab === t.key ? "text-hub-text" : "text-hub-muted hover:text-hub-text",
+              )}
+            >
+              {t.label}
+              {t.count !== undefined ? (
+                <span className="rounded-[10px] bg-hub-hover px-1.5 text-[11.5px] text-hub-faint">{t.count}</span>
+              ) : null}
+              {tab === t.key ? <span aria-hidden className="absolute inset-x-1.5 -bottom-px h-0.5 rounded-sm bg-hub-text" /> : null}
+            </button>
+          ))}
+        </div>
+
+        {/* Body */}
+        <div role="tabpanel" id={`${tabId}-panel`} aria-labelledby={`${tabId}-${tab}`} tabIndex={0} className="outline-none">
+          {tab === "access" ? (
+            <>
+              <Callout className="mt-[18px] text-[13.5px]">
+                <b className="font-semibold text-hub-text">
+                  {custom ? "Custom access." : `Using ${ROLE_LABELS[member.role]} defaults.`}
+                </b>{" "}
+                {ROLE_DESCRIPTIONS[member.role]} Pages show in the sidebar and can be opened by URL.
+              </Callout>
+              <div className="mt-3.5 flex flex-wrap gap-0.5">
+                <TextButton onClick={() => onSetNav(NAV_KEYS.filter((key) => key !== "dashboard" || member.role === "owner"))} disabled={busy}>Select all</TextButton>
+                <TextButton onClick={() => onSetNav([])} disabled={busy}>Clear</TextButton>
+                <TextButton onClick={() => onSetNav(null)} disabled={busy || member.allowed_nav === null}>
                   Reset to role default
-                </MiniButton>
+                </TextButton>
               </div>
-              <div className="space-y-4">
-                {ALL_NAV_GROUPS.map((g) => (
-                  <div key={g.label}>
-                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                      {g.label}
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      {g.keys.map((key) => {
-                        const lockReason = key === "welcome" ? "Welcome is always available"
-                          : key === "dashboard" && member.role !== "owner" ? "Dashboard is only available to owners"
-                            : key === "settings" && member.role === "owner" ? "Settings is always available to owners" : undefined;
-                        return (
-                          <ToggleChip
-                            key={key}
-                            checked={eff.has(key)}
-                            locked={!!lockReason}
-                            disabled={busy}
-                            title={lockReason}
-                            onChange={(on) => togglePage(key, on)}
-                          >
-                            {DEFAULT_NAV_LABELS[key]}
-                          </ToggleChip>
-                        );
-                      })}
-                    </div>
+              {ACCESS_GROUPS.map((g) => (
+                <div key={g.label} className="mt-5">
+                  <div className="flex items-center justify-between px-1.5 pb-1 text-xs font-medium tracking-[0.01em] text-hub-faint">
+                    <span>{g.label}</span>
+                    <span className="tabular-nums">{g.keys.filter((k) => eff.has(k)).length}/{g.keys.length}</span>
                   </div>
+                  {g.keys.map((key) => {
+                    const lockReason = lockReasonFor(key, member.role);
+                    const Icon = NAV_ICONS[key];
+                    return (
+                      <SwitchRow
+                        key={key}
+                        checked={eff.has(key)}
+                        locked={!!lockReason}
+                        disabled={busy}
+                        title={lockReason}
+                        onChange={(on) => togglePage(key, on)}
+                      >
+                        <Icon size={16} strokeWidth={1.6} className="shrink-0 text-hub-muted" />
+                        <span className={lockReason ? "text-hub-muted" : ""}>{DEFAULT_NAV_LABELS[key]}</span>
+                        {lockReason ? <Lock size={13} strokeWidth={1.6} className="ml-0.5 shrink-0 text-hub-faint" /> : null}
+                      </SwitchRow>
+                    );
+                  })}
+                </div>
+              ))}
+            </>
+          ) : null}
+
+          {tab === "locations" ? (
+            <>
+              <Callout className="mt-[18px] text-[13.5px]">Members only see stock, orders and reports for the locations they&apos;re assigned to.</Callout>
+              <div className="mt-3">
+                {LOCATIONS.map((loc) => (
+                  <SwitchRow
+                    key={loc}
+                    checked={member.locations.includes(loc)}
+                    disabled={busy}
+                    onChange={(on) => onToggleLocation(loc, on)}
+                    className="gap-3 rounded-none border-b border-hub-line py-2.5"
+                  >
+                    <span className="grid h-5 w-7 shrink-0 place-items-center rounded border border-hub-line bg-hub-fill text-[10.5px] font-semibold text-hub-muted">
+                      {(LOCATION_SHORT[loc] ?? loc).slice(0, 3).toUpperCase()}
+                    </span>
+                    <span className="flex-1">
+                      {LOCATION_LABELS[loc as keyof typeof LOCATION_LABELS]}
+                      {LOCATION_SUBTITLES[loc] ? <span className="block text-[12.5px] text-hub-faint">{LOCATION_SUBTITLES[loc]}</span> : null}
+                    </span>
+                  </SwitchRow>
                 ))}
               </div>
-            </div>
-          </>
-        ) : null}
+            </>
+          ) : null}
 
-        {tab === "locations" ? (
-          <div>
-            <SectionTitle title="Locations" hint="Which locations this member can switch to." />
-            <div className="grid gap-2">
-              {LOCATIONS.map((loc) => (
-                <ToggleChip
-                  key={loc}
-                  checked={member.locations.includes(loc)}
-                  disabled={busy}
-                  onChange={(on) => onToggleLocation(loc, on)}
-                >
-                  {LOCATION_LABELS[loc as keyof typeof LOCATION_LABELS]}
-                </ToggleChip>
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        {tab === "production" ? (
-          <>
-            <div>
-              <SectionTitle title="Lanyard barcode" hint="Scanned at stations to log production work." />
-              {member.barcode ? (
-                <div className="flex flex-wrap items-center gap-4 rounded bg-slate-50 p-4 ring-1 ring-slate-200 dark:bg-slate-800/40 dark:ring-slate-700">
-                  <code className="font-mono text-base tracking-[0.15em] text-slate-900 dark:text-slate-100">
-                    {member.barcode}
-                  </code>
-                  <div className="flex gap-2">
-                    <MiniButton onClick={onPrint} title="Open a print window with this user's lanyard card">
-                      <Printer size={12} /> Print lanyard
-                    </MiniButton>
-                    <MiniButton onClick={onIssueBarcode} disabled={busy} title="Generate a new barcode — invalidates the old lanyard">
-                      <RefreshCw size={12} /> Regenerate
-                    </MiniButton>
-                  </div>
-                </div>
-              ) : (
-                <div className="rounded border-[1.5px] border-dashed border-slate-300 p-6 text-center text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400">
-                  No lanyard yet
-                  <div className="mt-3">
-                    <Button
-                      size="sm"
+          {tab === "production" ? (
+            <>
+              <div className="mt-[18px] flex flex-col items-center gap-2.5 rounded-lg border border-hub-line p-[18px]">
+                {member.barcode ? (
+                  <>
+                    <BarcodeGraphic token={member.barcode} />
+                    <code className="font-mono text-[12.5px] tracking-[0.12em] text-hub-muted">{member.barcode}</code>
+                    <div className="mt-1 flex flex-wrap justify-center gap-2">
+                      <OutlineButton onClick={onPrint} title="Open a print window with this user's lanyard card">
+                        <Printer size={13} strokeWidth={1.6} /> Print lanyard
+                      </OutlineButton>
+                      <OutlineButton onClick={onIssueBarcode} disabled={busy} title="Generate a new barcode — invalidates the old lanyard">
+                        <RefreshCw size={13} strokeWidth={1.6} /> Regenerate
+                      </OutlineButton>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-center text-[13.5px] text-hub-faint">
+                      No lanyard issued yet.<br />
+                      Issue one so {member.display_name.split(" ")[0]} can scan in on the floor.
+                    </div>
+                    <OutlineButton
                       onClick={onIssueBarcode}
                       disabled={busy || member.locations.length === 0}
                       title={member.locations.length === 0 ? "Grant a location first" : "Generate a new barcode token"}
-                      className="rounded-full px-4"
                     >
-                      Issue lanyard barcode
-                    </Button>
-                  </div>
+                      Issue lanyard
+                    </OutlineButton>
+                  </>
+                )}
+              </div>
+              <div className="mt-5">
+                <div className="px-1.5 pb-1 text-xs font-medium text-hub-faint">Pay</div>
+                <div className="grid grid-cols-[140px_minmax(0,1fr)]">
+                  <PropKey icon={Coins}>Hourly rate</PropKey>
+                  <div className="flex min-h-[34px] items-center"><RateInput member={member} busy={busy} onRate={onRate} /></div>
                 </div>
-              )}
-            </div>
-            <div>
-              <SectionTitle title="Hourly rate" hint="Used for labour cost in production reports." />
-              <label className="flex h-10 w-44 items-center rounded-md bg-white pl-3 ring-1 ring-slate-300 focus-within:ring-emerald-400 dark:bg-slate-900 dark:ring-slate-700">
-                <span className="text-sm text-slate-400">$</span>
-                <input
-                  type="number"
-                  disabled={busy}
-                  min={0}
-                  step={0.01}
-                  defaultValue={member.hourly_rate ?? ""}
-                  placeholder="0.00"
-                  aria-label="Hourly rate"
-                  onBlur={(e) => {
-                    const v = e.target.value.trim();
-                    if (v === "") {
-                      if (member.hourly_rate !== null) onRate(null);
-                      return;
-                    }
-                    const n = Number(v);
-                    if (!Number.isFinite(n) || n < 0) return;
-                    if (n !== member.hourly_rate) onRate(n);
-                  }}
-                  className="h-full w-full bg-transparent px-1.5 text-sm outline-none"
-                />
-                <span className="pr-3 text-sm text-slate-400">/hr</span>
-              </label>
-            </div>
-          </>
-        ) : null}
+                <p className="px-1.5 text-[12.5px] text-hub-faint">Used for labour cost in production reports.</p>
+              </div>
+            </>
+          ) : null}
+        </div>
       </div>
 
       {/* Footer */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-800">
-        {isSelf ? (
-          <span className="text-xs text-slate-400">You can't remove yourself</span>
-        ) : (
-          <button
-            type="button"
-            onClick={onRemove}
-            disabled={busy}
-            className="inline-flex h-8 items-center gap-1.5 rounded-full px-3.5 text-xs font-medium text-red-600 ring-1 ring-red-200 hover:bg-red-50 disabled:opacity-50 dark:text-red-400 dark:ring-red-900/50 dark:hover:bg-red-900/20"
-          >
-            <Trash2 size={13} /> Remove member
-          </button>
-        )}
-        <span className="text-xs text-slate-400">{busy ? "Saving…" : "Changes save automatically"}</span>
+      <div className="flex shrink-0 items-center justify-between gap-2 border-t border-hub-line px-6 py-2.5 text-[12.5px] text-hub-faint sm:px-10">
+        <span className="flex items-center gap-1.5">
+          <span aria-hidden className={cn("h-1.5 w-1.5 rounded-full", busy ? "bg-hub-warn" : "bg-hub-accent-text")} />
+          {busy ? "Saving…" : "Changes save automatically"}
+        </span>
+        <button
+          type="button"
+          onClick={onRemove}
+          disabled={busy || isSelf}
+          className="rounded-[5px] px-2 py-[3px] text-[12.5px] text-hub-bad hover:bg-[rgba(226,85,79,.1)] disabled:pointer-events-none disabled:text-hub-faint"
+        >
+          {isSelf ? "You can't remove yourself" : "Remove from team"}
+        </button>
       </div>
     </div>
   );
 }
 
-function MiniButton({
-  children, onClick, disabled, title,
-}: {
-  children: ReactNode;
-  onClick: () => void;
-  disabled?: boolean;
-  title?: string;
-}) {
+const fieldCls = "h-9 w-full rounded-md bg-hub-hover px-2.5 text-[13.5px] text-hub-text outline-none ring-1 ring-transparent placeholder:text-hub-faint focus:ring-hub-accent-text";
+
+function FormField({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className="inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-xs text-slate-600 ring-1 ring-slate-200 transition-colors hover:text-slate-900 hover:ring-slate-400 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-300 dark:ring-slate-700 dark:hover:text-slate-100 dark:hover:ring-slate-500"
-    >
+    <label className="block">
+      <span className="mb-1.5 block text-[13px] font-medium text-hub-muted">{label}</span>
       {children}
-    </button>
+      {hint ? <span className="mt-1.5 block text-[12.5px] text-hub-faint">{hint}</span> : null}
+    </label>
   );
 }
 
@@ -1145,79 +1478,71 @@ function AddMemberPanel({
     <form
       onSubmit={(e) => { e.preventDefault(); onSubmit(); }}
       autoComplete="off"
+      className="flex min-h-0 flex-1 flex-col"
     >
-      <div className="flex items-center justify-between gap-3 border-b border-slate-200 p-6 dark:border-slate-800">
-        <div className="flex items-center gap-3">
-          <span className="grid h-14 w-14 place-items-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-400/15 dark:text-emerald-300">
-            <UserPlus size={22} />
-          </span>
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-10 pt-3.5 sm:px-10">
+        <span className="mb-3.5 grid h-16 w-16 place-items-center rounded-full bg-hub-accent-bg text-hub-accent-text">
+          <UserPlus size={26} strokeWidth={1.6} />
+        </span>
+        <h2 className="text-[28px] font-bold leading-[1.2] tracking-[-0.02em]">Add a new member</h2>
+        <p className="mt-1 text-[13.5px] text-hub-muted">Creates their login. Give them the email and password.</p>
+
+        <fieldset disabled={inviteBusy} className="mt-6 min-w-0 space-y-5">
+          <FormField label="Name">
+            <input className={fieldCls} value={newName} maxLength={80} onChange={(e) => setNewName(e.target.value)} placeholder="Jane Smith" />
+          </FormField>
+          <FormField label="Email" hint="What they type to sign in.">
+            <input
+              className={fieldCls}
+              type="email"
+              value={newEmail}
+              onChange={(e) => setNewEmail(e.target.value)}
+              placeholder="jane@inkaarthouse.com"
+              autoComplete="off"
+            />
+          </FormField>
           <div>
-            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Add a new member</h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400">Creates their login. Give them the email and password.</p>
-          </div>
-        </div>
-        {onCancel ? (
-          <button type="button" onClick={onCancel} className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200" aria-label="Close">
-            <X size={18} />
-          </button>
-        ) : null}
-      </div>
-      <fieldset disabled={inviteBusy} className="min-w-0 space-y-5 p-4 sm:p-6">
-        <Field label="Name">
-          <Input value={newName} maxLength={80} onChange={(e) => setNewName(e.target.value)} placeholder="Jane Smith" />
-        </Field>
-        <Field label="Email" hint="What they type to sign in.">
-          <Input
-            type="email"
-            value={newEmail}
-            onChange={(e) => setNewEmail(e.target.value)}
-            placeholder="jane@inkaarthouse.com"
-            autoComplete="off"
-          />
-        </Field>
-        <div>
-          <div className="mb-1.5 text-xs font-medium text-slate-700 dark:text-slate-300">Password</div>
-          <div className="flex flex-wrap gap-2">
-            <div className="relative min-w-0 flex-1 basis-40">
-              <Input
-                type={showPassword ? "text" : "password"}
-                aria-label="Password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="At least 8 characters"
-                autoComplete="new-password"
-                className="pr-10"
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((v) => !v)}
-                className="absolute inset-y-0 right-0 grid w-10 place-items-center text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-                aria-label={showPassword ? "Hide password" : "Show password"}
+            <div className="mb-1.5 text-[13px] font-medium text-hub-muted">Password</div>
+            <div className="flex flex-wrap gap-2">
+              <div className="relative min-w-0 flex-1 basis-40">
+                <input
+                  className={cn(fieldCls, "pr-10")}
+                  type={showPassword ? "text" : "password"}
+                  aria-label="Password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="At least 8 characters"
+                  autoComplete="new-password"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((v) => !v)}
+                  className="absolute inset-y-0 right-0 grid w-10 place-items-center text-hub-faint hover:text-hub-text"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff size={16} strokeWidth={1.6} /> : <Eye size={16} strokeWidth={1.6} />}
+                </button>
+              </div>
+              <OutlineButton
+                onClick={() => { setNewPassword(generatePassword()); setShowPassword(true); }}
+                title="Fill in a random, easy-to-read password"
               >
-                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
+                <Wand2 size={13} strokeWidth={1.6} /> Generate
+              </OutlineButton>
             </div>
-            <MiniButton
-              onClick={() => { setNewPassword(generatePassword()); setShowPassword(true); }}
-              title="Fill in a random, easy-to-read password"
-            >
-              <Wand2 size={12} /> Generate
-            </MiniButton>
+            <p className="mt-1.5 text-[12.5px] text-hub-faint">
+              Pass this on to them yourself. They can change it later with &quot;Forgot your password?&quot;.
+            </p>
           </div>
-          <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
-            Pass this on to them yourself. They can change it later with "Forgot your password?".
-          </p>
-        </div>
-        <Field label="Role" hint={ROLE_DESCRIPTIONS[newRole]}>
-          <Select value={newRole} onChange={(e) => setNewRole(e.target.value as Role)}>
-            {ROLE_ORDER.map((r) => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
-          </Select>
-        </Field>
-        <div>
-          <div className="mb-2 text-xs font-medium text-slate-700 dark:text-slate-300">Locations they can access</div>
-          <div className="grid grid-cols-2 gap-2">
+          <FormField label="Role" hint={ROLE_DESCRIPTIONS[newRole]}>
+            <select className={cn(fieldCls, "cursor-pointer")} value={newRole} onChange={(e) => setNewRole(e.target.value as Role)}>
+              {ROLE_ORDER.map((r) => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+            </select>
+          </FormField>
+          <div>
+            <div className="mb-1 text-[13px] font-medium text-hub-muted">Locations they can access</div>
             {LOCATIONS.map((loc) => (
-              <ToggleChip
+              <SwitchRow
                 key={loc}
                 checked={newLocs.has(loc)}
                 onChange={(on) => setNewLocs((prev) => {
@@ -1227,21 +1552,23 @@ function AddMemberPanel({
                   return next;
                 })}
               >
-                {LOCATION_LABELS[loc as keyof typeof LOCATION_LABELS]}
-              </ToggleChip>
+                <span>{LOCATION_LABELS[loc as keyof typeof LOCATION_LABELS]}</span>
+              </SwitchRow>
             ))}
           </div>
-        </div>
-      </fieldset>
-      <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 px-6 py-4 dark:border-slate-800">
-        <Button type="submit" disabled={inviteBusy} className="rounded-full px-5">
+        </fieldset>
+      </div>
+      <div className="flex shrink-0 flex-wrap items-center gap-3 border-t border-hub-line px-6 py-2.5 sm:px-10">
+        <button
+          type="submit"
+          disabled={inviteBusy}
+          className="inline-flex h-7 items-center rounded-md bg-hub-accent px-3 text-[13.5px] font-semibold text-[#0d2b1d] hover:brightness-95 disabled:opacity-60"
+        >
           {inviteBusy ? "Adding…" : "Add member"}
-        </Button>
+        </button>
+        {onCancel ? <TextButton onClick={onCancel}>Cancel</TextButton> : null}
         {inviteMsg ? (
-          <span role="alert" className={cn(
-            "text-xs",
-            inviteMsg.startsWith("Invite failed") ? "text-red-600 dark:text-red-400" : "text-emerald-700 dark:text-emerald-400",
-          )}>
+          <span role="alert" className={cn("text-[12.5px]", inviteMsg.startsWith("Invite failed") ? "text-hub-bad" : "text-hub-accent-text")}>
             {inviteMsg}
           </span>
         ) : null}
