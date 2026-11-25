@@ -4,9 +4,13 @@ insert into public.locations(key,label) values ('au','Australia'),('uk','United 
 insert into public.settings(location) select key from public.locations;
 
 -- 49 synthetic auth users (no password, cannot sign in) + the 5 existing test logins
-insert into auth.users (instance_id, id, aud, role, email, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, email_confirmed_at)
+-- Token columns must be '' not NULL, or GoTrue fails every lookup of these users ("Database error finding user").
+insert into auth.users (instance_id, id, aud, role, email, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, email_confirmed_at,
+                        confirmation_token, recovery_token, email_change_token_new, email_change, email_change_token_current,
+                        phone_change, phone_change_token, reauthentication_token)
 select '00000000-0000-0000-0000-000000000000'::uuid, ('5e000000-0000-4000-8000-'||lpad(g::text,12,'0'))::uuid, 'authenticated','authenticated',
-       'synthetic-'||g||'@inka-staging.test', now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, now()
+       'synthetic-'||g||'@inka-staging.test', now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, now(),
+       '', '', '', '', '', '', '', ''
 from generate_series(1,49) g
 on conflict (id) do nothing;
 
