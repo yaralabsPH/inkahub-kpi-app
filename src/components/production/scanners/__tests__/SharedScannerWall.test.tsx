@@ -12,7 +12,7 @@ const device = (over: Partial<DeviceStatus> = {}): DeviceStatus => ({
   started: true, online: true, focused: true, visible: true, capturePaused: false, wakeLock: "on", audio: "on", ...over,
 });
 const state = (over: Partial<WallState> = {}): WallState => ({
-  slots: emptySlots(["S1", "S2", "S3"]), last: null, recovery: null, view: { jobs: [], corrupt: [], waiting: 0, blocked: 0, uncertain: 0 },
+  slots: emptySlots(["S1", "S2", "S3"]), last: null, recovery: null, slotNotes: {}, view: { jobs: [], corrupt: [], waiting: 0, blocked: 0, uncertain: 0 },
   storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null, ...over,
 });
 function render(over: Partial<SharedScannerWallProps> = {}) {
@@ -78,6 +78,31 @@ describe("SharedScannerWall", () => {
     const slots = emptySlots(["S1", "S2", "S3"]);
     slots.S1 = { ...slots.S1, identity: { personId: "p", displayName: "Alice", badge: "B", activatedAt: 1_000_000, lastFramingAt: 1_000_000 } };
     expect(render({ state: state({ slots }) })).toContain("Signs out in 15:00");
+  });
+
+  it("shows sign-out progress per scanner, survives another scanner's result, and the suppression note", () => {
+    const slots = emptySlots(["S1", "S2", "S3"]);
+    slots.S2 = {
+      ...slots.S2,
+      identity: { personId: "p", displayName: "Ben", badge: "B", activatedAt: 1_000_000, lastFramingAt: 1_000_000 },
+      signOut: { badge: "B", personId: "p", displayName: "Ben", firstRepeatAt: 0, count: 2 },
+    };
+    const html = render({
+      state: state({
+        slots,
+        slotNotes: { S2: "Remove the badge, wait one second, then scan again" },
+        last: { kind: "saved", title: "Saved #10190203", scannerId: "S1", person: "Alice", order: "10190203", pieces: 1, at: 1 },
+      }),
+    });
+    expect(html).toContain('data-testid="signout-S2"');
+    expect(html).toContain("S2 · Ben · Sign out 2/3");
+    expect(html).toContain("Remove badge; wait one second before scanning again.");
+    expect(html).toContain("Remove the badge, wait one second, then scan again");
+    expect(html).toContain('data-kind="saved"');
+    const out = render({ state: state({ last: { kind: "signed_out", title: "S2 signed out", detail: "Ben is still clocked in. Scan a badge to use S2.", scannerId: "S2", person: "Ben", at: 1 } }) });
+    expect(out).toContain("SIGNED OUT");
+    expect(out).not.toContain("SIGNED IN");
+    expect(out).toContain("Ben is still clocked in. Scan a badge to use S2.");
   });
 
   it("recovery stays visible beside an earlier saved result", () => {

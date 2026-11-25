@@ -17,6 +17,7 @@ import { CHOICE_CODES, dispatchShiftEnd, type FramerChoice, type ScanMode } from
 import { OutboxFullError, type JobScope, type ScannerOutbox, type ScopeView } from "./outbox";
 import type { ProtocolErrorReason } from "./protocol";
 import {
+  cancelGestures,
   clearAll,
   decideFrame,
   emptySlots,
@@ -28,7 +29,7 @@ import {
   type ScannerSlot,
 } from "./session";
 
-export type WallResultKind = "saved" | "queued" | "rejected" | "already" | "signed_in" | "info";
+export type WallResultKind = "saved" | "queued" | "rejected" | "already" | "signed_in" | "signed_out" | "info";
 
 export interface WallResult {
   kind: WallResultKind;
@@ -60,11 +61,18 @@ export const RECOVERY_TITLE = "That scan didn't come through.";
 export const RECOVERY_DETAIL =
   "Nothing was saved from that scan. Whoever just scanned: scan it again. If it was your badge, scan your badge again before your order.";
 export const RECOVERY_SETUP_HINT = "This scanner isn't set up here. Ask a manager to check its scanner ID.";
+export const SUPPRESSED_NOTE = "Remove the badge, wait one second, then scan again";
+export const REPEAT_HINT = "Remove badge; wait one second before scanning again.";
 
 export interface WallState {
   slots: Record<string, ScannerSlot>;
   last: WallResult | null;
   recovery: ScanRecovery | null;
+  /**
+   * Short per-scanner hint shown in that scanner's panel (the sign-out
+   * repeat guard). Cleared by that scanner's next counted scan.
+   */
+  slotNotes: Record<string, string>;
   view: ScopeView | null;
   storageError: string | null;
   deliveryWaiting: string | null;
@@ -84,6 +92,8 @@ export interface ControllerDeps {
   deliver(): Promise<DeliveryReport | null>;
   isOnline(): boolean;
   now(): number;
+  /** Monotonic clock for the sign-out gesture (performance.now()); defaults to now(). */
+  elapsedNow?(): number;
   newRequestId(): string;
   sound(kind: SoundKind): void;
 }
@@ -106,6 +116,7 @@ export class SharedScannerController {
       slots: emptySlots(d.scannerIds),
       last: null,
       recovery: null,
+      slotNotes: {},
       view: null,
       storageError: null,
       deliveryWaiting: null,
@@ -152,9 +163,11 @@ export class SharedScannerController {
    */
   onProtocolError(reason: ProtocolErrorReason, scannerId: string | null): void {
     if (this.disposed) return;
-    void scannerId; // never attributed: the burst may have come from anyone
+    // Never attributed to a worker; a known source cancels only its own
+    // sign-out progress, an unknown one cancels every scanner's.
     const seq = ++this.inputSeq;
     this.set({
+      slots: cancelGestures(this.s.slots, scannerId),
       recovery: {
         title: RECOVERY_TITLE,
         detail: RECOVERY_DETAIL,
@@ -163,6 +176,19 @@ export class SharedScannerController {
       },
     });
     this.d.sound("error");
+  }
+
+  private elapsed(): number {
+    return this.d.elapsedNow ? this.d.elapsedNow() : this.d.now();
+  }
+
+  private note(scannerId: string, text: string | null): void {
+    const has = scannerId in this.s.slotNotes;
+    if (text === null && !has) return;
+    const slotNotes = { ...this.s.slotNotes };
+    if (text === null) delete slotNotes[scannerId];
+    else slotNotes[scannerId] = text;
+    this.set({ slotNotes });
   }
 
   /** A good scan that arrived after the current recovery message clears it. */
@@ -179,9 +205,27 @@ export class SharedScannerController {
       online: this.d.isOnline(),
       now: this.d.now(),
       newRequestId: () => this.d.newRequestId(),
+      mode: this.mode,
+      elapsedNow: this.elapsed(),
     });
     this.set({ slots });
+    if (decision.action === "suppressed") {
+      // A held badge read again: nothing sent, nothing else changes.
+      this.note(scannerId, SUPPRESSED_NOTE);
+      return;
+    }
+    this.note(scannerId, null);
     switch (decision.action) {
+      case "sign_out": {
+        const name = decision.person.displayName;
+        this.goodScan(seq);
+        this.show({
+          kind: "signed_out", scannerId, person: name,
+          title: `${scannerId} signed out`,
+          detail: `${name} is still clocked in. Scan a badge to use ${scannerId}.`,
+        }, "ok");
+        return;
+      }
       case "reject":
         this.show({ kind: "rejected", scannerId, title: `${scannerId}: not saved`, detail: REJECT_TEXT[decision.code] }, "error");
         return;
@@ -214,7 +258,7 @@ export class SharedScannerController {
           : res.outcome === "unusable_badge"
             ? ({ outcome: "unusable_badge" } as const)
             : ({ outcome: "failed", message: res.message } as const);
-    const r = resolveActivation(this.s.slots, scannerId, epoch, requestId, result, this.d.now());
+    const r = resolveActivation(this.s.slots, scannerId, epoch, requestId, result, this.d.now(), this.elapsed());
     if (r.timedOut) {
       // Too late: ignored, scanner cleared, and the operator is told how to recover.
       this.set({ slots: r.slots });
@@ -225,6 +269,15 @@ export class SharedScannerController {
     this.set({ slots: r.slots });
     if (res.outcome === "activated") {
       this.goodScan(seq);
+      const progress = r.slots[scannerId]?.signOut;
+      if (progress) {
+        this.show({
+          kind: "info", scannerId, person: res.displayName,
+          title: `${scannerId} · ${res.displayName} · Sign out ${progress.count}/3`,
+          detail: REPEAT_HINT,
+        }, "ok");
+        return;
+      }
       const shift = expiresAt !== undefined ? ` Dispatching until ${new Date(expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.` : "";
       this.show({ kind: "signed_in", scannerId, person: res.displayName, title: `${scannerId}: ${res.displayName}`, detail: (res.clockedIn ? "Signed in and clocked in." : "Signed in.") + shift }, "ok");
       return;
@@ -283,9 +336,9 @@ export class SharedScannerController {
   /** Periodic: expire idle identities. */
   tick(): void {
     if (this.disposed) return;
-    const { slots, expired, timedOut } = expireIdle(this.s.slots, this.d.now());
+    const { slots, expired, timedOut } = expireIdle(this.s.slots, this.d.now(), this.elapsed());
+    if (slots !== this.s.slots && Object.keys(slots).some((id) => slots[id] !== this.s.slots[id])) this.set({ slots });
     if (expired.length === 0 && timedOut.length === 0) return;
-    this.set({ slots });
     if (timedOut.length > 0) {
       this.show({ kind: "rejected", scannerId: timedOut[0], title: `${timedOut.join(", ")}: badge check timed out`, detail: REJECT_TEXT.pending_timeout }, "error");
       return;
@@ -299,7 +352,7 @@ export class SharedScannerController {
 
   /** Clear every identity (auth/site/mode change, operator reset). */
   resetAll(reason: string): void {
-    this.set({ slots: clearAll(this.s.slots) });
+    this.set({ slots: clearAll(this.s.slots), slotNotes: {} });
     this.show({ kind: "info", scannerId: null, title: "All scanners signed out", detail: reason }, null);
   }
 

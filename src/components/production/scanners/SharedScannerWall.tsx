@@ -41,6 +41,7 @@ const RESULT_STYLE: Record<WallResult["kind"], string> = {
   already: "bg-orange-500 text-white",
   rejected: "bg-red-600 text-white",
   signed_in: "bg-sky-600 text-white",
+  signed_out: "bg-emerald-700 text-white",
   info: "bg-slate-700 text-white",
 };
 
@@ -50,6 +51,7 @@ const RESULT_WORD: Record<WallResult["kind"], string> = {
   already: "ALREADY RECORDED",
   rejected: "NOT SAVED",
   signed_in: "SIGNED IN",
+  signed_out: "SIGNED OUT",
   info: "NOTE",
 };
 
@@ -155,7 +157,7 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
             <div key={id} className="rounded-xl bg-slate-900 ring-1 ring-slate-700 p-4" data-testid={`scanner-${id}`}>
               <div className="text-sm font-mono text-slate-400">{id}</div>
               {slot?.pending ? (
-                <div className="text-2xl font-semibold text-sky-300 mt-1">Signing in…</div>
+                <div className="text-2xl font-semibold text-sky-300 mt-1">{slot.pending.repeat ? "Checking badge…" : "Signing in…"}</div>
               ) : slot?.identity ? (
                 <>
                   <div className="text-3xl font-bold mt-1">{slot.identity.displayName}</div>
@@ -164,10 +166,19 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
                       ? `Dispatching until ${new Date(slot.identity.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
                       : `Signs out in ${mmss(left ?? 0)} without a scan`}
                   </div>
+                  {slot.signOut ? (
+                    <div className="mt-2 rounded-lg bg-amber-400 text-amber-950 px-3 py-2" data-testid={`signout-${id}`}>
+                      <div className="text-lg font-bold">{id} · {slot.identity.displayName} · Sign out {slot.signOut.count}/3</div>
+                      <div className="text-sm">Remove badge; wait one second before scanning again.</div>
+                    </div>
+                  ) : null}
                 </>
               ) : (
                 <div className="text-2xl text-slate-500 mt-1">Scan badge</div>
               )}
+              {state.slotNotes[id] ? (
+                <div className="mt-2 text-sm font-semibold text-amber-300" data-testid={`note-${id}`}>{state.slotNotes[id]}</div>
+              ) : null}
             </div>
           );
         })}

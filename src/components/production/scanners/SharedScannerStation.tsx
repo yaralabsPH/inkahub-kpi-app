@@ -144,6 +144,11 @@ export function SharedScannerSetup({ current, onSave, onCancel }: {
           <label className="mr-4"><input type="radio" name="mode" checked={mode === "framing"} onChange={() => setMode("framing")} /> Framing (badge, then orders; {IDENTITY_IDLE_WORDS})</label>
           <label><input type="radio" name="mode" checked={mode === "dispatch"} onChange={() => setMode("dispatch")} /> Dispatch (badge once per shift, then order slips)</label>
         </fieldset>
+        {mode === "framing" ? (
+          <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="signout-guidance">
+            To sign out one scanner, scan your own badge 3 more times on it, about a second apart. You stay clocked in.
+          </p>
+        ) : null}
         {problem ? <div className="text-sm text-red-600">{problem}</div> : null}
         <div className="flex justify-end gap-2">
           <button type="button" onClick={onCancel} className="px-3 h-9 rounded-md ring-1 ring-slate-200 dark:ring-slate-700 text-sm">Cancel</button>

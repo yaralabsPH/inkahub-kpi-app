@@ -19,7 +19,7 @@ async function settle(n = 20) {
   for (let i = 0; i < n; i++) await tick();
 }
 
-function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId: string) => Promise<CommitOutcome>; failWrites?: () => boolean; clock?: () => number; mode?: ControllerDeps["mode"] } = {}) {
+function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId: string) => Promise<CommitOutcome>; failWrites?: () => boolean; clock?: () => number; mode?: ControllerDeps["mode"]; elapsed?: () => number } = {}) {
   const outbox = createScannerOutbox(memoryJobStore({ failWrites: over.failWrites }), over.clock);
   const sounds: SoundKind[] = [];
   const committedFor: string[] = [];
@@ -46,7 +46,8 @@ function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId
       },
     }),
     isOnline: () => true,
-    now: () => 1_000_000,
+    now: over.clock ?? (() => 1_000_000),
+    elapsedNow: over.elapsed,
     newRequestId: uuid,
     sound: (k) => sounds.push(k),
   });
@@ -315,5 +316,84 @@ describe("SharedScannerController", () => {
     expect(a.state.last?.kind).not.toBe("rejected");
     expect(a.state.last?.title ?? "").not.toMatch(/not saved/i);
   });
-});
 
+  it("badge x3: two repeat checks, then only that scanner signs out, with no third call and no clock-out", async () => {
+    let elapsed = 0;
+    const calls: string[] = [];
+    const { c, sounds, committedFor } = setup({
+      elapsed: () => elapsed,
+      activate: async ({ badge, scannerId }) => {
+        calls.push(`${scannerId}:${badge}`);
+        return badge === "AAAA0001"
+          ? { outcome: "activated", personId: ALICE, displayName: "Alice", clockedIn: calls.length === 1 }
+          : { outcome: "activated", personId: BOB, displayName: "Bob", clockedIn: true };
+      },
+    });
+    c.onFrame("S1", "AAAA0001");
+    c.onFrame("S2", "BBBB0002");
+    await settle();
+    // Alice frames an order, then signs out; the queued order keeps her as the person.
+    c.onFrame("S1", "190203");
+    await settle();
+    elapsed = 2_000;
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    expect(c.state.last).toMatchObject({ kind: "info", title: "S1 · Alice · Sign out 1/3", detail: "Remove badge; wait one second before scanning again." });
+    elapsed = 2_500; // held badge: suppressed locally, nothing sent
+    c.onFrame("S1", "AAAA0001");
+    expect(c.state.slotNotes.S1).toBe("Remove the badge, wait one second, then scan again");
+    await settle();
+    elapsed = 4_000;
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    expect(c.state.slotNotes.S1).toBeUndefined();
+    expect(c.state.last).toMatchObject({ title: "S1 · Alice · Sign out 2/3" });
+    elapsed = 6_000;
+    c.onFrame("S1", "AAAA0001");
+    expect(c.state.last).toMatchObject({ kind: "signed_out", title: "S1 signed out", detail: "Alice is still clocked in. Scan a badge to use S1." });
+    expect(c.state.slots.S1.identity).toBeNull();
+    expect(c.state.slots.S2.identity?.displayName).toBe("Bob");
+    await settle();
+    // Initial sign-in plus exactly two repeat checks; the third read made no call.
+    expect(calls).toEqual(["S1:AAAA0001", "S2:BBBB0002", "S1:AAAA0001", "S1:AAAA0001"]);
+    expect(committedFor).toEqual(["10190203:Alice"]);
+    expect(sounds.filter((x) => x === "error")).toEqual([]);
+    // A late answer cannot sign her back in, and S1 needs a badge for orders.
+    c.onFrame("S1", "190204");
+    expect(c.state.last).toMatchObject({ kind: "rejected", detail: "Scan your badge on this scanner first." });
+  });
+
+  it("successful repeats and sign-out clear recovery; suppressed reads do not", async () => {
+    let elapsed = 0;
+    const { c } = setup({ elapsed: () => elapsed });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onProtocolError("bad_structure", null);
+    elapsed = 500;
+    c.onFrame("S1", "AAAA0001"); // suppressed
+    await settle();
+    expect(c.state.recovery).not.toBeNull();
+    elapsed = 2_000;
+    c.onFrame("S1", "AAAA0001"); // counted repeat
+    await settle();
+    expect(c.state.recovery).toBeNull();
+    expect(c.state.slots.S1.signOut?.count).toBe(1);
+    // An unknown-source parser error cancels the progress but keeps Alice.
+    c.onProtocolError("too_slow", null);
+    expect(c.state.slots.S1.signOut).toBeNull();
+    expect(c.state.slots.S1.identity?.displayName).toBe("Alice");
+  });
+
+  it("dispatch shows no sign-out progress for repeated badge reads", async () => {
+    let elapsed = 0;
+    const { c } = setup({ elapsed: () => elapsed, mode: "dispatch" });
+    for (const at of [0, 300, 600, 900]) {
+      elapsed = at;
+      c.onFrame("S1", "AAAA0001");
+      await settle();
+      expect(c.state.slots.S1.signOut).toBeNull();
+      expect(c.state.last?.kind).toBe("signed_in");
+    }
+    expect(c.state.slots.S1.identity?.displayName).toBe("Alice");
+  });
+});
