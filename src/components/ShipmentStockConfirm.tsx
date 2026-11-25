@@ -36,7 +36,7 @@ export function shipmentStockConfirm(
           </ul>
         )}
         <p className="text-xs text-hub-muted">
-          These are the requested amounts. Stock never goes below zero, and a SKU that no longer exists is skipped,
+          These are the requested amounts. A SKU that no longer exists is skipped,
           so the recorded change can be smaller. Cancel leaves the shipment and stock as they are.
         </p>
       </div>

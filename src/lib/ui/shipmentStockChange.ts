@@ -1,9 +1,8 @@
 /**
  * Presentation only: which REQUESTED stock adjustment an existing shipment
  * save/delete will ask the selected backend to make, so the confirm step can
- * show it. It never performs anything and claims no final balance (stock is
- * clamped at zero, missing products are skipped, and the repository reads
- * the then-current row).
+ * show it. It never performs anything and claims no final balance (missing
+ * products are skipped, and the repository reads the then-current row).
  *
  * The two adapters differ, so the backend is explicit:
  *  - Supabase (SupabaseRepo.upsertShipment): reverse when auto-apply is on,

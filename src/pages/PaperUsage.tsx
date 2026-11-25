@@ -259,7 +259,7 @@ export function PaperUsage() {
                             ) : (
                               <p>No new rolls are deducted (no roll SKU mapped, or nothing to print).</p>
                             )}
-                            <p className="text-xs text-hub-muted">These are requested amounts. Stock never goes below zero, a roll SKU that no longer exists is skipped, and the earlier figure is what this snapshot recorded, which may differ from what the ledger actually moved. Cancel saves nothing and leaves stock as it is.</p>
+                            <p className="text-xs text-hub-muted">These are requested amounts. A roll SKU that no longer exists is skipped, and the earlier figure is what this snapshot recorded, which may differ from what the ledger actually moved. Cancel saves nothing and leaves stock as it is.</p>
                           </div>
                         ),
                       });
