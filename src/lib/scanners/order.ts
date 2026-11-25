@@ -123,12 +123,32 @@ export type FramingLineClass =
 
 /** Non-framing product families decided by SKU prefix alone. */
 const NON_FRAMING_PREFIX = /^INKA-(AUX|GC|PF)/;
-/** Words that mark a line with no usable SKU as a non-framing item. */
-const NON_FRAMING_WORDS = /\b(gift|hook|hooks|sample|samples|free|bag|certificate|voucher|canvas|unframed)\b/i;
+/**
+ * Explicit non-framing product categories, named in the line's title or
+ * variant. Whole category phrases only: a promotional word on its own
+ * ("free shipping", "gift wrapped") is not a category (review r1 M1).
+ */
+const NON_FRAMING_CATEGORY = new RegExp(
+  "\\b(" + [
+    "hooks?", "hanging (kit|hooks?|wire)",
+    "gift (bag|box|card|certificate|voucher)s?", "vouchers?",
+    "free (print|sample|poster)s?", "samples?",
+    "unframed", "canvas(es)?", "stretched canvas",
+    "picture frames?", "frame only", "frames? only",
+  ].join("|") + ")\\b",
+  "i",
+);
 const FRAMED_SUFFIX = /-(FB|FW|FN)$/;
 /** An INKA single or set artwork stem, whatever follows it. */
 const ARTWORK_STEM = /^INKA-(S\d)?[A-Z]{2,3}\d{4}(-|$)/;
 const FRAMED_WORD = /\bframed\b/i;
+/** Longest line description put into a refusal message (review r1 S1). */
+export const FRAMING_LABEL_MAX = 80;
+
+function lineLabel(sku: string, title: string, variant: string): string {
+  const raw = sku || title || variant || "a line without a SKU";
+  return raw.length > FRAMING_LABEL_MAX ? `${raw.slice(0, FRAMING_LABEL_MAX - 1)}…` : raw;
+}
 
 export function classifyFramingLine(line: {
   sku: string | null;
@@ -136,10 +156,12 @@ export function classifyFramingLine(line: {
   variant_title?: string | null;
 }): FramingLineClass {
   const sku = (line.sku ?? "").trim().toUpperCase();
-  const words = `${line.title ?? ""} ${line.variant_title ?? ""}`;
-  const label = sku || (line.title ?? "").trim() || "a line without a SKU";
+  const title = (line.title ?? "").trim();
+  const variant = (line.variant_title ?? "").trim();
+  const words = `${title} ${variant}`;
+  const label = lineLabel(sku, title, variant);
 
-  // 1. Explicit non-framing evidence wins.
+  // 1. A SKU the parser knows decides by itself.
   const p = sku ? parseSku(sku) : null;
   if (p) {
     const isPrint = p.type === "single_print" || p.type === "set_print";
@@ -150,11 +172,16 @@ export function classifyFramingLine(line: {
     return { kind: "framed", sku, workType: p.size === "A0" ? "a0_framed" : "framed" };
   }
   if (sku && NON_FRAMING_PREFIX.test(sku)) return { kind: "ignored" }; // e.g. INKA-AUXMFL
-  if (!sku && NON_FRAMING_WORDS.test(words)) return { kind: "ignored" };
 
-  // 3. Framing intent without a valid framed SKU: refuse rather than guess.
-  if (sku && FRAMED_SUFFIX.test(sku)) return { kind: "suspicious", label };
-  if (sku && ARTWORK_STEM.test(sku)) return { kind: "suspicious", label };
+  // 3. A SKU shaped like a framed print that does not parse is a typo, not
+  //    an accessory, whatever its title says: refuse rather than lose credit.
+  if (sku && (FRAMED_SUFFIX.test(sku) || ARTWORK_STEM.test(sku))) return { kind: "suspicious", label };
+
+  // 4. An explicit non-framing category outranks the word "framed"
+  //    ("Hook for framed prints"), for blank and unknown SKUs alike.
+  if (NON_FRAMING_CATEGORY.test(words)) return { kind: "ignored" };
+
+  // 5. Otherwise the word "framed" means a framed print we cannot identify.
   if (FRAMED_WORD.test(words)) return { kind: "suspicious", label };
 
   // 4. No sign of framing: not this bench's work.

@@ -142,6 +142,14 @@ After the classifier fixes and review follow-up, obtain green PR CI and record t
 
 ## Coder response
 
-(Coder fills this in after fixing.)
+All five items fixed in one commit (`review r1: ...`).
+
+- **M1 fixed.** Single promotional words are gone. Non-framing evidence is now a list of whole category phrases (`hook(s)`, `hanging kit/hook/wire`, `gift bag/box/card/certificate/voucher`, `voucher`, `free print/sample/poster`, `sample`, `unframed`, `canvas`, `stretched canvas`, `picture frame`, `frame(s) only`) in `src/lib/scanners/order.ts`. "Framed print with free shipping", "Framed print, gift wrapped" and "Framed print (bag included)" are now `suspicious`; a mixed order with one of them refuses with no prepared payload (`order.test.ts` "M1: a promotional word never hides an unidentified framed print") and never calls commit (`outbox.test.ts` "a suspicious mixed job never calls commit", now also for the free-shipping line).
+- **M2 fixed.** Order of checks for a SKU the parser does not know: INKA non-framing prefix → ignored; a SKU *shaped* like a framed print (framed suffix or artwork stem) → suspicious whatever the title says, so a typo is never silently dropped; explicit category phrase in title/variant → ignored, for blank **and** non-blank SKUs; the word "framed" → suspicious; otherwise ignored. `HOOK-01` / `GIFT-BAG-01` / `KIT-9` / `SAMPLE-1` / `PF-OLD` with "framed" in the title are ignored; regular and A0 mixed orders with those lines save only the framing lines, leave the lookup unchanged, and give the A0 order the same components and box as without them ("M2: …" tests).
+- **S1 fixed.** Label is SKU, else title, else variant, else "a line without a SKU", truncated to `FRAMING_LABEL_MAX` = 80 characters with "…" (test "S1: the refusal label is bounded and falls back to the variant").
+- **S2 fixed.** `tuning-e2e.test.ts` now holds repeat 2's activation reply with a deferred promise, feeds a real parser error while it is pending, then releases it: Alice stays, progress does not revive, recovery is not cleared by the pre-error reply, and the next run restarts at 1/3 and signs out with no call for the third read (5 activation calls asserted).
+- **S3 fixed.** Setup copy now says "at least one second apart". New `SharedScannerSetup.test.tsx` renders Framing (15-minute label + guidance) and Dispatch (once-per-shift text, no gesture guidance).
+
+Checks after the fixes: `npx tsc -b` exit 0; scanner suites 205/205. Full suite/build re-run before the next review request.
 
 STATUS: COMPLETE

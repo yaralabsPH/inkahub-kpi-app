@@ -146,7 +146,7 @@ export function SharedScannerSetup({ current, onSave, onCancel }: {
         </fieldset>
         {mode === "framing" ? (
           <p className="text-sm text-slate-600 dark:text-slate-300" data-testid="signout-guidance">
-            To sign out one scanner, scan your own badge 3 more times on it, about a second apart. You stay clocked in.
+            To sign out one scanner, scan your own badge 3 more times on it, at least one second apart. You stay clocked in.
           </p>
         ) : null}
         {problem ? <div className="text-sm text-red-600">{problem}</div> : null}

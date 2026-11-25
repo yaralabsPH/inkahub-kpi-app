@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyFramingLine, prepareFramingOrder, type OrderLookup, type PackagingSetup } from "../order";
+import { classifyFramingLine, FRAMING_LABEL_MAX, prepareFramingOrder, type OrderLookup, type PackagingSetup } from "../order";
 import type { RuleSetBody } from "@/lib/domain/packaging/ruleSet";
 
 // Synthetic catalogue and rules; not real stock codes or box rules.
@@ -84,6 +84,65 @@ describe("classifyFramingLine", () => {
     for (const [l, label] of suspicious) {
       expect(classifyFramingLine(l), JSON.stringify(l)).toEqual({ kind: "suspicious", label });
     }
+  });
+});
+
+describe("classifyFramingLine review r1", () => {
+  it("M1: a promotional word never hides an unidentified framed print", () => {
+    for (const title of ["Framed print with free shipping", "Framed print, gift wrapped", "Framed print (bag included)"]) {
+      expect(classifyFramingLine({ sku: null, title }), title).toEqual({ kind: "suspicious", label: title });
+    }
+    const r = prepareFramingOrder(order([
+      { sku: "INKA-ABC0001-A2-FB", quantity: 1 },
+      { sku: null, title: "Framed print with free shipping", quantity: 1 },
+    ]), ctx({ packaging: null }));
+    expect(r).toMatchObject({ ok: false, code: "suspicious_framing" });
+    expect(r).not.toHaveProperty("prepared");
+  });
+
+  it("M2: explicit categories are ignored for unknown non-blank SKUs too", () => {
+    const lines = [
+      { sku: "HOOK-01", title: "Hook for framed prints" },
+      { sku: "GIFT-BAG-01", title: "Gift bag for framed prints" },
+      { sku: "KIT-9", title: "Hanging kit", variant_title: "Framed" },
+      { sku: "SAMPLE-1", title: "Free sample (framed)" },
+      { sku: "PF-OLD", title: "Picture frame only" },
+    ];
+    for (const l of lines) expect(classifyFramingLine(l), l.sku).toEqual({ kind: "ignored" });
+    // ...but a SKU shaped like a framed print stays suspicious whatever its title says.
+    expect(classifyFramingLine({ sku: "INKA-ABC0001-A9-FB", title: "Hook" })).toEqual({ kind: "suspicious", label: "INKA-ABC0001-A9-FB" });
+    expect(classifyFramingLine({ sku: "OLD-1-FN", title: "Gift bag" })).toEqual({ kind: "suspicious", label: "OLD-1-FN" });
+  });
+
+  it("M2: regular and A0 orders with arbitrary accessory SKUs save framing lines only", () => {
+    const extras = [
+      { sku: "HOOK-01", title: "Hook for framed prints", quantity: 2 },
+      { sku: "GIFT-BAG-01", title: "Gift bag for framed prints", quantity: 1 },
+    ];
+    const regular = order([{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, ...extras]);
+    const before = JSON.stringify(regular);
+    const r = prepareFramingOrder(regular, ctx({ packaging: null }));
+    expect(JSON.stringify(regular)).toBe(before);
+    if (!r.ok) throw new Error(r.message);
+    expect(r.prepared.lines.map((l) => l.sku)).toEqual(["INKA-ABC0001-A2-FB"]);
+    expect(r.prepared.components).toEqual([]);
+
+    const a0 = prepareFramingOrder(order([{ sku: "INKA-ABC0001-A0-FB", quantity: 1 }, ...extras]), ctx());
+    const plain = prepareFramingOrder(order([{ sku: "INKA-ABC0001-A0-FB", quantity: 1 }]), ctx());
+    if (!a0.ok || !plain.ok) throw new Error("expected both to prepare");
+    expect(a0.prepared.components).toEqual([{ code: "A0-Black", qty: 1 }]);
+    expect(a0.prepared.packaging).toEqual(plain.prepared.packaging);
+    expect(JSON.stringify(a0.prepared)).not.toMatch(/HOOK|GIFT/);
+  });
+
+  it("S1: the refusal label is bounded and falls back to the variant", () => {
+    const long = `Framed ${"x".repeat(10_000)}`;
+    const c = classifyFramingLine({ sku: null, title: long });
+    if (c.kind !== "suspicious") throw new Error("expected suspicious");
+    expect(c.label).toHaveLength(FRAMING_LABEL_MAX);
+    expect(c.label.endsWith("…")).toBe(true);
+    expect(classifyFramingLine({ sku: null, title: "", variant_title: "A2 / Framed black" }))
+      .toEqual({ kind: "suspicious", label: "A2 / Framed black" });
   });
 });
 

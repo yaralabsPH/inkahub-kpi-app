@@ -21,7 +21,7 @@ let seq = 0;
 const uuid = () => `00000000-0000-4000-8000-${String(++seq).padStart(12, "0")}`;
 const settle = async (n = 20) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
 
-function rig(mode: "framing" | "dispatch") {
+function rig(mode: "framing" | "dispatch", hold?: { next: (() => Promise<void>) | null }) {
   let clock = 0; // the parser's key time and the gesture's elapsed clock
   const outbox = createScannerOutbox(memoryJobStore());
   const sounds: SoundKind[] = [];
@@ -34,6 +34,8 @@ function rig(mode: "framing" | "dispatch") {
     outbox,
     activate: async ({ badge, scannerId }): Promise<ActivateOutcome> => {
       activations.push(`${scannerId}:${badge}`);
+      const wait = hold?.next;
+      if (wait) { hold.next = null; await wait(); }
       const p = PEOPLE[badge];
       return p ? { outcome: "activated", personId: p.id, displayName: p.name, clockedIn: false } : { outcome: "unknown_badge" };
     },
@@ -145,24 +147,39 @@ describe("tuning end to end", () => {
   });
 
   it("cancelled sign-out progress stays cancelled through corruption and a late reply", async () => {
-    const r = rig("framing");
+    const hold: { next: (() => Promise<void>) | null } = { next: null };
+    const r = rig("framing", hold);
     r.scan("<S1>AAAA0001</S1>", 2_000);
     await settle();
-    r.scan("<S1>AAAA0001</S1>", 1_500); // repeat 1
+    r.scan("<S1>AAAA0001</S1>", 1_500); // repeat 1, answered at once
     await settle();
     expect(r.c.state.slots.S1.signOut?.count).toBe(1);
-    r.scan("<S1>190204</S2>", 1_500); // corruption of unknown source cancels progress, keeps Alice
+    // Repeat 2: its activation reply is held back while a real parser error arrives.
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    hold.next = () => gate;
+    r.scan("<S1>AAAA0001</S1>", 1_500);
     await settle();
-    expect(r.c.state.slots.S1.signOut).toBeNull();
-    expect(r.c.state.slots.S1.identity?.displayName).toBe("Alice");
-    r.scan("<S1>AAAA0001</S1>", 1_500); // starts again at 1/3
+    expect(r.c.state.slots.S1.pending?.repeat?.progress.count).toBe(2);
+    r.scan("<S1>190204</S2>", 1_500); // unknown-source corruption while the reply is pending
+    expect(r.c.state.recovery).not.toBeNull();
+    release(); // the late reply now arrives
+    await settle();
+    expect(r.c.state.slots.S1.identity?.displayName).toBe("Alice"); // the person survives
+    expect(r.c.state.slots.S1.signOut).toBeNull(); // the cancelled progress does not revive
+    expect(r.c.state.recovery).not.toBeNull(); // a reply to a scan from before the error cannot clear it
+    // The next qualifying repeat starts again at 1/3; three in a row sign out.
+    r.scan("<S1>AAAA0001</S1>", 1_500);
     await settle();
     expect(r.c.state.slots.S1.signOut?.count).toBe(1);
+    expect(r.c.state.recovery).toBeNull();
     r.scan("<S1>AAAA0001</S1>", 1_500);
     await settle();
     r.scan("<S1>AAAA0001</S1>", 1_500);
     expect(r.c.state.last).toMatchObject({ kind: "signed_out", title: "S1 signed out" });
     expect(r.c.state.slots.S1.identity).toBeNull();
-    expect(r.activations.filter((a) => a.startsWith("S1:"))).toHaveLength(4); // sign-in + 3 counted repeats, none for the 3rd of the last run
+    // sign-in + repeat 1 + held repeat 2 + two repeats of the new run; the final third made no call
+    expect(r.activations.filter((a) => a.startsWith("S1:"))).toHaveLength(5);
   });
+
 });

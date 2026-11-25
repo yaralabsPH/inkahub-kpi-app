@@ -232,17 +232,19 @@ describe("delivery", () => {
   });
 
   it("a suspicious mixed job never calls commit", async () => {
-    const ob = createScannerOutbox(memoryJobStore());
-    await ob.enqueue(captured(), scope, uuid());
-    const d = deps({
-      outbox: ob,
-      lookupOrder: async () => ({ kind: "ok", lookup: { ...framedOrder(), line_items: [
-        { sku: "INKA-ABC0001-A2-FB", quantity: 1 },
-        { sku: "INKA-ABC0001-A9-FB", quantity: 1 },
-      ] } }),
-    });
-    expect(await processNext(d)).toMatchObject({ kind: "blocked", code: "suspicious_framing" });
-    expect(d.commits).toHaveLength(0);
+    for (const bad of [
+      { sku: "INKA-ABC0001-A9-FB", quantity: 1 },
+      { sku: null, title: "Framed print with free shipping", quantity: 1 }, // review r1 M1
+    ]) {
+      const ob = createScannerOutbox(memoryJobStore());
+      await ob.enqueue(captured(), scope, uuid());
+      const d = deps({
+        outbox: ob,
+        lookupOrder: async () => ({ kind: "ok", lookup: { ...framedOrder(), line_items: [{ sku: "INKA-ABC0001-A2-FB", quantity: 1 }, bad] } }),
+      });
+      expect(await processNext(d), JSON.stringify(bad)).toMatchObject({ kind: "blocked", code: "suspicious_framing" });
+      expect(d.commits).toHaveLength(0);
+    }
   });
 
   it("an order that is not safe for shared scanners is blocked with its reason, not dropped", async () => {
