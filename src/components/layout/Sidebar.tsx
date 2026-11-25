@@ -1,37 +1,15 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
-import {
-  Home, LayoutDashboard, Package, ClipboardList, Truck,
-  CalendarDays, Warehouse, ShoppingCart, Settings, Users, Printer, ArrowLeftRight, LifeBuoy,
-  PackageOpen, ScanLine, BarChart3, LogOut, Search, X,
-} from "lucide-react";
+import { LogOut, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { navLabel, type NavKey } from "@/lib/domain";
 import { useAppStore } from "@/lib/state/appStore";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { effectiveNavAccess, allNavAccess } from "@/lib/auth/permissions";
-import { visibleNavGroups } from "./navigation";
+import { visibleNavGroups, NAV_ICONS as ICONS } from "./navigation";
 import logoUrl from "@/assets/inka-arthouse-logo.png";
 
-const ICONS: Record<NavKey, typeof LayoutDashboard> = {
-  welcome: Home,
-  dashboard: LayoutDashboard,
-  skus: Package,
-  sales: ClipboardList,
-  shipments: Truck,
-  events: CalendarDays,
-  warehouse: Warehouse,
-  orders: ShoppingCart,
-  paper: Printer,
-  movements: ArrowLeftRight,
-  cs_cases: LifeBuoy,
-  cs_returns: PackageOpen,
-  order_submission: ScanLine,
-  reports: BarChart3,
-  team: Users,
-  settings: Settings,
-};
 
 const ROLE_LABEL: Record<string, string> = {
   owner: "Owner",

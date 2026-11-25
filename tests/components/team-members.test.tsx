@@ -24,8 +24,8 @@ function panel(over: Partial<Parameters<typeof MemberPanel>[0]> = {}) {
 }
 function checkbox(html: string, label: string) {
   const buttons = html.match(/<button\b[\s\S]*?<\/button>/g) ?? [];
-  const result = buttons.find((b) => b.includes('role="checkbox"') && b.includes(`>${label}</span>`));
-  expect(result, `checkbox ${label}`).toBeDefined();
+  const result = buttons.find((b) => b.includes('role="switch"') && b.includes(`>${label}</span>`));
+  expect(result, `switch ${label}`).toBeDefined();
   return result!;
 }
 
@@ -58,7 +58,7 @@ describe("Team member rendering", () => {
     expect(html).toMatch(/<input[^>]*disabled=""/);
     expect(html).toMatch(/<select[^>]*disabled=""/);
     for (const button of html.match(/<button\b[\s\S]*?<\/button>/g) ?? []) {
-      if (button.includes('role="checkbox"') || /Select all|>Clear<|Reset to role default|Remove member/.test(button)) {
+      if (button.includes('role="switch"') || /Select all|>Clear<|Reset to role default|Remove from team/.test(button)) {
         expect(button).toContain('disabled=""');
       }
     }
@@ -80,7 +80,24 @@ describe("Team member rendering", () => {
   it("keeps self-role and self-removal protections", () => {
     const html = panel({ isSelf: true, member: { ...member, role: "owner" } });
     expect(html).toMatch(/<select[^>]*disabled=""/);
-    expect(html).not.toContain("Remove member</button>");
-    expect(html).toContain("You can&#x27;t remove yourself");
+    expect(html).not.toContain("Remove from team</button>");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>You can&#x27;t remove yourself<\/button>/);
+  });
+
+  it("labels role-default vs custom page access", () => {
+    const defaults = panel();
+    expect(defaults).toContain("Using Staff defaults.");
+    expect(defaults).toMatch(/<button[^>]*disabled=""[^>]*>Reset to role default<\/button>/);
+    const custom = panel({ member: { ...member, allowed_nav: ["welcome", "skus"] } });
+    expect(custom).toContain("Custom access.");
+    expect(custom).not.toMatch(/<button[^>]*disabled=""[^>]*>Reset to role default<\/button>/);
+    // An explicit list equal to the role defaults is not "custom".
+    expect(panel({ member: { ...member, allowed_nav: ["welcome", "reports"] } })).toContain("Using Staff defaults.");
+  });
+
+  it("shows email only when provided and renders the lanyard code", () => {
+    expect(panel()).not.toContain(">Email<");
+    expect(panel({ email: "me@example.test" })).toContain("me@example.test");
+    expect(panel({ tab: "production" })).toContain("TEST-BARCODE");
   });
 });
