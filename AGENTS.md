@@ -118,6 +118,13 @@ Rules:
   planner through `codex exec`. In that mode the planner writes only the file
   it was asked for and does not commit; the coder commits it. CJ still
   approves the spec and the plan, and still does every release step.
+- **Handoff gate.** Any step that produces evidence for the other agent
+  (a staging run, a review, measurements, a script's results file) must end
+  its output with exactly one line: `STATUS: COMPLETE` or
+  `STATUS: FAILED – <reason>`. The coder continues only on
+  `STATUS: COMPLETE`. On a FAILED line, a missing line or missing output, it
+  stops and tells CJ the exact missing item in one message. It does not
+  re-run, guess or fill the gap itself.
 - File names: `docs/specs/<slug>.md`, `docs/plans/<slug>.md`,
   `docs/reviews/<slug>-r<N>.md`. Templates live in `docs/templates/`.
 

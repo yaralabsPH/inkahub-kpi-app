@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Package } from "lucide-react";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
+import { Button } from "@/components/ui/Button";
 import { getSupabase } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
 import { useDataset } from "@/lib/hooks/useDataset";
@@ -22,6 +23,11 @@ interface LedgerRow {
  * Packages used in the current Reports date range. Reads the ledger for
  * negative-delta rows against package products (A0 boxes, mail tubes,
  * etc.) and aggregates by product.
+ *
+ * Historical read on request only (Task 17): nothing is fetched on mount or
+ * on a Reports refresh. A change of site, range or package set clears the
+ * rows back to "not loaded"; Load reads every page (ts, id) or shows an
+ * error - a partial aggregate is never shown as complete.
  */
 export function PackageUsageCard({
   fromIso,
@@ -35,9 +41,11 @@ export function PackageUsageCard({
   const supabase = getSupabase();
   const location = useAppStore((s) => s.location);
   const { data } = useDataset();
-  const [rows, setRows] = useState<LedgerRow[]>([]);
-  const [loading, setLoading] = useState(true);
+  /** null = not loaded for the current site/range/package set. */
+  const [rows, setRows] = useState<LedgerRow[] | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const seq = useRef(0);
 
   // Which product IDs are packages? Match PACKAGE_TYPES.key against
   // product.code (dispatch scan flow) + the two known mail tube IDs
@@ -54,46 +62,54 @@ export function PackageUsageCard({
     return ids;
   }, [data]);
 
-  // Fetch ledger rows for package products in the range.
+  // A new site/range/package set invalidates any shown or in-flight result (no read here).
+  const scopeKey = `${location}|${fromIso}|${toIso}|${Array.from(packageProductIds).sort().join(",")}`;
   useEffect(() => {
+    seq.current++;
+    setRows(null);
+    setLoading(false);
+    setError(null);
+  }, [scopeKey]);
+
+  // Explicit, complete read of the package ledger rows in the range.
+  const load = useCallback(async () => {
     if (!data || packageProductIds.size === 0) {
       setRows([]);
-      setLoading(false);
       return;
     }
-    let cancelled = false;
+    const mine = ++seq.current;
     setLoading(true);
     setError(null);
-    (async () => {
-      try {
-        const idsArray = Array.from(packageProductIds);
-        const results = await fetchAllRows<LedgerRow>((from, to) =>
-          supabase
-            .from("ledger")
-            .select("product_id, delta, ts")
-            .eq("location", location)
-            .in("product_id", idsArray)
-            .lt("delta", 0)
-            .gte("ts", fromIso)
-            .lte("ts", toIso)
-            .order("ts", { ascending: true })
-            .range(from, to),
-        );
-        if (cancelled) return;
-        setRows(results);
-      } catch (e) {
-        if (!cancelled) setError((e as Error).message);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
+    try {
+      const idsArray = Array.from(packageProductIds);
+      const results = await fetchAllRows<LedgerRow>((from, to) =>
+        supabase
+          .from("ledger")
+          .select("product_id, delta, ts")
+          .eq("location", location)
+          .in("product_id", idsArray)
+          .lt("delta", 0)
+          .gte("ts", fromIso)
+          .lte("ts", toIso)
+          .order("ts", { ascending: true })
+          .order("id", { ascending: true })
+          .range(from, to),
+      );
+      if (mine !== seq.current) return;
+      setRows(results);
+    } catch (e) {
+      if (mine !== seq.current) return;
+      setRows(null); // never a partial aggregate
+      setError((e as Error).message);
+    } finally {
+      if (mine === seq.current) setLoading(false);
+    }
   }, [supabase, location, fromIso, toIso, packageProductIds, data]);
 
   const summary = useMemo(() => {
     if (!data) return { rows: [], totalQty: 0, totalCost: 0, hasCost: false };
     const perProduct = new Map<string, number>();
-    for (const r of rows) {
+    for (const r of rows ?? []) {
       perProduct.set(r.product_id, (perProduct.get(r.product_id) ?? 0) + Math.abs(r.delta));
     }
     const productById = new Map(data.products.map((p) => [p.id, p]));
@@ -130,7 +146,15 @@ export function PackageUsageCard({
         {loading ? (
           <div className="p-6 text-sm text-slate-500">Loadingâ€¦</div>
         ) : error ? (
-          <div className="p-6 text-sm text-red-600 dark:text-red-400">{error}</div>
+          <div className="p-6 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
+            {error}
+            <Button variant="secondary" size="sm" onClick={() => void load()}>Retry</Button>
+          </div>
+        ) : rows === null ? (
+          <div className="p-6 text-sm text-slate-500 flex items-center gap-2">
+            Not loaded for this range.
+            <Button variant="secondary" size="sm" onClick={() => void load()}>Load package usage</Button>
+          </div>
         ) : summary.rows.length === 0 ? (
           <div className="p-6 text-sm text-slate-500 italic">
             No packages deducted in this range.
