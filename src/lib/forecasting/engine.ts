@@ -197,17 +197,43 @@ export function forecast(input: ForecastInput): ForecastResult {
   // demand events, and zero-clamp logic. Implication:
   //   - Pipeline shipping in next week with lead=8w → counted, gap shrinks.
   //   - Pipeline shipping in week 30 with lead=8w → ignored this cycle.
-  //   - SKU that goes OOS during lead time → projected = 0 (clamped), so
-  //     Suggested ≈ target_stock (we're not asked to recover lost sales).
-  const arrivalIdx = Math.min(leadTimeWeeks, rows.length) - 1;
-  const adjustedStock = arrivalIdx >= 0 ? rows[arrivalIdx].stockEnd : startingStock;
-  // Cumulative lost demand during lead time = clamped (>= 0) minus unclamped
-  // (can be negative). When a SKU runs OOS for some weeks before the new
-  // order arrives, this is the units of demand that physically couldn't be
-  // sold. The order builder's "Cover backorders" toggle adds this to the
-  // suggested qty so the next order recovers those lost sales.
-  const unclampedAtArrival = arrivalIdx >= 0 ? stockUnclampedByWeek[arrivalIdx + 1] : startingStock;
-  const unfulfilledDemand = Math.max(0, adjustedStock - unclampedAtArrival);
+  //   - SKU that goes OOS during lead time → stock entering the arrival
+  //     week is 0 (clamped), so Suggested ≈ target_stock + the arrival
+  //     week's own demand (we're not asked to recover earlier lost sales).
+  //
+  // The arrival week itself is NOT clamped: the new order lands in that
+  // week and serves that week's demand, so adjustedStock can go negative
+  // by up to one week of demand. Clamping it (the old behaviour) left the
+  // suggestion one week short for any SKU out of stock at arrival, so after
+  // placing exactly the suggested order the list asked for ~1 more week
+  // (rounded up to MOQ) of the same SKU. Placing the suggested qty must
+  // bring the next suggestion to 0.
+  //
+  // The arrival week is the calendar week an order placed today would land
+  // in (today + lead time), mapped exactly the way pipeline shipments are
+  // mapped above. ceil(lead / 7) alone can be a week late depending on the
+  // weekday, which made the engine measure stock one week after the new
+  // order already landed and ask for another week of the same SKU.
+  const arrivalWeek = Math.min(
+    Math.max(weekIndexOf(addDays(today, leadTime), scenarioStart), 1),
+    rows.length,
+  );
+  const arrivalIdx = arrivalWeek - 1;
+  const stockEnteringArrivalWeek =
+    arrivalIdx > 0 ? rows[arrivalIdx - 1].stockEnd : startingStock;
+  const adjustedStock =
+    arrivalIdx >= 0
+      ? stockEnteringArrivalWeek + rows[arrivalIdx].arrivals - rows[arrivalIdx].demand
+      : startingStock;
+  // Cumulative lost demand BEFORE the arrival week = clamped (>= 0) minus
+  // unclamped (can be negative). When a SKU runs OOS for some weeks before
+  // the new order arrives, this is the units of demand that physically
+  // couldn't be sold. The order builder's "Cover backorders" toggle adds
+  // this to the suggested qty so the next order recovers those lost sales.
+  // The arrival week's shortfall is already in adjustedStock above, so it
+  // is left out here to avoid counting it twice.
+  const unclampedBeforeArrival = arrivalIdx >= 0 ? stockUnclampedByWeek[arrivalIdx] : startingStock;
+  const unfulfilledDemand = Math.max(0, stockEnteringArrivalWeek - unclampedBeforeArrival);
   const suggestedOrderQty = computeSuggestedOrderQty(targetStock, adjustedStock, product);
   const reorderByDate = computeReorderByDate(today, weeksUntilOosCurrent, leadTime);
   const daysUntilOos = weeksUntilOosCurrent === null ? null : weeksUntilOosCurrent * 7;
