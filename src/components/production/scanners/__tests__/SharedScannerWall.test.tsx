@@ -12,7 +12,7 @@ const device = (over: Partial<DeviceStatus> = {}): DeviceStatus => ({
   started: true, online: true, focused: true, visible: true, capturePaused: false, wakeLock: "on", audio: "on", ...over,
 });
 const state = (over: Partial<WallState> = {}): WallState => ({
-  slots: emptySlots(["S1", "S2", "S3"]), last: null, view: { jobs: [], corrupt: [], waiting: 0, blocked: 0, uncertain: 0 },
+  slots: emptySlots(["S1", "S2", "S3"]), last: null, recovery: null, view: { jobs: [], corrupt: [], waiting: 0, blocked: 0, uncertain: 0 },
   storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null, ...over,
 });
 function render(over: Partial<SharedScannerWallProps> = {}) {
@@ -72,6 +72,32 @@ describe("SharedScannerWall", () => {
     expect(html).toContain("Retry");
     expect(html).toContain("Recorded on classic");
     expect(html).toContain("cannot be read");
+  });
+
+  it("recovery stays visible beside an earlier saved result", () => {
+    for (const mode of ["framing", "dispatch"] as const) {
+      const html = render({
+        mode,
+        state: state({
+          last: { kind: "saved", title: "Saved #10190203", scannerId: "S1", person: "Alice", order: "10190203", pieces: 3, at: 1 },
+          recovery: { title: "That scan didn't come through.", detail: "Nothing was saved from that scan.", setupHint: null, seq: 4 },
+        }),
+      });
+      expect(html).toContain('data-testid="scan-recovery"');
+      expect(html).toContain("That scan didn&#x27;t come through.");
+      expect(html).toContain('data-kind="saved"');
+      expect(html).not.toContain("isn&#x27;t set up here");
+    }
+  });
+
+  it("unknown scanner adds setup instruction", () => {
+    for (const mode of ["framing", "dispatch"] as const) {
+      const html = render({
+        mode,
+        state: state({ recovery: { title: "That scan didn't come through.", detail: "x", setupHint: "This scanner isn't set up here. Ask a manager to check its scanner ID.", seq: 1 } }),
+      });
+      expect(html).toContain("isn&#x27;t set up here. Ask a manager to check its scanner ID.");
+    }
   });
 
   it("R1-2: an uncertain blocked scan never offers classic re-recording", () => {

@@ -110,7 +110,7 @@ export function useSharedScannerStation(opts: {
   // signed-in account), and a disposed controller starts nothing new.
   const [controller, setController] = useState<SharedScannerController | null>(null);
   const [state, setState] = useState<WallState>(() => ({
-    slots: emptySlots(scannerIds), last: null, view: null, storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null,
+    slots: emptySlots(scannerIds), last: null, recovery: null, view: null, storageError: null, deliveryWaiting: null, authProblem: false, lastAcceptedAt: null,
   }));
   useEffect(() => {
     const ids = idsKey.split(",");

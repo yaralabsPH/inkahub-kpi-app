@@ -19,7 +19,7 @@ async function settle(n = 20) {
   for (let i = 0; i < n; i++) await tick();
 }
 
-function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId: string) => Promise<CommitOutcome>; failWrites?: () => boolean; clock?: () => number } = {}) {
+function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId: string) => Promise<CommitOutcome>; failWrites?: () => boolean; clock?: () => number; mode?: ControllerDeps["mode"] } = {}) {
   const outbox = createScannerOutbox(memoryJobStore({ failWrites: over.failWrites }), over.clock);
   const sounds: SoundKind[] = [];
   const committedFor: string[] = [];
@@ -29,6 +29,7 @@ function setup(over: { activate?: ControllerDeps["activate"]; commit?: (personId
   self = new SharedScannerController({
     scannerIds: ["S1", "S2", "S3"],
     scope,
+    mode: over.mode,
     outbox,
     activate: over.activate ?? (async ({ badge }): Promise<ActivateOutcome> =>
       people[badge] ? { outcome: "activated", personId: people[badge].id, displayName: people[badge].name, clockedIn: true } : { outcome: "unknown_badge" }),
@@ -115,24 +116,106 @@ describe("SharedScannerController", () => {
     expect(committedFor).toEqual([]);
   });
 
-  it("a garbled stream signs every scanner out; a late activation answer is ignored", async () => {
-    let release!: () => void;
-    const slow = new Promise<void>((r) => (release = r));
+  it("corruption retains identities pending activation and activity timestamps", async () => {
+    const reasons = ["stray_text", "too_long", "too_slow", "frame_timeout", "bad_structure", "mismatched_markers", "unknown_scanner", "bad_payload", "unexpected_key"] as const;
+    for (const mode of ["framing", "dispatch"] as const) {
+      for (const reason of reasons) {
+        for (const source of [null, "S1"] as const) {
+          let release!: () => void;
+          const slow = new Promise<void>((r) => (release = r));
+          let activations = 0;
+          const { c, sounds, outbox } = setup({
+            mode,
+            activate: async ({ badge }) => {
+              activations++;
+              if (badge === "BBBB0002") await slow;
+              return { outcome: "activated", personId: badge === "AAAA0001" ? ALICE : BOB, displayName: badge === "AAAA0001" ? "Alice" : "Bob", clockedIn: false };
+            },
+          });
+          c.onFrame("S1", "AAAA0001");
+          await settle();
+          c.onFrame("S2", "BBBB0002"); // still pending when the error arrives
+          const before = JSON.stringify(c.state.slots);
+          const soundsBefore = sounds.length;
+          c.onProtocolError(reason, source);
+          const label = `${mode}/${reason}/${source}`;
+          expect(JSON.stringify(c.state.slots), label).toBe(before); // identities, pending, epochs, idle times
+          expect(sounds.slice(soundsBefore), label).toEqual(["error"]);
+          expect(activations, label).toBe(2);
+          expect((await outbox.view(scope)).jobs, label).toHaveLength(0);
+          expect(c.state.recovery?.title, label).toBe("That scan didn't come through.");
+          expect(c.state.recovery?.setupHint !== null, label).toBe(reason === "unknown_scanner");
+          // The earlier valid activation still binds its worker, but cannot dismiss recovery.
+          release();
+          await settle();
+          expect(c.state.slots.S2.identity?.displayName, label).toBe("Bob");
+          expect(c.state.slots.S1.identity?.displayName, label).toBe("Alice");
+          expect(c.state.recovery, label).not.toBeNull();
+        }
+      }
+    }
+  });
+
+  it("recovery survives old completions and refused frames", async () => {
+    let releaseBadge!: () => void;
+    const slowBadge = new Promise<void>((r) => (releaseBadge = r));
+    let releaseCommit!: () => void;
+    const slowCommit = new Promise<void>((r) => (releaseCommit = r));
     const { c } = setup({
       activate: async ({ badge }) => {
-        if (badge === "BBBB0002") await slow;
-        return { outcome: "activated", personId: ALICE, displayName: badge, clockedIn: false };
+        if (badge === "BBBB0002") await slowBadge;
+        return { outcome: "activated", personId: badge === "AAAA0001" ? ALICE : BOB, displayName: badge === "AAAA0001" ? "Alice" : "Bob", clockedIn: false };
+      },
+      commit: async () => {
+        await slowCommit;
+        return { outcome: "saved", result: { pieces: 2, eventIds: [], negativeCodes: [], replayed: false } };
       },
     });
     c.onFrame("S1", "AAAA0001");
     await settle();
-    c.onFrame("S2", "BBBB0002");
+    c.onFrame("S1", "190203"); // accepted before the error; its delivery is still running
+    c.onFrame("S2", "BBBB0002"); // activation still running
+    await settle(3);
     c.onProtocolError("bad_structure", null);
-    expect(c.state.slots.S1.identity).toBeNull();
-    expect(c.state.last).toMatchObject({ kind: "rejected", title: expect.stringMatching(/every scanner signed out/) });
-    release();
+    // Old completions, a refused frame and an invalid payload leave recovery up.
+    c.onFrame("S3", "190204"); // no person on S3: refused
+    c.onFrame("S1", "NOT-A-CODE"); // invalid payload: refused
+    c.tick();
+    await c.refreshView();
+    releaseBadge();
+    releaseCommit();
     await settle();
-    expect(c.state.slots.S2.identity).toBeNull();
+    expect(c.state.last?.kind).toBe("saved");
+    expect(c.state.recovery).not.toBeNull();
+    // A good scan after the error clears it, from any scanner.
+    c.onFrame("S2", "190205");
+    await settle();
+    expect(c.state.recovery).toBeNull();
+    // Two errors with a good scan between them: the earlier good scan cannot clear the newer error.
+    c.onProtocolError("too_slow", null);
+    c.onFrame("S1", "190206");
+    c.onProtocolError("mismatched_markers", "S1");
+    await settle();
+    expect(c.state.recovery).not.toBeNull();
+  });
+
+  it("a failed queue write or a refused badge does not clear recovery", async () => {
+    let fail = false;
+    const { c } = setup({ failWrites: () => fail });
+    c.onFrame("S1", "AAAA0001");
+    await settle();
+    c.onProtocolError("bad_structure", null);
+    fail = true;
+    c.onFrame("S1", "190203");
+    await settle();
+    expect(c.state.last?.title).toMatch(/NOT SAVED/);
+    expect(c.state.recovery).not.toBeNull();
+    fail = false;
+    c.onFrame("S2", "CCCC0003"); // unknown badge
+    await settle();
+    expect(c.state.recovery).not.toBeNull();
+    c.resetAll("Signed out by the operator.");
+    expect(c.state.recovery).not.toBeNull();
   });
 
   it("an unknown outcome stays amber and retries; already-recorded is not green", async () => {

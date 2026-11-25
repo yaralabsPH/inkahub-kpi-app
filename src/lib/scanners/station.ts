@@ -15,7 +15,7 @@
 import type { ActivateOutcome, DeliveryReport, SavedAttribution } from "./client";
 import { CHOICE_CODES, dispatchShiftEnd, type FramerChoice, type ScanMode } from "./dispatch";
 import { OutboxFullError, type JobScope, type ScannerOutbox, type ScopeView } from "./outbox";
-import { PROTOCOL_ERROR_TEXT, type ProtocolErrorReason } from "./protocol";
+import type { ProtocolErrorReason } from "./protocol";
 import {
   clearAll,
   decideFrame,
@@ -42,9 +42,28 @@ export interface WallResult {
   at: number;
 }
 
+/**
+ * scanner-stations-tuning: shown after any scan the parser could not read.
+ * Receiver-wide; stays until a good scan that arrived after it.
+ */
+export interface ScanRecovery {
+  title: string;
+  detail: string;
+  /** Extra line when the scan named a scanner this station does not know. */
+  setupHint: string | null;
+  /** Input sequence of the error; only a newer good scan clears it. */
+  seq: number;
+}
+
+export const RECOVERY_TITLE = "That scan didn't come through.";
+export const RECOVERY_DETAIL =
+  "Nothing was saved from that scan. Whoever just scanned: scan it again. If it was your badge, scan your badge again before your order.";
+export const RECOVERY_SETUP_HINT = "This scanner isn't set up here. Ask a manager to check its scanner ID.";
+
 export interface WallState {
   slots: Record<string, ScannerSlot>;
   last: WallResult | null;
+  recovery: ScanRecovery | null;
   view: ScopeView | null;
   storageError: string | null;
   deliveryWaiting: string | null;
@@ -74,6 +93,8 @@ export class SharedScannerController {
   private pumping = false;
   private pumpAgain = false;
   private disposed = false;
+  /** Order of every input (frames and parser errors), for recovery clearing. */
+  private inputSeq = 0;
 
   get mode(): ScanMode {
     return this.d.mode ?? "framing";
@@ -83,6 +104,7 @@ export class SharedScannerController {
     this.s = {
       slots: emptySlots(d.scannerIds),
       last: null,
+      recovery: null,
       view: null,
       storageError: null,
       deliveryWaiting: null,
@@ -122,19 +144,36 @@ export class SharedScannerController {
 
   // ---- input -------------------------------------------------------------
 
+  /**
+   * scanner-stations-tuning (CJ): a scan the parser could not read saves
+   * nothing and credits nobody, but signs nobody out. A clear recovery
+   * message stays up until a newer good scan from any scanner.
+   */
   onProtocolError(reason: ProtocolErrorReason, scannerId: string | null): void {
-    if (scannerId === null) {
-      // Source uncertain: nobody keeps an identity.
-      this.set({ slots: clearAll(this.s.slots) });
-      this.show({ kind: "rejected", scannerId: null, title: "Scan garbled — every scanner signed out", detail: `${PROTOCOL_ERROR_TEXT[reason]} Scan your badge again, then the order.` }, "error");
-      return;
-    }
-    this.show({ kind: "rejected", scannerId, title: `${scannerId}: scan not accepted`, detail: PROTOCOL_ERROR_TEXT[reason] }, "error");
+    if (this.disposed) return;
+    void scannerId; // never attributed: the burst may have come from anyone
+    const seq = ++this.inputSeq;
+    this.set({
+      recovery: {
+        title: RECOVERY_TITLE,
+        detail: RECOVERY_DETAIL,
+        setupHint: reason === "unknown_scanner" ? RECOVERY_SETUP_HINT : null,
+        seq,
+      },
+    });
+    this.d.sound("error");
+  }
+
+  /** A good scan that arrived after the current recovery message clears it. */
+  private goodScan(seq: number): void {
+    const r = this.s.recovery;
+    if (r && seq > r.seq) this.set({ recovery: null });
   }
 
   /** Call for every whole frame. Synchronous decision; effects run after. */
   onFrame(scannerId: string, payload: string): void {
     if (this.disposed) return; // a closed station starts nothing
+    const seq = ++this.inputSeq;
     const { slots, decision } = decideFrame(this.s.slots, { scannerId, payload }, {
       online: this.d.isOnline(),
       now: this.d.now(),
@@ -146,15 +185,15 @@ export class SharedScannerController {
         this.show({ kind: "rejected", scannerId, title: `${scannerId}: not saved`, detail: REJECT_TEXT[decision.code] }, "error");
         return;
       case "enqueue":
-        void this.enqueue(decision.order);
+        void this.enqueue(decision.order, seq);
         return;
       case "activate":
-        void this.runActivation(scannerId, decision.epoch, decision.pending.requestId, decision.pending.badge);
+        void this.runActivation(scannerId, decision.epoch, decision.pending.requestId, decision.pending.badge, seq);
         return;
     }
   }
 
-  private async runActivation(scannerId: string, epoch: number, requestId: string, badge: string): Promise<void> {
+  private async runActivation(scannerId: string, epoch: number, requestId: string, badge: string, seq: number): Promise<void> {
     let res: ActivateOutcome;
     try {
       res = await this.d.activate({ requestId, scannerId, badge });
@@ -184,12 +223,13 @@ export class SharedScannerController {
     if (r.stale) return; // the scanner moved on; never bind an old answer
     this.set({ slots: r.slots });
     if (res.outcome === "activated") {
+      this.goodScan(seq);
       const shift = expiresAt !== undefined ? ` Dispatching until ${new Date(expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.` : "";
       this.show({ kind: "signed_in", scannerId, person: res.displayName, title: `${scannerId}: ${res.displayName}`, detail: (res.clockedIn ? "Signed in and clocked in." : "Signed in.") + shift }, "ok");
       return;
     }
     if (r.order) {
-      void this.enqueue(r.order);
+      void this.enqueue(r.order, seq);
       return;
     }
     if (r.rejected) {
@@ -208,7 +248,7 @@ export class SharedScannerController {
     this.show({ kind: "rejected", scannerId, title: `${scannerId}: badge not signed in`, detail }, "error");
   }
 
-  private async enqueue(order: CapturedOrder): Promise<void> {
+  private async enqueue(order: CapturedOrder, seq: number): Promise<void> {
     try {
       await this.d.outbox.enqueue(order, this.d.scope, this.d.newRequestId(), this.mode);
     } catch (e) {
@@ -226,6 +266,7 @@ export class SharedScannerController {
       return;
     }
     this.set({ storageError: null, lastAcceptedAt: this.d.now() });
+    this.goodScan(seq);
     this.show({
       kind: "queued",
       scannerId: order.scannerId,

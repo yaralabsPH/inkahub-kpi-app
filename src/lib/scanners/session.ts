@@ -301,7 +301,7 @@ export function expireIdle(
   return { slots: next, expired, timedOut };
 }
 
-/** Clear every scanner (corrupt stream, reload, account/site/mode change). */
+/** Clear every scanner (reload, account/site/mode change, operator reset). */
 export function clearAll(slots: Slots): Record<string, ScannerSlot> {
   const next: Record<string, ScannerSlot> = {};
   for (const [id, slot] of Object.entries(slots)) next[id] = cleared(slot);

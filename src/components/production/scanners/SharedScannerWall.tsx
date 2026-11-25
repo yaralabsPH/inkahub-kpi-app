@@ -173,6 +173,17 @@ export function SharedScannerWall(p: SharedScannerWallProps) {
         })}
       </section>
 
+      {state.recovery ? (
+        <section className="px-6 mt-4" role="alert" data-testid="scan-recovery">
+          <div className="rounded-2xl bg-amber-400 text-amber-950 px-8 py-6">
+            <div className="text-lg font-bold tracking-widest">NOTHING SAVED · NOBODY SIGNED OUT</div>
+            <div className="text-5xl font-extrabold mt-2">{state.recovery.title}</div>
+            <div className="text-2xl mt-3">{state.recovery.detail}</div>
+            {state.recovery.setupHint ? <div className="text-2xl mt-2 font-semibold">{state.recovery.setupHint}</div> : null}
+          </div>
+        </section>
+      ) : null}
+
       <section className="flex-1 px-6 py-4">
         {last ? (
           <div className={cn("rounded-2xl px-8 py-8 h-full flex flex-col justify-center", RESULT_STYLE[last.kind])} data-testid="last-result" data-kind={last.kind}>
