@@ -42,6 +42,18 @@ export interface ScannerWallTotals {
   incomplete: boolean;
 }
 
+/** Today's totals as the wall's station loaded them (Framing only). */
+export interface WallTotalsView {
+  status: "loading" | "current" | "stale" | "unavailable";
+  totals: ScannerWallTotals | null;
+  /** People whose numbers are being re-read after a scanner changed hands. */
+  pendingPersonIds: readonly string[];
+  loadedAtUtc: string | null;
+  message: string | null;
+  /** Last numbers read today for anyone seen on this wall (for goodbyes). */
+  lastKnown?: Readonly<Record<string, { orders: number; pieces: number | null }>>;
+}
+
 export class WallTotalsRangeError extends Error {
   constructor() {
     super("The production snapshot was not read for this production day.");
