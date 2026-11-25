@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prepareFramingOrder, type OrderLookup, type PackagingSetup } from "../order";
+import { classifyFramingLine, prepareFramingOrder, type OrderLookup, type PackagingSetup } from "../order";
 import type { RuleSetBody } from "@/lib/domain/packaging/ruleSet";
 
 // Synthetic catalogue and rules; not real stock codes or box rules.
@@ -28,6 +28,61 @@ const ctx = (over: Partial<Parameters<typeof prepareFramingOrder>[1]> = {}) => (
   products,
   packaging: auto,
   ...over,
+});
+
+describe("classifyFramingLine", () => {
+  it("classifies current framed singles sets and GW forms", () => {
+    const framed: Array<[string, string]> = [
+      ["INKA-ABC0001-A0-FB", "a0_framed"],
+      ["INKA-ABC0001-A1-FW", "framed"],
+      ["INKA-ABC0001-A2-FN", "framed"],
+      ["INKA-NO0338-A3-FB", "framed"],
+      [" inka-abc0001-a4-fb ", "framed"], // case and whitespace normalised
+      ["INKA-S3WIL0049-A3-FN", "framed"],
+      ["INKA-S2ABC0003-A0-FN", "a0_framed"],
+      ["INKA-S5ABC0004-GW-FB", "framed"], // gallery wall sets are supported
+    ];
+    for (const [sku, workType] of framed) {
+      expect(classifyFramingLine({ sku }), sku).toEqual({ kind: "framed", sku: sku.trim().toUpperCase(), workType });
+    }
+  });
+
+  it("explicit exclusions outrank framing words", () => {
+    const ignored: Array<{ sku: string | null; title?: string; variant_title?: string }> = [
+      { sku: "INKA-ABC0001-A2-SC" }, // stretched canvas
+      { sku: "INKA-AUXMFL", title: "Framed print hanging kit" },
+      { sku: "INKA-AUX-HOOK", title: "Hook for framed prints" },
+      { sku: "INKA-AUX-FP-ESP-A2", title: "Free print" },
+      { sku: "INKA-GC0001-100", title: "Gift card" },
+      { sku: "INKA-PF0004-A0-PW", title: "Picture frame" },
+      { sku: "INKA-ABC0002-A1-UN", title: "Unframed print" },
+      { sku: null, title: "Gift bag" },
+      { sku: "", title: "Gift certificate", variant_title: "Framed" },
+      { sku: "FREE-SAMPLE-01", title: "Free sample" },
+      { sku: "A2 Black Frame", title: "A2 Black Frame" }, // legacy frame-only: no framing evidence
+      { sku: null, title: "Mystery extra" },
+      { sku: "SOMETHING-ELSE" },
+      { sku: null, title: "Unframed poster" }, // "unframed" is not the word "framed"
+    ];
+    for (const l of ignored) expect(classifyFramingLine(l), JSON.stringify(l)).toEqual({ kind: "ignored" });
+  });
+
+  it("rejects suspicious framing intent without guessing", () => {
+    const suspicious: Array<[{ sku: string | null; title?: string; variant_title?: string }, string]> = [
+      [{ sku: "INKA-ABC0001-FB" }, "INKA-ABC0001-FB"], // missing size
+      [{ sku: "INKA-ABC0001-A9-FB" }, "INKA-ABC0001-A9-FB"], // bad size
+      [{ sku: "INKA-ABC0001-A2-FX" }, "INKA-ABC0001-A2-FX"], // bad variant on an artwork stem
+      [{ sku: "INKA-S9ABC0001-A2" }, "INKA-S9ABC0001-A2"], // invalid set tail
+      [{ sku: "OLD-PRINT-123-FN" }, "OLD-PRINT-123-FN"], // unknown SKU ending in a framed variant
+      [{ sku: "A2-OLD", title: "Framed print, black" }, "A2-OLD"], // legacy SKU, framed title
+      [{ sku: null, title: "Framed print" }, "Framed print"],
+      [{ sku: "  ", title: "Print", variant_title: "A2 / Framed black" }, "Print"],
+      [{ sku: "INKA-ABC0001-GW-FB" }, "INKA-ABC0001-GW-FB"], // single gallery wall is not supported
+    ];
+    for (const [l, label] of suspicious) {
+      expect(classifyFramingLine(l), JSON.stringify(l)).toEqual({ kind: "suspicious", label });
+    }
+  });
 });
 
 describe("prepareFramingOrder", () => {

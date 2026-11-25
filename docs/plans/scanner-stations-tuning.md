@@ -42,7 +42,7 @@ Fixed values: `IDENTITY_IDLE_MS = 15 * 60 * 1000`, existing strict `>` idle boun
 
 Execute in order, with one writer. Each task is one coder commit named `task N: <summary>`; tick its checkbox and add evidence to the Implementation log. Use the existing inline execution workflow (`executing-plans`); this plan does not request parallel writers. For each behavior change, write the named tests, observe the expected failure, implement, then rerun. Run `npx tsc -b` and `npm run test -- --run` before each task handoff; run `npm run build` at least once after all code changes and before review. The planner's documentation handoff makes no implementation/test-pass claim and performs no commit.
 
-### [ ] Task 1: Classify framing lines without changing shared SKU rules
+### [x] Task 1: Classify framing lines without changing shared SKU rules
 
 - Files: modify `src/lib/scanners/order.ts`; tests in `src/lib/scanners/__tests__/order.test.ts`.
 - Interface: add exported `classifyFramingLine(item: NonNullable<OrderLookup["line_items"]>[number]): FramingLineClassification`, returning `{ kind: "framing"; sku: string; workType: FramingWorkType }`, `{ kind: "ignore" }`, or `{ kind: "suspicious"; line: string }`. `line` is a bounded identifying SKU/title/variant label, with an unnamed-line fallback; render it as text. Do not add a catalogue lookup or repair a SKU.
@@ -156,3 +156,4 @@ Coder writes here if implementation finds anything this plan did not foresee; st
 Coder adds one line per task with commit, named tests/check results and any limitations; CJ's staging/release evidence must be marked separately from local tests.
 
 - 2026-11-25 — Planner: inspected current branch and wrote this plan; spec approval recorded exactly as instructed. No implementation, SQL, staging run, test/build result or release is claimed. A0 operational question remains a pre-release gate.
+- 2026-11-25 — Task 1: added `classifyFramingLine` in `src/lib/scanners/order.ts` (explicit non-framing first, strict framed grammar second, suffix/artwork-stem/"framed"-word safeguards third, else ignored); 3 table tests in `order.test.ts` (24/24 pass), `npx tsc -b` clean. Not yet used by preparation (Task 2). Note: `INKA-AUX*`, `INKA-GC*`, `INKA-PF*` prefixes count as explicit non-framing even when they do not parse.

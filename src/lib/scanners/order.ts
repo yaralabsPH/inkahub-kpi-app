@@ -102,6 +102,62 @@ export type PrepareCode =
 export type PrepareRefusal = { ok: false; code: PrepareCode; message: string };
 export type PrepareResult = { ok: true; prepared: PreparedFraming } | PrepareRefusal;
 
+/**
+ * scanner-stations-tuning: what one order line means for shared Framing.
+ *  - "framed": a valid current framed print (single or set, FB/FW/FN); it
+ *    earns framing credit.
+ *  - "ignored": anything else with no sign of framing (accessories, hooks,
+ *    free prints, gift items, unframed, canvas, picture frames, unknown or
+ *    blank SKUs). Silent: no credit, no warning.
+ *  - "suspicious": looks like a framed print but is not a valid current
+ *    framed SKU. The whole scan is refused so a typo never loses credit.
+ * Title words are only ever a reason to refuse or ignore, never to credit.
+ */
+export type FramingLineClass =
+  | { kind: "framed"; sku: string; workType: FramingWorkType }
+  | { kind: "ignored" }
+  | { kind: "suspicious"; label: string };
+
+/** Non-framing product families decided by SKU prefix alone. */
+const NON_FRAMING_PREFIX = /^INKA-(AUX|GC|PF)/;
+/** Words that mark a line with no usable SKU as a non-framing item. */
+const NON_FRAMING_WORDS = /\b(gift|hook|hooks|sample|samples|free|bag|certificate|voucher|canvas|unframed)\b/i;
+const FRAMED_SUFFIX = /-(FB|FW|FN)$/;
+/** An INKA single or set artwork stem, whatever follows it. */
+const ARTWORK_STEM = /^INKA-(S\d)?[A-Z]{2,3}\d{4}(-|$)/;
+const FRAMED_WORD = /\bframed\b/i;
+
+export function classifyFramingLine(line: {
+  sku: string | null;
+  title?: string | null;
+  variant_title?: string | null;
+}): FramingLineClass {
+  const sku = (line.sku ?? "").trim().toUpperCase();
+  const words = `${line.title ?? ""} ${line.variant_title ?? ""}`;
+  const label = sku || (line.title ?? "").trim() || "a line without a SKU";
+
+  // 1. Explicit non-framing evidence wins.
+  const p = sku ? parseSku(sku) : null;
+  if (p) {
+    const isPrint = p.type === "single_print" || p.type === "set_print";
+    if (!isPrint) return { kind: "ignored" }; // picture frame, gift card, free print, accessory
+    if (p.variant === "UN" || p.variant === "SC") return { kind: "ignored" }; // unframed, canvas
+    // 2. A valid current framed print.
+    if (p.size === "GW" && p.type !== "set_print") return { kind: "suspicious", label }; // single GW is not supported
+    return { kind: "framed", sku, workType: p.size === "A0" ? "a0_framed" : "framed" };
+  }
+  if (sku && NON_FRAMING_PREFIX.test(sku)) return { kind: "ignored" }; // e.g. INKA-AUXMFL
+  if (!sku && NON_FRAMING_WORDS.test(words)) return { kind: "ignored" };
+
+  // 3. Framing intent without a valid framed SKU: refuse rather than guess.
+  if (sku && FRAMED_SUFFIX.test(sku)) return { kind: "suspicious", label };
+  if (sku && ARTWORK_STEM.test(sku)) return { kind: "suspicious", label };
+  if (FRAMED_WORD.test(words)) return { kind: "suspicious", label };
+
+  // 4. No sign of framing: not this bench's work.
+  return { kind: "ignored" };
+}
+
 export const EDIT_WARNING_TAGS = ["Edit Order", "oe-staff-edit"] as const;
 export const MAX_LINE_QUANTITY = 100;
 export const MAX_ORDER_LINES = 50;
