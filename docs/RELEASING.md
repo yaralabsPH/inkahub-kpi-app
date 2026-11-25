@@ -28,6 +28,9 @@ test values (see "One-time setup").
       acceptance criteria and the smoke test below.
 - [ ] If the change has a migration: it was applied to **staging** first and the
       preview worked with it. The migration is backward-compatible (see below).
+- [ ] If the frontend needs a Supabase Edge Function: CJ deployed and tested
+      the reviewed function on staging, then deployed it to production **before
+      merging**. Vercel does not deploy Supabase Edge Functions.
 
 ### 2. Smoke test (staging preview, about 10 minutes)
 
@@ -109,6 +112,72 @@ always safe.
    for `main`: require a pull request before merging, and require the "CI /
    check" status to pass. This makes it impossible to push untested code
    straight to production, including by an AI agent.
+
+## Team member creation (`add-member` Edge Function)
+
+CJ deploys this function; agents never deploy it or apply SQL. There are no
+schema changes or new browser secrets for this feature.
+
+1. Redeploy `supabase/functions/add-member/index.ts` **and its shared core** to
+   staging (`ybrzhrgfrnvtcwymjdrq`). The review fixes change both files, so the
+   previously tested v2 is not sufficient. Keep gateway JWT verification enabled.
+2. Run the role, failure, keyboard, light/dark and mobile checks in
+   [team-page-redesign review](reviews/team-page-redesign-r1.md#staging-test-plan).
+   Confirm the new account can sign in with only the intended role and locations.
+3. Before merging PR #8, record the existing production Vercel deployment and
+   any existing production `add-member` function version. Deploy the reviewed
+   function to the **production Supabase project**, explicitly checking the
+   target project. Confirm its server-provided `SUPABASE_URL`,
+   `SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are available; never put
+   the service key in a `VITE_*` variable. Table operations must continue to
+   run as the calling owner under RLS. Do not add service-role table grants.
+4. Merge only after CI and staging checks pass. Watch Supabase Edge Function
+   logs as well as Vercel: `add-member failed` logs a fixed stage and the new
+   user id when known, without request bodies, passwords, tokens or raw errors.
+
+For a lost response, duplicate-email response, or `rollback` failure, **check
+the existing account before retrying**. Auth creation and table writes are
+separate requests. Email uniqueness prevents a second login, but cannot prove
+that a previous request completed. CJ checks Authentication > Users and the
+profile/location rows, then completes the intended setup or removes a confirmed
+unused partial account. Never delete an established account just to retry.
+
+Rollback the frontend through Vercel Instant Rollback. The old Team page remains
+compatible with the unchanged schema and its dashboard-created-UID workflow.
+**Vercel rollback does not roll back the Edge Function.** CJ must separately
+restore a previously safe function version or disable `add-member` if the
+function itself is faulty. Do not restore staging v2's unchecked cleanup path.
+Existing members and normal production work do not require `add-member`.
+
+## Team member removal (`remove-member` Edge Function)
+
+Deploy alongside `add-member`, with the same rules: CJ deploys, gateway JWT
+verification stays on, no schema changes, no service-role table grants.
+
+1. Deploy `supabase/functions/remove-member/index.ts` **and**
+   `supabase/functions/_shared/remove-member-core.ts` to staging, then to the
+   production Supabase project before merging PR #8. Without it, "Remove
+   member" in production fails with "the remove-member function isn't deployed".
+2. What removal does, in order: bans the Auth login (no new sign-in or
+   session refresh), sets the member's active `staff_barcodes` to inactive,
+   deletes their `user_locations` rows, deletes their `profiles` row. The Auth
+   user is **not** deleted: `production_events` references it with
+   `ON DELETE RESTRICT`, and deleting it would cascade away barcode history.
+3. Staging checks: remove a disposable member that has a lanyard and
+   locations. Confirm they cannot sign in, their barcode no longer scans, and
+   they disappear from the Team page; confirm their past production events
+   still show in reports. Confirm a manager/staff call is rejected (403) and
+   an owner cannot remove themself.
+4. Failure part-way leaves **less** access, never more, and every step is
+   idempotent: retrying "Remove" is always safe. `remove-member failed` logs
+   a fixed stage and the target user id only.
+5. Re-adding the same email later returns "already has a login" because the
+   banned Auth user still exists. To reinstate someone, CJ unbans them in
+   Authentication > Users and re-creates their profile/locations.
+
+Rollback: restore the previous function version or disable `remove-member`.
+Vercel rollback restores the old "delete profile only" button, which is the
+incomplete behaviour this replaced, so prefer fixing forward.
 
 ## Daily KPI digest endpoint (`/api/reports/daily-digest`)
 
