@@ -11,7 +11,9 @@ function deps(over: Partial<RemoveMemberDeps> = {}) {
     verifyToken: vi.fn(async (t: string) => (t === "owner-token" ? OWNER_ID : t === "staff-token" ? "staff-id" : null)),
     getRole: vi.fn(async (id: string) => (id === OWNER_ID ? "owner" : "staff")),
     blockLogin: vi.fn(async () => { calls.push("block"); }),
+    getCallerLocations: vi.fn(async () => ["au", "default", "uk", "us"]),
     revokeBarcodes: vi.fn(async () => { calls.push("barcodes"); return 2; }),
+    countActiveBarcodes: vi.fn(async () => 0),
     deleteLocations: vi.fn(async () => { calls.push("locations"); }),
     deleteProfile: vi.fn(async () => { calls.push("profile"); }),
     now: () => "2026-11-17T00:00:00.000Z",
@@ -83,5 +85,24 @@ describe("remove-member edge function core", () => {
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(second.body).toEqual({ user_id: TARGET, barcodes_revoked: 0 });
+  });
+
+  it("refuses an owner who lacks any location, before touching anything", async () => {
+    for (const locs of [["default", "us"], ["au", "uk", "us"], []]) {
+      const { d, calls } = deps({ getCallerLocations: vi.fn(async () => locs) });
+      const r = await runRemoveMember(d, OWNER, { user_id: TARGET });
+      expect(r.status).toBe(403);
+      expect((r.body as { error: string }).error).toMatch(/every location/);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  it("fails loudly if any lanyard is still active, and keeps their profile", async () => {
+    const { d, calls } = deps({ countActiveBarcodes: vi.fn(async () => 1) });
+    const r = await runRemoveMember(d, OWNER, { user_id: TARGET });
+    expect(r.status).toBe(500);
+    expect((r.body as { error: string }).error).toMatch(/lanyard is off everywhere.*already blocked.*safe to try again/);
+    expect(calls).toEqual(["block", "barcodes"]);
+    expect(d.deleteProfile).not.toHaveBeenCalled();
   });
 });

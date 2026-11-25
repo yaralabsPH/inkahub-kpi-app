@@ -59,6 +59,11 @@ Deno.serve(async (req: Request) => {
       const { error } = await admin.auth.admin.updateUserById(userId, { ban_duration: BAN_DURATION });
       if (error) throw new Error("Block failed");
     },
+    async getCallerLocations(userId) {
+      const { data, error } = await asCaller.from("user_locations").select("location").eq("user_id", userId);
+      if (error) throw new Error("Location lookup failed");
+      return (data ?? []).map((r: { location: string }) => r.location);
+    },
     async revokeBarcodes(userId, revokedAt) {
       const { data, error } = await asCaller
         .from("staff_barcodes")
@@ -68,6 +73,15 @@ Deno.serve(async (req: Request) => {
         .select("user_id");
       if (error) throw new Error("Barcode revoke failed");
       return data?.length ?? 0;
+    },
+    async countActiveBarcodes(userId) {
+      const { count, error } = await asCaller
+        .from("staff_barcodes")
+        .select("user_id", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("active", true);
+      if (error || count === null) throw new Error("Barcode check failed");
+      return count;
     },
     async deleteLocations(userId) {
       const { error } = await asCaller.from("user_locations").delete().eq("user_id", userId);

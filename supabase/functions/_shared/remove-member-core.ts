@@ -15,13 +15,23 @@
  *
  * Steps run in that order so a failure part-way leaves the member with LESS
  * access, never more. Every step is idempotent, so a retry is always safe.
+ *
+ * Lanyards: barcode writes run as the caller under RLS, which only reaches
+ * the caller's own locations. So the caller must have access to EVERY
+ * location, and after revoking, no active barcode may remain; otherwise the
+ * removal fails loudly instead of leaving a working lanyard at another site.
  */
+
+/** Every location a member can have (matches add-member's TEAM_LOCATIONS). */
+export const ALL_LOCATIONS = ["au", "default", "uk", "us"] as const;
 
 export type RemoveMemberStage =
   | "verify_token"
   | "get_role"
   | "block_login"
+  | "check_locations"
   | "revoke_barcodes"
+  | "verify_barcodes"
   | "delete_locations"
   | "delete_profile";
 
@@ -32,8 +42,12 @@ export interface RemoveMemberDeps {
   getRole(userId: string): Promise<string | null>;
   /** Ban the login so it can't sign in or refresh. Throw on failure. */
   blockLogin(userId: string): Promise<void>;
+  /** Locations the caller can access (their own user_locations rows). */
+  getCallerLocations(userId: string): Promise<string[]>;
   /** Mark active barcodes inactive. Returns how many were revoked. Throw on failure. */
   revokeBarcodes(userId: string, revokedAt: string): Promise<number>;
+  /** How many of the target's barcodes are still active. Throw on failure. */
+  countActiveBarcodes(userId: string): Promise<number>;
   /** Delete all location grants. Throw on failure. */
   deleteLocations(userId: string): Promise<void>;
   /** Delete the profile row. Throw on failure. */
@@ -54,8 +68,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STAGE_LABEL: Record<RemoveMemberStage, string> = {
   verify_token: "checking your session",
   get_role: "checking your role",
+  check_locations: "checking your location access",
   block_login: "blocking their login",
   revoke_barcodes: "turning off their lanyard",
+  verify_barcodes: "checking their lanyard is off everywhere",
   delete_locations: "removing their location access",
   delete_profile: "removing their profile",
 };
@@ -91,11 +107,21 @@ export async function runRemoveMember(
     if (targetId.toLowerCase() === callerId.toLowerCase()) {
       return { status: 400, body: { error: "You can't remove yourself." } };
     }
+    stage = "check_locations";
+    const mine = new Set(await deps.getCallerLocations(callerId));
+    if (!ALL_LOCATIONS.every((l) => mine.has(l))) {
+      return {
+        status: 403,
+        body: { error: "Only an owner with access to every location (AU, UK, US and Default) can remove a member, so their lanyard is turned off everywhere." },
+      };
+    }
 
     stage = "block_login";
     await deps.blockLogin(targetId);
     stage = "revoke_barcodes";
     const revoked = await deps.revokeBarcodes(targetId, deps.now());
+    stage = "verify_barcodes";
+    if ((await deps.countActiveBarcodes(targetId)) !== 0) throw new Error("Barcodes still active");
     stage = "delete_locations";
     await deps.deleteLocations(targetId);
     stage = "delete_profile";
@@ -105,7 +131,7 @@ export async function runRemoveMember(
   } catch {
     deps.reportFailure?.(stage, targetId || undefined);
     const doneSoFar =
-      stage === "block_login" || stage === "verify_token" || stage === "get_role"
+      stage === "block_login" || stage === "verify_token" || stage === "get_role" || stage === "check_locations"
         ? "Nothing was changed."
         : "Their login is already blocked.";
     return {
