@@ -31,7 +31,8 @@ export interface Repository {
   /**
    * Atomically apply a delta to `current_on_hand`. Used by the auto-adjust
    * pipeline so multiple in-flight sales upserts can't race each other and
-   * lose a deduction. Result is clamped at zero.
+   * lose a deduction. Exact in both directions (no floor at zero), so
+   * on-hand can be negative, like dispatch deductions.
    *
    * `context` (optional) lets the caller categorize the resulting ledger
    * row. Without it the row is recorded as `reason: "manual"`. Call sites
