@@ -13,6 +13,8 @@ import {
   MAIL_TUBE_LABELS,
 } from "@/lib/domain/skuRouting";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
+import { usePackagingCatalogue } from "@/lib/hooks/usePackagingCatalogue";
+import { PACKAGE_USAGE_ROWS_FILTER, usageOf } from "@/lib/domain/packaging/usage";
 
 interface LedgerRow {
   product_id: string;
@@ -66,7 +68,7 @@ function isoDate(d: Date): string {
 }
 
 function Sparkline({ values, width = 140, height = 28 }: { values: number[]; width?: number; height?: number }) {
-  if (values.length === 0) return <span className="text-slate-400 text-xs">â€”</span>;
+  if (values.length === 0) return <span className="text-slate-400 text-xs">—</span>;
   const max = Math.max(...values, 1);
   const stepX = values.length > 1 ? width / (values.length - 1) : width;
   const pts = values.map((v, i) => {
@@ -107,6 +109,7 @@ export function PackageHistoryCard() {
   const supabase = getSupabase();
   const location = useAppStore((s) => s.location);
   const { data } = useDataset();
+  const catalogue = usePackagingCatalogue();
   const [periodKey, setPeriodKey] = useState<PeriodKey>("12w");
   const period = PERIODS.find((p) => p.key === periodKey) ?? PERIODS[3];
 
@@ -172,8 +175,23 @@ export function PackageHistoryCard() {
           : null,
       });
     }
+    // F4: packaging items from the site's rule sets that are not in the
+    // hard-coded list above.
+    const listed = new Set(slots.map((s) => s.product?.id).filter(Boolean));
+    for (const [productId, label] of catalogue) {
+      if (listed.has(productId)) continue;
+      const product = byId.get(productId) ?? null;
+      slots.push({
+        key: productId,
+        label,
+        kind: "box",
+        product: product
+          ? { id: product.id, supplier: product.supplier ?? "", current_on_hand: product.current_on_hand ?? 0 }
+          : null,
+      });
+    }
     return slots;
-  }, [data]);
+  }, [data, catalogue]);
 
   const packageProductIds = useMemo(() => {
     const s = new Set<string>();
@@ -207,7 +225,8 @@ export function PackageHistoryCard() {
               .select("product_id, delta, ts")
               .eq("location", location)
               .in("product_id", idsArray)
-              .lt("delta", 0)
+              // F4: include rows written back by packaging corrections.
+              .or(PACKAGE_USAGE_ROWS_FILTER)
               .gte("ts", fromIso)
               .order("ts", { ascending: true })
               .order("id", { ascending: true })
@@ -278,7 +297,12 @@ export function PackageHistoryCard() {
       const idx = bucketKeys.indexOf(key);
       if (idx < 0) continue;
       const arr = perProduct.get(r.product_id);
-      if (arr) arr[idx] += Math.abs(r.delta);
+      if (arr) arr[idx] += usageOf(r);
+    }
+    // A correction can land in a later bucket than its deduction; never show
+    // negative usage for a bucket.
+    for (const arr of perProduct.values()) {
+      for (let i = 0; i < arr.length; i++) if (arr[i] < 0) arr[i] = 0;
     }
     return packageSlots.map((slot) => {
       const buckets = slot.product ? (perProduct.get(slot.product.id) ?? new Array(period.bucketCount).fill(0)) : new Array(period.bucketCount).fill(0);
@@ -315,8 +339,8 @@ export function PackageHistoryCard() {
           </CardTitle>
           <div className="text-xs text-slate-500 dark:text-slate-400">
             {events === null
-              ? `${period.label} Â· not loaded`
-              : <>{period.label} Â· {denominators.framed.toLocaleString()} framed orders (A0 + dispatch) Â· {denominators.unframed.toLocaleString()} unframed completed</>}
+              ? `${period.label} · not loaded`
+              : <>{period.label} · {denominators.framed.toLocaleString()} framed orders (A0 + dispatch) · {denominators.unframed.toLocaleString()} unframed completed</>}
           </div>
         </div>
         <div className="inline-flex rounded-md ring-1 ring-slate-200 dark:ring-slate-700 overflow-hidden text-xs">
@@ -335,7 +359,7 @@ export function PackageHistoryCard() {
       </CardHeader>
       <CardBody className="p-0">
         {loading ? (
-          <div className="p-6 text-sm text-slate-500">Loadingâ€¦</div>
+          <div className="p-6 text-sm text-slate-500">Loading…</div>
         ) : error ? (
           <div className="p-6 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
             {error}
@@ -379,7 +403,7 @@ export function PackageHistoryCard() {
                         {r.catalogued ? (
                           r.supplier ? <div className="text-[11px] text-slate-500">{r.supplier}</div> : null
                         ) : (
-                          <div className="text-[11px] text-amber-700 dark:text-amber-400 italic">not in catalogue â€” add on SKUs page as code "{r.slotKey}"</div>
+                          <div className="text-[11px] text-amber-700 dark:text-amber-400 italic">not in catalogue — add on SKUs page as code "{r.slotKey}"</div>
                         )}
                       </td>
                       <td className="px-3 py-2">
@@ -388,13 +412,13 @@ export function PackageHistoryCard() {
                           {r.totalUsed.toLocaleString()} used
                         </div>
                       </td>
-                      <td className="px-3 py-2 text-right tabular-nums">{r.catalogued ? r.onHand.toLocaleString() : "â€”"}</td>
-                      <td className="px-3 py-2 text-right tabular-nums">{r.catalogued ? r.perBucketAvg.toFixed(1) : "â€”"}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{r.catalogued ? r.onHand.toLocaleString() : "—"}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{r.catalogued ? r.perBucketAvg.toFixed(1) : "—"}</td>
                       <td className="px-3 py-2 text-right tabular-nums" title={r.ratio == null ? `No ${denomLabel}s in window` : `${(r.ratio * 100).toFixed(0)}% of ${denomLabel}s used this`}>
-                        {r.ratio == null ? "â€”" : r.ratio.toFixed(2)}
+                        {r.ratio == null ? "—" : r.ratio.toFixed(2)}
                       </td>
                       <td className={"px-3 py-2 text-right tabular-nums " + (critical ? "text-red-700 dark:text-red-300 font-semibold" : warn ? "text-amber-700 dark:text-amber-300" : "")}>
-                        {r.cover == null ? "â€”" : r.cover.toFixed(1) + (period.bucketDays === 7 ? "w" : "d")}
+                        {r.cover == null ? "—" : r.cover.toFixed(1) + (period.bucketDays === 7 ? "w" : "d")}
                       </td>
                       <td className="px-4 py-2 text-right">
                         {r.supplier ? (
@@ -406,7 +430,7 @@ export function PackageHistoryCard() {
                             Build PO <ExternalLink size={11} />
                           </Link>
                         ) : (
-                          <span className="text-xs text-slate-400 italic">â€”</span>
+                          <span className="text-xs text-slate-400 italic">—</span>
                         )}
                       </td>
                     </tr>
@@ -415,7 +439,7 @@ export function PackageHistoryCard() {
               </tbody>
             </table>
             <div className="px-4 py-2 text-[11px] text-slate-500 border-t border-slate-200 dark:border-slate-800">
-              Boxes ratio = usage Ã· framed orders (dispatch + A0 framed). Tubes ratio = usage Ã· unframed orders completed. Multiply by expected order volume to size next PO.
+              Boxes ratio = usage ÷ framed orders (dispatch + A0 framed). Tubes ratio = usage ÷ unframed orders completed. Multiply by expected order volume to size next PO.
             </div>
           </div>
         )}

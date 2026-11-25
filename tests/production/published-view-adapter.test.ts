@@ -247,10 +247,14 @@ describe("Task 18: the published CSV is built incrementally, page by page", () =
     const src = readFileSync("src/pages/Reports.tsx", "utf8");
     const start = src.indexOf("const handlePublishedExport = useCallback(");
     const body = src.slice(start, src.indexOf("}, [", start));
-    expect(body).toMatch(/const chunks: BlobPart\[\] = \[publishedCsvHeader\(\)\];/);
+    // F7 integration: the header carries the two framer columns; pages are held (one array per page) until the
+    // collection resolved, because the attribution read needs every shared-scanner dispatch id.
+    expect(body).toMatch(/const chunks: BlobPart\[\] = \[publishedCsvHeader\(ATTRIBUTION_CSV_HEADERS\)\];/);
+    expect(body).toMatch(/onPage: \(rows\) => \{\s*if \(rows\.length\) pages\.push\(rows\)/);
+    expect(body).toMatch(/fetchAttributionsForEvents\(supabase, location, attrIds\)/);
     expect(body).toMatch(/collectAll\("raw-export", \{\s*limit: 1000,\s*onPage: /);
     // each page becomes exactly one CRLF-led chunk
-    expect(body).toMatch(/chunks\.push\(`\\r\\n\$\{publishedCsvLines\(rows, nameOf\)\.join\("\\r\\n"\)\}`\)/);
+    expect(body).toMatch(/chunks\.push\(`\\r\\n\$\{publishedCsvLines\(rows, nameOf, extra\)\.join\("\\r\\n"\)\}`\)/);
     expect(body).not.toMatch(/\.push\(\.\.\./); // never one part per row
     expect(body).not.toMatch(/(chunks|parts)\.join\(/); // never a whole-file string copy
     expect(body).toMatch(/new Blob\(chunks, /);

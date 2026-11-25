@@ -172,6 +172,60 @@ processor is off.
    and US `2,17,32,47` minutes past each hour. The three digest schedules are
    unchanged.
 
+#### Integration amendment (2026-11-23): refresh schedules are dormant
+
+The integrated F1 + F4–F7 build (`feature/item-counting-integration`) is
+deployed to a **Vercel Hobby** project. Hobby refuses sub-daily cron
+definitions at deploy time, so `vercel.json` keeps only the three unchanged
+daily digest crons and the two `maxDuration: 300` functions (300 s needs
+Fluid Compute; verify the project's actual runtime before relying on a full
+240 s worker budget). **No refresh runs on its own** in this Preview.
+
+- Staging publication is exercised by the operator workflow above
+  (`reporting-admin` `rebuild`, or an authorized manual
+  `GET /api/reports/refresh-summaries?site=…`), and Reports/Welcome show the
+  published cutoff and staleness. This is a staging scheduling exception, not
+  autonomous refresh.
+- Before production relies on published reads, a hosting plan that allows
+  15-minute crons must exist (CJ decision; nothing is purchased here). Then add
+  these three entries back to `vercel.json` `crons`, exactly:
+
+```json
+{"path":"/api/reports/refresh-summaries?site=au","schedule":"0,15,30,45 * * * *"}
+{"path":"/api/reports/refresh-summaries?site=uk","schedule":"1,16,31,46 * * * *"}
+{"path":"/api/reports/refresh-summaries?site=us","schedule":"2,17,32,47 * * * *"}
+```
+
+- Until then keep every site's `readMode` `legacy` for real staff, or accept
+  that published reads only advance when an operator refreshes.
+
+#### Integration amendment: what is proven in code vs still owed on staging
+
+Proven locally on the integrated tree (no database, no deploy): `npx tsc -b`,
+`typecheck:digest`, `typecheck:api`, the full vitest suite (including the
+PGlite runs of the real reporting SQL 0037–0046) and `npm run build`; the
+seam tests in `tests/production/item-counting-integration.test.ts` (F6/F7
+scanner rows through the F1 reducer, no framing credit from shared dispatch,
+F7 framer columns on both CSV exports, F4 packaging wiring).
+
+Not proven until checked on staging (Codex / CJ steps):
+
+- installed schema matches the files: 0034–0047 and 0052–0056 present, with
+  the 0044/0045 receipts that are currently missing reconciled first;
+- PGlite does not load 0047/0052–0056 together with the reporting SQL
+  (`NON_REPORTING_MIGRATIONS` in `tests/reporting/pg/harness.ts`), so the
+  reporting reads over the F5 snapshot columns and the F6/F7 triggers are only
+  verified against the real staging database;
+- a bounded worker rehearsal (capture is OFF, epoch 27; every site legacy with
+  the processor off): enable only for an owned fixture, clean it up, and check
+  the original-data hash;
+- the hosted Preview: Reports (legacy and published, CSV with framer
+  columns), Welcome, the classic and new station counter, scanner routes,
+  packaging UI and a dry digest; the actual function runtime/duration.
+
+Rollback: restore the previous Preview and keep sites on legacy read mode;
+the additive schema stays installed.
+
 Operator commands are `POST /api/reports/reporting-admin` with
 `Authorization: Bearer <REPORTING_OPERATOR_SECRET>` and a JSON body:
 `status`, `rebuild`, `cleanup`, `set-mode`, `abandon`, `disable-capture`,

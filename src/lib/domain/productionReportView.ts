@@ -17,10 +17,10 @@ import {
   type ProductionSummary,
   type ProductionVisibility,
   type WorkType,
-} from "./productionCounts";
-import { productionDatesBetween, productionRange, type ProductionRange } from "./productionPeriods";
-import { frameTimingLines, frameTimingTotals, type FrameTimingTotals } from "./productionFrameTiming";
-import { parseSku } from "./skuRouting";
+} from "./productionCounts.js";
+import { productionDatesBetween, productionRange, type ProductionRange } from "./productionPeriods.js";
+import { frameTimingLines, frameTimingTotals, type FrameTimingTotals } from "./productionFrameTiming.js";
+import { parseSku } from "./skuRouting.js";
 
 export interface ReportScope {
   range: ProductionRange;

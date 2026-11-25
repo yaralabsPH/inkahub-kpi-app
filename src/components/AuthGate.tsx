@@ -36,7 +36,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
-        <div className="text-sm text-slate-500">Loadingâ€¦</div>
+        <div className="text-sm text-slate-500">Loading…</div>
       </div>
     );
   }
@@ -104,7 +104,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
                   <div className="text-sm text-red-600 dark:text-red-400">{formError}</div>
                 ) : null}
                 <Button type="submit" disabled={busy} className="w-full">
-                  {busy ? "Updatingâ€¦" : "Update password"}
+                  {busy ? "Updating…" : "Update password"}
                 </Button>
               </form>
             </CardBody>
@@ -131,7 +131,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
                 <Lock size={16} /> Sign in
               </CardTitle>
               <span className="text-xs text-slate-500">
-                Inka Arthouse â€” multi-user mode. Use the email + password set up by your team's owner.
+                Inka Arthouse — multi-user mode. Use the email + password set up by your team's owner.
               </span>
             </CardHeader>
             <CardBody>
@@ -178,7 +178,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
                   <div className="text-sm text-red-600 dark:text-red-400">{formError}</div>
                 ) : null}
                 <Button type="submit" disabled={busy} className="w-full">
-                  {busy ? "Signing inâ€¦" : "Sign in"}
+                  {busy ? "Signing in…" : "Sign in"}
                 </Button>
               </form>
 
@@ -232,7 +232,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
                     ) : null}
                     <div className="flex items-center gap-2">
                       <Button type="submit" disabled={busy} className="flex-1">
-                        {busy ? "Sendingâ€¦" : forgotSent ? "Send again" : "Send reset link"}
+                        {busy ? "Sending…" : forgotSent ? "Send again" : "Send reset link"}
                       </Button>
                       <Button
                         type="button"
@@ -273,7 +273,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950">
-        <div className="text-sm text-slate-500">Loading profileâ€¦</div>
+        <div className="text-sm text-slate-500">Loading profile…</div>
       </div>
     );
   }

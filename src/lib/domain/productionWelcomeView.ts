@@ -12,8 +12,8 @@
  *     yesterday.
  * All counts come from summarizeProduction; Orders are completed orders.
  */
-import { summarizeProduction, WORK_TYPES, type PreparedProductionEvidence, type ProductionSummary, type WorkType } from "./productionCounts";
-import { productionDateAt, productionRange, shiftProductionDate, type ProductionRange, type ReportSite } from "./productionPeriods";
+import { summarizeProduction, WORK_TYPES, type PreparedProductionEvidence, type ProductionSummary, type WorkType } from "./productionCounts.js";
+import { productionDateAt, productionRange, shiftProductionDate, type ProductionRange, type ReportSite } from "./productionPeriods.js";
 
 /** Production days the Welcome page needs, ending today: 8 days back covers every comparison. */
 export const WELCOME_LOOKBACK_DAYS = 8;

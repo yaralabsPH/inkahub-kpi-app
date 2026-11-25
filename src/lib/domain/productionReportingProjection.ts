@@ -51,8 +51,8 @@ import {
   type UnresolvedParentReason,
   type UtcWindow,
   type WorkType,
-} from "./productionCounts";
-import { FRAME_GAP_CAP_MIN, frameTimingWeight, isTimingStreamSku, type FrameTimingLine } from "./productionFrameTiming";
+} from "./productionCounts.js";
+import { FRAME_GAP_CAP_MIN, frameTimingWeight, isTimingStreamSku, type FrameTimingLine } from "./productionFrameTiming.js";
 import {
   canonicalJson,
   partitionHash,
@@ -63,7 +63,7 @@ import {
   type ItemFact,
   type PartitionResult,
   type SourceIssueFact,
-} from "./productionReporting";
+} from "./productionReporting.js";
 
 // ---------------------------------------------------------------------------
 // Projection

@@ -1244,7 +1244,7 @@ function AccountsSection({
               flush({ payment_terms_days: nextDays });
             }}
           >
-            <option value="">â€” use supplier default â€”</option>
+            <option value="">— use supplier default —</option>
             {STANDARD_PAYMENT_TERMS.map((t) => (
               <option key={t.value} value={String(t.value)}>{t.label}</option>
             ))}

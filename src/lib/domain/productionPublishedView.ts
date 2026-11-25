@@ -171,12 +171,12 @@ export function publishedCsv(rows: readonly PublishedDetailRow[], nameOf: (staff
 }
 
 /** The published CSV's header line (the legacy export's columns). */
-export function publishedCsvHeader(): string {
-  return CSV_HEADERS.map(csvCell).join(",");
+export function publishedCsvHeader(extraHeaders: readonly string[] = []): string {
+  return [...CSV_HEADERS, ...extraHeaders].map(csvCell).join(",");
 }
 
 /** CSV lines for ONE page of raw-export rows (the export is built page by page; joined with CRLF). */
-export function publishedCsvLines(rows: readonly PublishedDetailRow[], nameOf: (staffId: string) => string): string[] {
+export function publishedCsvLines(rows: readonly PublishedDetailRow[], nameOf: (staffId: string) => string, extraCells?: (eventId: string) => readonly string[]): string[] {
   return rows.map((r) => {
     if (r.kind !== "raw-export") throw new RangeError(`A published CSV holds raw-export rows only, not ${r.kind}`);
     const e = r.row;
@@ -190,6 +190,7 @@ export function publishedCsvLines(rows: readonly PublishedDetailRow[], nameOf: (
       e.eventType,
       e.stationId ?? "",
       (e.note ?? "").replace(/[\r\n]+/g, " "),
+      ...(extraCells ? extraCells(e.id) : []),
     ].map((c) => csvCell(String(c))).join(",");
   });
 }

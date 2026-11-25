@@ -1,13 +1,27 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { shouldDropRepeatScan } from "@/lib/domain/scanDedupe";
+import { missingStockMessage } from "@/lib/domain/deductResult";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Settings as SettingsIcon, LogOut, ScanLine,
   Play, Check, X as XIcon,
 } from "lucide-react";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
+import { useOrderPackaging } from "@/lib/hooks/useOrderPackaging";
+import { packagingLinesFromOrder, type PackagingLineInput } from "@/lib/domain/packaging/contents";
+import { PackagingPanel, PackagingPendingNotice } from "@/components/production/PackagingPanel";
 import { useAuthOptional } from "@/lib/auth/AuthProvider";
 import { useDataset } from "@/lib/hooks/useDataset";
 import { useAppStore } from "@/lib/state/appStore";
 import { OrderLineDisplay } from "@/components/production/OrderLineDisplay";
+import { StationOrderScreen } from "@/components/production/station/StationOrderScreen";
+import {
+  completeBlockReason,
+  packagingBlocksComplete,
+  readTabOverride,
+  resolveStationUi,
+  stationNeedsPackaging,
+  type StationPackagingMode,
+} from "@/components/production/station/stationScreenModel";
 import {
   loadStationConfig, saveStationConfig, clearStationConfig,
   type StationConfig,
@@ -19,6 +33,9 @@ import {
   isLineMyDept,
   skuTypeBadge,
   parseSku,
+  variantChipClass,
+  friendlySize,
+  friendlyVariant,
   detectOrientation,
   shouldDeductAtDept,
   routeShopifyLineToCatalogueLines,
@@ -43,6 +60,13 @@ import { buildProductionCounterView, type ProductionCounterView } from "@/lib/do
 import { snapshotCovers, type WorkType } from "@/lib/domain/productionCounts";
 import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { Modal } from "@/components/ui/Modal";
+import { SharedScannerSetup, SharedScannerStation } from "@/components/production/scanners/SharedScannerStation";
+import {
+  browserStorage,
+  loadSharedScannerConfig,
+  saveSharedScannerConfig,
+  type SharedScannerConfig,
+} from "@/lib/scanners/config";
 
 /**
  * Production / Order Submission tablet page.
@@ -98,6 +122,8 @@ interface CurrentOrder {
   lines: OrderLine[];
   /** Total lines on the order across all departments — to show "3 of 5 lines for your department". */
   total_lines: number;
+  /** F4: every line as packaging input, including blank-SKU lines that `lines` drops. */
+  packaging_lines: PackagingLineInput[];
   /** Shopify cancelledAt (ISO) when the order is cancelled; null otherwise. */
   cancelled_at: string | null;
   /** Cancellation reason if cancelled; null otherwise. */
@@ -161,6 +187,20 @@ function lineKey(order: string, sku: string): string {
   return `${order}__${sku}`;
 }
 
+/**
+ * Station screen redesign: per-tab override for side-by-side testing.
+ * Visit with ?ui=classic or ?ui=new; the choice sticks for the tab.
+ */
+function readStationUiTabOverride(): string | null {
+  let storage: Storage | null = null;
+  try {
+    storage = window.sessionStorage;
+  } catch {
+    storage = null; // storage blocked: the URL choice still applies
+  }
+  return readTabOverride(window.location.search, storage);
+}
+
 /** Compact human duration: "12s" / "3m 27s" / "1h 4m". */
 function fmtDuration(ms: number): string {
   if (ms < 0) ms = 0;
@@ -199,10 +239,46 @@ export function Production() {
   const [scanError, setScanError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
 
+  // F6: opt-in Shared scanners mode, saved on this device. Off = the
+  // classic station below, unchanged. Turning it off keeps its queue.
+  const [shared, setShared] = useState<SharedScannerConfig | null>(() => loadSharedScannerConfig(browserStorage()));
+  const [sharedSetup, setSharedSetup] = useState(false);
+
   const handlePickStation = (cfg: StationConfig) => {
     saveStationConfig(cfg);
     setStation(cfg);
   };
+
+  if (sharedSetup) {
+    return (
+      <SharedScannerSetup
+        current={shared}
+        onCancel={() => setSharedSetup(false)}
+        onSave={(cfg) => {
+          saveSharedScannerConfig(browserStorage(), cfg);
+          setShared(cfg);
+          setSharedSetup(false);
+          setShowSettings(false);
+        }}
+      />
+    );
+  }
+  if (shared?.enabled) {
+    return (
+      <SharedScannerStation
+        config={shared}
+        onChangeConfig={(cfg) => {
+          saveSharedScannerConfig(browserStorage(), cfg);
+          setShared(cfg);
+        }}
+        onExit={() => {
+          const off = { ...shared, enabled: false };
+          saveSharedScannerConfig(browserStorage(), off);
+          setShared(off);
+        }}
+      />
+    );
+  }
 
   // Department wasn't set, or operator clicked the gear → show the picker.
   if (!station || showSettings) {
@@ -211,6 +287,7 @@ export function Production() {
         current={station}
         onPick={(cfg) => { handlePickStation(cfg); setShowSettings(false); }}
         onClose={station ? () => setShowSettings(false) : undefined}
+        onSharedScanners={() => setSharedSetup(true)}
         onReset={station ? () => {
           clearStationConfig();
           setStation(null);
@@ -251,8 +328,21 @@ function ProductionStation({
   const location = useAppStore((s) => s.location);
   const auth = useAuthOptional();
   const { data: dataset } = useDataset();
+  // Station screen redesign: new screen by default, classic via
+  // VITE_STATION_UI=classic (rollback) or ?ui=classic (per tab).
+  const stationUi = useMemo(
+    () => resolveStationUi({
+      department: station.department,
+      envValue: import.meta.env.VITE_STATION_UI ?? null,
+      tabOverride: readStationUiTabOverride(),
+    }),
+    [station.department],
+  );
   const [scanBuffer, setScanBuffer] = useState("");
   const [busy, setBusy] = useState(false);
+  // Synchronous guards for processScan (see the comment there).
+  const scanInFlightRef = useRef(false);
+  const lastScanRef = useRef<{ value: string; at: number } | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   // In-flight guard against duplicate line_verified writes. Records line
   // keys whose insertEvent is currently awaiting. Synchronous check at
@@ -383,11 +473,54 @@ function ProductionStation({
     } | null;
   } | null>(null);
 
+  // F4 box-auto-pick. In scan mode (default) this only reads the site
+  // setting; every packaging path below behaves exactly as before.
+  const packagingOrder = useMemo(
+    () => (currentOrder ? { number: currentOrder.number, lines: currentOrder.packaging_lines } : null),
+    [currentOrder],
+  );
+  const packaging = useOrderPackaging({
+    client: supabase,
+    location,
+    department: station.department,
+    order: packagingOrder,
+    csCaseId: activeCase?.caseId ?? null,
+    staffId: activeStaff?.user_id ?? null,
+    onError: onScanError,
+  });
+  const packagingMode = packaging.mode;
+  const scanLegacyBarcode = packaging.scanLegacyBarcode;
+  const currentOrderRef = useRef(currentOrder);
+  currentOrderRef.current = currentOrder;
+  /** The auto-pick panel for either station screen; null in scan mode. */
+  const renderPackagingSlot = (variant: "station" | "classic") => {
+    if (packagingMode !== "auto") return null;
+    const v = packaging.view;
+    if (!v) return <PackagingPendingNotice variant={variant} count={packaging.pendingCount} />;
+    return (
+      <PackagingPanel
+        variant={variant}
+        status={v.status}
+        chosen={v.chosen}
+        predicted={v.prediction.evaluation.packages}
+        reason={v.prediction.evaluation.reason}
+        alternatives={v.alternatives}
+        pendingCount={packaging.pendingCount}
+        onTap={packaging.tap}
+        onAdd={packaging.add}
+        onAdjust={packaging.adjust}
+        onReset={packaging.reset}
+        saved={packaging.saved}
+      />
+    );
+  };
+
   // Auto-assign mail tube at unframed station based on order contents.
   // Runs whenever the current order changes. Cleared when order clears.
   useEffect(() => {
     if (!currentOrder) return;
     if (station.department !== "unframed") return;
+    if (packagingMode === "auto") return; // F4: the rules pick the tube
     const skus = currentOrder.lines.map((l) => l.sku);
     const tubeId = autoMailTubeForUnframedOrder(skus);
     if (tubeId) {
@@ -398,7 +531,7 @@ function ProductionStation({
         return next;
       });
     }
-  }, [currentOrder, station.department]);
+  }, [currentOrder, station.department, packagingMode]);
   // Phase 5: when an order loads, fetch line_verified + cancelled events,
   // filter out verifies that have been cancelled, and resolve the verifier
   // display names via staff_barcodes.
@@ -611,6 +744,7 @@ function ProductionStation({
         display_name: body.order_name ?? `#${orderNumber}`,
         lines: matched,
         total_lines: allLines.length,
+        packaging_lines: packagingLinesFromOrder(allLines),
         cancelled_at: body.cancelled_at ?? null,
         cancel_reason: body.cancel_reason ?? null,
       };
@@ -952,13 +1086,32 @@ function ProductionStation({
     // actually meant to scrap. Dispatch is a one-tap finalise so it's
     // exempt. Read from the ref so a fast "verify -> click Complete"
     // never sees a stale empty map from a not-yet-rebuilt closure.
-    if (station.department !== "dispatch") {
-      const verifiedCount = Math.max(verifiedLinesRef.current.size, verifiedLines.size);
-      if (verifiedCount === 0) {
-        onScanError("Verify at least one item before completing the order.");
+    // Station screen redesign: the Complete rule lives in the tested
+    // completeBlockReason(). Dispatch is exempt; classic needs at least one
+    // verified line; the new screen (CJ decision A) needs every line this
+    // station must check. Ref and state can each lag the other by a render,
+    // so a line counts as verified if either has it.
+    {
+      const blockReason = completeBlockReason({
+        department: station.department,
+        stationUi,
+        verifiedCount: Math.max(verifiedLinesRef.current.size, verifiedLines.size),
+        lines: currentOrder.lines.map((l) => ({
+          key: lineKey(currentOrder.number, l.sku),
+          sku: l.sku,
+          belongsToThisDept: l.belongsToThisDept,
+        })),
+        isVerified: (key) => verifiedLinesRef.current.has(key) || verifiedLines.has(key),
+      });
+      if (blockReason) {
+        onScanError(blockReason);
         return;
       }
     }
+    // F4: take this order's packaging now, before any await, so loading or
+    // clearing an order while the event saves cannot change what is recorded.
+    const packagingCapture = packagingMode === "auto" ? packaging.capture() : null;
+    const completedOrder = currentOrder;
     const totalItems = currentOrder.lines.reduce(
       (s, l) => s + (typeof l.quantity === "number" ? l.quantity : 1),
       0,
@@ -994,8 +1147,12 @@ function ProductionStation({
       // Add packages to the deduction list. They deduct from the same RPC -
       // the cache key is the product code (for scanned packages) or product
       // id (for auto-assigned mail tubes); the RPC handles both.
-      for (const [pkgKey, qty] of packages.entries()) {
-        componentMap.set(pkgKey, (componentMap.get(pkgKey) ?? 0) + qty);
+      // F4: in auto mode packaging goes through packaging_apply below, never
+      // through this call.
+      if (packagingMode !== "auto") {
+        for (const [pkgKey, qty] of packages.entries()) {
+          componentMap.set(pkgKey, (componentMap.get(pkgKey) ?? 0) + qty);
+        }
       }
       if (componentMap.size > 0) {
         const componentArray = Array.from(componentMap.entries()).map(
@@ -1009,6 +1166,9 @@ function ProductionStation({
           console.error("[auto-deduct] RPC error:", deductErr);
         } else {
           console.log("[auto-deduct] result:", deductResult);
+          // A missing stock item used to skip silently. Say so on the screen.
+          const missingMsg = missingStockMessage(deductResult);
+          if (missingMsg) onScanError(missingMsg);
         }
       } else {
         console.log("[auto-deduct] no components to deduct for this event");
@@ -1016,11 +1176,18 @@ function ProductionStation({
     } catch (e) {
       console.error("[auto-deduct] exception:", e);
     }
+    // F4: record and deduct the packaging for this completion. A no-op in
+    // scan mode. Not awaited: a slow or failed save queues on the device and
+    // never holds up the bench.
+    if (packagingCapture) void packaging.applyAfterEvent(inserted, packagingCapture);
+    // Only clear the order that was completed: another order may have been
+    // scanned while this one saved.
     window.setTimeout(() => {
-      setCurrentOrder(null);
+      if (currentOrderRef.current !== completedOrder) return;
+      setCurrentOrder((now) => (now === completedOrder ? null : now));
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, refreshCounter]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent, refreshCounter, onScanError]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
@@ -1121,12 +1288,25 @@ function ProductionStation({
    * vanishingly small).
    */
   const processScan = useCallback(async (raw: string) => {
-    if (busy) return;
+    // `busy` is React state, so two calls in the same tick both see false.
+    // A lanyard is submitted at its 8th character AND again by the scanner's
+    // Enter key before the buffer is cleared; that wrote two clock_in rows.
+    // The ref lock and the repeat check below are synchronous.
+    const scanValue = raw.trim();
+    if (!scanValue) return;
+    if (scanInFlightRef.current) return;
+    if (shouldDropRepeatScan(lastScanRef.current, scanValue, Date.now())) return;
+    lastScanRef.current = { value: scanValue, at: Date.now() };
+    scanInFlightRef.current = true;
+    if (busy) {
+      scanInFlightRef.current = false;
+      return;
+    }
     setBusy(true);
     onScanError(null);
     setDispatchFlash(null);
     try {
-      const value = raw.trim();
+      const value = scanValue;
       if (!value) return;
       lastActivityRef.current = Date.now();
       // eslint-disable-next-line no-console
@@ -1173,7 +1353,26 @@ function ProductionStation({
               // eslint-disable-next-line no-console
               console.log("[clock-in] confirmed?", ok);
               if (!ok) return;
-              const clockInId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+              // The confirm box blocks the page. Look again right before
+              // writing, in case a clock-in landed meanwhile.
+              const recheck = await supabase
+                .from("production_events")
+                .select("event_type")
+                .eq("location", location)
+                .eq("staff_id", staff.user_id)
+                .in("event_type", ["clock_in", "clock_out"])
+                .gte("created_at", dayStart.toISOString())
+                .order("created_at", { ascending: false })
+                .limit(1);
+              if (recheck.error) {
+                onScanError(`Clock-state check failed: ${recheck.error.message}. Not signing in.`);
+                return;
+              }
+              if (recheck.data?.[0]?.event_type === "clock_in") {
+                onSetActiveStaff(staff);
+                return;
+              }
+              const clockInId =`evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
               const payload = {
                 location,
                 id: clockInId,
@@ -1228,6 +1427,17 @@ function ProductionStation({
       const pkgMatch = value.match(/\+\d+=/);
       if (pkgMatch) {
         const pkgBarcode = pkgMatch[0];
+        // F4 auto mode: a printed box barcode is a manual pick for the
+        // current order. It is never required and never pre-staged.
+        if (packagingMode === "auto") {
+          if (scanLegacyBarcode(pkgBarcode)) return;
+          onScanError(
+            currentOrderRef.current
+              ? `Box barcode "${pkgBarcode}" is not in this site's packaging list. Tap the packaging you used instead.`
+              : "Scan the order first. The packaging is picked automatically.",
+          );
+          return;
+        }
         const pkg = packageFromBarcode(pkgBarcode, station.department);
         // eslint-disable-next-line no-console
         console.log("[package] match?", pkgBarcode, "(from value", JSON.stringify(value) + ")", station.department, "->", pkg ? pkg.key : "NO MATCH");
@@ -1337,9 +1547,10 @@ function ProductionStation({
 
 
     } finally {
+      scanInFlightRef.current = false;
       setBusy(false);
     }
-  }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location]);
+  }, [busy, lookupStaff, activeStaff, station.department, onSetActiveStaff, onScanError, fetchOrder, insertEvent, location, packagingMode, scanLegacyBarcode]);
 
   /**
    * Global keystroke capture. USB barcode scanners type the value as
@@ -1441,8 +1652,122 @@ function ProductionStation({
     return () => clearInterval(interval);
   }, [activeStaff, onSetActiveStaff]);
 
+  // Station screen redesign: same clock_out write as the classic Sign out
+  // and Clock out buttons. A failed write still idles the station.
+  const clockOutAndIdle = async (note: string) => {
+    if (activeStaff) {
+      try {
+        const clockOutId = `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const { error: coErr } = await supabase
+          .from("production_events")
+          .insert({
+            location,
+            id: clockOutId,
+            staff_id: activeStaff.user_id,
+            department: station.department,
+            event_type: "clock_out",
+            note,
+          });
+        if (coErr) {
+          onScanError(`Clock-out write failed: ${coErr.message}. Idling station anyway.`);
+        }
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("[clock-out] write failed:", e);
+      }
+    }
+    onSetActiveStaff(null);
+  };
+  const findLineByKey = (key: string): OrderLine | undefined =>
+    currentOrder?.lines.find((l) => lineKey(currentOrder.number, l.sku) === key);
+  const useNewScreen = !!activeStaff && stationUi === "new";
+
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950">
+    <div className={useNewScreen ? "h-screen flex flex-col" : "min-h-screen flex flex-col bg-slate-50 dark:bg-slate-950"}>
+      {useNewScreen && activeStaff ? (
+        <StationOrderScreen
+          departmentLabel={PRODUCTION_DEPARTMENT_LABELS[station.department]}
+          locationCode={location}
+          locationLabel={LOCATION_LABELS[location as LocationKey] ?? location}
+          staff={activeStaff}
+          todayCount={counter ? counter.normal.orders : null}
+          todayItems={counter ? counter.normal.items : null}
+          todayState={counterEvidence.status}
+          todayRework={counter ? counter.rework : null}
+          onRetryCount={refreshCounter}
+          countStatus={
+            <ProductionCountStatus
+              className="max-w-[16rem] text-left"
+              state={counterEvidence}
+              range={counter?.range ?? null}
+              coverage={counter?.coverage ?? null}
+              compact
+            />
+          }
+          order={currentOrder ? {
+            number: currentOrder.number,
+            displayName: currentOrder.display_name,
+            totalLines: currentOrder.total_lines,
+            lines: currentOrder.lines.map((l) => ({
+              key: lineKey(currentOrder.number, l.sku),
+              sku: l.sku,
+              title: l.title,
+              quantity: l.quantity,
+              variantTitle: l.variantTitle ?? null,
+              belongsToThisDept: l.belongsToThisDept,
+              otherDeptLabel: l.dept ? PRODUCTION_DEPARTMENT_LABELS[l.dept] : null,
+            })),
+          } : null}
+          verified={verifiedLines}
+          staffNames={staffNames}
+          scanBuffer={scanBuffer}
+          error={scanError}
+          notes={currentOrder ? (
+            <OrderNotesPanel
+              supabase={supabase}
+              location={location}
+              orderNumber={currentOrder.number}
+              author={null}
+              variant="loud"
+            />
+          ) : null}
+          activeCase={activeCase}
+          packages={
+            stationNeedsPackaging(station.department, packagingMode)
+              ? {
+                  required: true,
+                  auto: station.department === "unframed",
+                  rows: Array.from(packages.entries()).map(([key, qty]) => ({
+                    key,
+                    qty,
+                    label: PACKAGE_TYPES.find((p) => p.key === key)?.label ?? MAIL_TUBE_LABELS[key] ?? key,
+                  })),
+                }
+              : null
+          }
+          packagingSlot={renderPackagingSlot("station")}
+          onVerify={(key) => { const l = findLineByKey(key); if (l) void handleVerifyLine(l); }}
+          onUnverify={(key) => { const l = findLineByKey(key); if (l) void handleUnverifyLine(l); }}
+          onCompleteOrder={() => void handleCompleteOrder()}
+          onScrapOrder={() => void handleScrapOrder()}
+          onClearOrder={handleClearOrder}
+          onManualOrderSubmit={(n) => void processScan(n)}
+          onRemovePackage={(key) =>
+            setPackages((m) => {
+              const next = new Map(m);
+              const cur = next.get(key) ?? 0;
+              if (cur <= 1) next.delete(key);
+              else next.set(key, cur - 1);
+              return next;
+            })
+          }
+          onClearPackages={() => setPackages(new Map())}
+          onClockOut={() => void clockOutAndIdle("Sign out via prominent button")}
+          onSignOut={() => void clockOutAndIdle("Sign out via Sign out button")}
+          onOpenSettings={onOpenSettings}
+          backHref="/returns"
+        />
+      ) : (<>
       {/* Top bar — brand left, station/location middle, controls right. */}
       <header className="h-14 px-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80">
         <div className="font-serif tracking-[0.2em] text-sm text-slate-700 dark:text-slate-300 select-none">
@@ -1540,6 +1865,8 @@ function ProductionStation({
               })
             }
             onClearPackages={() => setPackages(new Map())}
+            packagingMode={packagingMode}
+            packagingSlot={renderPackagingSlot("classic")}
             verifiedLines={verifiedLines}
             onVerifyLine={(line) => void handleVerifyLine(line)}
             onUnverifyLine={(line) => void handleUnverifyLine(line)}
@@ -1563,11 +1890,12 @@ function ProductionStation({
         <span>Scanner active · type Esc to clear the buffer</span>
         <span><LiveClock /></span>
       </footer>
+      </>)}
           {editOrderWarning ? (
             <Modal
               open
               onClose={() => setEditOrderWarning(null)}
-              title={"Edit Order â€” #" + editOrderWarning.orderNumber}
+              title={"Edit Order — #" + editOrderWarning.orderNumber}
               width="max-w-md"
             >
               <div className="mb-4 rounded-md ring-1 ring-amber-200 dark:ring-amber-900/40 bg-amber-50/60 dark:bg-amber-900/20 px-3 py-3">
@@ -1703,7 +2031,7 @@ function ActiveScreen({
   currentOrder, lineStates, dispatchFlash,
   onStartLine, onCompleteLine, onCancelLine, onClearOrder, onCompleteOrder, onScrapOrder,
   onManualOrderSubmit,
-  packages, onRemovePackage, onClearPackages,
+  packages, onRemovePackage, onClearPackages, packagingMode, packagingSlot,
   verifiedLines, onVerifyLine, onUnverifyLine, staffNames, activeCase,
   supabase, location, onSetActiveStaff,
 }: {
@@ -1726,6 +2054,10 @@ function ActiveScreen({
   packages: Map<string, number>;
   onRemovePackage: (key: string) => void;
   onClearPackages: () => void;
+  /** F4: "auto" hides the box-scan panels and never blocks Complete on packaging. */
+  packagingMode: StationPackagingMode;
+  /** F4: the auto-pick panel, shown in place of the scan panels in auto mode. */
+  packagingSlot: ReactNode;
   verifiedLines: Map<string, { event_id: string; staff_id: string; dept: string; time: string }>;
   onVerifyLine: (line: OrderLine) => void;
   onUnverifyLine: (line: OrderLine) => void;
@@ -1939,6 +2271,7 @@ function ActiveScreen({
             author={null}
             variant="loud"
           />
+
           {/* Phase 4: per-line verification list with three colour states. */}
           <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
             <div className="px-5 py-2 text-xs uppercase tracking-widest text-slate-500 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
@@ -2054,8 +2387,11 @@ function ActiveScreen({
             </div>
           </div>
 
+          {/* F4 auto mode: the app picks the packaging; no scan panels. */}
+          {packagingMode === "auto" ? packagingSlot : null}
+
           {/* Package selector - shown when station requires packaging */}
-          {stationRequiresPackages(department) ? (
+          {packagingMode !== "auto" && stationRequiresPackages(department) ? (
             <div className="rounded-2xl ring-1 ring-slate-200 dark:ring-slate-800 bg-white dark:bg-slate-900 p-5">
               <div className="text-xs uppercase tracking-widest text-slate-500 mb-3 flex items-center justify-between">
                 <span>Packages for this shipment</span>
@@ -2105,7 +2441,7 @@ function ActiveScreen({
           ) : null}
 
           {/* Auto mail-tube info shown at unframed station */}
-          {department === "unframed" && packages.size > 0 ? (
+          {packagingMode !== "auto" && department === "unframed" && packages.size > 0 ? (
             <div className="rounded-2xl ring-1 ring-emerald-200 dark:ring-emerald-800 bg-emerald-50/60 dark:bg-emerald-900/20 p-4">
               <div className="text-[10px] uppercase tracking-widest text-emerald-700 dark:text-emerald-300 font-bold mb-1">
                 Auto-assigned packaging
@@ -2124,6 +2460,7 @@ function ActiveScreen({
             onScrapOrder={onScrapOrder}
             department={department}
             packagesSet={packages.size > 0}
+            packagingMode={packagingMode}
           />
           {/* Inline error during line operations */}
           {error ? (
@@ -2267,12 +2604,14 @@ null
 // ============================================================
 
 function DepartmentPicker({
-  current, onPick, onClose, onReset,
+  current, onPick, onClose, onReset, onSharedScanners,
 }: {
   current: StationConfig | null;
   onPick: (cfg: StationConfig) => void;
   onClose?: () => void;
   onReset?: () => void;
+  /** F6: open the Shared scanners setup instead of a single bench. */
+  onSharedScanners?: () => void;
 }) {
   const [dept, setDept] = useState<ProductionDepartment>(current?.department ?? "framed");
 
@@ -2310,6 +2649,17 @@ function DepartmentPicker({
             ))}
           </div>
         </div>
+
+        {onSharedScanners ? (
+          <button
+            type="button"
+            onClick={onSharedScanners}
+            className="w-full px-4 py-3 rounded-lg ring-1 ring-sky-300 dark:ring-sky-800 text-left hover:bg-sky-50 dark:hover:bg-sky-950"
+          >
+            <div className="font-semibold">Shared scanners (wall receiver)</div>
+            <div className="text-xs opacity-70 mt-0.5">Up to three cordless scanners; badge, then order, saved without taps</div>
+          </button>
+        ) : null}
 
         <div className="flex items-center justify-between pt-2">
 
@@ -2366,14 +2716,16 @@ function LiveClock() {
 // fires onScrapOrder.
 // ============================================================
 function OrderActionBar({
-  onCompleteOrder, onScrapOrder, department, packagesSet,
+  onCompleteOrder, onScrapOrder, department, packagesSet, packagingMode,
 }: {
   onCompleteOrder: () => void;
   onScrapOrder: () => void;
   department: ProductionDepartment;
   packagesSet: boolean;
+  packagingMode: StationPackagingMode;
 }) {
-  const blocked = (department === "a0_framed" || department === "dispatch" || department === "unframed") && !packagesSet;
+  // Same predicate the new station screen uses (stationScreenModel).
+  const blocked = packagingBlocksComplete(department, packagesSet ? 1 : 0, packagingMode);
   const [scrapConfirm, setScrapConfirm] = useState(false);
   return (
     <div className="space-y-2">

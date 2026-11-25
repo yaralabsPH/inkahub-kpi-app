@@ -17,12 +17,12 @@ import type {
   Qualification,
   CancellationPairOutcome,
   WorkType,
-} from "./productionCounts";
-import { WORK_TYPES } from "./productionCounts";
-import type { FrameTimingTotals } from "./productionFrameTiming";
-import type { ProductionReportView, ReportPersonRow, ReportSkuRow } from "./productionReportView";
-import type { ProductionWelcomeView, WelcomeCounts, WelcomeDepartment, WelcomeMostImproved } from "./productionWelcomeView";
-import { isProductionDate, isReportSite, type ReportSite } from "./productionPeriods";
+} from "./productionCounts.js";
+import { WORK_TYPES } from "./productionCounts.js";
+import type { FrameTimingTotals } from "./productionFrameTiming.js";
+import type { ProductionReportView, ReportPersonRow, ReportSkuRow } from "./productionReportView.js";
+import type { ProductionWelcomeView, WelcomeCounts, WelcomeDepartment, WelcomeMostImproved } from "./productionWelcomeView.js";
+import { isProductionDate, isReportSite, type ReportSite } from "./productionPeriods.js";
 
 /** Rule identity frozen into every published generation and fact. */
 export const REPORTING_RULE_VERSION = "item-counting-summary-v1";

@@ -16,8 +16,8 @@
  * The frame predicates live here (moved from skuRouting.ts) because only frame
  * timing uses them; counting uses productionItems.ts.
  */
-import { parseSku } from "./skuRouting";
-import type { PreparedProductionEvidence, ProductionScope, WorkType } from "./productionCounts";
+import { parseSku } from "./skuRouting.js";
+import type { PreparedProductionEvidence, ProductionScope, WorkType } from "./productionCounts.js";
 
 export const FRAME_GAP_CAP_MIN = 30;
 

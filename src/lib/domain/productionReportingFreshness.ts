@@ -11,7 +11,7 @@
  * source cutoff; after the 04:00 rollover an older generation does not yet
  * cover "today", and today's figures must say so rather than show zeroes.
  */
-import { productionDateAt, type ReportSite } from "./productionPeriods";
+import { productionDateAt, type ReportSite } from "./productionPeriods.js";
 
 export const REFRESH_INTERVAL_MIN = 15;
 export const DELAYED_AFTER_MIN = 30;

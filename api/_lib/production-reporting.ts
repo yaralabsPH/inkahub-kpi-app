@@ -62,6 +62,7 @@ export function effectiveNav(profile: { role: string; allowed_nav: unknown } | n
       case "manager": keys = NAV.filter((k) => k !== "dashboard"); break;
       case "kiosk": keys = ["order_submission"]; break;
       case "cs": keys = ["cs_returns", "cs_cases"]; break;
+      case "staff": keys = ["welcome", "reports"]; break; // F8: own work only (server-enforced)
       default: keys = ["welcome"];
     }
   }
@@ -203,6 +204,13 @@ export type SummaryBody = Omit<SummaryResult, "meta">;
 export interface PublishedReader {
   /** The site's active published generation (generationId null) or the named one. */
   generation(site: ReportSite, generationId: string | null): Promise<GenerationMeta | null>;
+  /**
+   * The site's CURRENT effective read mode from its site state, whether or not
+   * any generation exists. Needed because a dormant site (read mode legacy,
+   * never published) has no generation to carry the mode. Throws 503 when the
+   * site state is missing or unreadable (fail closed).
+   */
+  siteReadMode(site: ReportSite): Promise<GenerationMeta["readMode"]>;
   summary(scope: ReaderScope, view: "reports" | "welcome", pages: { dailyLimit: number; peopleLimit: number }): Promise<SummaryBody>;
   detail(scope: ReaderScope, kind: DetailRequest["kind"], orderNumber: string | null, after: unknown, limit: number): Promise<{ rows: PublishedDetailRow[]; last: unknown; more: boolean; totalRows: number }>;
 }
@@ -212,7 +220,15 @@ export interface ReadDeps { reader: PublishedReader; now(): number; cursorSecret
 /** Resolve and check one generation: 503 missing/incomplete/failed, 410 expired or past retention; a mismatched pin is 410 (reload the whole view). */
 export async function resolveGeneration(reader: PublishedReader, site: ReportSite, pinned: string | null, nowMs: number): Promise<GenerationMeta> {
   const g = await reader.generation(site, pinned);
-  if (!g) throw pinned ? new ReportingHttpError(410, "GENERATION_EXPIRED", "This report version is no longer available; reload the view") : new ReportingHttpError(503, "UNAVAILABLE", "No published report is available for this site yet");
+  if (!g) {
+    if (pinned) throw new ReportingHttpError(410, "GENERATION_EXPIRED", "This report version is no longer available; reload the view");
+    // No active publication. A site that is explicitly on legacy (or shadow) reads must still get that
+    // signal, or the app could never select its existing reads before the first publication (dormant
+    // release). Only a site in summary mode is genuinely unavailable here.
+    const mode = await reader.siteReadMode(site);
+    if (mode !== "summary") throw new ReportingHttpError(503, mode === "shadow" ? "READ_MODE_SHADOW" : "READ_MODE_LEGACY", "Published reports are not enabled for this site");
+    throw new ReportingHttpError(503, "UNAVAILABLE", "No published report is available for this site yet");
+  }
   if (g.site !== site) throw new ReportingHttpError(400, "BAD_GENERATION", "The report version belongs to another site");
   // Effective per-site mode, delivered only through this authorized API: before activation (legacy) and during
   // shadow comparison the app keeps its existing reads; this explicit signal is never a silent raw-history fallback.

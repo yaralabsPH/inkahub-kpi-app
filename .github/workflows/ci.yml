@@ -37,6 +37,9 @@ jobs:
       - name: Type-check digest endpoint (api/ is outside tsc -b)
         run: npm run typecheck:digest
 
+      - name: Type-check Shopify order endpoint
+        run: npm run typecheck:api
+
       - name: Tests
         run: npm run test -- --run
 

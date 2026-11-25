@@ -12,6 +12,8 @@ import {
   MAIL_TUBE_LABELS,
 } from "@/lib/domain/skuRouting";
 import { fetchAllRows } from "@/lib/repository/supabase/pageThrough";
+import { usePackagingCatalogue } from "@/lib/hooks/usePackagingCatalogue";
+import { netUsageByProduct, PACKAGE_USAGE_ROWS_FILTER } from "@/lib/domain/packaging/usage";
 
 interface LedgerRow {
   product_id: string;
@@ -45,6 +47,8 @@ export function PackageUsageCard({
   const [rows, setRows] = useState<LedgerRow[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // F4: packaging items from the site's rule sets (empty when there are none).
+  const catalogue = usePackagingCatalogue();
   const seq = useRef(0);
 
   // Which product IDs are packages? Match PACKAGE_TYPES.key against
@@ -59,8 +63,9 @@ export function PackageUsageCard({
     }
     ids.add(MAIL_TUBE_LARGE_PRODUCT_ID);
     ids.add(MAIL_TUBE_SMALL_PRODUCT_ID);
+    for (const id of catalogue.keys()) ids.add(id);
     return ids;
-  }, [data]);
+  }, [data, catalogue]);
 
   // A new site/range/package set invalidates any shown or in-flight result (no read here).
   const scopeKey = `${location}|${fromIso}|${toIso}|${Array.from(packageProductIds).sort().join(",")}`;
@@ -88,7 +93,8 @@ export function PackageUsageCard({
           .select("product_id, delta, ts")
           .eq("location", location)
           .in("product_id", idsArray)
-          .lt("delta", 0)
+          // F4: include rows written back by packaging corrections.
+          .or(PACKAGE_USAGE_ROWS_FILTER)
           .gte("ts", fromIso)
           .lte("ts", toIso)
           .order("ts", { ascending: true })
@@ -108,10 +114,7 @@ export function PackageUsageCard({
 
   const summary = useMemo(() => {
     if (!data) return { rows: [], totalQty: 0, totalCost: 0, hasCost: false };
-    const perProduct = new Map<string, number>();
-    for (const r of rows ?? []) {
-      perProduct.set(r.product_id, (perProduct.get(r.product_id) ?? 0) + Math.abs(r.delta));
-    }
+    const perProduct = netUsageByProduct(rows ?? []);
     const productById = new Map(data.products.map((p) => [p.id, p]));
     const currency = data.settings?.currency_symbol ?? "$";
     let totalQty = 0;
@@ -122,6 +125,7 @@ export function PackageUsageCard({
       const label =
         product?.code ??
         MAIL_TUBE_LABELS[productId] ??
+        catalogue.get(productId) ??
         "Unknown package";
       const unitCost = product?.unit_cost ?? null;
       const cost = unitCost != null ? qty * unitCost : null;
@@ -130,7 +134,7 @@ export function PackageUsageCard({
       return { productId, label, qty, unitCost, cost };
     }).sort((a, b) => b.qty - a.qty);
     return { rows: summaryRows, totalQty, totalCost, hasCost, currency };
-  }, [rows, data]);
+  }, [rows, data, catalogue]);
 
   return (
     <Card>
@@ -139,12 +143,12 @@ export function PackageUsageCard({
           <Package size={16} /> Packages used
         </CardTitle>
         <span className="text-xs text-slate-500 dark:text-slate-400">
-          Boxes + mail tubes deducted from stock â€” {rangeLabel}
+          Boxes + mail tubes deducted from stock — {rangeLabel}
         </span>
       </CardHeader>
       <CardBody className="p-0">
         {loading ? (
-          <div className="p-6 text-sm text-slate-500">Loadingâ€¦</div>
+          <div className="p-6 text-sm text-slate-500">Loading…</div>
         ) : error ? (
           <div className="p-6 text-sm text-red-600 dark:text-red-400 flex items-center gap-2">
             {error}
@@ -176,7 +180,7 @@ export function PackageUsageCard({
                     <td className="px-4 py-2 font-medium">{r.label}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{r.qty.toLocaleString()}</td>
                     <td className="px-3 py-2 text-right tabular-nums text-slate-500">
-                      {r.unitCost == null ? "â€”" : `${summary.currency}${r.unitCost.toFixed(2)}`}
+                      {r.unitCost == null ? "—" : `${summary.currency}${r.unitCost.toFixed(2)}`}
                     </td>
                     <td className="px-4 py-2 text-right tabular-nums">
                       {r.cost == null
@@ -194,7 +198,7 @@ export function PackageUsageCard({
                   <td className="px-4 py-2 text-right tabular-nums">
                     {summary.hasCost
                       ? `${summary.currency}${summary.totalCost.toFixed(2)}`
-                      : <span className="text-slate-400 italic">â€”</span>}
+                      : <span className="text-slate-400 italic">—</span>}
                   </td>
                 </tr>
               </tbody>

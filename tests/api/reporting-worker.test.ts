@@ -2121,17 +2121,27 @@ describe("Task 15 handlers: reporting-admin", () => {
 // ---------------------------------------------------------------------------
 
 describe("Task 15 schedule and migration", () => {
-  it("adds exactly the three site-staggered refresh schedules; the digest entries are unchanged; 300 s functions", () => {
+  // Release review r1 (docs/reviews/release-stack-r1.md): the Vercel project is on Pro, which allows
+  // sub-daily crons, so the three 15-minute refresh schedules are active again next to the daily digests.
+  const REFRESH = [
+    { path: "/api/reports/refresh-summaries?site=au", schedule: "0,15,30,45 * * * *" },
+    { path: "/api/reports/refresh-summaries?site=uk", schedule: "1,16,31,46 * * * *" },
+    { path: "/api/reports/refresh-summaries?site=us", schedule: "2,17,32,47 * * * *" },
+  ];
+  const DORMANT = REFRESH;
+  it("active crons are the three daily digests plus the three 15-minute refreshes (Pro); 300 s functions kept", () => {
     const v = JSON.parse(read("vercel.json")) as { crons: Array<{ path: string; schedule: string }>; functions: Record<string, { maxDuration: number }> };
     expect(v.crons).toEqual([
       { path: "/api/reports/daily-digest?location=au", schedule: "55 13 * * *" },
       { path: "/api/reports/daily-digest?location=uk", schedule: "55 22 * * *" },
       { path: "/api/reports/daily-digest?location=us", schedule: "55 4 * * *" },
-      { path: "/api/reports/refresh-summaries?site=au", schedule: "0,15,30,45 * * * *" },
-      { path: "/api/reports/refresh-summaries?site=uk", schedule: "1,16,31,46 * * * *" },
-      { path: "/api/reports/refresh-summaries?site=us", schedule: "2,17,32,47 * * * *" },
+      ...REFRESH,
     ]);
     expect(v.functions).toEqual({ "api/reports/refresh-summaries.ts": { maxDuration: 300 }, "api/reports/reporting-admin.ts": { maxDuration: 300 } });
+  });
+  it("the refresh schedules are still recorded verbatim in the release doc", () => {
+    const doc = read("docs/releases/item-counting.md");
+    for (const c of DORMANT) expect(doc).toContain(JSON.stringify(c));
   });
   const sql = read("supabase/migrations/0043_reporting_worker_state.sql");
   const fns = ["save_reporting_enumeration(uuid, bigint, jsonb, jsonb, jsonb, boolean)", "read_reporting_worker_progress(uuid, bigint)", "list_reporting_worker_owners(uuid, bigint, boolean, text, text, integer)", "plan_reporting_owner(uuid, bigint, text, text, jsonb)", "verify_reporting_plan(uuid, bigint)", "list_reporting_work_descriptors(uuid, bigint, jsonb, integer)", "set_reporting_site_mode(text, text, boolean)", "record_reporting_run(text, text, text, text, uuid, uuid, timestamptz, integer, jsonb, text)", "cleanup_reporting_history(text, integer)", "save_reporting_walk(uuid, bigint, jsonb, jsonb, jsonb, text, integer, text[], jsonb, boolean)", "read_reporting_walk_line(uuid, bigint, text, integer, text)"];

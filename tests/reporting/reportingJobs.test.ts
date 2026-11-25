@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { splitSqlStatements } from "../staging/sqlStatements";
+import { NON_REPORTING_MIGRATIONS } from "./pg/harness";
 import {
   acknowledgeable,
   beginReportingBatch,
@@ -31,9 +32,12 @@ const fn = (name: string) => codes.find((c) => new RegExp(`^CREATE (OR REPLACE )
 
 describe("0038 migration text (Part A)", () => {
   it("is the next number, one transaction, and 0037 stays exactly as installed on staging", () => {
-    const names = readdirSync("supabase/migrations").filter((n) => /^\d{4}_/.test(n)).sort();
+    // Integration: later non-reporting migrations (F4 0047, F5–F7 0052–0056) are excluded by the shared list.
+    const names = readdirSync("supabase/migrations").filter((n) => /^\d{4}_/.test(n) && !NON_REPORTING_MIGRATIONS.has(n)).sort();
     // 0038 followed 0037; T13B2b-19 allocates 0039 next (plan: Task 14 = 0040, Task 16 = 0041).
-    expect(names.slice(-10)).toEqual(["0037_reporting_storage.sql", "0038_reporting_jobs.sql", "0039_reporting_rebuild_insert.sql", "0040_reporting_dependency_reads.sql", "0041_reporting_dependency_read_bounds.sql", "0042_reporting_access_paths.sql", "0043_reporting_worker_state.sql", "0044_reporting_reads.sql", "0045_reporting_predecessor_page.sql", "0046_reporting_owner_inputs.sql"]); // Task 14 drafts 0040/0041 + the evidence-backed 0042 access-path fix; Task 15 draft 0043; Task 16 draft 0044; Task 15 scale draft 0045; T15P-4 owner-input draft 0046
+    expect(names.slice(-16, -6)).toEqual(["0037_reporting_storage.sql", "0038_reporting_jobs.sql", "0039_reporting_rebuild_insert.sql", "0040_reporting_dependency_reads.sql", "0041_reporting_dependency_read_bounds.sql", "0042_reporting_access_paths.sql", "0043_reporting_worker_state.sql", "0044_reporting_reads.sql", "0045_reporting_predecessor_page.sql", "0046_reporting_owner_inputs.sql"]); // F8 appends 0057_reports_overview last (asserted below); Task 14 drafts 0040/0041 + the evidence-backed 0042 access-path fix; Task 15 draft 0043; Task 16 draft 0044; Task 15 scale draft 0045; T15P-4 owner-input draft 0046
+    expect(names.slice(-6)).toEqual(["0057_reports_overview.sql", "0058_frame_timing.sql", "0059_order_timeline.sql", "0060_make_milestones.sql",
+      "0061_order_timeline_scanner_proof.sql", "0062_order_timeline_shopify_proof.sql"]); // F8, F9, F10, F11, F10 scanner proof, F10 whole-order proof
     expect(codes[0]).toBe("BEGIN");
     expect(codes.at(-1)).toBe("COMMIT");
     // The installed 0037 bytes (Task 12 staging evidence: SHA-256 531BB2C5…) are unchanged.

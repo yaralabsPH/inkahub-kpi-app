@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { TeamMembersCard } from "@/components/TeamMembersCard";
+import { DepartmentsCard } from "@/components/departments/DepartmentsCard";
 import { Card, CardBody, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { useAppStore } from "@/lib/state/appStore";
@@ -23,6 +24,10 @@ export function Team() {
       </div>
 
       <TeamMembersCard />
+
+      {/* F5: business departments and home assignments. Owner-only; renders
+          nothing for other roles and a notice without Supabase. */}
+      <DepartmentsCard />
 
       <PrintAllLanyardsButton />
 

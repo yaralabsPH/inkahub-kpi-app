@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { BarChart3, ChevronDown, ChevronRight, ClipboardList, Download, RefreshCw, Search, Trash2 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
@@ -17,7 +17,21 @@ import { OrderNotesPanel } from "@/components/OrderNotesPanel";
 import { DailyTimesheetCard } from "@/components/DailyTimesheetCard";
 import { PackageUsageCard } from "@/components/PackageUsageCard";
 import { PackageHistoryCard } from "@/components/PackageHistoryCard";
+import { PackagingAttentionCard } from "@/components/PackagingAttentionCard";
 import { LiveOrderCompletionsCard } from "@/components/LiveOrderCompletionsCard";
+import { ReportsOverview } from "@/components/ReportsOverview";
+import { OrderTimelineCard } from "@/components/OrderTimelineCard";
+import { OrderFlowSection } from "@/components/OrderFlowSection";
+import {
+  ATTRIBUTION_CSV_HEADERS,
+  attributableEventIds,
+  attributionCsvCells,
+  fetchAttributionsForEvents,
+  fetchAttributionsForOrder,
+  groupByEvent,
+  type AttributionLoad,
+  type FramerAttribution,
+} from "@/lib/scanners/attribution";
 import { ProductionCountStatus } from "@/components/ProductionCountStatus";
 import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
 import { usePublishedManagement } from "@/lib/hooks/usePublishedManagement";
@@ -31,6 +45,7 @@ import {
   type ProductionRange,
 } from "@/lib/domain/productionPeriods";
 import { type ProductionEvidenceEvent, type WorkType } from "@/lib/domain/productionCounts";
+import { type PublishedDetailRow } from "@/lib/domain/productionReporting";
 import { buildProductionReportView, orderLookupCounts, type ItemsOrders, type ReportDay } from "@/lib/domain/productionReportView";
 import { loadOrderLookup } from "@/lib/repository/supabase/orderLookup";
 import { productionVisibilityFor } from "@/lib/repository/supabase/productionEvidence";
@@ -166,7 +181,98 @@ export function Reports() {
       </div>
     );
   }
-  return <SupabaseReports />;
+  return <RoleReports />;
+}
+
+/**
+ * F8: the role split runs BEFORE any legacy Reports hook mounts. Staff and CS
+ * get only the published overview (their own work / the server-chosen
+ * audience); the legacy full-team view (staff list, hourly rates, raw event
+ * reads) mounts only for owner and manager. Kiosk never sees Reports.
+ */
+export function reportsLayoutFor(role: string | null): "pending" | "denied" | "overview_only" | "full" {
+  if (role === null) return "pending";
+  if (role === "kiosk") return "denied";
+  if (role === "owner" || role === "manager") return "full";
+  return "overview_only";
+}
+
+/** F10: whole-order management view. Staff and kiosk never; CS still needs Reports permission + membership (server-enforced). */
+export function orderTimelineVisible(role: string | null): boolean {
+  return role === "owner" || role === "manager" || role === "cs";
+}
+
+export interface ReportsAccess {
+  layout: "pending" | "denied" | "overview_only" | "full";
+  userId: string | null;
+  role: string | null;
+  /** Trusted identity of everything shown: user + role + audience. A change remounts the summary. */
+  scopeKey: string;
+}
+
+/**
+ * Fail closed: while auth loads, or when the session, user and profile do not
+ * all belong to the same person (AuthProvider keeps the previous profile until
+ * the new one arrives), nothing role-dependent mounts.
+ */
+export function reportsAccessFor(a: {
+  loading: boolean;
+  session: { user: { id: string } } | null;
+  user: { id: string } | null;
+  profile: { user_id: string; role: string } | null;
+}): ReportsAccess {
+  const pending: ReportsAccess = { layout: "pending", userId: null, role: null, scopeKey: "" };
+  if (a.loading || !a.session || !a.user || !a.profile) return pending;
+  if (a.profile.user_id !== a.user.id || a.session.user.id !== a.user.id) return pending;
+  const role = a.profile.role;
+  const layout = reportsLayoutFor(role);
+  return { layout, userId: a.user.id, role, scopeKey: `${a.user.id}|${role}|${role === "staff" ? "self" : "site"}` };
+}
+
+/** The role-dependent tree for one resolved access (pure; legacy only for a matching owner/manager). */
+export function ReportsForAccess({ access, overview, legacy }: { access: ReportsAccess; overview: (a: ReportsAccess) => ReactNode; legacy: () => ReactNode }) {
+  if (access.layout === "pending") return <div className="p-6 text-sm text-slate-500" role="status">Loading your access…</div>;
+  if (access.layout === "denied") return <div className="p-6 text-sm text-slate-600 dark:text-slate-300">Reports are not available on kiosk accounts.</div>;
+  if (access.layout === "overview_only") return <div className="p-4 md:p-6 space-y-4">{overview(access)}</div>;
+  return (
+    <>
+      <div className="px-4 md:px-6 pt-4 md:pt-6">{overview(access)}</div>
+      {legacy()}
+    </>
+  );
+}
+
+function RoleReports() {
+  const auth = useAuth();
+  const supabase = getSupabase();
+  const location = useAppStore((s) => s.location);
+  const access = reportsAccessFor(auth);
+  return (
+    <ReportsForAccess
+      access={access}
+      overview={(a) => (
+        <>
+          <ReportsOverview
+            key={a.scopeKey}
+            supabase={supabase}
+            site={location}
+            scopeKey={a.scopeKey}
+            userId={a.userId}
+            role={a.role}
+            ownName={auth.profile?.display_name ?? null}
+            detailBelow={a.layout === "full"}
+          />
+          {orderTimelineVisible(a.role) ? (
+            <div key={`timeline|${a.scopeKey}`} className="mt-4 space-y-4">
+              <OrderTimelineCard supabase={supabase} scopeKey={a.scopeKey} site={location} role={a.role} />
+              <OrderFlowSection supabase={supabase} scopeKey={a.scopeKey} site={location} />
+            </div>
+          ) : null}
+        </>
+      )}
+      legacy={() => <SupabaseReports />}
+    />
+  );
 }
 
 function SupabaseReports() {
@@ -332,10 +438,15 @@ function SupabaseReports() {
           .range(from, to),
       );
       const byId = new Map(extra.map((r) => [r.id, r]));
+      // F7: framer attributions for the shared-scanner dispatch rows in this
+      // exact export, appended as two columns. Event columns and row counts are unchanged.
+      const attrIds = attributableEventIds(rowsToExport);
+      const attr = attrIds.length > 0 ? await fetchAttributionsForEvents(supabase, location, attrIds) : { ok: true as const, rows: [] };
+      const byEvent = groupByEvent(attr.ok ? attr.rows : []);
       const headers = [
         "timestamp", "staff_name", "department",
         "order_number", "sku", "quantity", "event_type",
-        "station_id", "note",
+        "station_id", "note", ...ATTRIBUTION_CSV_HEADERS,
       ];
       const rows = rowsToExport.map((e: ProductionEvidenceEvent) => {
         const x = byId.get(e.id);
@@ -349,6 +460,7 @@ function SupabaseReports() {
           e.event_type,
           x?.station_id ?? "",
           (x?.note ?? "").replace(/[\r\n]+/g, " "),
+          ...attributionCsvCells(e.id, byEvent, !attr.ok),
         ];
       });
       const csv = [headers, ...rows]
@@ -391,13 +503,26 @@ function SupabaseReports() {
       // never a string per row or a whole-file join. The Blob is created only after the WHOLE collection
       // resolved - any typed refusal (view changed, page failure, revocation, no progress) rejects first and
       // every buffered chunk is discarded: never a partial file.
-      const chunks: BlobPart[] = [publishedCsvHeader()];
+      // F7: the framer columns need the attributions of every shared-scanner dispatch row, so the
+      // validated pages are kept until the collection resolves, then rendered one chunk per page.
+      // The attribution read runs inside the collector (beforeFinish), so a view change during it is
+      // VIEW_CHANGED and nothing downloads; only synchronous work follows until the download.
+      const pages: PublishedDetailRow[][] = [];
+      let attr: AttributionLoad = { ok: true, rows: [] };
       await pub.collectAll("raw-export", {
         limit: 1000,
         onPage: (rows) => {
-          if (rows.length) chunks.push(`\r\n${publishedCsvLines(rows, nameOf).join("\r\n")}`);
+          if (rows.length) pages.push(rows);
+        },
+        beforeFinish: async () => {
+          const attrIds = attributableEventIds(pages.flat().flatMap((r) => (r.kind === "raw-export" ? [{ id: r.row.id, event_type: r.row.eventType }] : [])));
+          if (attrIds.length > 0) attr = await fetchAttributionsForEvents(supabase, location, attrIds);
         },
       });
+      const byEvent = groupByEvent(attr.ok ? attr.rows : []);
+      const extra = (eventId: string) => attributionCsvCells(eventId, byEvent, !attr.ok);
+      const chunks: BlobPart[] = [publishedCsvHeader(ATTRIBUTION_CSV_HEADERS)];
+      for (const rows of pages) chunks.push(`\r\n${publishedCsvLines(rows, nameOf, extra).join("\r\n")}`);
       const blob = new Blob(chunks, { type: "text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -414,7 +539,7 @@ function SupabaseReports() {
     } finally {
       setExporting(false);
     }
-  }, [source, pub, range, nameOf, staffId, workType]);
+  }, [source, pub, range, nameOf, staffId, workType, supabase, location]);
 
   // Selected person's published orders: loaded only on request, paged in the shown generation.
   const pubOrders = pubView ? publishedOrders(pub.details) : null;
@@ -1073,6 +1198,8 @@ function SupabaseReports() {
         rangeLabel={subtitleSuffix || "current range"}
       />
 
+      <PackagingAttentionCard fromIso={pkgWindow.from.toISOString()} toIso={pkgWindow.to.toISOString()} />
+
       <PackageHistoryCard />
 
       <DailyTimesheetCard />
@@ -1203,6 +1330,23 @@ function OrderLookupCard({
     return session.search(input);
   }, [session, scopeKey, location, input]);
 
+  // F7: stored "who framed it" rows for shared-scanner dispatches of the shown
+  // order, read after the lookup resolves; a late answer for an older search is dropped.
+  const [framers, setFramers] = useState<FramerAttribution[] | null>(null);
+  const [framersError, setFramersError] = useState<string | null>(null);
+  const framerSeq = useRef(0);
+  useEffect(() => {
+    const mine = ++framerSeq.current;
+    setFramers(null);
+    setFramersError(null);
+    if (!searched || !events || attributableEventIds(events).length === 0) return;
+    void fetchAttributionsForOrder(supabaseRef.current, location, searched).then((a) => {
+      if (mine !== framerSeq.current) return;
+      if (a.ok) setFramers(a.rows);
+      else setFramersError(a.message);
+    });
+  }, [events, searched, location, scopeKey]);
+
   // Per-event Remove action. Owner-only. Deletes the production_events
   // row + any matching ledger rows (parent_event_id) so the audit
   // trail stays consistent. Stock numbers themselves are NOT reversed
@@ -1242,6 +1386,8 @@ function OrderLookupCard({
   const reset = () => {
     setInput("");
     session.reset();
+    setFramers(null);
+    setFramersError(null);
   };
 
   // Departments that touched this order (set of unique department values from
@@ -1442,8 +1588,40 @@ function OrderLookupCard({
                 variant="compact"
               />
 
+              {/* F7: who framed it, as recorded at shared-scanner dispatch */}
+              {framersError ? (
+                <div className="text-xs text-rose-700 dark:text-rose-300">Couldn't load framer attribution: {framersError}</div>
+              ) : null}
+              {framers && framers.length > 0 ? (
+                <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 px-3 py-2" data-testid="framer-attribution">
+                  <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1">Framed by (recorded at dispatch)</div>
+                  <ul className="space-y-0.5 text-sm">
+                    {framers.map((f) => (
+                      <li key={`${f.dispatch_event_id}|${f.sku}`} className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-xs">{f.sku}</span>
+                        <span className="font-medium">{f.display_name}</span>
+                        {f.source === "manual" ? (
+                          <span className="inline-flex items-center rounded-full bg-amber-100 text-amber-800 ring-1 ring-amber-200 text-[11px] font-semibold px-2 py-0.5 dark:bg-amber-900/30 dark:text-amber-200 dark:ring-amber-800"
+                            title="Chosen by the dispatcher; no framing scan exists, so it adds no framing time or credit">
+                            Manual
+                          </span>
+                        ) : (
+                          <span className="text-emerald-700 dark:text-emerald-300 text-xs" title="Measured: framing verification and completion scans">✓ scanned</span>
+                        )}
+                        {f.source === "manual" ? (
+                          <span className="text-[11px] text-slate-500">
+                            chosen by {staffLookup.get(f.dispatcher_id)?.display_name ?? `User ${f.dispatcher_id.slice(0, 8)}`}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
               {/* Timeline */}
               <div className="rounded-md ring-1 ring-slate-200 dark:ring-slate-800 overflow-hidden">
+
                 <table className="w-full text-sm">
                   <thead className="bg-slate-50 dark:bg-slate-900/60 text-xs uppercase tracking-wide text-slate-600 dark:text-slate-400">
                     <tr>

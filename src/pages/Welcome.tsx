@@ -5,6 +5,7 @@ import { getSupabase, getBackendMode } from "@/lib/repository/supabase/client";
 import { useAppStore } from "@/lib/state/appStore";
 import { Card, CardBody } from "@/components/ui/Card";
 import { CurrentlyClockedInCard } from "@/components/CurrentlyClockedInCard";
+import { ScannerHealthCard } from "@/components/production/scanners/ScannerHealthCard";
 import { ProductionCountStatus } from "@/components/ProductionCountStatus";
 import { useProductionEvidence } from "@/lib/hooks/useProductionSummary";
 import { isReportSite, productionDateAt, productionRange } from "@/lib/domain/productionPeriods";
@@ -317,6 +318,7 @@ function SupabaseWelcome() {
       ) : null}
 
       <CurrentlyClockedInCard />
+      <ScannerHealthCard />
     </div>
   );
 }

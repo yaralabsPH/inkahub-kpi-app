@@ -143,8 +143,9 @@ export class PublishedViewController {
    * refresh does not interrupt it. Typed page errors are rethrown as they are. With `onPage` the export is
    * STREAMED: each validated page goes to the caller and nothing is retained here (the result is []), while
    * every total/progress check still applies, so the caller must discard its output on any rejection.
+   * `beforeFinish` runs after the last page and before resolving, under the same VIEW_CHANGED guard.
    */
-  async collectAll(identity: PublishedIdentity, kind: DetailKind, opts: { limit?: number; orderNumber?: string; onPage?: (rows: PublishedDetailRow[]) => void } = {}): Promise<PublishedDetailRow[]> {
+  async collectAll(identity: PublishedIdentity, kind: DetailKind, opts: { limit?: number; orderNumber?: string; onPage?: (rows: PublishedDetailRow[]) => void; beforeFinish?: () => Promise<void> } = {}): Promise<PublishedDetailRow[]> {
     const key = identityKey(identity);
     const s = this.state;
     if (!s.summary) throw new PublishedReadError(409, "NO_REPORT", "No report is shown to export");
@@ -191,6 +192,12 @@ export class PublishedViewController {
         else rows.push(...page.rows);
         if (page.nextCursor === null) {
           if (count !== total) throw new PublishedReadError(502, "INCOMPLETE", `The export ended with ${count} of ${total} rows`);
+          // Caller work that must belong to the same view (e.g. the F7 attribution read for the CSV) runs
+          // INSIDE the collector scope; any identity/generation change or reset meanwhile is VIEW_CHANGED.
+          if (opts.beforeFinish) {
+            await opts.beforeFinish();
+            if (ac.signal.aborted || changed()) throw viewChanged();
+          }
           return rows;
         }
         if (page.rows.length === 0) throw noProgress("an empty page that is not the last");
@@ -233,7 +240,7 @@ export function usePublishedProduction(identity: PublishedIdentity | null, deps:
   nextPage: (kind: DetailKind, limit?: number, orderNumber?: string) => void;
   refresh: () => void;
   /** Every page of one kind in the displayed generation (opt-in export); rejects when no report is shown. */
-  collectAll: (kind: DetailKind, opts?: { limit?: number; orderNumber?: string; onPage?: (rows: PublishedDetailRow[]) => void }) => Promise<PublishedDetailRow[]>;
+  collectAll: (kind: DetailKind, opts?: { limit?: number; orderNumber?: string; onPage?: (rows: PublishedDetailRow[]) => void; beforeFinish?: () => Promise<void> }) => Promise<PublishedDetailRow[]>;
 } {
   const ctrl = useMemo(() => (deps ? new PublishedViewController(deps) : null), [deps]);
   const [state, setState] = useState<PublishedState>(EMPTY);
