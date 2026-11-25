@@ -148,6 +148,7 @@ Acceptance coverage: criterion 1 → Tasks 3/6; criterion 2 → Tasks 1/2; crite
 Coder writes here if implementation finds anything this plan did not foresee; stop the affected work and obtain an inline planner/CJ answer rather than changing scope.
 
 - **CJ — required before release, not before build:** What is the operational packing and stock procedure for accessories/canvas excluded from shared A0 Framing, especially A0-only orders that have no later Dispatch step? The approved implementation deliberately excludes them from framing credit, components and box prediction. Record who packs them, how their stock/packaging is handled, and how staff avoid re-recording already saved framing on classic. Do not restore whole-order rejection or invent deductions while this answer is pending.
+  - **Answer (CJ, 2026-11-25, in chat):** "same with the others. we ignore accessories." Accessories and canvas are ignored at shared Framing for A0 orders exactly as for regular framed orders: no framing credit, no component deduction and no box contents for them. CJ approved the plan in the same message ("i approve the plan").
 - No other unresolved design choice blocks building this approved scope. Keyboard-wedge trigger release cannot be proven in software; CJ must commission the scanner's repeat settings and verify the approved 1-second/10-second gesture on the actual hardware before release.
 
 ## Implementation log
