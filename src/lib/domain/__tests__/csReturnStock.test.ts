@@ -8,16 +8,16 @@ import {
   type CsReturnStockMove,
 } from "../csReturnStock";
 import type { CsReturnLine, CsReturnStatus } from "../schemas";
+import { onHandAfterAdjust } from "../stockAdjust";
 
 /**
- * Simulates Repository.adjustOnHand exactly as both backends implement it:
- * Dexie `Math.max(before - delta, 0)` and SQL adjust_on_hand
- * `GREATEST(v_before - p_delta, 0)` (0002_rpc.sql).
+ * Applies moves with the same function DexieRepo.adjustOnHand uses; SQL
+ * adjust_on_hand does the same arithmetic since 0063 (exact, no floor).
  */
 function applyMoves(stock: Map<string, number>, moves: CsReturnStockMove[]) {
   for (const m of moves) {
     const before = stock.get(m.productId) ?? 0;
-    stock.set(m.productId, Math.max(before - m.delta, 0));
+    stock.set(m.productId, onHandAfterAdjust(before, m.delta));
   }
 }
 
@@ -209,12 +209,20 @@ describe("return restock: edits and removals", () => {
     expect(stock.get("p2")).toBe(4);
   });
 
-  it("removal after the units were used stops at zero", () => {
+  it("removal after the units were used is exact and can go below zero", () => {
     const stock = new Map([["p1", 0]]);
     const lines = save(stock, [], "received", [line()]);
     stock.set("p1", 1);
     save(stock, lines, "new", [line()]);
-    expect(stock.get("p1")).toBe(0);
+    expect(stock.get("p1")).toBe(-2);
+  });
+
+  it("restock onto negative stock adds exactly, and undo restores it (live case: −12)", () => {
+    const stock = new Map([["p1", -12]]);
+    const lines = save(stock, [], "received", [line({ quantity: 1 })]);
+    expect(stock.get("p1")).toBe(-11);
+    applyMoves(stock, csReturnDeleteMoves(lines));
+    expect(stock.get("p1")).toBe(-12);
   });
 });
 

@@ -24,6 +24,7 @@ import {
   type CsReturnWithLines,
 } from "@/lib/domain";
 import { planCsReturnStock, csReturnDeleteMoves, CsReturnStockError } from "@/lib/domain/csReturnStock";
+import { onHandAfterAdjust } from "@/lib/domain/stockAdjust";
 
 /**
  * Sortable ledger ID: unix-ms prefix + 6-char random suffix. Reads back in
@@ -152,18 +153,13 @@ export class DexieRepo implements Repository {
       const p = await this.db.products.get(productId);
       if (!p) return;
       const before = p.current_on_hand ?? 0;
-      const next = Math.max(before - delta, 0);
-      if (next === before) {
-        // No actual change to parent on-hand. Skip cascade too — most
-        // commonly happens when the floor-at-zero clamp swallows a
-        // negative-or-zero result.
-        return;
-      }
+      // Exact, no floor at zero (matches SQL adjust_on_hand since 0063).
+      const next = onHandAfterAdjust(before, delta);
+      if (next === before) return;
       await this.db.products.put({ ...p, current_on_hand: next });
       // adjustOnHand semantics: positive `delta` decrements on-hand. The
       // ledger uses natural signed convention (negative = outbound) and
-      // captures the *actual* on-hand change so the floor-at-zero clamp
-      // is reflected accurately.
+      // records the actual on-hand change.
       await this.appendLedger({
         product_id: productId,
         delta: next - before,
@@ -222,7 +218,7 @@ export class DexieRepo implements Repository {
       const child = await this.db.products.get(comp.child_product_id);
       if (!child) continue;
       const before = child.current_on_hand ?? 0;
-      const next = Math.max(before - childDelta, 0);
+      const next = onHandAfterAdjust(before, childDelta);
       if (next === before) continue;
       // eslint-disable-next-line no-await-in-loop
       await this.db.products.put({ ...child, current_on_hand: next });
@@ -660,12 +656,12 @@ export class DexieRepo implements Repository {
           next.inventory_applied_at = new Date().toISOString();
         } else if (!isDelivered && prevApplied) {
           // REVERSE — debit using prev lines so the same qty that was
-          // credited is taken back. Floor at zero defensively.
+          // credited is taken back. Exact (matches SQL since 0063).
           for (const line of prevLines) {
             const p = await this.db.products.get(line.product_id);
             if (!p) continue;
             const beforeQty = p.current_on_hand ?? 0;
-            const afterQty = Math.max(beforeQty - line.quantity, 0);
+            const afterQty = onHandAfterAdjust(beforeQty, line.quantity);
             const actualDelta = afterQty - beforeQty; // negative or zero
             await this.db.products.put({ ...p, current_on_hand: afterQty });
             await this.appendLedger({
@@ -699,7 +695,7 @@ export class DexieRepo implements Repository {
           const p = await this.db.products.get(line.product_id);
           if (!p) continue;
           const beforeQty = p.current_on_hand ?? 0;
-          const afterQty = Math.max(beforeQty - line.quantity, 0);
+          const afterQty = onHandAfterAdjust(beforeQty, line.quantity);
           const actualDelta = afterQty - beforeQty;
           await this.db.products.put({ ...p, current_on_hand: afterQty });
           if (actualDelta !== 0) {
