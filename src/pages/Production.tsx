@@ -1,4 +1,5 @@
 import { shouldDropRepeatScan } from "@/lib/domain/scanDedupe";
+import { beginCompletion, completionKey, createCompletionGuard, endCompletion } from "@/lib/domain/completionGuard";
 import { missingStockMessage } from "@/lib/domain/deductResult";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
@@ -342,6 +343,8 @@ function ProductionStation({
   const [busy, setBusy] = useState(false);
   // Synchronous guards for processScan (see the comment there).
   const scanInFlightRef = useRef(false);
+  /** Synchronous double-tap lock for Complete / Dispatch (see completionGuard.ts). */
+  const completionGuardRef = useRef(createCompletionGuard());
   const lastScanRef = useRef<{ value: string; at: number } | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   // In-flight guard against duplicate line_verified writes. Records line
@@ -1117,16 +1120,25 @@ function ProductionStation({
       0,
     );
     const evType = station.department === "dispatch" ? "dispatched" : "completed";
-    const inserted = await insertEvent({
-      staff_id: activeStaff.user_id,
-      order_number: currentOrder.number,
-      line_sku: null,
-      line_quantity: totalItems > 0 ? totalItems : null,
-      event_type: evType,
-      // Tag with the active CS Case if this is replacement work - so the
-      // RPC can skip deduction (CS Cases owns those movements).
-      cs_case_id: activeCase?.caseId ?? null,
-    });
+    // A double tap (or a tap while the saved order is still on screen) must
+    // not write a second completed/dispatched event for the same order.
+    const guardKey = completionKey(location, station.department, currentOrder.number);
+    if (!beginCompletion(completionGuardRef.current, guardKey, Date.now())) return;
+    let inserted: string | null = null;
+    try {
+      inserted = await insertEvent({
+        staff_id: activeStaff.user_id,
+        order_number: currentOrder.number,
+        line_sku: null,
+        line_quantity: totalItems > 0 ? totalItems : null,
+        event_type: evType,
+        // Tag with the active CS Case if this is replacement work - so the
+        // RPC can skip deduction (CS Cases owns those movements).
+        cs_case_id: activeCase?.caseId ?? null,
+      });
+    } finally {
+      endCompletion(completionGuardRef.current, guardKey, inserted !== null, Date.now());
+    }
     if (!inserted) return;
     // Saved: re-read the counter. Not awaited, so deduction below never waits on reporting.
     refreshCounter();
@@ -1187,7 +1199,7 @@ function ProductionStation({
       setCurrentOrder((now) => (now === completedOrder ? null : now));
       setLineStates(new Map());
     }, 400);
-  }, [activeStaff, currentOrder, busy, insertEvent, station.department, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent, refreshCounter, onScanError]);
+  }, [activeStaff, currentOrder, busy, insertEvent, station.department, location, activeCase, supabase, packages, verifiedLines, stationUi, packagingMode, packaging.capture, packaging.applyAfterEvent, refreshCounter, onScanError]);
 
   /**
    * Scrap the entire order. Inserts a 'cancelled' event for every line on
